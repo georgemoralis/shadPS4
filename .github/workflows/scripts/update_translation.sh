@@ -2,6 +2,8 @@
 
 SCRIPTDIR=$(dirname "${BASH_SOURCE[0]}")
 
+git update-index --chmod=-x  ./.github/workflows/scripts/update_translation.sh
+
 set -e
 
 sudo apt-get -y install qt6-l10n-tools python3
