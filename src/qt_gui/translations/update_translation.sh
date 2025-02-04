@@ -6,4 +6,4 @@ OPTS="-tr-function-alias QT_TRANSLATE_NOOP+=TRANSLATE,QT_TRANSLATE_NOOP+=TRANSLA
 SRCDIRS=$(realpath "$SCRIPTDIR/..")/\ $(realpath "$SCRIPTDIR/../..")/
 OUTDIR=$(realpath "$SCRIPTDIR")
 
-lupdate $SRCDIRS $OPTS -source-language en -ts "$OUTDIR/en.ts"
+lupdate $SRCDIRS $OPTS -locations none -source-language en -ts "$OUTDIR/en.ts"
