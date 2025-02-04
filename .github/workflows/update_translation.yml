@@ -5,7 +5,7 @@ on:
 
 jobs:
   update:
-    if: github.repository == 'shadps4-emu/shadPS4'
+    if: github.repository == 'georgemoralis/shadPS4'
     name: "Update Translation"
     runs-on: ubuntu-22.04
     steps:
