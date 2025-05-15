@@ -676,9 +676,7 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, int op, OrbisNetId id,
         LOG_ERROR(Lib_Net, "epoll id is invalid = {}", eid);
         return ORBIS_NET_ERROR_EBADF;
     }
-    if (id == 100) {
-        UNREACHABLE_MSG("Hitted resolver id not supported");
-    }
+
     auto* socket_call = Common::Singleton<NetInternal>::Instance();
     auto sock = socket_call->FindSocket(id);
     if (!sock) {

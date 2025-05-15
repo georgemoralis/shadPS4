@@ -4,6 +4,7 @@
 #pragma once
 
 #include "common/types.h"
+#include "epoll.h"
 #include "netctl.h"
 
 namespace Core::Loader {
