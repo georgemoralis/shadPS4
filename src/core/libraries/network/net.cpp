@@ -17,9 +17,11 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net.h"
+#include "epoll.h"
 #include "net_error.h"
 #include "net_util.h"
 #include "netctl.h"
+#include "sockets.h"
 #include "sys_net.h"
 
 namespace Libraries::Net {
@@ -664,18 +666,89 @@ int PS4_SYSV_ABI sceNetEpollAbort() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetEpollControl() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, int op, OrbisNetId id,
+                                    OrbisNetEpollEvent* event) {
+    auto* net_epoll = Common::Singleton<NetEpollInternal>::Instance();
+
+    auto epoll = net_epoll->FindEpoll(eid);
+    if (!epoll) {
+        net_errno = ORBIS_NET_EBADF;
+        LOG_ERROR(Lib_Net, "epoll id is invalid = {}", eid);
+        return ORBIS_NET_ERROR_EBADF;
+    }
+    if (id == 100) {
+        UNREACHABLE_MSG("Hitted resolver id not supported");
+    }
+    auto* socket_call = Common::Singleton<NetInternal>::Instance();
+    auto sock = socket_call->FindSocket(id);
+    if (!sock) {
+        net_errno = ORBIS_NET_EBADF;
+        LOG_ERROR(Lib_Net, "socket id is invalid = {}", id);
+        return ORBIS_NET_ERROR_EBADF;
+    }
+    auto posixSocket = std::dynamic_pointer_cast<PosixSocket>(sock);
+    if (!posixSocket) {
+        net_errno = ORBIS_NET_EBADF;
+        LOG_ERROR(Lib_Net, "Can't create posix socket");
+        return ORBIS_NET_ERROR_EBADF;
+    }
+    switch (op) {
+        LOG_ERROR(Lib_Net, "(STUBBED) called");
+    case ORBIS_NET_EPOLL_CTL_ADD: {
+        return ORBIS_OK;
+        int add = epoll->Add(id, posixSocket->sock, event);
+        if (add == ORBIS_NET_ERROR_EEXIST) {
+            net_errno = ORBIS_NET_EEXIST;
+            LOG_ERROR(Lib_Net, "epoll event already added");
+            return ORBIS_NET_ERROR_EEXIST;
+        }
+        return ORBIS_OK;
+    }
+    case ORBIS_NET_EPOLL_CTL_DEL: {
+        int del = epoll->Del(id, posixSocket->sock, event);
+        if (del == ORBIS_NET_ERROR_ENOENT) {
+            net_errno = ORBIS_NET_ENOENT;
+            LOG_ERROR(Lib_Net, "no epoll event in wait state");
+            return ORBIS_NET_ERROR_ENOENT;
+        }
+        return ORBIS_OK;
+    }
+    case ORBIS_NET_EPOLL_CTL_MOD: {
+        int mod = epoll->Mod(id, posixSocket->sock, event);
+        if (mod == ORBIS_NET_ERROR_ENOENT) {
+            net_errno = ORBIS_NET_ENOENT;
+            LOG_ERROR(Lib_Net, "no epoll event in wait state");
+            return ORBIS_NET_ERROR_ENOENT;
+        }
+        return ORBIS_OK;
+    }
+    default:
+        net_errno = ORBIS_NET_EINVAL;
+        LOG_ERROR(Lib_Net, "Unknown operation = {}", op);
+        return ORBIS_NET_ERROR_EINVAL;
+    }
 }
 
-int PS4_SYSV_ABI sceNetEpollCreate() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetEpollCreate(const char* name, int flags) {
+    if (name == nullptr) {
+        LOG_DEBUG(Lib_Net, "name = no-name flags= {}", flags);
+    } else {
+        LOG_DEBUG(Lib_Net, "name = {} flags= {}", std::string(name), flags);
+    }
+    auto* net_epoll = Common::Singleton<NetEpollInternal>::Instance();
+    auto epoll = std::make_shared<NetEpoll>();
+    auto id = ++net_epoll->next_epool_sock_id;
+    net_epoll->epolls.emplace(id, epoll);
+    return id;
 }
 
-int PS4_SYSV_ABI sceNetEpollDestroy() {
-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+int PS4_SYSV_ABI sceNetEpollDestroy(int eid) {
+    auto* net_epoll = Common::Singleton<NetEpollInternal>::Instance();
+    if (net_epoll->EraseEpoll(eid) == 0) {
+        net_errno = ORBIS_NET_EBADF;
+        LOG_ERROR(Lib_Net, "Error deleting eid = {}", eid);
+        return ORBIS_NET_ERROR_EBADF;
+    }
     return ORBIS_OK;
 }
 
