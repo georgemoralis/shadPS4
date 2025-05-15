@@ -668,6 +668,7 @@ int PS4_SYSV_ABI sceNetEpollAbort() {
 
 int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, int op, OrbisNetId id,
                                     OrbisNetEpollEvent* event) {
+    LOG_INFO(Lib_Net, "eid = {} op = {} id = {}", eid, op, id);
     auto* net_epoll = Common::Singleton<NetEpollInternal>::Instance();
 
     auto epoll = net_epoll->FindEpoll(eid);
@@ -691,7 +692,6 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, int op, OrbisNetId id,
         return ORBIS_NET_ERROR_EBADF;
     }
     switch (op) {
-        LOG_ERROR(Lib_Net, "(STUBBED) called");
     case ORBIS_NET_EPOLL_CTL_ADD: {
         return ORBIS_OK;
         int add = epoll->Add(id, posixSocket->sock, event);
@@ -729,9 +729,9 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId eid, int op, OrbisNetId id,
 
 int PS4_SYSV_ABI sceNetEpollCreate(const char* name, int flags) {
     if (name == nullptr) {
-        LOG_DEBUG(Lib_Net, "name = no-name flags= {}", flags);
+        LOG_INFO(Lib_Net, "name = no-name flags= {}", flags);
     } else {
-        LOG_DEBUG(Lib_Net, "name = {} flags= {}", std::string(name), flags);
+        LOG_INFO(Lib_Net, "name = {} flags= {}", std::string(name), flags);
     }
     auto* net_epoll = Common::Singleton<NetEpollInternal>::Instance();
     auto epoll = std::make_shared<NetEpoll>();
