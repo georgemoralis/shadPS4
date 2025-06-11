@@ -242,14 +242,12 @@ int PS4_SYSV_ABI sceNpTrophyGetGameIcon(OrbisNpTrophyContext context, OrbisNpTro
         Common::FS::GetUserPath(Common::FS::PathType::MetaDataDir) / game_serial / "TrophyFiles";
     auto icon_file = trophy_dir / "trophy00" / "Icons" / "ICON0.PNG";
 
-    if (buffer == nullptr || size == nullptr) {
-        LOG_ERROR(Lib_NpTrophy, "Buffer or size pointer is null");
-        return ORBIS_NP_TROPHY_ERROR_INVALID_ARGUMENT;
-    }
-
     Common::FS::IOFile icon(icon_file, Common::FS::FileAccessMode::Read);
     size_t icon_size = icon.GetSize();
-    ReadFile(icon, buffer, *size);
+
+    if (buffer != nullptr) {
+        ReadFile(icon, buffer, *size);
+    }
 
     *size = icon_size;
 
