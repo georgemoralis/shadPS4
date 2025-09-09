@@ -104,6 +104,15 @@ enum OrbisNetResolverFlag : u32 {
     ORBIS_NET_RESOLVER_START_NTOA_DISABLE_IPADDRESS = 0x10000,
 };
 
+enum OrbisNetMsgFlag : u32 {
+    ORBIS_NET_MSG_PEEK = 0x00000002,         // recv,recvfrom,recvmsg
+    ORBIS_NET_MSG_WAITALL = 0x00000040,      // recv,recvfrom,recvmsg
+    ORBIS_NET_MSG_DONTWAIT = 0x00000080,     // send,sendto,sendmsg,recv,recvfrom,recvmsg
+    ORBIS_NET_MSG_USECRYPTO = 0x00000400,    // send,sendto,sendmsg
+    ORBIS_NET_MSG_USESIGNATURE = 0x00000800, // send,sendto,sendmg
+    ORBIS_NET_MSG_PEEKLEN = (0x00001000 | ORBIS_NET_MSG_PEEK) // recv,recvfrom
+};
+
 using OrbisNetId = s32;
 
 struct OrbisNetSockaddr {
