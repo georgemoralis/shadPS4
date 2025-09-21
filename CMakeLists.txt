@@ -392,6 +392,8 @@ set(NETWORK_LIBS src/core/libraries/network/http.cpp
                  src/core/libraries/network/p2p_sockets.cpp
                  src/core/libraries/network/unix_sockets.cpp
                  src/core/libraries/network/sockets.h
+                 src/core/libraries/network/epoll.cpp
+                 src/core/libraries/network/epoll.h
 )
 
 set(AVPLAYER_LIB src/core/libraries/avplayer/avplayer_common.cpp
