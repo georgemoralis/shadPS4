@@ -23,7 +23,8 @@ class SettingsDialog : public QDialog {
 public:
     explicit SettingsDialog(std::shared_ptr<gui_settings> gui_settings,
                             std::shared_ptr<CompatibilityInfoClass> m_compat_info,
-                            QWidget* parent = nullptr);
+                            QWidget* parent = nullptr, bool is_game_running = false,
+                            bool is_game_specific = false, std::string gsc_serial = "");
     ~SettingsDialog();
 
     bool eventFilter(QObject* obj, QEvent* event) override;
@@ -32,19 +33,22 @@ public:
     int exec() override;
 
 signals:
-    void LanguageChanged(const std::string& locale);
+    void LanguageChanged(const QString& locale);
     void CompatibilityChanged();
     void BackgroundOpacityChanged(int opacity);
 
 private:
     void LoadValuesFromConfig();
-    void UpdateSettings();
-    void ResetInstallFolders();
+    void UpdateSettings(bool game_specific = false);
+    void SyncRealTimeWidgetstoConfig();
     void InitializeEmulatorLanguages();
     void OnLanguageChanged(int index);
     void OnCursorStateChanged(s16 index);
     void closeEvent(QCloseEvent* event) override;
     void setDefaultValues();
+    void VolumeSliderChange(int value);
+    void onAudioDeviceChange(bool isAdd);
+    void pollSDLevents();
 
     std::unique_ptr<Ui::SettingsDialog> ui;
 
@@ -54,6 +58,12 @@ private:
 
     int initialHeight;
 
-    bool is_saving = false;
+    std::string gs_serial;
+
+    bool is_game_running = false;
+    bool is_game_specific = false;
+    bool is_game_saving = false;
+
     std::shared_ptr<gui_settings> m_gui_settings;
+    QFuture<void> Polling;
 };
