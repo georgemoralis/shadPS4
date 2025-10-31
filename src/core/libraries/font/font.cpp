@@ -209,7 +209,6 @@ s32 PS4_SYSV_ABI sceFontCharacterGetTextOrder(OrbisFontTextCharacter* textCharac
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
     }
 
-    // Retrieve text order
     *pTextOrder = textCharacter->textOrder;
     return ORBIS_OK;
 }
@@ -219,7 +218,6 @@ u32 PS4_SYSV_ABI sceFontCharacterLooksFormatCharacters(OrbisFontTextCharacter* t
         return 0;
     }
 
-    // Check if the format flag (bit 2) is set
     return (textCharacter->formatFlags & 0x04) ? textCharacter->characterCode : 0;
 }
 
@@ -1521,8 +1519,6 @@ void PS4_SYSV_ABI sceFontRenderSurfaceInit(OrbisFontRenderSurface* renderSurface
         renderSurface->pad2 = 0;
         renderSurface->width = (widthPixel < 0) ? 0 : widthPixel;
         renderSurface->height = (heightPixel < 0) ? 0 : heightPixel;
-
-        // Set the clipping/scaling rectangle
         renderSurface->sc_x0 = 0;
         renderSurface->sc_y0 = 0;
         renderSurface->sc_x1 = static_cast<u32>(renderSurface->width);
@@ -1542,7 +1538,6 @@ void PS4_SYSV_ABI sceFontRenderSurfaceSetScissor(OrbisFontRenderSurface* renderS
     if (!renderSurface)
         return;
 
-    // Handle horizontal clipping
     int surfaceWidth = renderSurface->width;
     int clip_x0, clip_x1;
 
@@ -1560,7 +1555,6 @@ void PS4_SYSV_ABI sceFontRenderSurfaceSetScissor(OrbisFontRenderSurface* renderS
         renderSurface->sc_x1 = static_cast<u32>(clip_x1);
     }
 
-    // Handle vertical clipping
     int surfaceHeight = renderSurface->height;
     int clip_y0, clip_y1;
 

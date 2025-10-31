@@ -229,15 +229,11 @@ if (APPLE)
         add_subdirectory(date)
     endif()
 
-    # MoltenVK (optional vendor for bundling). Guard if submodule is missing.
+    # MoltenVK
     if (NOT TARGET MoltenVK)
         set(MVK_EXCLUDE_SPIRV_TOOLS ON)
         set(MVK_USE_METAL_PRIVATE_API ON)
-        if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/MoltenVK/CMakeLists.txt")
-            add_subdirectory(MoltenVK)
-        else()
-            message(STATUS "MoltenVK submodule not present; skipping vendor build.")
-        endif()
+        add_subdirectory(MoltenVK)
     endif()
 
     if (NOT TARGET epoll-shim)
@@ -249,3 +245,7 @@ endif()
 if (WIN32)
 add_subdirectory(ext-wepoll)
 endif()
+
+#nlohmann json 
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+add_subdirectory(json)
