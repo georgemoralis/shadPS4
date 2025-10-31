@@ -25,7 +25,13 @@ static_assert(sizeof(u128) == 16, "u128 must be 128 bits wide");
 using VAddr = uintptr_t;
 using PAddr = uintptr_t;
 
+// On non-x86_64 targets (e.g., macOS arm64) the SysV ABI attribute is not available.
+// Guard it so builds on macOS/ARM and other unsupported targets don't fail.
+#if (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__))
 #define PS4_SYSV_ABI __attribute__((sysv_abi))
+#else
+#define PS4_SYSV_ABI
+#endif
 
 // UDLs for memory size values
 constexpr unsigned long long operator""_KB(unsigned long long x) {

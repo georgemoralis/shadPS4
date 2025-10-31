@@ -6,6 +6,7 @@ path = [
     "crowdin.yml",
     "CMakeSettings.json",
     "CMakeLinuxPresets.json",
+    "CMakeDarwinPresets.json",
     "CMakeWindowsPresets.json",
     "CMakePresets.json",
     ".github/FUNDING.yml",
