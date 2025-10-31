@@ -1,21 +1,177 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/font/font.h"
 #include "core/libraries/libs.h"
 #include "font_error.h"
 
+#define STBTT_STATIC
+#define STB_TRUETYPE_IMPLEMENTATION
+#include "externals/dear_imgui/imstb_truetype.h"
+
+namespace {
+struct GlyphEntry {
+    std::vector<std::uint8_t> bitmap;
+    int w = 0;
+    int h = 0;
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+    float advance = 0.0f;
+    float bearingX = 0.0f;
+};
+
+struct FontState {
+    float scale_w = 16.0f;
+    float scale_h = 16.0f;
+    Libraries::Font::OrbisFontLib library = nullptr;
+    bool face_ready = false;
+    std::vector<unsigned char> face_data;
+    stbtt_fontinfo face{};
+    float scale_for_height = 0.0f;
+    int ascent = 0, descent = 0, lineGap = 0;
+    bool ext_face_ready = false;
+    std::vector<unsigned char> ext_face_data;
+    stbtt_fontinfo ext_face{};
+    float ext_scale_for_height = 0.0f;
+    int ext_ascent = 0, ext_descent = 0, ext_lineGap = 0;
+    std::unordered_map<std::uint64_t, GlyphEntry> ext_cache;
+    std::unordered_map<std::uint64_t, GlyphEntry> sys_cache;
+    std::unordered_map<std::uint64_t, float> ext_kern_cache;
+    std::unordered_map<std::uint64_t, float> sys_kern_cache;
+    std::vector<std::uint8_t> scratch;
+    bool logged_ext_use = false;
+    bool logged_sys_use = false;
+};
+
+static std::unordered_map<Libraries::Font::OrbisFontHandle, FontState> g_font_state;
+
+struct LibraryState {
+    bool support_system = false;
+    bool support_external = false;
+    u32 external_formats = 0;
+    u32 external_fontMax = 0;
+};
+static std::unordered_map<Libraries::Font::OrbisFontLib, LibraryState> g_library_state;
+
+static std::unordered_map<Libraries::Font::OrbisFontRenderSurface*,
+                          const Libraries::Font::OrbisFontStyleFrame*>
+    g_style_for_surface;
+
+static FontState& GetState(Libraries::Font::OrbisFontHandle h) {
+    return g_font_state[h];
+}
+
+static LibraryState& GetLibState(Libraries::Font::OrbisFontLib lib) {
+    return g_library_state[lib];
+}
+
+static void LogExternalFormatSupport(u32 formats_mask) {
+    LOG_INFO(Lib_Font, "ExternalFormatsMask=0x{:X}", formats_mask);
+}
+
+static bool ReadFileBinary(const std::string& path, std::vector<unsigned char>& out) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        return false;
+    f.seekg(0, std::ios::end);
+    std::streampos sz = f.tellg();
+    if (sz <= 0)
+        return false;
+    out.resize(static_cast<size_t>(sz));
+    f.seekg(0, std::ios::beg);
+    f.read(reinterpret_cast<char*>(out.data()), sz);
+    return f.good();
+}
+
+static bool EnsureSystemFace(FontState& st) {
+    if (st.face_ready)
+        return true;
+    std::vector<std::string> candidates;
+    if (const char* env_dir = std::getenv("SHADPS4_FONTS_DIR"); env_dir && *env_dir) {
+        candidates.emplace_back(std::string(env_dir) + "/NotoSansJP-Regular.ttf");
+        candidates.emplace_back(std::string(env_dir) + "/ProggyVector-Regular.ttf");
+    }
+    static const char* rel_roots[] = {".", "..", "../..", "../../..", "../../../.."};
+    for (auto* root : rel_roots) {
+        candidates.emplace_back(std::string(root) +
+                                "/src/imgui/renderer/fonts/NotoSansJP-Regular.ttf");
+        candidates.emplace_back(std::string(root) +
+                                "/src/imgui/renderer/fonts/ProggyVector-Regular.ttf");
+    }
+    for (const auto& path : candidates) {
+        st.face_data.clear();
+        if (ReadFileBinary(path, st.face_data)) {
+            if (stbtt_InitFont(&st.face, st.face_data.data(), 0)) {
+                st.face_ready = true;
+                stbtt_GetFontVMetrics(&st.face, &st.ascent, &st.descent, &st.lineGap);
+                if (st.scale_for_height == 0.0f)
+                    st.scale_for_height = stbtt_ScaleForPixelHeight(&st.face, st.scale_h);
+                LOG_INFO(Lib_Font,
+                         "SystemFace: loaded '{}' (ascent={}, descent={}, lineGap={}, scale={})",
+                         path, st.ascent, st.descent, st.lineGap, st.scale_for_height);
+                return true;
+            } else {
+                LOG_WARNING(Lib_Font, "SystemFace: stbtt_InitFont failed for '{}'", path);
+            }
+        } else {
+            LOG_DEBUG(Lib_Font, "SystemFace: could not open '{}'", path);
+        }
+    }
+    LOG_WARNING(Lib_Font, "SystemFace: no font file found; using placeholder rectangles");
+    return false;
+}
+
+static std::unordered_set<u32> g_logged_pua;
+
+static inline std::uint64_t MakeGlyphKey(u32 code, int pixel_h) {
+    return (static_cast<std::uint64_t>(code) << 32) | static_cast<std::uint32_t>(pixel_h);
+}
+static std::unordered_set<const void*> g_stride_logged;
+static inline void LogStrideOnce(const Libraries::Font::OrbisFontRenderSurface* surf) {
+    if (!surf)
+        return;
+    const void* key = static_cast<const void*>(surf);
+    if (g_stride_logged.insert(key).second) {
+        const int bpp = std::max(1, static_cast<int>(surf->pixelSizeByte));
+        const long expected = static_cast<long>(surf->width) * bpp;
+        const bool match = (expected == surf->widthByte);
+        LOG_INFO(Lib_Font,
+                 "StrideCheck: surf={} buf={} width={} height={} pixelSizeByte={} widthByte={} "
+                 "expected={} match={}",
+                 key, surf->buffer, surf->width, surf->height, bpp, surf->widthByte, expected,
+                 match);
+    }
+}
+} // namespace
+
 namespace Libraries::Font {
 
-s32 PS4_SYSV_ABI sceFontAttachDeviceCacheBuffer() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+struct FontLibOpaque {};
+struct OrbisFontRenderer_ {};
+
+s32 PS4_SYSV_ABI sceFontAttachDeviceCacheBuffer(OrbisFontLib library, void* buffer, u32 size) {
+    LOG_ERROR(Lib_Font, "(STUBBED) called library={} buffer={} size={}",
+              static_cast<const void*>(library), static_cast<const void*>(buffer), size);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontBindRenderer() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontBindRenderer(OrbisFontHandle fontHandle, OrbisFontRenderer renderer) {
+    LOG_DEBUG(Lib_Font, "sceFontBindRenderer fontHandle={} renderer={}",
+              static_cast<const void*>(fontHandle), static_cast<const void*>(renderer));
     return ORBIS_OK;
 }
 
@@ -78,33 +234,33 @@ u32 PS4_SYSV_ABI sceFontCharacterLooksWhiteSpace(OrbisFontTextCharacter* textCha
 OrbisFontTextCharacter* PS4_SYSV_ABI
 sceFontCharacterRefersTextBack(OrbisFontTextCharacter* textCharacter) {
     if (!textCharacter)
-        return NULL; // Check if input is NULL
+        return NULL;
 
-    OrbisFontTextCharacter* current = textCharacter->prev; // Move backward instead of forward
+    OrbisFontTextCharacter* current = textCharacter->prev;
     while (current) {
         if (current->unkn_0x31 == 0 && current->unkn_0x33 == 0) {
-            return current; // Return the first matching node
+            return current;
         }
-        current = current->prev; // Move to the previous node
+        current = current->prev;
     }
 
-    return NULL; // No valid node found
+    return NULL;
 }
 
 OrbisFontTextCharacter* PS4_SYSV_ABI
 sceFontCharacterRefersTextNext(OrbisFontTextCharacter* textCharacter) {
     if (!textCharacter)
-        return NULL; // Null check
+        return NULL;
 
     OrbisFontTextCharacter* current = textCharacter->next;
     while (current) {
         if (current->unkn_0x31 == 0 && current->unkn_0x33 == 0) {
-            return current; // Found a match
+            return current;
         }
-        current = current->next; // Move to the next node
+        current = current->next;
     }
 
-    return NULL; // No matching node found
+    return NULL;
 }
 
 s32 PS4_SYSV_ABI sceFontCharactersRefersTextCodes() {
@@ -147,8 +303,16 @@ s32 PS4_SYSV_ABI sceFontCreateLibrary() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontCreateLibraryWithEdition() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontCreateLibraryWithEdition(const OrbisFontMem* memory,
+                                                 OrbisFontLibCreateParams create_params,
+                                                 u64 edition, OrbisFontLib* pLibrary) {
+    if (!pLibrary) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    (void)memory;
+    (void)create_params;
+    (void)edition;
+    *pLibrary = new FontLibOpaque{};
     return ORBIS_OK;
 }
 
@@ -157,8 +321,16 @@ s32 PS4_SYSV_ABI sceFontCreateRenderer() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontCreateRendererWithEdition() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontCreateRendererWithEdition(const OrbisFontMem* memory,
+                                                  OrbisFontRendererCreateParams create_params,
+                                                  u64 edition, OrbisFontRenderer* pRenderer) {
+    if (!pRenderer) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    (void)memory;
+    (void)create_params;
+    (void)edition;
+    *pRenderer = new OrbisFontRenderer_{};
     return ORBIS_OK;
 }
 
@@ -242,8 +414,102 @@ s32 PS4_SYSV_ABI sceFontGetCharGlyphCode() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontGetCharGlyphMetrics() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontGetCharGlyphMetrics(OrbisFontHandle fontHandle, u32 code,
+                                            OrbisFontGlyphMetrics* metrics) {
+    if (!metrics) {
+        LOG_DEBUG(Lib_Font, "sceFontGetCharGlyphMetrics: invalid params");
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    auto& st = GetState(fontHandle);
+    const stbtt_fontinfo* face = nullptr;
+    float scale = 0.0f;
+    bool use_ext = false;
+
+    int ext_glyph = 0;
+    if (st.ext_face_ready) {
+        if (st.ext_scale_for_height == 0.0f)
+            st.ext_scale_for_height = stbtt_ScaleForPixelHeight(&st.ext_face, st.scale_h);
+        ext_glyph = stbtt_FindGlyphIndex(&st.ext_face, static_cast<int>(code));
+        if (ext_glyph > 0) {
+            face = &st.ext_face;
+            scale = st.ext_scale_for_height;
+            use_ext = true;
+            if (!st.logged_ext_use) {
+                LOG_INFO(Lib_Font, "RenderFace: handle={} source=external (game font)",
+                         static_cast<const void*>(fontHandle));
+                st.logged_ext_use = true;
+            }
+        }
+    }
+    if (!face && EnsureSystemFace(st)) {
+        if (st.scale_for_height == 0.0f)
+            st.scale_for_height = stbtt_ScaleForPixelHeight(&st.face, st.scale_h);
+        int sys_glyph = stbtt_FindGlyphIndex(&st.face, static_cast<int>(code));
+        if (sys_glyph > 0) {
+            face = &st.face;
+            scale = st.scale_for_height;
+            use_ext = false;
+            if (!st.logged_sys_use) {
+                LOG_INFO(Lib_Font, "RenderFace: handle={} source=system (fallback)",
+                         static_cast<const void*>(fontHandle));
+                st.logged_sys_use = true;
+            }
+        }
+    }
+    if (face) {
+        const int pixel_h = std::max(1, (int)std::lround(st.scale_h));
+        const std::uint64_t key = MakeGlyphKey(code, pixel_h);
+        GlyphEntry* ge = nullptr;
+        if (use_ext) {
+            auto it = st.ext_cache.find(key);
+            if (it != st.ext_cache.end())
+                ge = &it->second;
+        } else {
+            auto it = st.sys_cache.find(key);
+            if (it != st.sys_cache.end())
+                ge = &it->second;
+        }
+        if (!ge) {
+            GlyphEntry entry{};
+            int aw = 0, lsb = 0;
+            stbtt_GetCodepointHMetrics(face, static_cast<int>(code), &aw, &lsb);
+            stbtt_GetCodepointBitmapBox(face, static_cast<int>(code), scale, scale, &entry.x0,
+                                        &entry.y0, &entry.x1, &entry.y1);
+            entry.w = std::max(0, entry.x1 - entry.x0);
+            entry.h = std::max(0, entry.y1 - entry.y0);
+            entry.advance = static_cast<float>(aw) * scale;
+            entry.bearingX = static_cast<float>(lsb) * scale;
+            if (use_ext) {
+                ge = &st.ext_cache.emplace(key, std::move(entry)).first->second;
+            } else {
+                ge = &st.sys_cache.emplace(key, std::move(entry)).first->second;
+            }
+        }
+        metrics->w = ge->w > 0 ? (float)ge->w : st.scale_w;
+        metrics->h = ge->h > 0 ? (float)ge->h : st.scale_h;
+        metrics->h_bearing_x = ge->bearingX;
+        metrics->h_bearing_y = static_cast<float>(-ge->y0);
+        metrics->h_adv = ge->advance > 0.0f ? ge->advance : st.scale_w;
+        metrics->v_bearing_x = 0.0f;
+        metrics->v_bearing_y = 0.0f;
+        metrics->v_adv = 0.0f;
+        LOG_TRACE(Lib_Font,
+                  "GetCharGlyphMetrics: code=U+{:04X} src={} size=({}, {}) adv={} bearing=({}, {}) "
+                  "box={}x{}",
+                  code, use_ext ? "external" : "system", st.scale_w, st.scale_h, metrics->h_adv,
+                  metrics->h_bearing_x, metrics->h_bearing_y, metrics->w, metrics->h);
+        return ORBIS_OK;
+    }
+    metrics->w = st.scale_w;
+    metrics->h = st.scale_h;
+    metrics->h_bearing_x = 0.0f;
+    metrics->h_bearing_y = st.scale_h;
+    metrics->h_adv = st.scale_w;
+    metrics->v_bearing_x = 0.0f;
+    metrics->v_bearing_y = 0.0f;
+    metrics->v_adv = 0.0f;
+    LOG_TRACE(Lib_Font, "GetCharGlyphMetrics(fallback): code=U+{:04X} size=({}, {}) box={}x{}",
+              code, st.scale_w, st.scale_h, metrics->w, metrics->h);
     return ORBIS_OK;
 }
 
@@ -288,17 +554,64 @@ s32 PS4_SYSV_ABI sceFontGetGlyphExpandBufferState() {
 }
 
 s32 PS4_SYSV_ABI sceFontGetHorizontalLayout() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+    LOG_DEBUG(Lib_Font, "GetHorizontalLayout: default layout (no effects)");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontGetKerning() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontGetKerning(OrbisFontHandle fontHandle, u32 preCode, u32 code,
+                                   OrbisFontKerning* kerning) {
+    if (!kerning) {
+        LOG_DEBUG(Lib_Font, "sceFontGetKerning: invalid params");
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    auto& st = GetState(fontHandle);
+    const stbtt_fontinfo* face = nullptr;
+    float scale = 0.0f;
+    if (st.ext_face_ready) {
+        if (st.ext_scale_for_height == 0.0f)
+            st.ext_scale_for_height = stbtt_ScaleForPixelHeight(&st.ext_face, st.scale_h);
+        int g1 = stbtt_FindGlyphIndex(&st.ext_face, static_cast<int>(preCode));
+        int g2 = stbtt_FindGlyphIndex(&st.ext_face, static_cast<int>(code));
+        if (g1 > 0 && g2 > 0) {
+            face = &st.ext_face;
+            scale = st.ext_scale_for_height;
+        }
+    }
+    if (!face && EnsureSystemFace(st)) {
+        if (st.scale_for_height == 0.0f)
+            st.scale_for_height = stbtt_ScaleForPixelHeight(&st.face, st.scale_h);
+        int g1 = stbtt_FindGlyphIndex(&st.face, static_cast<int>(preCode));
+        int g2 = stbtt_FindGlyphIndex(&st.face, static_cast<int>(code));
+        if (g1 > 0 && g2 > 0) {
+            face = &st.face;
+            scale = st.scale_for_height;
+        }
+    }
+    if (face) {
+        const int kern =
+            stbtt_GetCodepointKernAdvance(face, static_cast<int>(preCode), static_cast<int>(code));
+        const float kx = static_cast<float>(kern) * scale;
+        kerning->dx = kx;
+        kerning->dy = 0.0f;
+        kerning->px = 0.0f;
+        kerning->py = 0.0f;
+        LOG_TRACE(Lib_Font, "GetKerning: pre=U+{:04X} code=U+{:04X} dx={}", preCode, code, kx);
+        return ORBIS_OK;
+    }
+    kerning->dx = 0.0f;
+    kerning->dy = 0.0f;
+    kerning->px = 0.0f;
+    kerning->py = 0.0f;
+    LOG_TRACE(Lib_Font, "GetKerning: pre=U+{:04X} code=U+{:04X} dx=0 (no face)", preCode, code);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontGetLibrary() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontGetLibrary(OrbisFontHandle fontHandle, OrbisFontLib* pLibrary) {
+    if (!pLibrary) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    const auto& st = GetState(fontHandle);
+    *pLibrary = st.library;
     return ORBIS_OK;
 }
 
@@ -342,8 +655,16 @@ s32 PS4_SYSV_ABI sceFontGetResolutionDpi() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontGetScalePixel() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontGetScalePixel(OrbisFontHandle fontHandle, float* w, float* h) {
+    if (!w || !h) {
+        LOG_DEBUG(Lib_Font, "sceFontGetScalePixel: invalid params");
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    const auto& st = GetState(fontHandle);
+    *w = st.scale_w;
+    *h = st.scale_h;
+    LOG_DEBUG(Lib_Font, "GetScalePixel: handle={} -> w={}, h={}",
+              static_cast<const void*>(fontHandle), *w, *h);
     return ORBIS_OK;
 }
 
@@ -682,8 +1003,16 @@ s32 PS4_SYSV_ABI sceFontGraphicsUpdateShapeFillPlot() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontMemoryInit() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontMemoryInit(OrbisFontMem* fontMemory, void* address, u32 sizeByte,
+                                   const OrbisFontMemInterface* memInterface, void* mspaceObject,
+                                   OrbisFontMemDestroyCb destroyCallback, void* destroyObject) {
+    LOG_ERROR(Lib_Font,
+              "(STUBBED) called font_mem={} region_base={} sizeByte={} mem_if={} mspace_handle={}"
+              " destroy_cb={} destroy_ctx={}",
+              static_cast<const void*>(fontMemory), static_cast<const void*>(address), sizeByte,
+              static_cast<const void*>(memInterface), static_cast<const void*>(mspaceObject),
+              reinterpret_cast<const void*>(destroyCallback),
+              static_cast<const void*>(destroyObject));
     return ORBIS_OK;
 }
 
@@ -702,28 +1031,461 @@ s32 PS4_SYSV_ABI sceFontOpenFontInstance() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontOpenFontMemory() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontOpenFontMemory(OrbisFontLib library, const void* fontAddress, u32 fontSize,
+                                       const OrbisFontOpenParams* open_params,
+                                       OrbisFontHandle* pFontHandle) {
+    if (!library || !fontAddress || fontSize == 0 || !pFontHandle) {
+        LOG_DEBUG(Lib_Font, "sceFontOpenFontMemory: invalid params");
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    (void)open_params;
+    auto* f = new OrbisFontHandleOpaque{};
+    *pFontHandle = f;
+    auto& st = GetState(f);
+    st.library = library;
+    const unsigned char* p = reinterpret_cast<const unsigned char*>(fontAddress);
+    auto& ls = GetLibState(library);
+    LOG_INFO(Lib_Font,
+             "OpenFontMemory: lib={} size={} open_params={} handle={} sig='{}{}{}{}' "
+             "ext_supported={} formats=0x{:X}",
+             static_cast<const void*>(library), fontSize, static_cast<const void*>(open_params),
+             static_cast<const void*>(*pFontHandle), (fontSize >= 1 ? (char)p[0] : '?'),
+             (fontSize >= 2 ? (char)p[1] : '?'), (fontSize >= 3 ? (char)p[2] : '?'),
+             (fontSize >= 4 ? (char)p[3] : '?'), ls.support_external, ls.external_formats);
+    st.ext_face_data.assign(reinterpret_cast<const unsigned char*>(fontAddress),
+                            reinterpret_cast<const unsigned char*>(fontAddress) + fontSize);
+    int font_count = stbtt_GetNumberOfFonts(st.ext_face_data.data());
+    int chosen_index = 0;
+    if (font_count > 1) {
+        chosen_index = 0;
+        if (open_params) {
+            chosen_index =
+                static_cast<int>(open_params->subfont_index % static_cast<u32>(font_count));
+        }
+    }
+    int offset = stbtt_GetFontOffsetForIndex(st.ext_face_data.data(), chosen_index);
+    const unsigned char* d = st.ext_face_data.data();
+    const u32 sig32 = (fontSize >= 4)
+                          ? (static_cast<u32>(d[0]) << 24) | (static_cast<u32>(d[1]) << 16) |
+                                (static_cast<u32>(d[2]) << 8) | static_cast<u32>(d[3])
+                          : 0u;
+    const bool is_ttc = (font_count > 1);
+    const bool is_otf_cff = (sig32 == 0x4F54544Fu);
+    const bool is_ttf_sfnt = (sig32 == 0x00010000u) || (sig32 == 0x74727565u);
+    const bool is_sfnt_typ1 = (sig32 == 0x74797031u);
+    if (is_otf_cff) {
+        LOG_WARNING(Lib_Font,
+                    "ExternalFace: OTF/CFF detected (OTTO). CFF outlines are not supported;"
+                    " handle={} fonts={} requested_index={} -> fallback may occur",
+                    static_cast<const void*>(*pFontHandle), font_count, chosen_index);
+    }
+    if (stbtt_InitFont(&st.ext_face, st.ext_face_data.data(), offset)) {
+        st.ext_face_ready = true;
+        stbtt_GetFontVMetrics(&st.ext_face, &st.ext_ascent, &st.ext_descent, &st.ext_lineGap);
+        st.ext_scale_for_height = stbtt_ScaleForPixelHeight(&st.ext_face, st.scale_h);
+        LOG_INFO(Lib_Font,
+                 "ExternalFace: handle={} ascent={} descent={} lineGap={} scale={} (data={} bytes)"
+                 " fonts={} chosen_index={} ttc={} sig=0x{:08X} kind={}",
+                 static_cast<const void*>(*pFontHandle), st.ext_ascent, st.ext_descent,
+                 st.ext_lineGap, st.ext_scale_for_height, (int)st.ext_face_data.size(), font_count,
+                 chosen_index, is_ttc, sig32,
+                 is_otf_cff ? "OTF/CFF (unsupported)"
+                            : (is_ttf_sfnt ? "TTF (ready)"
+                                           : (is_sfnt_typ1 ? "Type1(sfnt) (stub)" : "unknown")));
+        if (is_ttf_sfnt) {
+            LOG_INFO(Lib_Font, "ExternalFormat: OpenType-TT (glyf) -> ready");
+        } else if (is_otf_cff) {
+            LOG_WARNING(Lib_Font, "ExternalFormat: OpenType-CFF -> stub (CFF unsupported)");
+        } else if (is_sfnt_typ1) {
+            LOG_WARNING(Lib_Font, "ExternalFormat: Type 1 (sfnt wrapper) -> stub");
+        }
+    } else {
+        LOG_WARNING(Lib_Font,
+                    "ExternalFace: stbtt_InitFont failed for handle={} size={} fonts={}"
+                    " chosen_index={} sig='{}{}{}{}' (OTF/CFF unsupported={})",
+                    static_cast<const void*>(*pFontHandle), fontSize, font_count, chosen_index,
+                    (fontSize >= 1 ? (char)p[0] : '?'), (fontSize >= 2 ? (char)p[1] : '?'),
+                    (fontSize >= 3 ? (char)p[2] : '?'), (fontSize >= 4 ? (char)p[3] : '?'),
+                    is_otf_cff);
+        if (is_otf_cff) {
+            LOG_WARNING(Lib_Font, "Stubbed: CFF outlines not implemented; fallback to system font");
+        }
+    }
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontOpenFontSet() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontOpenFontSet(OrbisFontLib library, u32 fontSetType, u32 openMode,
+                                    const OrbisFontOpenParams* open_params,
+                                    OrbisFontHandle* pFontHandle) {
+    (void)fontSetType;
+    (void)openMode;
+    (void)open_params;
+    if (!pFontHandle) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    auto* f = new OrbisFontHandleOpaque{};
+    *pFontHandle = f;
+    auto& st = GetState(f);
+    st.library = library;
+    EnsureSystemFace(st);
+    if (st.scale_for_height == 0.0f)
+        st.scale_for_height = stbtt_ScaleForPixelHeight(&st.face, st.scale_h);
+    LOG_INFO(
+        Lib_Font,
+        "OpenFontSet: lib={} fontSetType={} openMode={} open_params={} handle={} (system face={})",
+        static_cast<const void*>(library), fontSetType, openMode,
+        static_cast<const void*>(open_params), static_cast<const void*>(*pFontHandle),
+        EnsureSystemFace(GetState(f)));
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontRebindRenderer() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontRebindRenderer(OrbisFontHandle fontHandle) {
+    LOG_ERROR(Lib_Font, "(STUBBED) called fontHandle={}", static_cast<const void*>(fontHandle));
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontRenderCharGlyphImage() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceFontRenderCharGlyphImage(OrbisFontHandle fontHandle, u32 code,
+                                             OrbisFontRenderSurface* surf, float x, float y,
+                                             OrbisFontGlyphMetrics* metrics,
+                                             OrbisFontRenderOutput* result) {
+    return sceFontRenderCharGlyphImageHorizontal(fontHandle, code, surf, x, y, metrics, result);
 }
 
-s32 PS4_SYSV_ABI sceFontRenderCharGlyphImageHorizontal() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontRenderCharGlyphImageHorizontal(OrbisFontHandle fontHandle, u32 code,
+                                                       OrbisFontRenderSurface* surf, float x,
+                                                       float y, OrbisFontGlyphMetrics* metrics,
+                                                       OrbisFontRenderOutput* result) {
+    LOG_INFO(Lib_Font,
+             "RenderGlyph(H): handle={} code=U+{:04X} x={} y={} metrics={} result={} surf={}"
+             " buf={} widthByte={} pixelSizeByte={} size={}x{} sc=[{},{}-{}:{}] styleFlag={}",
+             static_cast<const void*>(fontHandle), code, x, y, static_cast<const void*>(metrics),
+             static_cast<const void*>(result), static_cast<const void*>(surf),
+             surf ? static_cast<const void*>(surf->buffer) : nullptr, surf ? surf->widthByte : -1,
+             surf ? (int)surf->pixelSizeByte : -1, surf ? surf->width : -1,
+             surf ? surf->height : -1, surf ? surf->sc_x0 : 0u, surf ? surf->sc_y0 : 0u,
+             surf ? surf->sc_x1 : 0u, surf ? surf->sc_y1 : 0u, surf ? (int)surf->styleFlag : -1);
+    if (!surf || !surf->buffer) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    LogStrideOnce(surf);
+    LOG_DEBUG(Lib_Font,
+              "RenderGlyph(H): handle={} code=U+{:04X} x={} y={} surf={} size={}x{} bpp={} "
+              "sc=[{},{}-{}:{}]",
+              static_cast<const void*>(fontHandle), code, x, y, static_cast<const void*>(surf),
+              surf->width, surf->height, (int)surf->pixelSizeByte, surf->sc_x0, surf->sc_y0,
+              surf->sc_x1, surf->sc_y1);
+    if (result) {
+        result->stage = nullptr;
+        result->slot.maybe_addr = static_cast<u8*>(surf->buffer);
+        result->slot.maybe_rowBytes = static_cast<u32>(std::max(0, surf->widthByte));
+        result->slot.maybe_pixelSize = static_cast<u8>(std::max(1, (int)surf->pixelSizeByte));
+        result->slot.maybe_pixelFmt = (result->slot.maybe_pixelSize == 4) ? 1 : 0;
+    }
+    auto& st = GetState(fontHandle);
+    float fw = st.scale_w;
+    float fh = st.scale_h;
+    int g_x0 = 0, g_y0 = 0, g_x1 = 0, g_y1 = 0;
+    const stbtt_fontinfo* face = nullptr;
+    float scale = 0.0f;
+    bool use_ext = false;
+
+    int ext_glyph = 0;
+    if (st.ext_face_ready) {
+        if (st.ext_scale_for_height == 0.0f)
+            st.ext_scale_for_height = stbtt_ScaleForPixelHeight(&st.ext_face, st.scale_h);
+        ext_glyph = stbtt_FindGlyphIndex(&st.ext_face, static_cast<int>(code));
+        if (ext_glyph > 0) {
+            face = &st.ext_face;
+            scale = st.ext_scale_for_height;
+            use_ext = true;
+        }
+    }
+    if (!face && EnsureSystemFace(st)) {
+        if (st.scale_for_height == 0.0f)
+            st.scale_for_height = stbtt_ScaleForPixelHeight(&st.face, st.scale_h);
+        int sys_glyph = stbtt_FindGlyphIndex(&st.face, static_cast<int>(code));
+        if (sys_glyph > 0) {
+            face = &st.face;
+            scale = st.scale_for_height;
+            use_ext = false;
+        }
+    }
+    if (face) {
+        LOG_DEBUG(Lib_Font, "RenderGlyphSrc(H): handle={} code=U+{:04X} src={}",
+                  static_cast<const void*>(fontHandle), code, use_ext ? "external" : "system");
+        const float frac_x = x - std::floor(x);
+        const float frac_y = y - std::floor(y);
+        const bool use_subpixel = (frac_x != 0.0f) || (frac_y != 0.0f);
+        const int pixel_h = std::max(1, (int)std::lround(st.scale_h));
+        const std::uint64_t key = MakeGlyphKey(code, pixel_h);
+        GlyphEntry* ge = nullptr;
+        if (!use_subpixel) {
+            if (use_ext) {
+                auto it = st.ext_cache.find(key);
+                if (it != st.ext_cache.end())
+                    ge = &it->second;
+            } else {
+                auto it = st.sys_cache.find(key);
+                if (it != st.sys_cache.end())
+                    ge = &it->second;
+            }
+        }
+        if (!ge) {
+            GlyphEntry entry{};
+            int aw = 0, lsb = 0;
+            stbtt_GetCodepointHMetrics(face, static_cast<int>(code), &aw, &lsb);
+            if (use_subpixel) {
+                stbtt_GetCodepointBitmapBoxSubpixel(face, static_cast<int>(code), scale, scale,
+                                                    frac_x, frac_y, &entry.x0, &entry.y0, &entry.x1,
+                                                    &entry.y1);
+            } else {
+                stbtt_GetCodepointBitmapBox(face, static_cast<int>(code), scale, scale, &entry.x0,
+                                            &entry.y0, &entry.x1, &entry.y1);
+            }
+            entry.w = std::max(0, entry.x1 - entry.x0);
+            entry.h = std::max(0, entry.y1 - entry.y0);
+            entry.advance = static_cast<float>(aw) * scale;
+            entry.bearingX = static_cast<float>(lsb) * scale;
+            if (!use_subpixel && entry.w > 0 && entry.h > 0) {
+                entry.bitmap.resize(static_cast<size_t>(entry.w * entry.h));
+                stbtt_MakeCodepointBitmap(face, entry.bitmap.data(), entry.w, entry.h, entry.w,
+                                          scale, scale, static_cast<int>(code));
+            }
+            if (!use_subpixel) {
+                if (use_ext) {
+                    ge = &st.ext_cache.emplace(key, std::move(entry)).first->second;
+                } else {
+                    ge = &st.sys_cache.emplace(key, std::move(entry)).first->second;
+                }
+            } else {
+                fw = (float)entry.w;
+                fh = (float)entry.h;
+                g_x0 = entry.x0;
+                g_y0 = entry.y0;
+                g_x1 = entry.x1;
+                g_y1 = entry.y1;
+            }
+        }
+        if (ge) {
+            fw = (float)ge->w;
+            fh = (float)ge->h;
+            g_x0 = ge->x0;
+            g_y0 = ge->y0;
+            g_x1 = ge->x1;
+            g_y1 = ge->y1;
+        }
+    }
+    if (metrics) {
+        if (face) {
+            int aw = 0, lsb = 0;
+            stbtt_GetCodepointHMetrics(face, static_cast<int>(code), &aw, &lsb);
+            metrics->w = fw;
+            metrics->h = fh;
+            metrics->h_bearing_x = static_cast<float>(lsb) * scale;
+            metrics->h_bearing_y = static_cast<float>(-g_y0);
+            metrics->h_adv = static_cast<float>(aw) * scale;
+        } else {
+            metrics->w = fw;
+            metrics->h = fh;
+            metrics->h_bearing_x = 0.0f;
+            metrics->h_bearing_y = fh;
+            metrics->h_adv = fw;
+        }
+        metrics->v_bearing_x = 0.0f;
+        metrics->v_bearing_y = 0.0f;
+        metrics->v_adv = 0.0f;
+    }
+
+    if (code == 0x20) {
+        if (result) {
+            result->new_x = 0;
+            result->new_y = 0;
+            result->new_w = 0;
+            result->new_h = 0;
+            result->ImageMetrics = {};
+        }
+        return ORBIS_OK;
+    }
+
+    int ix = static_cast<int>(std::floor(x));
+    int iy = static_cast<int>(std::floor(y));
+    int left = ix;
+    int top = iy;
+    if (face) {
+        left = ix + g_x0;
+        top = iy + g_y0;
+    }
+    int iw = std::max(0, static_cast<int>(std::round(fw)));
+    int ih = std::max(0, static_cast<int>(std::round(fh)));
+
+    int sw = surf->width;
+    int sh = surf->height;
+    if (sw <= 0 || sh <= 0 || iw <= 0 || ih <= 0) {
+        return ORBIS_OK;
+    }
+
+    int sx0 = 0, sy0 = 0, sx1 = sw, sy1 = sh;
+    if (surf->sc_x1 > 0 || surf->sc_y1 > 0 || surf->sc_x0 > 0 || surf->sc_y0 > 0) {
+        sx0 = static_cast<int>(surf->sc_x0);
+        sy0 = static_cast<int>(surf->sc_y0);
+        sx1 = static_cast<int>(surf->sc_x1);
+        sy1 = static_cast<int>(surf->sc_y1);
+        sx0 = std::clamp(sx0, 0, sw);
+        sy0 = std::clamp(sy0, 0, sh);
+        sx1 = std::clamp(sx1, 0, sw);
+        sy1 = std::clamp(sy1, 0, sh);
+    }
+
+    int rx0 = left;
+    int ry0 = top;
+    int rx1 = left + iw;
+    int ry1 = top + ih;
+
+    rx0 = std::clamp(rx0, sx0, sx1);
+    ry0 = std::clamp(ry0, sy0, sy1);
+    rx1 = std::clamp(rx1, sx0, sx1);
+    ry1 = std::clamp(ry1, sy0, sy1);
+
+    int cw = std::max(0, rx1 - rx0);
+    int ch = std::max(0, ry1 - ry0);
+
+    if (cw > 0 && ch > 0) {
+        const int bpp = std::max(1, static_cast<int>(surf->pixelSizeByte));
+        bool is_pua = (code >= 0xE000 && code <= 0xF8FF) || (code >= 0xF0000 && code <= 0xFFFFD) ||
+                      (code >= 0x100000 && code <= 0x10FFFD);
+        bool is_placeholder_ascii = (code == 'h' || code == 'p' || code == 'x' || code == 'o');
+        if ((is_pua || is_placeholder_ascii) && g_logged_pua.insert(code).second) {
+            LOG_DEBUG(
+                Lib_Font,
+                "GlyphTrace: code=U+{:04X} pua={} placeholder_ascii={} dst=[{},{} {}x{}] bpp={}",
+                code, is_pua, is_placeholder_ascii, rx0, ry0, cw, ch, bpp);
+        }
+        if (face && iw > 0 && ih > 0) {
+            const int pixel_h = std::max(1, (int)std::lround(st.scale_h));
+            const std::uint64_t key = MakeGlyphKey(code, pixel_h);
+            const GlyphEntry* ge = nullptr;
+            if (use_ext) {
+                auto it = st.ext_cache.find(key);
+                if (it != st.ext_cache.end())
+                    ge = &it->second;
+            } else {
+                auto it = st.sys_cache.find(key);
+                if (it != st.sys_cache.end())
+                    ge = &it->second;
+            }
+            const float frac_x = x - std::floor(x);
+            const float frac_y = y - std::floor(y);
+            const bool use_subpixel = (frac_x != 0.0f) || (frac_y != 0.0f);
+            const std::uint8_t* src_bitmap = nullptr;
+            if (!use_subpixel && ge && ge->w == iw && ge->h == ih && !ge->bitmap.empty()) {
+                src_bitmap = ge->bitmap.data();
+            } else {
+                st.scratch.assign(static_cast<size_t>(iw * ih), 0);
+                if (use_subpixel) {
+                    stbtt_MakeCodepointBitmapSubpixel(face, st.scratch.data(), iw, ih, iw, scale,
+                                                      scale, frac_x, frac_y,
+                                                      static_cast<int>(code));
+                } else {
+                    stbtt_MakeCodepointBitmap(face, st.scratch.data(), iw, ih, iw, scale, scale,
+                                              static_cast<int>(code));
+                }
+                src_bitmap = st.scratch.data();
+            }
+
+            const std::uint8_t* eff_src = src_bitmap;
+
+            const int src_x0 = std::max(0, sx0 - rx0);
+            const int src_y0 = std::max(0, sy0 - ry0);
+            const int dst_x0 = std::max(rx0, sx0);
+            const int dst_y0 = std::max(ry0, sy0);
+            const int copy_w = std::min(rx1, sx1) - dst_x0;
+            const int copy_h = std::min(ry1, sy1) - dst_y0;
+            if (copy_w > 0 && copy_h > 0) {
+                LOG_TRACE(Lib_Font,
+                          "RenderGlyph(H): code=U+{:04X} baseline=({}, {}) box=[{},{}-{}:{}] "
+                          "dst=[{},{} {}x{}] bpp={}",
+                          code, ix, iy, g_x0, g_y0, g_x1, g_y1, dst_x0, dst_y0, copy_w, copy_h,
+                          bpp);
+                for (int row = 0; row < copy_h; ++row) {
+                    const int src_y = src_y0 + row;
+                    const std::uint8_t* src_row = eff_src + src_y * iw + src_x0;
+                    int row_shift = 0;
+                    int row_dst_x = dst_x0 + row_shift;
+                    int row_copy_w = copy_w;
+                    if (row_dst_x < sx0) {
+                        int delta = sx0 - row_dst_x;
+                        row_dst_x = sx0;
+                        if (delta < row_copy_w) {
+                            src_row += delta;
+                            row_copy_w -= delta;
+                        } else {
+                            row_copy_w = 0;
+                        }
+                    }
+                    if (row_dst_x + row_copy_w > sx1) {
+                        row_copy_w = std::max(0, sx1 - row_dst_x);
+                    }
+                    std::uint8_t* dst_row = static_cast<std::uint8_t*>(surf->buffer) +
+                                            (dst_y0 + row) * surf->widthByte + row_dst_x * bpp;
+                    if (bpp == 1) {
+                        for (int col = 0; col < row_copy_w; ++col) {
+                            std::uint8_t cov = src_row[col];
+                            std::uint8_t& d = dst_row[col];
+                            d = std::max(d, cov);
+                        }
+                    } else if (bpp == 4) {
+                        std::uint32_t* px = reinterpret_cast<std::uint32_t*>(dst_row);
+                        for (int col = 0; col < row_copy_w; ++col) {
+                            std::uint8_t a = src_row[col];
+                            px[col] = (static_cast<std::uint32_t>(a) << 24) | 0x00FFFFFFu;
+                        }
+                    } else {
+                        for (int col = 0; col < row_copy_w; ++col) {
+                            std::uint8_t a = src_row[col];
+                            std::uint8_t* p = dst_row + col * bpp;
+                            std::memset(p, 0xFF, static_cast<size_t>(bpp));
+                            p[0] = a;
+                        }
+                    }
+                }
+            }
+        } else {
+            if (result) {
+                result->new_x = 0;
+                result->new_y = 0;
+                result->new_w = 0;
+                result->new_h = 0;
+                result->ImageMetrics.width = 0;
+                result->ImageMetrics.height = 0;
+            }
+            LOG_DEBUG(Lib_Font, "RenderGlyph(H): skip draw (no face/zero size) code=U+{:04X}",
+                      code);
+            return ORBIS_OK;
+        }
+    }
+
+    if (result) {
+        result->new_x = static_cast<u32>(rx0);
+        result->new_y = static_cast<u32>(ry0);
+        result->new_w = static_cast<u32>(cw);
+        result->new_h = static_cast<u32>(ch);
+        const float stride_bytes = static_cast<float>(std::max(0, surf->widthByte));
+        result->ImageMetrics.bearing_x = static_cast<float>(g_x0);
+        result->ImageMetrics.bearing_y = static_cast<float>(-g_y0);
+        float adv_px = 0.0f;
+        if (face) {
+            int aw_tmp = 0, lsb_tmp = 0;
+            stbtt_GetCodepointHMetrics(face, static_cast<int>(code), &aw_tmp, &lsb_tmp);
+            adv_px = static_cast<float>(aw_tmp) * scale;
+        }
+        result->ImageMetrics.dv = adv_px;
+        result->ImageMetrics.stride = stride_bytes;
+        result->ImageMetrics.width = static_cast<u32>(cw);
+        result->ImageMetrics.height = static_cast<u32>(ch);
+        LOG_DEBUG(Lib_Font, "RenderGlyph(H): UpdateRect=[{},{} {}x{}] stride={} adv={}",
+                  result->new_x, result->new_y, result->new_w, result->new_h,
+                  result->ImageMetrics.stride, result->ImageMetrics.dv);
+    }
     return ORBIS_OK;
 }
 
@@ -750,49 +1512,52 @@ s32 PS4_SYSV_ABI sceFontRendererSetOutlineBufferPolicy() {
 void PS4_SYSV_ABI sceFontRenderSurfaceInit(OrbisFontRenderSurface* renderSurface, void* buffer,
                                            int bufWidthByte, int pixelSizeByte, int widthPixel,
                                            int heightPixel) {
-    if (renderSurface) { // Ensure surface is not NULL before modifying it
+    if (renderSurface) {
         renderSurface->buffer = buffer;
         renderSurface->widthByte = bufWidthByte;
-        renderSurface->pixelSizeByte = pixelSizeByte;
-
-        // Initialize unknown fields (likely reserved or flags)
-        renderSurface->unkn_0xd = 0;
+        renderSurface->pixelSizeByte = static_cast<int8_t>(pixelSizeByte);
+        renderSurface->pad0 = 0;
         renderSurface->styleFlag = 0;
-        renderSurface->unkn_0xf = 0;
-
-        // Ensure width and height are non-negative
+        renderSurface->pad2 = 0;
         renderSurface->width = (widthPixel < 0) ? 0 : widthPixel;
         renderSurface->height = (heightPixel < 0) ? 0 : heightPixel;
 
         // Set the clipping/scaling rectangle
         renderSurface->sc_x0 = 0;
         renderSurface->sc_y0 = 0;
-        renderSurface->sc_x1 = renderSurface->width;
-        renderSurface->sc_y1 = renderSurface->height;
+        renderSurface->sc_x1 = static_cast<u32>(renderSurface->width);
+        renderSurface->sc_y1 = static_cast<u32>(renderSurface->height);
+        std::fill(std::begin(renderSurface->reserved_q), std::end(renderSurface->reserved_q), 0);
+        LOG_INFO(Lib_Font,
+                 "RenderSurfaceInit: buf={} widthByte={} pixelSizeByte={} size={}x{} "
+                 "scissor=[0,0-{}:{}]",
+                 static_cast<const void*>(buffer), bufWidthByte, pixelSizeByte,
+                 renderSurface->width, renderSurface->height, renderSurface->sc_x1,
+                 renderSurface->sc_y1);
     }
 }
 
 void PS4_SYSV_ABI sceFontRenderSurfaceSetScissor(OrbisFontRenderSurface* renderSurface, int x0,
                                                  int y0, int w, int h) {
     if (!renderSurface)
-        return; // Null check
+        return;
 
     // Handle horizontal clipping
     int surfaceWidth = renderSurface->width;
     int clip_x0, clip_x1;
 
     if (surfaceWidth != 0) {
-        if (x0 < 0) { // Adjust for negative x0
+        if (x0 < 0) {
             clip_x0 = 0;
             clip_x1 = (w + x0 > surfaceWidth) ? surfaceWidth : w + x0;
             if (w <= -x0)
-                clip_x1 = 0; // Entire width is clipped
+                clip_x1 = 0;
         } else {
             clip_x0 = (x0 > surfaceWidth) ? surfaceWidth : x0;
             clip_x1 = (w + x0 > surfaceWidth) ? surfaceWidth : w + x0;
         }
-        renderSurface->sc_x0 = clip_x0;
-        renderSurface->sc_x1 = clip_x1;
+        renderSurface->sc_x0 = static_cast<u32>(clip_x0);
+        renderSurface->sc_x1 = static_cast<u32>(clip_x1);
     }
 
     // Handle vertical clipping
@@ -800,52 +1565,41 @@ void PS4_SYSV_ABI sceFontRenderSurfaceSetScissor(OrbisFontRenderSurface* renderS
     int clip_y0, clip_y1;
 
     if (surfaceHeight != 0) {
-        if (y0 < 0) { // Adjust for negative y0
+        if (y0 < 0) {
             clip_y0 = 0;
             clip_y1 = (h + y0 > surfaceHeight) ? surfaceHeight : h + y0;
             if (h <= -y0)
-                clip_y1 = 0; // Entire height is clipped
+                clip_y1 = 0;
         } else {
             clip_y0 = (y0 > surfaceHeight) ? surfaceHeight : y0;
             clip_y1 = (h + y0 > surfaceHeight) ? surfaceHeight : h + y0;
         }
-        renderSurface->sc_y0 = clip_y0;
-        renderSurface->sc_y1 = clip_y1;
+        renderSurface->sc_y0 = static_cast<u32>(clip_y0);
+        renderSurface->sc_y1 = static_cast<u32>(clip_y1);
     }
+    LOG_INFO(Lib_Font, "RenderSurfaceSetScissor: [{},{}-{}:{}]", renderSurface->sc_x0,
+             renderSurface->sc_y0, renderSurface->sc_x1, renderSurface->sc_y1);
 }
 
 s32 PS4_SYSV_ABI sceFontRenderSurfaceSetStyleFrame(OrbisFontRenderSurface* renderSurface,
                                                    OrbisFontStyleFrame* styleFrame) {
-    if (!renderSurface) {
-        LOG_ERROR(Lib_Font, "Invalid Parameter");
+    if (!renderSurface)
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    if (!styleFrame) {
-        renderSurface->styleFlag &= 0xFE; // Clear style flag
-    } else {
-        // Validate magic number
-        if (styleFrame->magic != 0xF09) {
-            LOG_ERROR(Lib_Font, "Invalid magic");
-            return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-        }
-
-        renderSurface->styleFlag |= 1; // Set style flag
-    }
-
-    // Assign style frame pointer
-    renderSurface->unkn_28[0] = styleFrame;
-    *(uint32_t*)(renderSurface->unkn_28 + 1) = 0; // Reset related field
+    g_style_for_surface[renderSurface] = styleFrame;
+    renderSurface->styleFlag |= 0x1;
+    renderSurface->reserved_q[0] = reinterpret_cast<u64>(styleFrame);
+    LOG_INFO(Lib_Font, "RenderSurfaceSetStyleFrame: surf={} styleFrame={}",
+             static_cast<const void*>(renderSurface), static_cast<const void*>(styleFrame));
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceFontSetEffectSlant() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+    LOG_DEBUG(Lib_Font, "SetEffectSlant: no-op (effects not implemented)");
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceFontSetEffectWeight() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+    LOG_DEBUG(Lib_Font, "SetEffectWeight: no-op (effects not implemented)");
     return ORBIS_OK;
 }
 
@@ -859,8 +1613,23 @@ s32 PS4_SYSV_ABI sceFontSetResolutionDpi() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontSetScalePixel() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontSetScalePixel(OrbisFontHandle fontHandle, float w, float h) {
+    if (w <= 0.0f || h <= 0.0f) {
+        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
+    }
+    auto& st = GetState(fontHandle);
+    st.scale_w = w;
+    st.scale_h = h;
+    const bool sys_ok = EnsureSystemFace(st);
+    if (st.ext_face_ready)
+        st.ext_scale_for_height = stbtt_ScaleForPixelHeight(&st.ext_face, st.scale_h);
+    if (sys_ok)
+        st.scale_for_height = stbtt_ScaleForPixelHeight(&st.face, st.scale_h);
+    LOG_INFO(
+        Lib_Font,
+        "SetScalePixel: handle={} w={} h={} ext_scale={} sys_scale={} ext_ready={} sys_ready={}",
+        static_cast<const void*>(fontHandle), w, h, st.ext_scale_for_height, st.scale_for_height,
+        st.ext_face_ready, sys_ok);
     return ORBIS_OK;
 }
 
@@ -889,9 +1658,11 @@ s32 PS4_SYSV_ABI sceFontSetupRenderEffectWeight() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontSetupRenderScalePixel() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceFontSetupRenderScalePixel(OrbisFontHandle fontHandle, float w, float h) {
+    auto rc = sceFontSetScalePixel(fontHandle, w, h);
+    LOG_INFO(Lib_Font, "SetupRenderScalePixel: handle={} w={} h={}",
+             static_cast<const void*>(fontHandle), w, h);
+    return rc;
 }
 
 s32 PS4_SYSV_ABI sceFontSetupRenderScalePoint() {
@@ -926,65 +1697,28 @@ s32 PS4_SYSV_ABI sceFontStringRefersTextCharacters() {
 
 s32 PS4_SYSV_ABI sceFontStyleFrameGetEffectSlant(OrbisFontStyleFrame* styleFrame,
                                                  float* slantRatio) {
-    if (!styleFrame) {
-        LOG_ERROR(Lib_Font, "Invalid Parameter");
+    if (!styleFrame || !slantRatio)
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    // Validate the magic number
-    if (styleFrame->magic != 0xF09) {
-        LOG_ERROR(Lib_Font, "Invalid Magic");
-        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    // Check if the slant effect is enabled (bit 1 in flags)
-    if (!(styleFrame->flags & 0x02)) {
-        LOG_ERROR(Lib_Font, "Flag not set");
-        return ORBIS_FONT_ERROR_UNSET_PARAMETER;
-    }
-
-    if (!slantRatio) {
-        LOG_ERROR(Lib_Font, "Invalid Parameter");
-        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    // Retrieve slant ratio
-    *slantRatio = styleFrame->slantRatio;
+    *slantRatio = 0.0f;
+    LOG_DEBUG(Lib_Font, "StyleFrameGetEffectSlant: frame={} slant={} (opaque)",
+              static_cast<const void*>(styleFrame), *slantRatio);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceFontStyleFrameGetEffectWeight(OrbisFontStyleFrame* fontStyleFrame,
                                                   float* weightXScale, float* weightYScale,
                                                   uint32_t* mode) {
-    if (!fontStyleFrame) {
-        LOG_ERROR(Lib_Font, "Invalid Parameter");
+    if (!fontStyleFrame)
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    // Validate the magic number
-    if (fontStyleFrame->magic != 0xF09) {
-        LOG_ERROR(Lib_Font, "Magic not set");
-        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    // Check if the weight effect is enabled (bit 2 in flags)
-    if (!(fontStyleFrame->flags & 0x04)) {
-        LOG_ERROR(Lib_Font, "Flag not set");
-        return ORBIS_FONT_ERROR_UNSET_PARAMETER;
-    }
-
-    // Retrieve weight scales (default is +1.0 to maintain normal weight)
-    if (weightXScale) {
-        *weightXScale = fontStyleFrame->weightXScale + 1.0f;
-    }
-    if (weightYScale) {
-        *weightYScale = fontStyleFrame->weightYScale + 1.0f;
-    }
-
-    // Reset mode if provided
-    if (mode) {
+    if (weightXScale)
+        *weightXScale = 1.0f;
+    if (weightYScale)
+        *weightYScale = 1.0f;
+    if (mode)
         *mode = 0;
-    }
+    LOG_DEBUG(Lib_Font, "StyleFrameGetEffectWeight: frame={} weight=({}, {}) mode={} (opaque)",
+              static_cast<const void*>(fontStyleFrame), weightXScale ? *weightXScale : -1.0f,
+              weightYScale ? *weightYScale : -1.0f, mode ? *mode : 0u);
     return ORBIS_OK;
 }
 
@@ -995,37 +1729,14 @@ s32 PS4_SYSV_ABI sceFontStyleFrameGetResolutionDpi() {
 
 s32 PS4_SYSV_ABI sceFontStyleFrameGetScalePixel(OrbisFontStyleFrame* styleFrame, float* w,
                                                 float* h) {
-    if (!styleFrame) {
-        LOG_ERROR(Lib_Font, "Invalid Parameter");
+    if (!styleFrame)
         return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    if (styleFrame->magic != 0xF09) {
-        LOG_ERROR(Lib_Font, "Invalid magic");
-        return ORBIS_FONT_ERROR_INVALID_PARAMETER;
-    }
-
-    if (!(styleFrame->flags & 0x01)) {
-        LOG_ERROR(Lib_Font, "Scaling effect parameter not set");
-        return ORBIS_FONT_ERROR_UNSET_PARAMETER;
-    }
-
-    // Check if scaling is allowed
-    int isScalingEnabled = styleFrame->scalingFlag;
-    if (w) {
-        *w = styleFrame->scaleWidth;
-        if (isScalingEnabled && styleFrame->dpiX) {
-            *w *= ((float)styleFrame->dpiX / 72.0f);
-        }
-    }
-
-    if (h) {
-        *h = styleFrame->scaleHeight;
-        if (isScalingEnabled && styleFrame->dpiY) {
-            *h *= ((float)styleFrame->dpiY / 72.0f);
-        }
-    }
-
+    if (w)
+        *w = 0.0f;
+    if (h)
+        *h = 0.0f;
+    LOG_DEBUG(Lib_Font, "StyleFrameGetScalePixel: frame={} -> w={}, h={} (opaque)",
+              static_cast<const void*>(styleFrame), w ? *w : 0.0f, h ? *h : 0.0f);
     return ORBIS_OK;
 }
 
@@ -1079,8 +1790,14 @@ s32 PS4_SYSV_ABI sceFontStyleFrameUnsetScale() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontSupportExternalFonts() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontSupportExternalFonts(OrbisFontLib library, u32 fontMax, u32 formats) {
+    auto& ls = GetLibState(library);
+    ls.support_external = true;
+    ls.external_fontMax = fontMax;
+    ls.external_formats = formats;
+    LOG_INFO(Lib_Font, "SupportExternalFonts: lib={} fontMax={} formats=0x{:X}",
+             static_cast<const void*>(library), fontMax, formats);
+    LogExternalFormatSupport(formats);
     return ORBIS_OK;
 }
 
@@ -1089,8 +1806,10 @@ s32 PS4_SYSV_ABI sceFontSupportGlyphs() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontSupportSystemFonts() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontSupportSystemFonts(OrbisFontLib library) {
+    auto& ls = GetLibState(library);
+    ls.support_system = true;
+    LOG_INFO(Lib_Font, "SupportSystemFonts: lib={} system=on", static_cast<const void*>(library));
     return ORBIS_OK;
 }
 
@@ -1124,8 +1843,9 @@ s32 PS4_SYSV_ABI sceFontTextSourceSetWritingForm() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceFontUnbindRenderer() {
-    LOG_ERROR(Lib_Font, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceFontUnbindRenderer(OrbisFontHandle fontHandle) {
+    LOG_DEBUG(Lib_Font, "sceFontUnbindRenderer fontHandle={}",
+              static_cast<const void*>(fontHandle));
     return ORBIS_OK;
 }
 
@@ -1365,316 +2085,247 @@ s32 PS4_SYSV_ABI Func_FE7E5AE95D3058F5() {
 }
 
 void RegisterlibSceFont(Core::Loader::SymbolsResolver* sym) {
-    LIB_FUNCTION("CUKn5pX-NVY", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontAttachDeviceCacheBuffer);
-    LIB_FUNCTION("3OdRkSjOcog", "libSceFont", 1, "libSceFont", 1, 1, sceFontBindRenderer);
-    LIB_FUNCTION("6DFUkCwQLa8", "libSceFont", 1, "libSceFont", 1, 1, sceFontCharacterGetBidiLevel);
-    LIB_FUNCTION("coCrV6IWplE", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("CUKn5pX-NVY", "libSceFont", 1, "libSceFont", sceFontAttachDeviceCacheBuffer);
+    LIB_FUNCTION("3OdRkSjOcog", "libSceFont", 1, "libSceFont", sceFontBindRenderer);
+    LIB_FUNCTION("6DFUkCwQLa8", "libSceFont", 1, "libSceFont", sceFontCharacterGetBidiLevel);
+    LIB_FUNCTION("coCrV6IWplE", "libSceFont", 1, "libSceFont",
                  sceFontCharacterGetSyllableStringState);
-    LIB_FUNCTION("zN3+nuA0SFQ", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCharacterGetTextFontCode);
-    LIB_FUNCTION("mxgmMj-Mq-o", "libSceFont", 1, "libSceFont", 1, 1, sceFontCharacterGetTextOrder);
-    LIB_FUNCTION("-P6X35Rq2-E", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("zN3+nuA0SFQ", "libSceFont", 1, "libSceFont", sceFontCharacterGetTextFontCode);
+    LIB_FUNCTION("mxgmMj-Mq-o", "libSceFont", 1, "libSceFont", sceFontCharacterGetTextOrder);
+    LIB_FUNCTION("-P6X35Rq2-E", "libSceFont", 1, "libSceFont",
                  sceFontCharacterLooksFormatCharacters);
-    LIB_FUNCTION("SaRlqtqaCew", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCharacterLooksWhiteSpace);
-    LIB_FUNCTION("6Gqlv5KdTbU", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCharacterRefersTextBack);
-    LIB_FUNCTION("BkjBP+YC19w", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCharacterRefersTextNext);
-    LIB_FUNCTION("lVSR5ftvNag", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCharactersRefersTextCodes);
-    LIB_FUNCTION("I9R5VC6eZWo", "libSceFont", 1, "libSceFont", 1, 1, sceFontClearDeviceCache);
-    LIB_FUNCTION("vzHs3C8lWJk", "libSceFont", 1, "libSceFont", 1, 1, sceFontCloseFont);
-    LIB_FUNCTION("MpKSBaYKluo", "libSceFont", 1, "libSceFont", 1, 1, sceFontControl);
-    LIB_FUNCTION("WBNBaj9XiJU", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateGraphicsDevice);
-    LIB_FUNCTION("4So0MC3oBIM", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateGraphicsService);
-    LIB_FUNCTION("NlO5Qlhjkng", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("SaRlqtqaCew", "libSceFont", 1, "libSceFont", sceFontCharacterLooksWhiteSpace);
+    LIB_FUNCTION("6Gqlv5KdTbU", "libSceFont", 1, "libSceFont", sceFontCharacterRefersTextBack);
+    LIB_FUNCTION("BkjBP+YC19w", "libSceFont", 1, "libSceFont", sceFontCharacterRefersTextNext);
+    LIB_FUNCTION("lVSR5ftvNag", "libSceFont", 1, "libSceFont", sceFontCharactersRefersTextCodes);
+    LIB_FUNCTION("I9R5VC6eZWo", "libSceFont", 1, "libSceFont", sceFontClearDeviceCache);
+    LIB_FUNCTION("vzHs3C8lWJk", "libSceFont", 1, "libSceFont", sceFontCloseFont);
+    LIB_FUNCTION("MpKSBaYKluo", "libSceFont", 1, "libSceFont", sceFontControl);
+    LIB_FUNCTION("WBNBaj9XiJU", "libSceFont", 1, "libSceFont", sceFontCreateGraphicsDevice);
+    LIB_FUNCTION("4So0MC3oBIM", "libSceFont", 1, "libSceFont", sceFontCreateGraphicsService);
+    LIB_FUNCTION("NlO5Qlhjkng", "libSceFont", 1, "libSceFont",
                  sceFontCreateGraphicsServiceWithEdition);
-    LIB_FUNCTION("nWrfPI4Okmg", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateLibrary);
-    LIB_FUNCTION("n590hj5Oe-k", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCreateLibraryWithEdition);
-    LIB_FUNCTION("u5fZd3KZcs0", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateRenderer);
-    LIB_FUNCTION("WaSFJoRWXaI", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontCreateRendererWithEdition);
-    LIB_FUNCTION("MO24vDhmS4E", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateString);
-    LIB_FUNCTION("cYrMGk1wrMA", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateWords);
-    LIB_FUNCTION("7rogx92EEyc", "libSceFont", 1, "libSceFont", 1, 1, sceFontCreateWritingLine);
-    LIB_FUNCTION("8h-SOB-asgk", "libSceFont", 1, "libSceFont", 1, 1, sceFontDefineAttribute);
-    LIB_FUNCTION("LHDoRWVFGqk", "libSceFont", 1, "libSceFont", 1, 1, sceFontDeleteGlyph);
-    LIB_FUNCTION("5QG71IjgOpQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyGraphicsDevice);
-    LIB_FUNCTION("zZQD3EwJo3c", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyGraphicsService);
-    LIB_FUNCTION("FXP359ygujs", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyLibrary);
-    LIB_FUNCTION("exAxkyVLt0s", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyRenderer);
-    LIB_FUNCTION("SSCaczu2aMQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyString);
-    LIB_FUNCTION("hWE4AwNixqY", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyWords);
-    LIB_FUNCTION("PEjv7CVDRYs", "libSceFont", 1, "libSceFont", 1, 1, sceFontDestroyWritingLine);
-    LIB_FUNCTION("UuY-OJF+f0k", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontDettachDeviceCacheBuffer);
-    LIB_FUNCTION("C-4Qw5Srlyw", "libSceFont", 1, "libSceFont", 1, 1, sceFontGenerateCharGlyph);
-    LIB_FUNCTION("5kx49CAlO-M", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetAttribute);
-    LIB_FUNCTION("OINC0X9HGBY", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetCharGlyphCode);
-    LIB_FUNCTION("L97d+3OgMlE", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetCharGlyphMetrics);
-    LIB_FUNCTION("ynSqYL8VpoA", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetEffectSlant);
-    LIB_FUNCTION("d7dDgRY+Bzw", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetEffectWeight);
-    LIB_FUNCTION("ZB8xRemRRG8", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetFontGlyphsCount);
-    LIB_FUNCTION("4X14YSK4Ldk", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGetFontGlyphsOutlineProfile);
-    LIB_FUNCTION("eb9S3zNlV5o", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetFontMetrics);
-    LIB_FUNCTION("tiIlroGki+g", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetFontResolution);
-    LIB_FUNCTION("3hVv3SNoL6E", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGetFontStyleInformation);
-    LIB_FUNCTION("gVQpMBuB7fE", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGetGlyphExpandBufferState);
-    LIB_FUNCTION("imxVx8lm+KM", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetHorizontalLayout);
-    LIB_FUNCTION("sDuhHGNhHvE", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetKerning);
-    LIB_FUNCTION("LzmHDnlcwfQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetLibrary);
-    LIB_FUNCTION("BozJej5T6fs", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetPixelResolution);
-    LIB_FUNCTION("IQtleGLL5pQ", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGetRenderCharGlyphMetrics);
-    LIB_FUNCTION("Gqa5Pp7y4MU", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetRenderEffectSlant);
-    LIB_FUNCTION("woOjHrkjIYg", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetRenderEffectWeight);
-    LIB_FUNCTION("ryPlnDDI3rU", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetRenderScaledKerning);
-    LIB_FUNCTION("EY38A01lq2k", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetRenderScalePixel);
-    LIB_FUNCTION("FEafYUcxEGo", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetRenderScalePoint);
-    LIB_FUNCTION("8REoLjNGCpM", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetResolutionDpi);
-    LIB_FUNCTION("CkVmLoCNN-8", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetScalePixel);
-    LIB_FUNCTION("GoF2bhB7LYk", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetScalePoint);
-    LIB_FUNCTION("IrXeG0Lc6nA", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetScriptLanguage);
-    LIB_FUNCTION("7-miUT6pNQw", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetTypographicDesign);
-    LIB_FUNCTION("3BrWWFU+4ts", "libSceFont", 1, "libSceFont", 1, 1, sceFontGetVerticalLayout);
-    LIB_FUNCTION("8-zmgsxkBek", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphDefineAttribute);
-    LIB_FUNCTION("oO33Uex4Ui0", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphGetAttribute);
-    LIB_FUNCTION("PXlA0M8ax40", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphGetGlyphForm);
-    LIB_FUNCTION("XUfSWpLhrUw", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphGetMetricsForm);
-    LIB_FUNCTION("lNnUqa1zA-M", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphGetScalePixel);
-    LIB_FUNCTION("ntrc3bEWlvQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphRefersMetrics);
-    LIB_FUNCTION("9kTbF59TjLs", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGlyphRefersMetricsHorizontal);
-    LIB_FUNCTION("nJavPEdMDvM", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("nWrfPI4Okmg", "libSceFont", 1, "libSceFont", sceFontCreateLibrary);
+    LIB_FUNCTION("n590hj5Oe-k", "libSceFont", 1, "libSceFont", sceFontCreateLibraryWithEdition);
+    LIB_FUNCTION("u5fZd3KZcs0", "libSceFont", 1, "libSceFont", sceFontCreateRenderer);
+    LIB_FUNCTION("WaSFJoRWXaI", "libSceFont", 1, "libSceFont", sceFontCreateRendererWithEdition);
+    LIB_FUNCTION("MO24vDhmS4E", "libSceFont", 1, "libSceFont", sceFontCreateString);
+    LIB_FUNCTION("cYrMGk1wrMA", "libSceFont", 1, "libSceFont", sceFontCreateWords);
+    LIB_FUNCTION("7rogx92EEyc", "libSceFont", 1, "libSceFont", sceFontCreateWritingLine);
+    LIB_FUNCTION("8h-SOB-asgk", "libSceFont", 1, "libSceFont", sceFontDefineAttribute);
+    LIB_FUNCTION("LHDoRWVFGqk", "libSceFont", 1, "libSceFont", sceFontDeleteGlyph);
+    LIB_FUNCTION("5QG71IjgOpQ", "libSceFont", 1, "libSceFont", sceFontDestroyGraphicsDevice);
+    LIB_FUNCTION("zZQD3EwJo3c", "libSceFont", 1, "libSceFont", sceFontDestroyGraphicsService);
+    LIB_FUNCTION("FXP359ygujs", "libSceFont", 1, "libSceFont", sceFontDestroyLibrary);
+    LIB_FUNCTION("exAxkyVLt0s", "libSceFont", 1, "libSceFont", sceFontDestroyRenderer);
+    LIB_FUNCTION("SSCaczu2aMQ", "libSceFont", 1, "libSceFont", sceFontDestroyString);
+    LIB_FUNCTION("hWE4AwNixqY", "libSceFont", 1, "libSceFont", sceFontDestroyWords);
+    LIB_FUNCTION("PEjv7CVDRYs", "libSceFont", 1, "libSceFont", sceFontDestroyWritingLine);
+    LIB_FUNCTION("UuY-OJF+f0k", "libSceFont", 1, "libSceFont", sceFontDettachDeviceCacheBuffer);
+    LIB_FUNCTION("C-4Qw5Srlyw", "libSceFont", 1, "libSceFont", sceFontGenerateCharGlyph);
+    LIB_FUNCTION("5kx49CAlO-M", "libSceFont", 1, "libSceFont", sceFontGetAttribute);
+    LIB_FUNCTION("OINC0X9HGBY", "libSceFont", 1, "libSceFont", sceFontGetCharGlyphCode);
+    LIB_FUNCTION("L97d+3OgMlE", "libSceFont", 1, "libSceFont", sceFontGetCharGlyphMetrics);
+    LIB_FUNCTION("ynSqYL8VpoA", "libSceFont", 1, "libSceFont", sceFontGetEffectSlant);
+    LIB_FUNCTION("d7dDgRY+Bzw", "libSceFont", 1, "libSceFont", sceFontGetEffectWeight);
+    LIB_FUNCTION("ZB8xRemRRG8", "libSceFont", 1, "libSceFont", sceFontGetFontGlyphsCount);
+    LIB_FUNCTION("4X14YSK4Ldk", "libSceFont", 1, "libSceFont", sceFontGetFontGlyphsOutlineProfile);
+    LIB_FUNCTION("eb9S3zNlV5o", "libSceFont", 1, "libSceFont", sceFontGetFontMetrics);
+    LIB_FUNCTION("tiIlroGki+g", "libSceFont", 1, "libSceFont", sceFontGetFontResolution);
+    LIB_FUNCTION("3hVv3SNoL6E", "libSceFont", 1, "libSceFont", sceFontGetFontStyleInformation);
+    LIB_FUNCTION("gVQpMBuB7fE", "libSceFont", 1, "libSceFont", sceFontGetGlyphExpandBufferState);
+    LIB_FUNCTION("imxVx8lm+KM", "libSceFont", 1, "libSceFont", sceFontGetHorizontalLayout);
+    LIB_FUNCTION("sDuhHGNhHvE", "libSceFont", 1, "libSceFont", sceFontGetKerning);
+    LIB_FUNCTION("LzmHDnlcwfQ", "libSceFont", 1, "libSceFont", sceFontGetLibrary);
+    LIB_FUNCTION("BozJej5T6fs", "libSceFont", 1, "libSceFont", sceFontGetPixelResolution);
+    LIB_FUNCTION("IQtleGLL5pQ", "libSceFont", 1, "libSceFont", sceFontGetRenderCharGlyphMetrics);
+    LIB_FUNCTION("Gqa5Pp7y4MU", "libSceFont", 1, "libSceFont", sceFontGetRenderEffectSlant);
+    LIB_FUNCTION("woOjHrkjIYg", "libSceFont", 1, "libSceFont", sceFontGetRenderEffectWeight);
+    LIB_FUNCTION("ryPlnDDI3rU", "libSceFont", 1, "libSceFont", sceFontGetRenderScaledKerning);
+    LIB_FUNCTION("EY38A01lq2k", "libSceFont", 1, "libSceFont", sceFontGetRenderScalePixel);
+    LIB_FUNCTION("FEafYUcxEGo", "libSceFont", 1, "libSceFont", sceFontGetRenderScalePoint);
+    LIB_FUNCTION("8REoLjNGCpM", "libSceFont", 1, "libSceFont", sceFontGetResolutionDpi);
+    LIB_FUNCTION("CkVmLoCNN-8", "libSceFont", 1, "libSceFont", sceFontGetScalePixel);
+    LIB_FUNCTION("GoF2bhB7LYk", "libSceFont", 1, "libSceFont", sceFontGetScalePoint);
+    LIB_FUNCTION("IrXeG0Lc6nA", "libSceFont", 1, "libSceFont", sceFontGetScriptLanguage);
+    LIB_FUNCTION("7-miUT6pNQw", "libSceFont", 1, "libSceFont", sceFontGetTypographicDesign);
+    LIB_FUNCTION("3BrWWFU+4ts", "libSceFont", 1, "libSceFont", sceFontGetVerticalLayout);
+    LIB_FUNCTION("8-zmgsxkBek", "libSceFont", 1, "libSceFont", sceFontGlyphDefineAttribute);
+    LIB_FUNCTION("oO33Uex4Ui0", "libSceFont", 1, "libSceFont", sceFontGlyphGetAttribute);
+    LIB_FUNCTION("PXlA0M8ax40", "libSceFont", 1, "libSceFont", sceFontGlyphGetGlyphForm);
+    LIB_FUNCTION("XUfSWpLhrUw", "libSceFont", 1, "libSceFont", sceFontGlyphGetMetricsForm);
+    LIB_FUNCTION("lNnUqa1zA-M", "libSceFont", 1, "libSceFont", sceFontGlyphGetScalePixel);
+    LIB_FUNCTION("ntrc3bEWlvQ", "libSceFont", 1, "libSceFont", sceFontGlyphRefersMetrics);
+    LIB_FUNCTION("9kTbF59TjLs", "libSceFont", 1, "libSceFont", sceFontGlyphRefersMetricsHorizontal);
+    LIB_FUNCTION("nJavPEdMDvM", "libSceFont", 1, "libSceFont",
                  sceFontGlyphRefersMetricsHorizontalAdvance);
-    LIB_FUNCTION("JCnVgZgcucs", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("JCnVgZgcucs", "libSceFont", 1, "libSceFont",
                  sceFontGlyphRefersMetricsHorizontalX);
-    LIB_FUNCTION("R1T4i+DOhNY", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphRefersOutline);
-    LIB_FUNCTION("RmkXfBcZnrM", "libSceFont", 1, "libSceFont", 1, 1, sceFontGlyphRenderImage);
-    LIB_FUNCTION("r4KEihtwxGs", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGlyphRenderImageHorizontal);
-    LIB_FUNCTION("n22d-HIdmMg", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGlyphRenderImageVertical);
-    LIB_FUNCTION("RL2cAQgyXR8", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsBeginFrame);
-    LIB_FUNCTION("dUmIK6QjT7E", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsDrawingCancel);
-    LIB_FUNCTION("X2Vl3yU19Zw", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsDrawingFinish);
-    LIB_FUNCTION("DOmdOwV3Aqw", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsEndFrame);
-    LIB_FUNCTION("zdYdKRQC3rw", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsExchangeResource);
-    LIB_FUNCTION("UkMUIoj-e9s", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsFillMethodInit);
-    LIB_FUNCTION("DJURdcnVUqo", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsFillPlotInit);
-    LIB_FUNCTION("eQac6ftmBQQ", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsFillPlotSetLayout);
-    LIB_FUNCTION("PEYQJa+MWnk", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsFillPlotSetMapping);
-    LIB_FUNCTION("21g4m4kYF6g", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsFillRatesInit);
-    LIB_FUNCTION("pJzji5FvdxU", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("R1T4i+DOhNY", "libSceFont", 1, "libSceFont", sceFontGlyphRefersOutline);
+    LIB_FUNCTION("RmkXfBcZnrM", "libSceFont", 1, "libSceFont", sceFontGlyphRenderImage);
+    LIB_FUNCTION("r4KEihtwxGs", "libSceFont", 1, "libSceFont", sceFontGlyphRenderImageHorizontal);
+    LIB_FUNCTION("n22d-HIdmMg", "libSceFont", 1, "libSceFont", sceFontGlyphRenderImageVertical);
+    LIB_FUNCTION("RL2cAQgyXR8", "libSceFont", 1, "libSceFont", sceFontGraphicsBeginFrame);
+    LIB_FUNCTION("dUmIK6QjT7E", "libSceFont", 1, "libSceFont", sceFontGraphicsDrawingCancel);
+    LIB_FUNCTION("X2Vl3yU19Zw", "libSceFont", 1, "libSceFont", sceFontGraphicsDrawingFinish);
+    LIB_FUNCTION("DOmdOwV3Aqw", "libSceFont", 1, "libSceFont", sceFontGraphicsEndFrame);
+    LIB_FUNCTION("zdYdKRQC3rw", "libSceFont", 1, "libSceFont", sceFontGraphicsExchangeResource);
+    LIB_FUNCTION("UkMUIoj-e9s", "libSceFont", 1, "libSceFont", sceFontGraphicsFillMethodInit);
+    LIB_FUNCTION("DJURdcnVUqo", "libSceFont", 1, "libSceFont", sceFontGraphicsFillPlotInit);
+    LIB_FUNCTION("eQac6ftmBQQ", "libSceFont", 1, "libSceFont", sceFontGraphicsFillPlotSetLayout);
+    LIB_FUNCTION("PEYQJa+MWnk", "libSceFont", 1, "libSceFont", sceFontGraphicsFillPlotSetMapping);
+    LIB_FUNCTION("21g4m4kYF6g", "libSceFont", 1, "libSceFont", sceFontGraphicsFillRatesInit);
+    LIB_FUNCTION("pJzji5FvdxU", "libSceFont", 1, "libSceFont",
                  sceFontGraphicsFillRatesSetFillEffect);
-    LIB_FUNCTION("scaro-xEuUM", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsFillRatesSetLayout);
-    LIB_FUNCTION("W66Kqtt0xU0", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsFillRatesSetMapping);
-    LIB_FUNCTION("FzpLsBQEegQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsGetDeviceUsage);
-    LIB_FUNCTION("W80hs0g5d+E", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsRegionInit);
-    LIB_FUNCTION("S48+njg9p-o", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsRegionInitCircular);
-    LIB_FUNCTION("wcOQ8Fz73+M", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsRegionInitRoundish);
-    LIB_FUNCTION("YBaw2Yyfd5E", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsRelease);
-    LIB_FUNCTION("qkySrQ4FGe0", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsRenderResource);
-    LIB_FUNCTION("qzNjJYKVli0", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetFramePolicy);
-    LIB_FUNCTION("9iRbHCtcx-o", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupClipping);
-    LIB_FUNCTION("KZ3qPyz5Opc", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsSetupColorRates);
-    LIB_FUNCTION("LqclbpVzRvM", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsSetupFillMethod);
-    LIB_FUNCTION("Wl4FiI4qKY0", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupFillRates);
-    LIB_FUNCTION("WC7s95TccVo", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupGlyphFill);
-    LIB_FUNCTION("zC6I4ty37NA", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsSetupGlyphFillPlot);
-    LIB_FUNCTION("drZUF0XKTEI", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsSetupHandleDefault);
-    LIB_FUNCTION("MEAmHMynQXE", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupLocation);
-    LIB_FUNCTION("XRUOmQhnYO4", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsSetupPositioning);
-    LIB_FUNCTION("98XGr2Bkklg", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupRotation);
-    LIB_FUNCTION("Nj-ZUVOVAvc", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupScaling);
-    LIB_FUNCTION("p0avT2ggev0", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsSetupShapeFill);
-    LIB_FUNCTION("0C5aKg9KghY", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsSetupShapeFillPlot);
-    LIB_FUNCTION("4pA3qqAcYco", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsStructureCanvas);
-    LIB_FUNCTION("cpjgdlMYdOM", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("scaro-xEuUM", "libSceFont", 1, "libSceFont", sceFontGraphicsFillRatesSetLayout);
+    LIB_FUNCTION("W66Kqtt0xU0", "libSceFont", 1, "libSceFont", sceFontGraphicsFillRatesSetMapping);
+    LIB_FUNCTION("FzpLsBQEegQ", "libSceFont", 1, "libSceFont", sceFontGraphicsGetDeviceUsage);
+    LIB_FUNCTION("W80hs0g5d+E", "libSceFont", 1, "libSceFont", sceFontGraphicsRegionInit);
+    LIB_FUNCTION("S48+njg9p-o", "libSceFont", 1, "libSceFont", sceFontGraphicsRegionInitCircular);
+    LIB_FUNCTION("wcOQ8Fz73+M", "libSceFont", 1, "libSceFont", sceFontGraphicsRegionInitRoundish);
+    LIB_FUNCTION("YBaw2Yyfd5E", "libSceFont", 1, "libSceFont", sceFontGraphicsRelease);
+    LIB_FUNCTION("qkySrQ4FGe0", "libSceFont", 1, "libSceFont", sceFontGraphicsRenderResource);
+    LIB_FUNCTION("qzNjJYKVli0", "libSceFont", 1, "libSceFont", sceFontGraphicsSetFramePolicy);
+    LIB_FUNCTION("9iRbHCtcx-o", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupClipping);
+    LIB_FUNCTION("KZ3qPyz5Opc", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupColorRates);
+    LIB_FUNCTION("LqclbpVzRvM", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupFillMethod);
+    LIB_FUNCTION("Wl4FiI4qKY0", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupFillRates);
+    LIB_FUNCTION("WC7s95TccVo", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupGlyphFill);
+    LIB_FUNCTION("zC6I4ty37NA", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupGlyphFillPlot);
+    LIB_FUNCTION("drZUF0XKTEI", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupHandleDefault);
+    LIB_FUNCTION("MEAmHMynQXE", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupLocation);
+    LIB_FUNCTION("XRUOmQhnYO4", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupPositioning);
+    LIB_FUNCTION("98XGr2Bkklg", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupRotation);
+    LIB_FUNCTION("Nj-ZUVOVAvc", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupScaling);
+    LIB_FUNCTION("p0avT2ggev0", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupShapeFill);
+    LIB_FUNCTION("0C5aKg9KghY", "libSceFont", 1, "libSceFont", sceFontGraphicsSetupShapeFillPlot);
+    LIB_FUNCTION("4pA3qqAcYco", "libSceFont", 1, "libSceFont", sceFontGraphicsStructureCanvas);
+    LIB_FUNCTION("cpjgdlMYdOM", "libSceFont", 1, "libSceFont",
                  sceFontGraphicsStructureCanvasSequence);
-    LIB_FUNCTION("774Mee21wKk", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsStructureDesign);
-    LIB_FUNCTION("Hp3NIFhUXvQ", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("774Mee21wKk", "libSceFont", 1, "libSceFont", sceFontGraphicsStructureDesign);
+    LIB_FUNCTION("Hp3NIFhUXvQ", "libSceFont", 1, "libSceFont",
                  sceFontGraphicsStructureDesignResource);
-    LIB_FUNCTION("bhmZlml6NBs", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("bhmZlml6NBs", "libSceFont", 1, "libSceFont",
                  sceFontGraphicsStructureSurfaceTexture);
-    LIB_FUNCTION("5sAWgysOBfE", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsUpdateClipping);
-    LIB_FUNCTION("W4e8obm+w6o", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateColorRates);
-    LIB_FUNCTION("EgIn3QBajPs", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateFillMethod);
-    LIB_FUNCTION("MnUYAs2jVuU", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateFillRates);
-    LIB_FUNCTION("R-oVDMusYbc", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateGlyphFill);
-    LIB_FUNCTION("b9R+HQuHSMI", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateGlyphFillPlot);
-    LIB_FUNCTION("IN4P5pJADQY", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsUpdateLocation);
-    LIB_FUNCTION("U+LLXdr2DxM", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdatePositioning);
-    LIB_FUNCTION("yStTYSeb4NM", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsUpdateRotation);
-    LIB_FUNCTION("eDxmMoxE5xU", "libSceFont", 1, "libSceFont", 1, 1, sceFontGraphicsUpdateScaling);
-    LIB_FUNCTION("Ax6LQJJq6HQ", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateShapeFill);
-    LIB_FUNCTION("I5Rf2rXvBKQ", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontGraphicsUpdateShapeFillPlot);
-    LIB_FUNCTION("whrS4oksXc4", "libSceFont", 1, "libSceFont", 1, 1, sceFontMemoryInit);
-    LIB_FUNCTION("h6hIgxXEiEc", "libSceFont", 1, "libSceFont", 1, 1, sceFontMemoryTerm);
-    LIB_FUNCTION("RvXyHMUiLhE", "libSceFont", 1, "libSceFont", 1, 1, sceFontOpenFontFile);
-    LIB_FUNCTION("JzCH3SCFnAU", "libSceFont", 1, "libSceFont", 1, 1, sceFontOpenFontInstance);
-    LIB_FUNCTION("KXUpebrFk1U", "libSceFont", 1, "libSceFont", 1, 1, sceFontOpenFontMemory);
-    LIB_FUNCTION("cKYtVmeSTcw", "libSceFont", 1, "libSceFont", 1, 1, sceFontOpenFontSet);
-    LIB_FUNCTION("Z2cdsqJH+5k", "libSceFont", 1, "libSceFont", 1, 1, sceFontRebindRenderer);
-    LIB_FUNCTION("3G4zhgKuxE8", "libSceFont", 1, "libSceFont", 1, 1, sceFontRenderCharGlyphImage);
-    LIB_FUNCTION("kAenWy1Zw5o", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("5sAWgysOBfE", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateClipping);
+    LIB_FUNCTION("W4e8obm+w6o", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateColorRates);
+    LIB_FUNCTION("EgIn3QBajPs", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateFillMethod);
+    LIB_FUNCTION("MnUYAs2jVuU", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateFillRates);
+    LIB_FUNCTION("R-oVDMusYbc", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateGlyphFill);
+    LIB_FUNCTION("b9R+HQuHSMI", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateGlyphFillPlot);
+    LIB_FUNCTION("IN4P5pJADQY", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateLocation);
+    LIB_FUNCTION("U+LLXdr2DxM", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdatePositioning);
+    LIB_FUNCTION("yStTYSeb4NM", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateRotation);
+    LIB_FUNCTION("eDxmMoxE5xU", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateScaling);
+    LIB_FUNCTION("Ax6LQJJq6HQ", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateShapeFill);
+    LIB_FUNCTION("I5Rf2rXvBKQ", "libSceFont", 1, "libSceFont", sceFontGraphicsUpdateShapeFillPlot);
+    LIB_FUNCTION("whrS4oksXc4", "libSceFont", 1, "libSceFont", sceFontMemoryInit);
+    LIB_FUNCTION("h6hIgxXEiEc", "libSceFont", 1, "libSceFont", sceFontMemoryTerm);
+    LIB_FUNCTION("RvXyHMUiLhE", "libSceFont", 1, "libSceFont", sceFontOpenFontFile);
+    LIB_FUNCTION("JzCH3SCFnAU", "libSceFont", 1, "libSceFont", sceFontOpenFontInstance);
+    LIB_FUNCTION("KXUpebrFk1U", "libSceFont", 1, "libSceFont", sceFontOpenFontMemory);
+    LIB_FUNCTION("cKYtVmeSTcw", "libSceFont", 1, "libSceFont", sceFontOpenFontSet);
+    LIB_FUNCTION("Z2cdsqJH+5k", "libSceFont", 1, "libSceFont", sceFontRebindRenderer);
+    LIB_FUNCTION("3G4zhgKuxE8", "libSceFont", 1, "libSceFont", sceFontRenderCharGlyphImage);
+    LIB_FUNCTION("kAenWy1Zw5o", "libSceFont", 1, "libSceFont",
                  sceFontRenderCharGlyphImageHorizontal);
-    LIB_FUNCTION("i6UNdSig1uE", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontRenderCharGlyphImageVertical);
-    LIB_FUNCTION("amcmrY62BD4", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontRendererGetOutlineBufferSize);
-    LIB_FUNCTION("ai6AfGrBs4o", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontRendererResetOutlineBuffer);
-    LIB_FUNCTION("ydF+WuH0fAk", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("i6UNdSig1uE", "libSceFont", 1, "libSceFont", sceFontRenderCharGlyphImageVertical);
+    LIB_FUNCTION("amcmrY62BD4", "libSceFont", 1, "libSceFont", sceFontRendererGetOutlineBufferSize);
+    LIB_FUNCTION("ai6AfGrBs4o", "libSceFont", 1, "libSceFont", sceFontRendererResetOutlineBuffer);
+    LIB_FUNCTION("ydF+WuH0fAk", "libSceFont", 1, "libSceFont",
                  sceFontRendererSetOutlineBufferPolicy);
-    LIB_FUNCTION("gdUCnU0gHdI", "libSceFont", 1, "libSceFont", 1, 1, sceFontRenderSurfaceInit);
-    LIB_FUNCTION("vRxf4d0ulPs", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontRenderSurfaceSetScissor);
-    LIB_FUNCTION("0hr-w30SjiI", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontRenderSurfaceSetStyleFrame);
-    LIB_FUNCTION("TMtqoFQjjbA", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetEffectSlant);
-    LIB_FUNCTION("v0phZwa4R5o", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetEffectWeight);
-    LIB_FUNCTION("kihFGYJee7o", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetFontsOpenMode);
-    LIB_FUNCTION("I1acwR7Qp8E", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetResolutionDpi);
-    LIB_FUNCTION("N1EBMeGhf7E", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetScalePixel);
-    LIB_FUNCTION("sw65+7wXCKE", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetScalePoint);
-    LIB_FUNCTION("PxSR9UfJ+SQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetScriptLanguage);
-    LIB_FUNCTION("SnsZua35ngs", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetTypographicDesign);
-    LIB_FUNCTION("lz9y9UFO2UU", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetupRenderEffectSlant);
-    LIB_FUNCTION("XIGorvLusDQ", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontSetupRenderEffectWeight);
-    LIB_FUNCTION("6vGCkkQJOcI", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetupRenderScalePixel);
-    LIB_FUNCTION("nMZid4oDfi4", "libSceFont", 1, "libSceFont", 1, 1, sceFontSetupRenderScalePoint);
-    LIB_FUNCTION("ObkDGDBsVtw", "libSceFont", 1, "libSceFont", 1, 1, sceFontStringGetTerminateCode);
-    LIB_FUNCTION("+B-xlbiWDJ4", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStringGetTerminateOrder);
-    LIB_FUNCTION("o1vIEHeb6tw", "libSceFont", 1, "libSceFont", 1, 1, sceFontStringGetWritingForm);
-    LIB_FUNCTION("hq5LffQjz-s", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStringRefersRenderCharacters);
-    LIB_FUNCTION("Avv7OApgCJk", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStringRefersTextCharacters);
-    LIB_FUNCTION("lOfduYnjgbo", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameGetEffectSlant);
-    LIB_FUNCTION("HIUdjR-+Wl8", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameGetEffectWeight);
-    LIB_FUNCTION("VSw18Aqzl0U", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameGetResolutionDpi);
-    LIB_FUNCTION("2QfqfeLblbg", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameGetScalePixel);
-    LIB_FUNCTION("7x2xKiiB7MA", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameGetScalePoint);
-    LIB_FUNCTION("la2AOWnHEAc", "libSceFont", 1, "libSceFont", 1, 1, sceFontStyleFrameInit);
-    LIB_FUNCTION("394sckksiCU", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameSetEffectSlant);
-    LIB_FUNCTION("faw77-pEBmU", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameSetEffectWeight);
-    LIB_FUNCTION("dB4-3Wdwls8", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameSetResolutionDpi);
-    LIB_FUNCTION("da4rQ4-+p-4", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameSetScalePixel);
-    LIB_FUNCTION("O997laxY-Ys", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameSetScalePoint);
-    LIB_FUNCTION("dUmABkAnVgk", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameUnsetEffectSlant);
-    LIB_FUNCTION("hwsuXgmKdaw", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontStyleFrameUnsetEffectWeight);
-    LIB_FUNCTION("bePC0L0vQWY", "libSceFont", 1, "libSceFont", 1, 1, sceFontStyleFrameUnsetScale);
-    LIB_FUNCTION("mz2iTY0MK4A", "libSceFont", 1, "libSceFont", 1, 1, sceFontSupportExternalFonts);
-    LIB_FUNCTION("71w5DzObuZI", "libSceFont", 1, "libSceFont", 1, 1, sceFontSupportGlyphs);
-    LIB_FUNCTION("SsRbbCiWoGw", "libSceFont", 1, "libSceFont", 1, 1, sceFontSupportSystemFonts);
-    LIB_FUNCTION("IPoYwwlMx-g", "libSceFont", 1, "libSceFont", 1, 1, sceFontTextCodesStepBack);
-    LIB_FUNCTION("olSmXY+XP1E", "libSceFont", 1, "libSceFont", 1, 1, sceFontTextCodesStepNext);
-    LIB_FUNCTION("oaJ1BpN2FQk", "libSceFont", 1, "libSceFont", 1, 1, sceFontTextSourceInit);
-    LIB_FUNCTION("VRFd3diReec", "libSceFont", 1, "libSceFont", 1, 1, sceFontTextSourceRewind);
-    LIB_FUNCTION("eCRMCSk96NU", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontTextSourceSetDefaultFont);
-    LIB_FUNCTION("OqQKX0h5COw", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontTextSourceSetWritingForm);
-    LIB_FUNCTION("1QjhKxrsOB8", "libSceFont", 1, "libSceFont", 1, 1, sceFontUnbindRenderer);
-    LIB_FUNCTION("H-FNq8isKE0", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWordsFindWordCharacters);
-    LIB_FUNCTION("fljdejMcG1c", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWritingGetRenderMetrics);
-    LIB_FUNCTION("fD5rqhEXKYQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontWritingInit);
-    LIB_FUNCTION("1+DgKL0haWQ", "libSceFont", 1, "libSceFont", 1, 1, sceFontWritingLineClear);
-    LIB_FUNCTION("JQKWIsS9joE", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWritingLineGetOrderingSpace);
-    LIB_FUNCTION("nlU2VnfpqTM", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWritingLineGetRenderMetrics);
-    LIB_FUNCTION("+FYcYefsVX0", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWritingLineRefersRenderStep);
-    LIB_FUNCTION("wyKFUOWdu3Q", "libSceFont", 1, "libSceFont", 1, 1, sceFontWritingLineWritesOrder);
-    LIB_FUNCTION("W-2WOXEHGck", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWritingRefersRenderStep);
-    LIB_FUNCTION("f4Onl7efPEY", "libSceFont", 1, "libSceFont", 1, 1,
+    LIB_FUNCTION("gdUCnU0gHdI", "libSceFont", 1, "libSceFont", sceFontRenderSurfaceInit);
+    LIB_FUNCTION("vRxf4d0ulPs", "libSceFont", 1, "libSceFont", sceFontRenderSurfaceSetScissor);
+    LIB_FUNCTION("0hr-w30SjiI", "libSceFont", 1, "libSceFont", sceFontRenderSurfaceSetStyleFrame);
+    LIB_FUNCTION("TMtqoFQjjbA", "libSceFont", 1, "libSceFont", sceFontSetEffectSlant);
+    LIB_FUNCTION("v0phZwa4R5o", "libSceFont", 1, "libSceFont", sceFontSetEffectWeight);
+    LIB_FUNCTION("kihFGYJee7o", "libSceFont", 1, "libSceFont", sceFontSetFontsOpenMode);
+    LIB_FUNCTION("I1acwR7Qp8E", "libSceFont", 1, "libSceFont", sceFontSetResolutionDpi);
+    LIB_FUNCTION("N1EBMeGhf7E", "libSceFont", 1, "libSceFont", sceFontSetScalePixel);
+    LIB_FUNCTION("sw65+7wXCKE", "libSceFont", 1, "libSceFont", sceFontSetScalePoint);
+    LIB_FUNCTION("PxSR9UfJ+SQ", "libSceFont", 1, "libSceFont", sceFontSetScriptLanguage);
+    LIB_FUNCTION("SnsZua35ngs", "libSceFont", 1, "libSceFont", sceFontSetTypographicDesign);
+    LIB_FUNCTION("lz9y9UFO2UU", "libSceFont", 1, "libSceFont", sceFontSetupRenderEffectSlant);
+    LIB_FUNCTION("XIGorvLusDQ", "libSceFont", 1, "libSceFont", sceFontSetupRenderEffectWeight);
+    LIB_FUNCTION("6vGCkkQJOcI", "libSceFont", 1, "libSceFont", sceFontSetupRenderScalePixel);
+    LIB_FUNCTION("nMZid4oDfi4", "libSceFont", 1, "libSceFont", sceFontSetupRenderScalePoint);
+    LIB_FUNCTION("ObkDGDBsVtw", "libSceFont", 1, "libSceFont", sceFontStringGetTerminateCode);
+    LIB_FUNCTION("+B-xlbiWDJ4", "libSceFont", 1, "libSceFont", sceFontStringGetTerminateOrder);
+    LIB_FUNCTION("o1vIEHeb6tw", "libSceFont", 1, "libSceFont", sceFontStringGetWritingForm);
+    LIB_FUNCTION("hq5LffQjz-s", "libSceFont", 1, "libSceFont", sceFontStringRefersRenderCharacters);
+    LIB_FUNCTION("Avv7OApgCJk", "libSceFont", 1, "libSceFont", sceFontStringRefersTextCharacters);
+    LIB_FUNCTION("lOfduYnjgbo", "libSceFont", 1, "libSceFont", sceFontStyleFrameGetEffectSlant);
+    LIB_FUNCTION("HIUdjR-+Wl8", "libSceFont", 1, "libSceFont", sceFontStyleFrameGetEffectWeight);
+    LIB_FUNCTION("VSw18Aqzl0U", "libSceFont", 1, "libSceFont", sceFontStyleFrameGetResolutionDpi);
+    LIB_FUNCTION("2QfqfeLblbg", "libSceFont", 1, "libSceFont", sceFontStyleFrameGetScalePixel);
+    LIB_FUNCTION("7x2xKiiB7MA", "libSceFont", 1, "libSceFont", sceFontStyleFrameGetScalePoint);
+    LIB_FUNCTION("la2AOWnHEAc", "libSceFont", 1, "libSceFont", sceFontStyleFrameInit);
+    LIB_FUNCTION("394sckksiCU", "libSceFont", 1, "libSceFont", sceFontStyleFrameSetEffectSlant);
+    LIB_FUNCTION("faw77-pEBmU", "libSceFont", 1, "libSceFont", sceFontStyleFrameSetEffectWeight);
+    LIB_FUNCTION("dB4-3Wdwls8", "libSceFont", 1, "libSceFont", sceFontStyleFrameSetResolutionDpi);
+    LIB_FUNCTION("da4rQ4-+p-4", "libSceFont", 1, "libSceFont", sceFontStyleFrameSetScalePixel);
+    LIB_FUNCTION("O997laxY-Ys", "libSceFont", 1, "libSceFont", sceFontStyleFrameSetScalePoint);
+    LIB_FUNCTION("dUmABkAnVgk", "libSceFont", 1, "libSceFont", sceFontStyleFrameUnsetEffectSlant);
+    LIB_FUNCTION("hwsuXgmKdaw", "libSceFont", 1, "libSceFont", sceFontStyleFrameUnsetEffectWeight);
+    LIB_FUNCTION("bePC0L0vQWY", "libSceFont", 1, "libSceFont", sceFontStyleFrameUnsetScale);
+    LIB_FUNCTION("mz2iTY0MK4A", "libSceFont", 1, "libSceFont", sceFontSupportExternalFonts);
+    LIB_FUNCTION("71w5DzObuZI", "libSceFont", 1, "libSceFont", sceFontSupportGlyphs);
+    LIB_FUNCTION("SsRbbCiWoGw", "libSceFont", 1, "libSceFont", sceFontSupportSystemFonts);
+    LIB_FUNCTION("IPoYwwlMx-g", "libSceFont", 1, "libSceFont", sceFontTextCodesStepBack);
+    LIB_FUNCTION("olSmXY+XP1E", "libSceFont", 1, "libSceFont", sceFontTextCodesStepNext);
+    LIB_FUNCTION("oaJ1BpN2FQk", "libSceFont", 1, "libSceFont", sceFontTextSourceInit);
+    LIB_FUNCTION("VRFd3diReec", "libSceFont", 1, "libSceFont", sceFontTextSourceRewind);
+    LIB_FUNCTION("eCRMCSk96NU", "libSceFont", 1, "libSceFont", sceFontTextSourceSetDefaultFont);
+    LIB_FUNCTION("OqQKX0h5COw", "libSceFont", 1, "libSceFont", sceFontTextSourceSetWritingForm);
+    LIB_FUNCTION("1QjhKxrsOB8", "libSceFont", 1, "libSceFont", sceFontUnbindRenderer);
+    LIB_FUNCTION("H-FNq8isKE0", "libSceFont", 1, "libSceFont", sceFontWordsFindWordCharacters);
+    LIB_FUNCTION("fljdejMcG1c", "libSceFont", 1, "libSceFont", sceFontWritingGetRenderMetrics);
+    LIB_FUNCTION("fD5rqhEXKYQ", "libSceFont", 1, "libSceFont", sceFontWritingInit);
+    LIB_FUNCTION("1+DgKL0haWQ", "libSceFont", 1, "libSceFont", sceFontWritingLineClear);
+    LIB_FUNCTION("JQKWIsS9joE", "libSceFont", 1, "libSceFont", sceFontWritingLineGetOrderingSpace);
+    LIB_FUNCTION("nlU2VnfpqTM", "libSceFont", 1, "libSceFont", sceFontWritingLineGetRenderMetrics);
+    LIB_FUNCTION("+FYcYefsVX0", "libSceFont", 1, "libSceFont", sceFontWritingLineRefersRenderStep);
+    LIB_FUNCTION("wyKFUOWdu3Q", "libSceFont", 1, "libSceFont", sceFontWritingLineWritesOrder);
+    LIB_FUNCTION("W-2WOXEHGck", "libSceFont", 1, "libSceFont", sceFontWritingRefersRenderStep);
+    LIB_FUNCTION("f4Onl7efPEY", "libSceFont", 1, "libSceFont",
                  sceFontWritingRefersRenderStepCharacter);
-    LIB_FUNCTION("BbCZjJizU4A", "libSceFont", 1, "libSceFont", 1, 1,
-                 sceFontWritingSetMaskInvisible);
-    LIB_FUNCTION("APTXePHIjLM", "libSceFont", 1, "libSceFont", 1, 1, Func_00F4D778F1C88CB3);
-    LIB_FUNCTION("A8ZQAl+7Dec", "libSceFont", 1, "libSceFont", 1, 1, Func_03C650025FBB0DE7);
-    LIB_FUNCTION("B+q4oWOyfho", "libSceFont", 1, "libSceFont", 1, 1, Func_07EAB8A163B27E1A);
-    LIB_FUNCTION("CUCOiOT5fOM", "libSceFont", 1, "libSceFont", 1, 1, Func_09408E88E4F97CE3);
-    LIB_FUNCTION("CfkpBe2CqBQ", "libSceFont", 1, "libSceFont", 1, 1, Func_09F92905ED82A814);
-    LIB_FUNCTION("DRQs7hqyGr4", "libSceFont", 1, "libSceFont", 1, 1, Func_0D142CEE1AB21ABE);
-    LIB_FUNCTION("FL0unhGcFvI", "libSceFont", 1, "libSceFont", 1, 1, Func_14BD2E9E119C16F2);
-    LIB_FUNCTION("GsU8nt6ujXU", "libSceFont", 1, "libSceFont", 1, 1, Func_1AC53C9EDEAE8D75);
-    LIB_FUNCTION("HUARhdXiTD0", "libSceFont", 1, "libSceFont", 1, 1, Func_1D401185D5E24C3D);
-    LIB_FUNCTION("HoPNIMLMmW8", "libSceFont", 1, "libSceFont", 1, 1, Func_1E83CD20C2CC996F);
-    LIB_FUNCTION("MUsfdluf54o", "libSceFont", 1, "libSceFont", 1, 1, Func_314B1F765B9FE78A);
-    LIB_FUNCTION("NQ5nJf7eKeE", "libSceFont", 1, "libSceFont", 1, 1, Func_350E6725FEDE29E1);
-    LIB_FUNCTION("Pbdz8KYEvzk", "libSceFont", 1, "libSceFont", 1, 1, Func_3DB773F0A604BF39);
-    LIB_FUNCTION("T-Sd0h4xGxw", "libSceFont", 1, "libSceFont", 1, 1, Func_4FF49DD21E311B1C);
-    LIB_FUNCTION("UmKHZkpJOYE", "libSceFont", 1, "libSceFont", 1, 1, Func_526287664A493981);
-    LIB_FUNCTION("VcpxjbyEpuk", "libSceFont", 1, "libSceFont", 1, 1, Func_55CA718DBC84A6E9);
-    LIB_FUNCTION("Vj-F8HBqi00", "libSceFont", 1, "libSceFont", 1, 1, Func_563FC5F0706A8B4D);
-    LIB_FUNCTION("Vp4uzTQpD0U", "libSceFont", 1, "libSceFont", 1, 1, Func_569E2ECD34290F45);
-    LIB_FUNCTION("WgR3W2vkdoU", "libSceFont", 1, "libSceFont", 1, 1, Func_5A04775B6BE47685);
-    LIB_FUNCTION("X9k7yrb3l1A", "libSceFont", 1, "libSceFont", 1, 1, Func_5FD93BCAB6F79750);
-    LIB_FUNCTION("YrU5j4ZL07Q", "libSceFont", 1, "libSceFont", 1, 1, Func_62B5398F864BD3B4);
-    LIB_FUNCTION("b5AQKU2CI2c", "libSceFont", 1, "libSceFont", 1, 1, Func_6F9010294D822367);
-    LIB_FUNCTION("d1fpR0I6emc", "libSceFont", 1, "libSceFont", 1, 1, Func_7757E947423A7A67);
-    LIB_FUNCTION("fga6Ugd-VPo", "libSceFont", 1, "libSceFont", 1, 1, Func_7E06BA52077F54FA);
-    LIB_FUNCTION("k7Nt6gITEdY", "libSceFont", 1, "libSceFont", 1, 1, Func_93B36DEA021311D6);
-    LIB_FUNCTION("lLCJHnERWYo", "libSceFont", 1, "libSceFont", 1, 1, Func_94B0891E7111598A);
-    LIB_FUNCTION("l4XJEowv580", "libSceFont", 1, "libSceFont", 1, 1, Func_9785C9128C2FE7CD);
-    LIB_FUNCTION("l9+8m2X7wOE", "libSceFont", 1, "libSceFont", 1, 1, Func_97DFBC9B65FBC0E1);
-    LIB_FUNCTION("rNlxdAXX08o", "libSceFont", 1, "libSceFont", 1, 1, Func_ACD9717405D7D3CA);
-    LIB_FUNCTION("sZqK7D-U8W8", "libSceFont", 1, "libSceFont", 1, 1, Func_B19A8AEC3FD4F16F);
-    LIB_FUNCTION("wQ9IitfPED0", "libSceFont", 1, "libSceFont", 1, 1, Func_C10F488AD7CF103D);
-    LIB_FUNCTION("0Mi1-0poJsc", "libSceFont", 1, "libSceFont", 1, 1, Func_D0C8B5FF4A6826C7);
-    LIB_FUNCTION("5I080Bw0KjM", "libSceFont", 1, "libSceFont", 1, 1, Func_E48D3CD01C342A33);
-    LIB_FUNCTION("6slrIYa3HhQ", "libSceFont", 1, "libSceFont", 1, 1, Func_EAC96B2186B71E14);
-    LIB_FUNCTION("-keIqW70YlY", "libSceFont", 1, "libSceFont", 1, 1, Func_FE4788A96EF46256);
-    LIB_FUNCTION("-n5a6V0wWPU", "libSceFont", 1, "libSceFont", 1, 1, Func_FE7E5AE95D3058F5);
+    LIB_FUNCTION("BbCZjJizU4A", "libSceFont", 1, "libSceFont", sceFontWritingSetMaskInvisible);
+    LIB_FUNCTION("APTXePHIjLM", "libSceFont", 1, "libSceFont", Func_00F4D778F1C88CB3);
+    LIB_FUNCTION("A8ZQAl+7Dec", "libSceFont", 1, "libSceFont", Func_03C650025FBB0DE7);
+    LIB_FUNCTION("B+q4oWOyfho", "libSceFont", 1, "libSceFont", Func_07EAB8A163B27E1A);
+    LIB_FUNCTION("CUCOiOT5fOM", "libSceFont", 1, "libSceFont", Func_09408E88E4F97CE3);
+    LIB_FUNCTION("CfkpBe2CqBQ", "libSceFont", 1, "libSceFont", Func_09F92905ED82A814);
+    LIB_FUNCTION("DRQs7hqyGr4", "libSceFont", 1, "libSceFont", Func_0D142CEE1AB21ABE);
+    LIB_FUNCTION("FL0unhGcFvI", "libSceFont", 1, "libSceFont", Func_14BD2E9E119C16F2);
+    LIB_FUNCTION("GsU8nt6ujXU", "libSceFont", 1, "libSceFont", Func_1AC53C9EDEAE8D75);
+    LIB_FUNCTION("HUARhdXiTD0", "libSceFont", 1, "libSceFont", Func_1D401185D5E24C3D);
+    LIB_FUNCTION("HoPNIMLMmW8", "libSceFont", 1, "libSceFont", Func_1E83CD20C2CC996F);
+    LIB_FUNCTION("MUsfdluf54o", "libSceFont", 1, "libSceFont", Func_314B1F765B9FE78A);
+    LIB_FUNCTION("NQ5nJf7eKeE", "libSceFont", 1, "libSceFont", Func_350E6725FEDE29E1);
+    LIB_FUNCTION("Pbdz8KYEvzk", "libSceFont", 1, "libSceFont", Func_3DB773F0A604BF39);
+    LIB_FUNCTION("T-Sd0h4xGxw", "libSceFont", 1, "libSceFont", Func_4FF49DD21E311B1C);
+    LIB_FUNCTION("UmKHZkpJOYE", "libSceFont", 1, "libSceFont", Func_526287664A493981);
+    LIB_FUNCTION("VcpxjbyEpuk", "libSceFont", 1, "libSceFont", Func_55CA718DBC84A6E9);
+    LIB_FUNCTION("Vj-F8HBqi00", "libSceFont", 1, "libSceFont", Func_563FC5F0706A8B4D);
+    LIB_FUNCTION("Vp4uzTQpD0U", "libSceFont", 1, "libSceFont", Func_569E2ECD34290F45);
+    LIB_FUNCTION("WgR3W2vkdoU", "libSceFont", 1, "libSceFont", Func_5A04775B6BE47685);
+    LIB_FUNCTION("X9k7yrb3l1A", "libSceFont", 1, "libSceFont", Func_5FD93BCAB6F79750);
+    LIB_FUNCTION("YrU5j4ZL07Q", "libSceFont", 1, "libSceFont", Func_62B5398F864BD3B4);
+    LIB_FUNCTION("b5AQKU2CI2c", "libSceFont", 1, "libSceFont", Func_6F9010294D822367);
+    LIB_FUNCTION("d1fpR0I6emc", "libSceFont", 1, "libSceFont", Func_7757E947423A7A67);
+    LIB_FUNCTION("fga6Ugd-VPo", "libSceFont", 1, "libSceFont", Func_7E06BA52077F54FA);
+    LIB_FUNCTION("k7Nt6gITEdY", "libSceFont", 1, "libSceFont", Func_93B36DEA021311D6);
+    LIB_FUNCTION("lLCJHnERWYo", "libSceFont", 1, "libSceFont", Func_94B0891E7111598A);
+    LIB_FUNCTION("l4XJEowv580", "libSceFont", 1, "libSceFont", Func_9785C9128C2FE7CD);
+    LIB_FUNCTION("l9+8m2X7wOE", "libSceFont", 1, "libSceFont", Func_97DFBC9B65FBC0E1);
+    LIB_FUNCTION("rNlxdAXX08o", "libSceFont", 1, "libSceFont", Func_ACD9717405D7D3CA);
+    LIB_FUNCTION("sZqK7D-U8W8", "libSceFont", 1, "libSceFont", Func_B19A8AEC3FD4F16F);
+    LIB_FUNCTION("wQ9IitfPED0", "libSceFont", 1, "libSceFont", Func_C10F488AD7CF103D);
+    LIB_FUNCTION("0Mi1-0poJsc", "libSceFont", 1, "libSceFont", Func_D0C8B5FF4A6826C7);
+    LIB_FUNCTION("5I080Bw0KjM", "libSceFont", 1, "libSceFont", Func_E48D3CD01C342A33);
+    LIB_FUNCTION("6slrIYa3HhQ", "libSceFont", 1, "libSceFont", Func_EAC96B2186B71E14);
+    LIB_FUNCTION("-keIqW70YlY", "libSceFont", 1, "libSceFont", Func_FE4788A96EF46256);
+    LIB_FUNCTION("-n5a6V0wWPU", "libSceFont", 1, "libSceFont", Func_FE7E5AE95D3058F5);
 };
 
 } // namespace Libraries::Font

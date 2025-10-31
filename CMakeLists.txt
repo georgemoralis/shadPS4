@@ -490,7 +490,7 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/mouse/mouse.h
                 src/core/libraries/web_browser_dialog/webbrowserdialog.cpp
                 src/core/libraries/web_browser_dialog/webbrowserdialog.h
-                src/core/libraries/font/font.cpp
+                                src/core/libraries/font/font.cpp
                 src/core/libraries/font/font.h
                 src/core/libraries/font/fontft.cpp
                 src/core/libraries/font/fontft.h
@@ -573,6 +573,13 @@ set(FIBER_LIB src/core/libraries/fiber/fiber_context.s
               src/core/libraries/fiber/fiber.cpp
               src/core/libraries/fiber/fiber.h
               src/core/libraries/fiber/fiber_error.h
+)
+
+set(FONT_LIB src/core/libraries/font/font.cpp
+             src/core/libraries/font/font.h
+             src/core/libraries/font/fontft.cpp
+             src/core/libraries/font/fontft.h
+             src/core/libraries/font/font_error.h
 )
 
 set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
@@ -1210,22 +1217,27 @@ if (APPLE)
         set(MVK_DST ${CMAKE_CURRENT_BINARY_DIR})
     endif()
 
-    set(MVK_DYLIB_SRC ${CMAKE_CURRENT_BINARY_DIR}/externals/MoltenVK/MoltenVK/libMoltenVK.dylib)
-    set(MVK_DYLIB_DST ${MVK_DST}/libMoltenVK.dylib)
-    set(MVK_ICD_SRC ${CMAKE_CURRENT_SOURCE_DIR}/externals/MoltenVK/MoltenVK/icd/MoltenVK_icd.json)
-    set(MVK_ICD_DST ${MVK_DST}/MoltenVK_icd.json)
+    # Only set up copy targets if MoltenVK is available (submodule built)
+    if (TARGET MoltenVK AND EXISTS "${CMAKE_CURRENT_BINARY_DIR}/externals/MoltenVK/MoltenVK/libMoltenVK.dylib")
+        set(MVK_DYLIB_SRC ${CMAKE_CURRENT_BINARY_DIR}/externals/MoltenVK/MoltenVK/libMoltenVK.dylib)
+        set(MVK_DYLIB_DST ${MVK_DST}/libMoltenVK.dylib)
+        set(MVK_ICD_SRC ${CMAKE_CURRENT_SOURCE_DIR}/externals/MoltenVK/MoltenVK/icd/MoltenVK_icd.json)
+        set(MVK_ICD_DST ${MVK_DST}/MoltenVK_icd.json)
 
-    add_custom_command(
-        OUTPUT ${MVK_ICD_DST}
-        DEPENDS ${MVK_ICD_SRC} ${MVK_DST}
-        COMMAND ${CMAKE_COMMAND} -E copy ${MVK_ICD_SRC} ${MVK_ICD_DST})
-    add_custom_command(
-        OUTPUT ${MVK_DYLIB_DST}
-        DEPENDS ${MVK_DYLIB_SRC} ${MVK_DST}
-        COMMAND ${CMAKE_COMMAND} -E copy ${MVK_DYLIB_SRC} ${MVK_DYLIB_DST})
-    add_custom_target(CopyMoltenVK DEPENDS ${MVK_ICD_DST} ${MVK_DYLIB_DST})
-    add_dependencies(CopyMoltenVK MoltenVK)
-    add_dependencies(shadps4 CopyMoltenVK)
+        add_custom_command(
+            OUTPUT ${MVK_ICD_DST}
+            DEPENDS ${MVK_ICD_SRC} ${MVK_DST}
+            COMMAND ${CMAKE_COMMAND} -E copy ${MVK_ICD_SRC} ${MVK_ICD_DST})
+        add_custom_command(
+            OUTPUT ${MVK_DYLIB_DST}
+            DEPENDS ${MVK_DYLIB_SRC} ${MVK_DST}
+            COMMAND ${CMAKE_COMMAND} -E copy ${MVK_DYLIB_SRC} ${MVK_DYLIB_DST})
+        add_custom_target(CopyMoltenVK DEPENDS ${MVK_ICD_DST} ${MVK_DYLIB_DST})
+        add_dependencies(CopyMoltenVK MoltenVK)
+        add_dependencies(shadps4 CopyMoltenVK)
+    else()
+        message(STATUS "MoltenVK not available; skipping bundling/copy steps.")
+    endif()
 
     if (ARCHITECTURE STREQUAL "x86_64")
         # Reserve system-managed memory space.
