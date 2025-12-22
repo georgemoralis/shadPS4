@@ -42,6 +42,7 @@
 #include "core/linker.h"
 #include "core/memory.h"
 #include "emulator.h"
+#include "video_core/cache_storage.h"
 #include "video_core/renderdoc.h"
 
 #ifdef _WIN32
@@ -58,10 +59,11 @@ Frontend::WindowSDL* g_window = nullptr;
 namespace Core {
 
 Emulator::Emulator() {
-    // Initialize NT API functions and set high priority
+    // Initialize NT API functions, set high priority and disable WER
 #ifdef _WIN32
     Common::NtApi::Initialize();
     SetPriorityClass(GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS);
+    SetErrorMode(SetErrorMode(0) | SEM_NOGPFAULTERRORBOX);
     // need to init this in order for winsock2 to work
     WORD versionWanted = MAKEWORD(2, 2);
     WSADATA wsaData;
@@ -113,6 +115,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string id;
     std::string title;
     std::string app_version;
+    u32 sdk_version;
     u32 fw_version;
     Common::PSFAttributes psf_attributes{};
     if (param_sfo_exists) {
@@ -132,7 +135,47 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         if (const auto raw_attributes = param_sfo->GetInteger("ATTRIBUTE")) {
             psf_attributes.raw = *raw_attributes;
         }
+
+        // Extract sdk version from pubtool info.
+        std::string_view pubtool_info =
+            param_sfo->GetString("PUBTOOLINFO").value_or("Unknown value");
+        u64 sdk_ver_offset = pubtool_info.find("sdk_ver");
+
+        if (sdk_ver_offset == pubtool_info.npos) {
+            // Default to using firmware version if SDK version is not found.
+            sdk_version = fw_version;
+        } else {
+            // Increment offset to account for sdk_ver= part of string.
+            sdk_ver_offset += 8;
+            u64 sdk_ver_len = pubtool_info.find(",", sdk_ver_offset);
+            if (sdk_ver_len == pubtool_info.npos) {
+                // If there's no more commas, this is likely the last entry of pubtool info.
+                // Use string length instead.
+                sdk_ver_len = pubtool_info.size();
+            }
+            sdk_ver_len -= sdk_ver_offset;
+            std::string sdk_ver_string = pubtool_info.substr(sdk_ver_offset, sdk_ver_len).data();
+            // Number is stored in base 16.
+            sdk_version = std::stoi(sdk_ver_string, nullptr, 16);
+        }
     }
+
+    auto& game_info = Common::ElfInfo::Instance();
+    game_info.initialized = true;
+    game_info.game_serial = id;
+    game_info.title = title;
+    game_info.app_ver = app_version;
+    game_info.firmware_ver = fw_version & 0xFFF00000;
+    game_info.raw_firmware_ver = fw_version;
+    game_info.sdk_ver = sdk_version;
+    game_info.psf_attributes = psf_attributes;
+
+    const auto pic1_path = mnt->GetHostPath("/app0/sce_sys/pic1.png");
+    if (std::filesystem::exists(pic1_path)) {
+        game_info.splash_path = pic1_path;
+    }
+
+    game_info.game_folder = game_folder;
 
     Config::load(Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (id + ".toml"),
                  true);
@@ -196,6 +239,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     if (param_sfo_exists) {
         LOG_INFO(Loader, "Game id: {} Title: {}", id, title);
         LOG_INFO(Loader, "Fw: {:#x} App Version: {}", fw_version, app_version);
+        LOG_INFO(Loader, "Compiled SDK version: {:#x}", sdk_version);
         LOG_INFO(Loader, "PSVR Supported: {}", (bool)psf_attributes.support_ps_vr.Value());
         LOG_INFO(Loader, "PSVR Required: {}", (bool)psf_attributes.require_ps_vr.Value());
     }
@@ -234,22 +278,6 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
             }
         }
     }
-
-    auto& game_info = Common::ElfInfo::Instance();
-    game_info.initialized = true;
-    game_info.game_serial = id;
-    game_info.title = title;
-    game_info.app_ver = app_version;
-    game_info.firmware_ver = fw_version & 0xFFF00000;
-    game_info.raw_firmware_ver = fw_version;
-    game_info.psf_attributes = psf_attributes;
-
-    const auto pic1_path = mnt->GetHostPath("/app0/sce_sys/pic1.png");
-    if (std::filesystem::exists(pic1_path)) {
-        game_info.splash_path = pic1_path;
-    }
-
-    game_info.game_folder = game_folder;
 
     std::string game_title = fmt::format("{} - {} <{}>", id, title, app_version);
     std::string window_title = "";
@@ -360,6 +388,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     UpdatePlayTime(id);
+    Storage::DataBase::Instance().Close();
 
     std::quick_exit(0);
 }

@@ -4,8 +4,9 @@
 #include <fstream>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <fmt/core.h>
-#include <fmt/xchar.h> // for wstring support
 #include <toml.hpp>
 
 #include "common/assert.h"
@@ -144,6 +145,9 @@ static ConfigEntry<string> isSideTrophy("right");
 static ConfigEntry<bool> isConnectedToNetwork(false);
 static bool enableDiscordRPC = false;
 static std::filesystem::path sys_modules_path = {};
+static std::filesystem::path sys_font_path = {};
+static std::string sys_font_fallback_name = {};
+static std::unordered_map<std::string, std::filesystem::path> system_font_overrides;
 
 // Input
 static ConfigEntry<int> cursorState(HideCursorState::Idle);
@@ -177,7 +181,7 @@ static ConfigEntry<bool> isFullscreen(false);
 static ConfigEntry<string> fullscreenMode("Windowed");
 static ConfigEntry<string> presentMode("Mailbox");
 static ConfigEntry<bool> isHDRAllowed(false);
-static ConfigEntry<bool> fsrEnabled(true);
+static ConfigEntry<bool> fsrEnabled(false);
 static ConfigEntry<bool> rcasEnabled(true);
 static ConfigEntry<int> rcasAttenuation(250);
 
@@ -191,12 +195,15 @@ static ConfigEntry<bool> vkCrashDiagnostic(false);
 static ConfigEntry<bool> vkHostMarkers(false);
 static ConfigEntry<bool> vkGuestMarkers(false);
 static ConfigEntry<bool> rdocEnable(false);
+static ConfigEntry<bool> pipelineCacheEnable(false);
+static ConfigEntry<bool> pipelineCacheArchive(false);
 
 // Debug
 static ConfigEntry<bool> isDebugDump(false);
 static ConfigEntry<bool> isShaderDebug(false);
 static ConfigEntry<bool> isSeparateLogFilesEnabled(false);
 static ConfigEntry<bool> isFpsColor(true);
+static ConfigEntry<bool> showFpsCounter(false);
 static ConfigEntry<bool> logEnabled(true);
 
 // GUI
@@ -240,6 +247,44 @@ std::filesystem::path getSysModulesPath() {
 
 void setSysModulesPath(const std::filesystem::path& path) {
     sys_modules_path = path;
+}
+
+std::filesystem::path getSysFontPath() {
+    return sys_font_path;
+}
+
+void setSysFontPath(const std::filesystem::path& path) {
+    sys_font_path = path;
+}
+
+std::optional<std::filesystem::path> getSystemFontOverride(std::string_view key) {
+    if (key.empty()) {
+        return std::nullopt;
+    }
+    auto it = system_font_overrides.find(std::string(key));
+    if (it == system_font_overrides.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+std::string getSystemFontFallbackName() {
+    return sys_font_fallback_name;
+}
+
+void setSystemFontFallbackName(const std::string& name) {
+    sys_font_fallback_name = name;
+}
+
+void setSystemFontOverride(std::string_view key, const std::filesystem::path& path) {
+    if (key.empty()) {
+        return;
+    }
+    system_font_overrides[std::string(key)] = path;
+}
+
+void clearSystemFontOverrides() {
+    system_font_overrides.clear();
 }
 
 int getVolumeSlider() {
@@ -452,8 +497,24 @@ bool isRdocEnabled() {
     return rdocEnable.get();
 }
 
+bool isPipelineCacheEnabled() {
+    return pipelineCacheEnable.get();
+}
+
+bool isPipelineCacheArchived() {
+    return pipelineCacheArchive.get();
+}
+
 bool fpsColor() {
     return isFpsColor.get();
+}
+
+bool getShowFpsCounter() {
+    return showFpsCounter.get();
+}
+
+void setShowFpsCounter(bool enable, bool is_game_specific) {
+    showFpsCounter.set(enable, is_game_specific);
 }
 
 bool isLoggingEnabled() {
@@ -601,6 +662,14 @@ void setVkGpuValidation(bool enable, bool is_game_specific) {
 
 void setRdocEnabled(bool enable, bool is_game_specific) {
     rdocEnable.set(enable, is_game_specific);
+}
+
+void setPipelineCacheEnabled(bool enable, bool is_game_specific) {
+    pipelineCacheEnable.set(enable, is_game_specific);
+}
+
+void setPipelineCacheArchived(bool enable, bool is_game_specific) {
+    pipelineCacheArchive.set(enable, is_game_specific);
 }
 
 void setVblankFreq(u32 value, bool is_game_specific) {
@@ -857,6 +926,10 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         return;
     }
 
+    if (!is_game_specific) {
+        system_font_overrides.clear();
+    }
+
     if (data.contains("General")) {
         const toml::value& general = data.at("General");
 
@@ -880,6 +953,43 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         isConnectedToNetwork.setFromToml(general, "isConnectedToNetwork", is_game_specific);
         defaultControllerID.setFromToml(general, "defaultControllerID", is_game_specific);
         sys_modules_path = toml::find_fs_path_or(general, "sysModulesPath", sys_modules_path);
+        // Accept alias without trailing 's'
+        sys_modules_path = toml::find_fs_path_or(general, "sysModulePath", sys_modules_path);
+        // Prefer 'sysFontPath'; accept 'SysFontPath' for compatibility
+        sys_font_path = toml::find_fs_path_or(general, "sysFontPath", sys_font_path);
+        sys_font_path = toml::find_fs_path_or(general, "SysFontPath", sys_font_path);
+    }
+
+    if (data.contains("SystemFonts")) {
+        const toml::value& fonts = data.at("SystemFonts");
+        if (fonts.is_table()) {
+            // Read fallback (lowercase preferred), accept 'Fallback'/'FallbackFontName' for compat
+            if (fonts.contains("fallback")) {
+                const auto& v = fonts.at("fallback");
+                if (v.is_string()) {
+                    sys_font_fallback_name = toml::get<std::string>(v);
+                }
+            } else if (fonts.contains("Fallback")) {
+                const auto& v = fonts.at("Fallback");
+                if (v.is_string()) {
+                    sys_font_fallback_name = toml::get<std::string>(v);
+                }
+            } else if (fonts.contains("FallbackFontName")) {
+                const auto& v = fonts.at("FallbackFontName");
+                if (v.is_string()) {
+                    sys_font_fallback_name = toml::get<std::string>(v);
+                }
+            }
+            for (const auto& [name, value] : fonts.as_table()) {
+                if (name == "fallback" || name == "Fallback" || name == "FallbackFontName") {
+                    continue;
+                }
+                if (value.is_string()) {
+                    system_font_overrides[name] =
+                        std::filesystem::path(toml::get<std::string>(value));
+                }
+            }
+        }
     }
 
     if (data.contains("Input")) {
@@ -939,6 +1049,8 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         vkHostMarkers.setFromToml(vk, "hostMarkers", is_game_specific);
         vkGuestMarkers.setFromToml(vk, "guestMarkers", is_game_specific);
         rdocEnable.setFromToml(vk, "rdocEnable", is_game_specific);
+        pipelineCacheEnable.setFromToml(vk, "pipelineCacheEnable", is_game_specific);
+        pipelineCacheArchive.setFromToml(vk, "pipelineCacheArchive", is_game_specific);
     }
 
     string current_version = {};
@@ -949,6 +1061,7 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         isSeparateLogFilesEnabled.setFromToml(debug, "isSeparateLogFilesEnabled", is_game_specific);
         isShaderDebug.setFromToml(debug, "CollectShader", is_game_specific);
         isFpsColor.setFromToml(debug, "FPSColor", is_game_specific);
+        showFpsCounter.setFromToml(debug, "showFpsCounter", is_game_specific);
         logEnabled.setFromToml(debug, "logEnabled", is_game_specific);
         current_version = toml::find_or<std::string>(debug, "ConfigVersion", current_version);
     }
@@ -1107,6 +1220,8 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     vkHostMarkers.setTomlValue(data, "Vulkan", "hostMarkers", is_game_specific);
     vkGuestMarkers.setTomlValue(data, "Vulkan", "guestMarkers", is_game_specific);
     rdocEnable.setTomlValue(data, "Vulkan", "rdocEnable", is_game_specific);
+    pipelineCacheEnable.setTomlValue(data, "Vulkan", "pipelineCacheEnable", is_game_specific);
+    pipelineCacheArchive.setTomlValue(data, "Vulkan", "pipelineCacheArchive", is_game_specific);
 
     isDebugDump.setTomlValue(data, "Debug", "DebugDump", is_game_specific);
     isShaderDebug.setTomlValue(data, "Debug", "CollectShader", is_game_specific);
@@ -1149,6 +1264,22 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         // Non game-specific entries
         data["General"]["enableDiscordRPC"] = enableDiscordRPC;
         data["General"]["sysModulesPath"] = string{fmt::UTF(sys_modules_path.u8string()).data};
+        // Save using 'sysFontPath' to match style
+        data["General"]["sysFontPath"] = string{fmt::UTF(sys_font_path.u8string()).data};
+        {
+            toml::table fonts_table;
+            if (!sys_font_fallback_name.empty()) {
+                fonts_table["fallback"] = sys_font_fallback_name;
+            }
+            for (const auto& [name, path_override] : system_font_overrides) {
+                fonts_table[name] = string{fmt::UTF(path_override.u8string()).data};
+            }
+            if (!fonts_table.empty()) {
+                data["SystemFonts"] = fonts_table;
+            } else if (data.is_table()) {
+                data.as_table().erase("SystemFonts");
+            }
+        }
         data["GUI"]["installDirs"] = install_dirs;
         data["GUI"]["installDirsEnabled"] = install_dirs_enabled;
         data["GUI"]["saveDataPath"] = string{fmt::UTF(save_data_path.u8string()).data};
@@ -1166,6 +1297,7 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
         data["GPU"]["internalScreenHeight"] = internalScreenHeight.base_value;
         data["GPU"]["patchShaders"] = shouldPatchShaders.base_value;
         data["Debug"]["FPSColor"] = isFpsColor.base_value;
+        data["Debug"]["showFpsCounter"] = showFpsCounter.base_value;
     }
 
     // Sorting of TOML sections
@@ -1237,6 +1369,8 @@ void setDefaultValues(bool is_game_specific) {
     vkHostMarkers.set(false, is_game_specific);
     vkGuestMarkers.set(false, is_game_specific);
     rdocEnable.set(false, is_game_specific);
+    pipelineCacheEnable.set(false, is_game_specific);
+    pipelineCacheArchive.set(false, is_game_specific);
 
     // GS - Debug
     isDebugDump.set(false, is_game_specific);
@@ -1272,6 +1406,7 @@ void setDefaultValues(bool is_game_specific) {
 
         // Debug
         isFpsColor.base_value = true;
+        showFpsCounter.base_value = false;
     }
 }
 
@@ -1286,6 +1421,7 @@ hotkey_pause = f9
 hotkey_reload_inputs = f8
 hotkey_toggle_mouse_to_joystick = f7
 hotkey_toggle_mouse_to_gyro = f6
+hotkey_toggle_mouse_to_touchpad = delete
 hotkey_quit = lctrl, lshift, end
 )";
 }

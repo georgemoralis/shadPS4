@@ -1285,7 +1285,8 @@ u16 PS4_SYSV_ABI sceNetNtohs(u16 net16) {
 
 int PS4_SYSV_ABI sceNetPoolCreate(const char* name, int size, int flags) {
     LOG_ERROR(Lib_Net, "(DUMMY) name = {} size = {} flags = {} ", std::string(name), size, flags);
-    return ORBIS_OK;
+    static s32 id = 1;
+    return id++;
 }
 
 int PS4_SYSV_ABI sceNetPoolDestroy() {
@@ -1356,7 +1357,8 @@ int PS4_SYSV_ABI sceNetResolverConnectDestroy() {
 }
 
 int PS4_SYSV_ABI sceNetResolverCreate(const char* name, int poolid, int flags) {
-    LOG_INFO(Lib_Net, "name = {}, poolid = {}, flags = {}", name, poolid, flags);
+    const char* safe_name = name ? name : "";
+    LOG_INFO(Lib_Net, "name = {}, poolid = {}, flags = {}", safe_name, poolid, flags);
 
     if (flags != 0) {
         *sceNetErrnoLoc() = ORBIS_NET_EINVAL;
@@ -1367,8 +1369,8 @@ int PS4_SYSV_ABI sceNetResolverCreate(const char* name, int poolid, int flags) {
     auto* resolver = FDTable::Instance()->GetFile(fd);
     resolver->is_opened = true;
     resolver->type = Core::FileSys::FileType::Resolver;
-    resolver->resolver = std::make_shared<Resolver>(name, poolid, flags);
-    resolver->m_guest_name = name;
+    resolver->resolver = std::make_shared<Resolver>(safe_name, poolid, flags);
+    resolver->m_guest_name = safe_name;
     return fd;
 }
 
