@@ -56,11 +56,33 @@ if (NOT TARGET ZLIB::ZLIB)
     set(ZLIB_INCLUDE_DIRS "${FETCHCONTENT_BASE_DIR}/zlib-build")
 endif()
 
+# FreeType
+if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/freetype/CMakeLists.txt" AND NOT TARGET freetype)
+    # Keep optional deps off to reduce build surface; zlib stays enabled for compressed fonts.
+    set(FT_DISABLE_BZIP2 ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_BROTLI ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_HARFBUZZ ON CACHE BOOL "" FORCE)
+    set(FT_DISABLE_PNG ON CACHE BOOL "" FORCE)
+    add_subdirectory(freetype)
+endif()
+
 # SDL3
 if (NOT TARGET SDL3::SDL3)
     set(SDL_TEST_LIBRARY OFF)
     set(SDL_PIPEWIRE OFF)
     add_subdirectory(sdl3)
+endif()
+
+# SDL3_mixer
+if (NOT TARGET SDL3_mixer::SDL3_mixer)
+    set(SDLMIXER_FLAC OFF)
+    set(SDLMIXER_OGG OFF)
+    set(SDLMIXER_MOD OFF)
+    set(SDLMIXER_MIDI OFF)
+    set(SDLMIXER_OPUS OFF)
+    set(SDLMIXER_WAVPACK OFF)
+    set(BUILD_SHARED_LIBS OFF)
+    add_subdirectory(sdl3_mixer)
 endif()
 
 # vulkan-headers
@@ -140,7 +162,7 @@ endif()
 # sirit
 add_subdirectory(sirit)
 if (WIN32)
-    target_compile_options(sirit PUBLIC "-Wno-error=unused-command-line-argument")
+    target_compile_options(sirit PRIVATE "-Wno-error=unused-command-line-argument")
 endif()
 
 # half
@@ -246,6 +268,13 @@ if (WIN32)
 add_subdirectory(ext-wepoll)
 endif()
 
+if (NOT TARGET fdk-aac)
+add_subdirectory(aacdec)
+endif()
+
 #nlohmann json 
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 add_subdirectory(json)
+
+# miniz
+add_subdirectory(miniz)

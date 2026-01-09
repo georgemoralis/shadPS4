@@ -3,12 +3,12 @@
 
 #pragma once
 
-#include <shared_mutex>
 #include <boost/container/small_vector.hpp>
 #include "common/lru_cache.h"
 #include "common/slot_vector.h"
 #include "common/types.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/multi_level_page_table.h"
 
@@ -40,9 +40,7 @@ public:
     static constexpr u64 CACHING_PAGESIZE = u64{1} << CACHING_PAGEBITS;
     static constexpr u64 DEVICE_PAGESIZE = 16_KB;
     static constexpr u64 CACHING_NUMPAGES = u64{1} << (40 - CACHING_PAGEBITS);
-
     static constexpr u64 BDA_PAGETABLE_SIZE = CACHING_NUMPAGES * sizeof(vk::DeviceAddress);
-    static constexpr u64 FAULT_BUFFER_SIZE = CACHING_NUMPAGES / 8; // Bit per page
 
     // Default values for garbage collection
     static constexpr s64 DEFAULT_TRIGGER_GC_MEMORY = 1_GB;
@@ -68,12 +66,6 @@ public:
         bool has_stream_leap = false;
     };
 
-    using IntervalSet =
-        boost::icl::interval_set<VAddr, std::less,
-                                 ICL_INTERVAL_INSTANCE(ICL_INTERVAL_DEFAULT, VAddr, std::less),
-                                 RangeSetsAllocator>;
-    using IntervalType = typename IntervalSet::interval_type;
-
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          AmdGpu::Liverpool* liverpool, TextureCache& texture_cache,
@@ -92,7 +84,7 @@ public:
 
     /// Retrieves the fault buffer.
     [[nodiscard]] Buffer* GetFaultBuffer() noexcept {
-        return &fault_buffer;
+        return fault_manager.GetFaultBuffer();
     }
 
     /// Retrieves the buffer with the specified id.
@@ -126,7 +118,7 @@ public:
     void BindIndexBuffer(u32 index_offset);
 
     /// Writes a value to GPU buffer. (uses command buffer to temporarily store the data)
-    void InlineData(VAddr address, const void* value, u32 num_bytes, bool is_gds);
+    void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
 
     /// Performs buffer to buffer data copy on the GPU.
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
@@ -159,9 +151,6 @@ public:
 
     /// Synchronizes all buffers neede for DMA.
     void SynchronizeDmaBuffers();
-
-    /// Record memory barrier. Used for buffers when accessed via BDA.
-    void MemoryBarrier();
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
@@ -204,8 +193,6 @@ private:
 
     bool SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, u32 size);
 
-    void InlineDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
-
     void WriteDataBuffer(Buffer& buffer, VAddr address, const void* value, u32 num_bytes);
 
     void TouchBuffer(const Buffer& buffer);
@@ -217,6 +204,7 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
+    FaultManager fault_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
     StreamBuffer staging_buffer;
     StreamBuffer stream_buffer;
@@ -224,8 +212,6 @@ private:
     StreamBuffer device_buffer;
     Buffer gds_buffer;
     Buffer bda_pagetable_buffer;
-    Buffer fault_buffer;
-    std::shared_mutex slot_buffers_mutex;
     Common::SlotVector<Buffer> slot_buffers;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
@@ -235,9 +221,6 @@ private:
     RangeSet gpu_modified_ranges;
     SplitRangeMap<BufferId> buffer_ranges;
     PageTable page_table;
-    vk::UniqueDescriptorSetLayout fault_process_desc_layout;
-    vk::UniquePipeline fault_process_pipeline;
-    vk::UniquePipelineLayout fault_process_pipeline_layout;
 };
 
 } // namespace VideoCore
