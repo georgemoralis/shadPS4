@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+# SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 # Version 3.24 needed for FetchContent OVERRIDE_FIND_PACKAGE
@@ -202,7 +202,7 @@ execute_process(
 
 # Set Version
 set(EMULATOR_VERSION_MAJOR "0")
-set(EMULATOR_VERSION_MINOR "12")
+set(EMULATOR_VERSION_MINOR "13")
 set(EMULATOR_VERSION_PATCH "1")
 
 set_source_files_properties(src/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
@@ -228,7 +228,10 @@ find_package(half 1.12.0 MODULE)
 find_package(magic_enum 0.9.7 CONFIG)
 find_package(PNG 1.6 MODULE)
 find_package(RenderDoc 1.6.0 MODULE)
-find_package(SDL3 3.1.2 CONFIG)
+find_package(SDL3_mixer 2.8.1 CONFIG)
+if (SDL3_mixer_FOUND)
+    find_package(SDL3 3.1.2 CONFIG)
+endif()
 find_package(stb MODULE)
 find_package(toml11 4.2.0 CONFIG)
 find_package(tsl-robin-map 1.3.0 CONFIG)
@@ -259,6 +262,8 @@ include_directories(src)
 
 set(AJM_LIB src/core/libraries/ajm/ajm.cpp
             src/core/libraries/ajm/ajm.h
+            src/core/libraries/ajm/ajm_aac.cpp
+            src/core/libraries/ajm/ajm_aac.h
             src/core/libraries/ajm/ajm_at9.cpp
             src/core/libraries/ajm/ajm_at9.h
             src/core/libraries/ajm/ajm_batch.cpp
@@ -419,6 +424,8 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/rtc/rtc.cpp
                 src/core/libraries/rtc/rtc.h
                 src/core/libraries/rtc/rtc_error.h
+                src/core/libraries/rudp/rudp.cpp
+                src/core/libraries/rudp/rudp.h
                 src/core/libraries/disc_map/disc_map.cpp
                 src/core/libraries/disc_map/disc_map.h
                 src/core/libraries/disc_map/disc_map_codes.h
@@ -463,8 +470,12 @@ set(SYSTEM_LIBS src/core/libraries/system/commondialog.cpp
                 src/core/libraries/web_browser_dialog/webbrowserdialog.h
                 src/core/libraries/font/font.cpp
                 src/core/libraries/font/font.h
+                src/core/libraries/font/font_internal.cpp
+                src/core/libraries/font/font_internal.h
                 src/core/libraries/font/fontft.cpp
                 src/core/libraries/font/fontft.h
+                src/core/libraries/font/fontft_internal.cpp
+                src/core/libraries/font/fontft_internal.h
                 src/core/libraries/font/font_error.h
 
 )
@@ -509,7 +520,7 @@ set(PAD_LIB src/core/libraries/pad/pad.cpp
             src/core/libraries/pad/pad_errors.h
 )
 
-set(SYSTEM_GESTURE_LIB 
+set(SYSTEM_GESTURE_LIB
             src/core/libraries/system_gesture/system_gesture.cpp
             src/core/libraries/system_gesture/system_gesture.h
 )
@@ -539,6 +550,10 @@ set(RANDOM_LIB src/core/libraries/random/random.cpp
 set(USBD_LIB src/core/libraries/usbd/usbd.cpp
              src/core/libraries/usbd/usbd.h
              src/core/libraries/usbd/usb_backend.h
+             src/core/libraries/usbd/emulated/dimensions.cpp
+             src/core/libraries/usbd/emulated/dimensions.h
+             src/core/libraries/usbd/emulated/infinity.cpp
+             src/core/libraries/usbd/emulated/infinity.h
              src/core/libraries/usbd/emulated/skylander.cpp
              src/core/libraries/usbd/emulated/skylander.h
 )
@@ -548,6 +563,8 @@ set(FIBER_LIB src/core/libraries/fiber/fiber_context.s
               src/core/libraries/fiber/fiber.h
               src/core/libraries/fiber/fiber_error.h
 )
+
+set_source_files_properties(src/core/libraries/fiber/fiber_context.s PROPERTIES COMPILE_OPTIONS -Wno-unused-command-line-argument)
 
 set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
              src/core/libraries/videodec/videodec2_impl.h
@@ -564,6 +581,8 @@ set(VDEC_LIB src/core/libraries/videodec/videodec2_impl.cpp
 set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_common.cpp
             src/core/libraries/np/np_common.h
+            src/core/libraries/np/np_commerce.cpp
+            src/core/libraries/np/np_commerce.h
             src/core/libraries/np/np_manager.cpp
             src/core/libraries/np/np_manager.h
             src/core/libraries/np/np_score.cpp
@@ -574,6 +593,8 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/trophy_ui.h
             src/core/libraries/np/np_web_api.cpp
             src/core/libraries/np/np_web_api.h
+            src/core/libraries/np/np_web_api2.cpp
+            src/core/libraries/np/np_web_api2.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
             src/core/libraries/np/np_auth.cpp
@@ -684,7 +705,6 @@ set(COMMON src/common/logging/backend.cpp
            src/common/lru_cache.h
            src/common/error.cpp
            src/common/error.h
-           src/common/scope_exit.h
            src/common/fixed_value.h
            src/common/func_traits.h
            src/common/native_clock.cpp
@@ -698,6 +718,8 @@ set(COMMON src/common/logging/backend.cpp
            src/common/rdtsc.h
            src/common/recursive_lock.cpp
            src/common/recursive_lock.h
+           src/common/scope_exit.h
+           src/common/serdes.h
            src/common/sha1.h
            src/common/shared_first_mutex.h
            src/common/signal_context.h
@@ -824,6 +846,10 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/thread.h
          src/core/tls.cpp
          src/core/tls.h
+         src/core/emulator_state.cpp
+         src/core/emulator_state.h
+         src/core/emulator_settings.cpp
+         src/core/emulator_settings.h
 )
 
 if (ARCHITECTURE STREQUAL "x86_64")
@@ -955,6 +981,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/buffer.h
                src/video_core/buffer_cache/buffer_cache.cpp
                src/video_core/buffer_cache/buffer_cache.h
+               src/video_core/buffer_cache/fault_manager.cpp
+               src/video_core/buffer_cache/fault_manager.h
                src/video_core/buffer_cache/memory_tracker.h
                src/video_core/buffer_cache/range_set.h
                src/video_core/buffer_cache/region_definitions.h
@@ -975,6 +1003,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.h
                src/video_core/renderer_vulkan/vk_pipeline_common.cpp
                src/video_core/renderer_vulkan/vk_pipeline_common.h
+               src/video_core/renderer_vulkan/vk_pipeline_serialization.cpp
+               src/video_core/renderer_vulkan/vk_pipeline_serialization.h
                src/video_core/renderer_vulkan/vk_platform.cpp
                src/video_core/renderer_vulkan/vk_platform.h
                src/video_core/renderer_vulkan/vk_presenter.cpp
@@ -1012,6 +1042,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/tile_manager.cpp
                src/video_core/texture_cache/tile_manager.h
                src/video_core/texture_cache/types.h
+               src/video_core/cache_storage.cpp
+               src/video_core/cache_storage.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
                src/video_core/multi_level_page_table.h
@@ -1065,8 +1097,9 @@ add_executable(shadps4
 
 create_target_directory_groups(shadps4)
 
-target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui gcn half::half ZLIB::ZLIB PNG::PNG)
-target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 pugixml::pugixml stb::headers libusb::usb lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json)
+target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui gcn half::half ZLIB::ZLIB PNG::PNG freetype)
+target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 SDL3_mixer::SDL3_mixer pugixml::pugixml)
+target_link_libraries(shadps4 PRIVATE stb::headers libusb::usb lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz fdk-aac)
 
 target_compile_definitions(shadps4 PRIVATE IMGUI_USER_CONFIG="imgui/imgui_config.h")
 target_compile_definitions(Dear_ImGui PRIVATE IMGUI_USER_CONFIG="${PROJECT_SOURCE_DIR}/src/imgui/imgui_config.h")
@@ -1115,22 +1148,22 @@ if (APPLE)
 endif()
 
 if (WIN32)
-    target_link_libraries(shadps4 PRIVATE mincore wepoll)
+    target_link_libraries(shadps4 PRIVATE mincore wepoll wbemuuid)
 
     if (MSVC)
         # MSVC likes putting opinions on what people can use, disable:
-        add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE -D_SCL_SECURE_NO_WARNINGS)
+        add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_DEPRECATE _SCL_SECURE_NO_WARNINGS)
     endif()
 
-    add_definitions(-DNOMINMAX -DWIN32_LEAN_AND_MEAN)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
 
     if (MSVC)
         # Needed for conflicts with time.h of windows.h
-        add_definitions(-D_TIMESPEC_DEFINED)
+        add_compile_definitions(_TIMESPEC_DEFINED)
     endif()
 
     # Target Windows 10 RS5
-    add_definitions(-DNTDDI_VERSION=0x0A000006 -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00)
+    add_compile_definitions(NTDDI_VERSION=0x0A000006 _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 
     if (MSVC)
         target_link_libraries(shadps4 PRIVATE clang_rt.builtins-x86_64.lib)
@@ -1162,7 +1195,7 @@ if (WIN32)
     target_sources(shadps4 PRIVATE src/shadps4.rc)
 endif()
 
-add_definitions(-DBOOST_ASIO_STANDALONE)
+add_compile_definitions(BOOST_ASIO_STANDALONE)
 
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 

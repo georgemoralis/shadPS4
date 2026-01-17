@@ -11,6 +11,7 @@
   <project_license translate="no">GPL-2.0</project_license>
   <launchable type="desktop-id" translate="no">net.shadps4.shadPS4.desktop</launchable>
   <url type="homepage" translate="no">https://shadps4.net/</url>
+  <url type="vcs-browser" translate="no">https://github.com/shadps4-emu/shadPS4</url>
   <description>
     <p>shadPS4 is an early PlayStation 4 emulator for Windows, Linux and macOS written in C++.</p>
     <p>The emulator is still early in development, so don't expect a flawless experience. Nonetheless, the emulator can already run a number of commercial games.</p>
@@ -18,25 +19,31 @@
   <screenshots>
     <screenshot type="default">
       <image type="source" translate="no" >https://cdn.jsdelivr.net/gh/shadps4-emu/shadps4@main/documents/Screenshots/1.png</image>
-      <caption>Bloodborne</caption>
+      <caption>Bloodborne by From Software</caption>
     </screenshot>
     <screenshot>
       <image type="source" translate="no">https://cdn.jsdelivr.net/gh/shadps4-emu/shadps4@main/documents/Screenshots/2.png</image>
-      <caption>Hatsune Miku: Project DIVA Future Tone</caption>
+      <caption>Hatsune Miku Project DIVA Future Tone by SEGA</caption>
     </screenshot>
     <screenshot>
       <image type="source" translate="no">https://cdn.jsdelivr.net/gh/shadps4-emu/shadps4@main/documents/Screenshots/3.png</image>
-      <caption>Yakuza 0</caption>
+      <caption>Yakuza 0 by SEGA</caption>
     </screenshot>
     <screenshot>
       <image type="source" translate="no">https://cdn.jsdelivr.net/gh/shadps4-emu/shadps4@main/documents/Screenshots/4.png</image>
-      <caption>Persona 4 Golden</caption>
+      <caption>DRIVECLUB™ by Evolution Studios</caption>
     </screenshot>
   </screenshots>
   <categories>
     <category translate="no">Game</category>
   </categories>
   <releases>
+    <release version="0.13.0" date="2025-12-24">
+      <url>https://github.com/shadps4-emu/shadPS4/releases/tag/v.0.13.0</url>
+    </release>
+    <release version="0.12.5" date="2025-11-07">
+      <url>https://github.com/shadps4-emu/shadPS4/releases/tag/v.0.12.5</url>
+    </release>
     <release version="0.12.0" date="2025-10-31">
       <url>https://github.com/shadps4-emu/shadPS4/releases/tag/v.0.12.0</url>
     </release>

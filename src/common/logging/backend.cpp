@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2014 Citra Emulator Project
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -97,6 +98,7 @@ private:
     std::size_t bytes_written = 0;
 };
 
+#ifdef _WIN32
 /**
  * Backend that writes to Visual Studio's output window
  */
@@ -107,15 +109,14 @@ public:
     ~DebuggerBackend() = default;
 
     void Write(const Entry& entry) {
-#ifdef _WIN32
         ::OutputDebugStringW(UTF8ToUTF16W(FormatLogMessage(entry).append(1, '\n')).c_str());
-#endif
     }
 
     void Flush() {}
 
     void EnableForStacktrace() {}
 };
+#endif
 
 bool initialization_in_progress_suppress_logging = true;
 
@@ -182,7 +183,13 @@ public:
     }
 
     void PushEntry(Class log_class, Level log_level, const char* filename, unsigned int line_num,
-                   const char* function, std::string message) {
+                   const char* function, const char* format, const fmt::format_args& args) {
+        if (!filter.CheckMessage(log_class, log_level) || !Config::getLoggingEnabled()) {
+            return;
+        }
+
+        const auto message = fmt::vformat(format, args);
+
         // Propagate important log messages to the profiler
         if (IsProfilerConnected()) {
             const auto& msg_str = fmt::format("[{}] {}", GetLogClassName(log_class), message);
@@ -201,10 +208,6 @@ public:
             }
         }
 
-        if (!filter.CheckMessage(log_class, log_level) || !Config::getLoggingEnabled()) {
-            return;
-        }
-
         using std::chrono::duration_cast;
         using std::chrono::microseconds;
         using std::chrono::steady_clock;
@@ -217,6 +220,7 @@ public:
             .line_num = line_num,
             .function = function,
             .message = std::move(message),
+            .thread = Common::GetCurrentThreadName(),
         };
         if (Config::getLogType() == "async") {
             message_queue.EmplaceWait(entry);
@@ -264,7 +268,9 @@ private:
     }
 
     void ForEachBackend(auto lambda) {
-        // lambda(debugger_backend);
+#ifdef _WIN32
+        lambda(debugger_backend);
+#endif
         lambda(color_console_backend);
         lambda(file_backend);
     }
@@ -277,7 +283,9 @@ private:
     static inline bool should_append{false};
 
     Filter filter;
+#ifdef _WIN32
     DebuggerBackend debugger_backend{};
+#endif
     ColorConsoleBackend color_console_backend{};
     FileBackend file_backend;
 
@@ -324,8 +332,8 @@ void FmtLogMessageImpl(Class log_class, Level log_level, const char* filename,
                        unsigned int line_num, const char* function, const char* format,
                        const fmt::format_args& args) {
     if (!initialization_in_progress_suppress_logging) [[likely]] {
-        Impl::Instance().PushEntry(log_class, log_level, filename, line_num, function,
-                                   fmt::vformat(format, args));
+        Impl::Instance().PushEntry(log_class, log_level, filename, line_num, function, format,
+                                   args);
     }
 }
 } // namespace Common::Log

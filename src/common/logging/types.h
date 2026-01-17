@@ -70,17 +70,20 @@ enum class Class : u8 {
     Lib_Http2,               ///< The LibSceHttp2 implementation.
     Lib_SysModule,           ///< The LibSceSysModule implementation
     Lib_NpCommon,            ///< The LibSceNpCommon implementation
+    Lib_NpCommerce,          ///< The LibSceNpCommerce implementation
     Lib_NpAuth,              ///< The LibSceNpAuth implementation
     Lib_NpManager,           ///< The LibSceNpManager implementation
     Lib_NpScore,             ///< The LibSceNpScore implementation
     Lib_NpTrophy,            ///< The LibSceNpTrophy implementation
     Lib_NpWebApi,            ///< The LibSceWebApi implementation
+    Lib_NpWebApi2,           ///< The LibSceWebApi2 implementation
     Lib_NpProfileDialog,     ///< The LibSceNpProfileDialog implementation
     Lib_NpSnsFacebookDialog, ///< The LibSceNpSnsFacebookDialog implementation
     Lib_Screenshot,          ///< The LibSceScreenshot implementation
     Lib_LibCInternal,        ///< The LibCInternal implementation.
     Lib_AppContent,          ///< The LibSceAppContent implementation.
     Lib_Rtc,                 ///< The LibSceRtc implementation.
+    Lib_Rudp,                ///< The LibSceRudp implementation.
     Lib_DiscMap,             ///< The LibSceDiscMap implementation.
     Lib_Png,                 ///< The LibScePng implementation.
     Lib_Jpeg,                ///< The LibSceJpeg implementation.
