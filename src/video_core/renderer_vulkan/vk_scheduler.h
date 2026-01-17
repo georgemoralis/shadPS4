@@ -33,16 +33,61 @@ struct RenderState {
     u32 width;
     u32 height;
 
-    RenderState() {
-        std::memset(this, 0, sizeof(*this));
-        color_attachments.fill(vk::RenderingAttachmentInfo{});
-        depth_attachment = vk::RenderingAttachmentInfo{};
-        stencil_attachment = vk::RenderingAttachmentInfo{};
-        num_layers = 1;
+    RenderState()
+        : color_attachments{}, depth_attachment{}, stencil_attachment{}, num_color_attachments(0),
+          num_layers(1), has_depth(false), has_stencil(false), width(0), height(0) {}
+
+    static bool compareClearValue(const vk::ClearValue& a, const vk::ClearValue& b) noexcept {
+        return std::memcmp(&a, &b, sizeof(vk::ClearValue)) == 0;
     }
 
+    static bool compareAttachment(const vk::RenderingAttachmentInfo& a,
+                                  const vk::RenderingAttachmentInfo& b) noexcept {
+        // Compare all members except clearValue with operator==
+        if (a.imageView != b.imageView || a.imageLayout != b.imageLayout ||
+            a.resolveMode != b.resolveMode || a.resolveImageView != b.resolveImageView ||
+            a.resolveImageLayout != b.resolveImageLayout || a.loadOp != b.loadOp ||
+            a.storeOp != b.storeOp) {
+            return false;
+        }
+        return compareClearValue(a.clearValue, b.clearValue);
+    }
+
+    bool compareColorAttachments(const RenderState& other) const noexcept {
+        if (num_color_attachments != other.num_color_attachments) {
+            return false;
+        }
+
+        for (u32 i = 0; i < num_color_attachments; ++i) {
+            if (!compareAttachment(color_attachments[i], other.color_attachments[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // Equality operator
     bool operator==(const RenderState& other) const noexcept {
-        return std::memcmp(this, &other, sizeof(RenderState)) == 0;
+
+        if (num_color_attachments != other.num_color_attachments ||
+            num_layers != other.num_layers || has_depth != other.has_depth ||
+            has_stencil != other.has_stencil || width != other.width || height != other.height) {
+            return false;
+        }
+
+        if (!compareColorAttachments(other)) {
+            return false;
+        }
+
+        if (has_depth && !compareAttachment(depth_attachment, other.depth_attachment)) {
+            return false;
+        }
+
+        if (has_stencil && !compareAttachment(stencil_attachment, other.stencil_attachment)) {
+            return false;
+        }
+
+        return true;
     }
 };
 
