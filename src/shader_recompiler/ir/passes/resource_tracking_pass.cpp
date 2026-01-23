@@ -498,7 +498,8 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
         // buffer_load_format_xyz v[8:10], v1, s[32:35], 0 ...
         // is used to define an inline buffer resource
         std::array<u64, 2> raw;
-        raw[0] = info.pgm_base + (handle->Arg(0).U32() | u64(handle->Arg(1).U32()) << 32);
+        // Keep relative address, we'll do fixup of the address at buffer fetch later
+        raw[0] = (handle->Arg(0).U32() | u64(handle->Arg(1).U32()) << 32);
         raw[1] = handle->Arg(2).U32() | u64(handle->Arg(3).U32()) << 32;
         const auto buffer = std::bit_cast<AmdGpu::Buffer>(raw);
         buffer_binding = descriptors.Add(BufferResource{
@@ -659,6 +660,7 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
         inst.SetArg(1, ir.Imm32(binding));
     } else {
         // Convert shared memory opcode to storage buffer atomic to GDS buffer.
+        auto& buffer = info.buffers[binding];
         const IR::U32 offset = IR::U32{inst.Arg(0)};
         const IR::U32 address_words = ir.ShiftRightLogical(offset, ir.Imm32(1));
         const IR::U32 address_dwords = ir.ShiftRightLogical(offset, ir.Imm32(2));
@@ -704,27 +706,35 @@ void PatchGlobalDataShareAccess(IR::Block& block, IR::Inst& inst, Info& info,
         case IR::Opcode::SharedAtomicXor32:
             inst.ReplaceUsesWith(ir.BufferAtomicXor(handle, address_dwords, inst.Arg(1), {}));
             break;
-        case IR::Opcode::LoadSharedU16:
+        case IR::Opcode::LoadSharedU16: {
             inst.ReplaceUsesWith(ir.LoadBufferU16(handle, address_words, {}));
+            buffer.used_types |= IR::Type::U16;
             break;
+        }
         case IR::Opcode::LoadSharedU32:
             inst.ReplaceUsesWith(ir.LoadBufferU32(1, handle, address_dwords, {}));
             break;
-        case IR::Opcode::LoadSharedU64:
+        case IR::Opcode::LoadSharedU64: {
             inst.ReplaceUsesWith(ir.LoadBufferU64(handle, address_qwords, {}));
+            buffer.used_types |= IR::Type::U64;
             break;
-        case IR::Opcode::WriteSharedU16:
+        }
+        case IR::Opcode::WriteSharedU16: {
             ir.StoreBufferU16(handle, address_words, IR::U16{inst.Arg(1)}, {});
             inst.Invalidate();
+            buffer.used_types |= IR::Type::U16;
             break;
+        }
         case IR::Opcode::WriteSharedU32:
             ir.StoreBufferU32(1, handle, address_dwords, inst.Arg(1), {});
             inst.Invalidate();
             break;
-        case IR::Opcode::WriteSharedU64:
+        case IR::Opcode::WriteSharedU64: {
             ir.StoreBufferU64(handle, address_qwords, IR::U64{inst.Arg(1)}, {});
             inst.Invalidate();
+            buffer.used_types |= IR::Type::U64;
             break;
+        }
         default:
             UNREACHABLE();
         }

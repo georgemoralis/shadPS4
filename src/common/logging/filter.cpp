@@ -1,4 +1,5 @@
 // SPDX-FileCopyrightText: Copyright 2014 Citra Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
@@ -104,16 +105,19 @@ bool ParseFilterRule(Filter& instance, Iterator begin, Iterator end) {
     SUB(Lib, Move)                                                                                 \
     SUB(Lib, NpAuth)                                                                               \
     SUB(Lib, NpCommon)                                                                             \
+    SUB(Lib, NpCommerce)                                                                           \
     SUB(Lib, NpManager)                                                                            \
     SUB(Lib, NpScore)                                                                              \
     SUB(Lib, NpTrophy)                                                                             \
     SUB(Lib, NpWebApi)                                                                             \
+    SUB(Lib, NpWebApi2)                                                                            \
     SUB(Lib, NpProfileDialog)                                                                      \
     SUB(Lib, NpSnsFacebookDialog)                                                                  \
     SUB(Lib, Screenshot)                                                                           \
     SUB(Lib, LibCInternal)                                                                         \
     SUB(Lib, AppContent)                                                                           \
     SUB(Lib, Rtc)                                                                                  \
+    SUB(Lib, Rudp)                                                                                 \
     SUB(Lib, DiscMap)                                                                              \
     SUB(Lib, Png)                                                                                  \
     SUB(Lib, Jpeg)                                                                                 \
@@ -156,6 +160,7 @@ bool ParseFilterRule(Filter& instance, Iterator begin, Iterator end) {
     CLS(ImGui)                                                                                     \
     CLS(Input)                                                                                     \
     CLS(Tty)                                                                                       \
+    CLS(KeyManager)                                                                                \
     CLS(Loader)
 
 // GetClassName is a macro defined by Windows.h, grrr...

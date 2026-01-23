@@ -655,10 +655,17 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
 
         switch (file->type) {
         case Core::FileSys::FileType::Socket: {
+            auto native_handle = file->socket->Native();
+            if (!native_handle) {
+                // P2P socket, cannot be added to epoll
+                LOG_ERROR(Lib_Net, "P2P socket cannot be added to epoll (unimplemented)");
+                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                return ORBIS_NET_ERROR_EBADF;
+            }
+
             epoll_event native_event = {.events = ConvertEpollEventsIn(event->events),
                                         .data = {.fd = id}};
-            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_ADD, *file->socket->Native(),
-                             &native_event) == 0);
+            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_ADD, *native_handle, &native_event) == 0);
             epoll->events.emplace_back(id, *event);
             break;
         }
@@ -696,10 +703,17 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
 
         switch (file->type) {
         case Core::FileSys::FileType::Socket: {
+            auto native_handle = file->socket->Native();
+            if (!native_handle) {
+                // P2P socket, cannot be modified in epoll
+                LOG_ERROR(Lib_Net, "P2P socket cannot be modified in epoll (unimplemented)");
+                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                return ORBIS_NET_ERROR_EBADF;
+            }
+
             epoll_event native_event = {.events = ConvertEpollEventsIn(event->events),
                                         .data = {.fd = id}};
-            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_MOD, *file->socket->Native(),
-                             &native_event) == 0);
+            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_MOD, *native_handle, &native_event) == 0);
             *it = {id, *event};
             break;
         }
@@ -731,8 +745,15 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
 
         switch (file->type) {
         case Core::FileSys::FileType::Socket: {
-            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_DEL, *file->socket->Native(), nullptr) ==
-                   0);
+            auto native_handle = file->socket->Native();
+            if (!native_handle) {
+                // P2P socket, cannot be removed from epoll
+                LOG_ERROR(Lib_Net, "P2P socket cannot be removed from epoll (unimplemented)");
+                *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                return ORBIS_NET_ERROR_EBADF;
+            }
+
+            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_DEL, *native_handle, nullptr) == 0);
             epoll->events.erase(it);
             break;
         }
@@ -1285,7 +1306,8 @@ u16 PS4_SYSV_ABI sceNetNtohs(u16 net16) {
 
 int PS4_SYSV_ABI sceNetPoolCreate(const char* name, int size, int flags) {
     LOG_ERROR(Lib_Net, "(DUMMY) name = {} size = {} flags = {} ", std::string(name), size, flags);
-    return ORBIS_OK;
+    static s32 id = 1;
+    return id++;
 }
 
 int PS4_SYSV_ABI sceNetPoolDestroy() {
@@ -1356,7 +1378,8 @@ int PS4_SYSV_ABI sceNetResolverConnectDestroy() {
 }
 
 int PS4_SYSV_ABI sceNetResolverCreate(const char* name, int poolid, int flags) {
-    LOG_INFO(Lib_Net, "name = {}, poolid = {}, flags = {}", name, poolid, flags);
+    const char* safe_name = name ? name : "";
+    LOG_INFO(Lib_Net, "name = {}, poolid = {}, flags = {}", safe_name, poolid, flags);
 
     if (flags != 0) {
         *sceNetErrnoLoc() = ORBIS_NET_EINVAL;
@@ -1367,8 +1390,8 @@ int PS4_SYSV_ABI sceNetResolverCreate(const char* name, int poolid, int flags) {
     auto* resolver = FDTable::Instance()->GetFile(fd);
     resolver->is_opened = true;
     resolver->type = Core::FileSys::FileType::Resolver;
-    resolver->resolver = std::make_shared<Resolver>(name, poolid, flags);
-    resolver->m_guest_name = name;
+    resolver->resolver = std::make_shared<Resolver>(safe_name, poolid, flags);
+    resolver->m_guest_name = safe_name;
     return fd;
 }
 
