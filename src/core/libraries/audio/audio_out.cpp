@@ -5,6 +5,7 @@
 #include "core/libraries/audio/audio_out.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include <magic_enum/magic_enum.hpp>
 
 namespace Libraries::AudioOut {
 
@@ -49,7 +50,7 @@ s32 PS4_SYSV_ABI sceAudioOutChangeAppModuleState() {
 }
 
 s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
-    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called, handle={}", handle);
     return ORBIS_OK;
 }
 
@@ -109,12 +110,21 @@ s32 PS4_SYSV_ABI sceAudioOutGetInfoOpenNum() {
 }
 
 s32 PS4_SYSV_ABI sceAudioOutGetLastOutputTime(s32 handle, u64* output_time) {
-    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called, handle={}, output_time={}", handle,
+              fmt::ptr(output_time));
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceAudioOutGetPortState(s32 handle, OrbisAudioOutPortState* state) {
-    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    if (state) {
+        LOG_ERROR(Lib_AudioOut,
+                  "(STUBBED) called, handle={}, state={}, output={}, channel={}, volume={}, "
+                  "rerouteCounter={}, flag={}",
+                  handle, fmt::ptr(state), state->output, state->channel, state->volume,
+                  state->rerouteCounter, state->flag);
+    } else {
+        LOG_ERROR(Lib_AudioOut, "(STUBBED) called, handle={}, state=nullptr", handle);
+    }
     return ORBIS_OK;
 }
 
@@ -182,7 +192,12 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
                                  OrbisAudioOutPort port_type, s32 index, u32 length,
                                  u32 sample_rate,
                                  OrbisAudioOutParamExtendedInformation param_type) {
-    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    LOG_ERROR(Lib_AudioOut,
+              "(STUBBED) called, user_id={}, port_type={}, index={}, length={}, sample_rate={}, "
+              "data_format={}, attributes={}",
+              user_id, static_cast<u32>(port_type), index, length, sample_rate,
+              magic_enum::enum_name(param_type.data_format.Value()),
+              magic_enum::enum_name(param_type.attributes.Value()));
     return ORBIS_OK;
 }
 
@@ -192,12 +207,20 @@ s32 PS4_SYSV_ABI sceAudioOutOpenEx() {
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOutput(s32 handle, void* ptr) {
-    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    LOG_ERROR(Lib_AudioOut, "(STUBBED) called, handle={}, ptr={}", handle, fmt::ptr(ptr));
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOutputs(OrbisAudioOutOutputParam* param, u32 num) {
-    LOG_ERROR(Lib_AudioOut, "(STUBBED) called");
+    if (param) {
+        LOG_ERROR(Lib_AudioOut, "(STUBBED) called, param={}, num={}", fmt::ptr(param), num);
+        for (u32 i = 0; i < num; i++) {
+            LOG_ERROR(Lib_AudioOut, "  [{}] handle={}, ptr={}", i, param[i].handle,
+                      fmt::ptr(param[i].ptr));
+        }
+    } else {
+        LOG_ERROR(Lib_AudioOut, "(STUBBED) called, param=nullptr, num={}", num);
+    }
     return ORBIS_OK;
 }
 
