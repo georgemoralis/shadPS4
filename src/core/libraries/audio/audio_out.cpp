@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <magic_enum/magic_enum.hpp>
 #include "common/logging/log.h"
 #include "core/libraries/audio/audio_out.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
-#include <magic_enum/magic_enum.hpp>
 
 namespace Libraries::AudioOut {
 
@@ -193,11 +193,13 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
                                  u32 sample_rate,
                                  OrbisAudioOutParamExtendedInformation param_type) {
     LOG_ERROR(Lib_AudioOut,
-              "(STUBBED) called, user_id={}, port_type={}, index={}, length={}, sample_rate={}, "
-              "data_format={}, attributes={}",
-              user_id, static_cast<u32>(port_type), index, length, sample_rate,
-              magic_enum::enum_name(param_type.data_format.Value()),
-              magic_enum::enum_name(param_type.attributes.Value()));
+              "(STUBBED) called, user_id={}, port_type={}({}), index={}, length={}, "
+              "sample_rate={}, data_format={}({}), attributes={}({})",
+              user_id, magic_enum::enum_name(port_type), static_cast<u32>(port_type), index, length,
+              sample_rate, magic_enum::enum_name(param_type.data_format.Value()),
+              static_cast<u32>(param_type.data_format.Value()),
+              magic_enum::enum_name(param_type.attributes.Value()),
+              static_cast<u32>(param_type.attributes.Value()));
     return ORBIS_OK;
 }
 
