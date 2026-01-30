@@ -1,9 +1,10 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+﻿// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <magic_enum/magic_enum.hpp>
 #include "common/logging/log.h"
 #include "core/libraries/audio/audio_out.h"
+#include "core/libraries/audio/audioout_error.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 
@@ -200,7 +201,82 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
               static_cast<u32>(param_type.data_format.Value()),
               magic_enum::enum_name(param_type.attributes.Value()),
               static_cast<u32>(param_type.attributes.Value()));
-    return ORBIS_OK;
+
+    /* Initialization checks */
+    // if (_lazy_init == 0 || g_audioout_interface == nullptr) {
+    //     return ORBIS_AUDIO_OUT_ERROR_NOT_INIT;
+    // }
+
+    /* len must be nonzero, ≤2048, and a multiple of 256 */
+    if (length == 0 || length > 2048 || (length & 0xFF) != 0) {
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_SIZE;
+    }
+    u32 param_raw = 0;
+    std::memcpy(&param_raw, &param_type, sizeof(param_raw));
+
+    /* param format restrictions */
+    if (port_type != OrbisAudioOutPort::Personal && (param_raw & 0x00020000) != 0) {
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+
+    if (port_type != OrbisAudioOutPort::Main && (param_raw & 0x70000000) != 0) {
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+
+    if ((param_raw & 0x8FFcff00) != 0) {
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
+    }
+
+    /*
+     * Validate port type + sample rate
+     */
+    u32 utype = static_cast<u32>(port_type);
+
+    switch (utype) {
+    case static_cast<u32>(OrbisAudioOutPort::Main):
+    case static_cast<u32>(OrbisAudioOutPort::Bgm):
+    case static_cast<u32>(OrbisAudioOutPort::Voice):
+    case static_cast<u32>(OrbisAudioOutPort::Personal):
+    case static_cast<u32>(OrbisAudioOutPort::PadSpk):
+    case static_cast<u32>(OrbisAudioOutPort::Aux):
+    case static_cast<u32>(OrbisAudioOutPort::Audio3d):
+    case static_cast<u32>(OrbisAudioOutPort::Unk1):
+        if (sample_rate != 48000) {
+            return ORBIS_AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
+        }
+        break;
+    default:
+        return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
+    }
+
+    /* clear high bit of port type */
+    utype &= 0x7FFFFFFF;
+
+    /*
+     * Open backend port
+     * (stubbed for now)
+     */
+    // mtx_lock(&g_port_lock);
+    s32 port_index = 1; /* temporary stub */
+    // s32 port_index = _out_open(user_id, utype, length, param_type);
+    // mtx_unlock(&g_port_lock);
+
+    
+
+    if (port_index < 0) {
+        return port_index;
+    }
+
+    /*
+     * Build PS4 audio handle
+     *  bits 31..29 : 0b001
+     *  bits 28..16 : port type
+     *  bits 15..0  : port index
+     */
+    s32 handle =
+        static_cast<s32>((utype << 16) | (static_cast<u32>(port_index) & 0xFFFF) | 0x20000000);
+
+    return handle;
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOpenEx() {

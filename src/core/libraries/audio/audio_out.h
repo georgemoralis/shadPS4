@@ -19,6 +19,7 @@ enum class OrbisAudioOutPort {
     Voice = 2,
     Personal = 3,
     PadSpk = 4,
+    Unk1 = 14, /*exists in decompile*/
     Audio3d = 126,
     Aux = 127,
 };
