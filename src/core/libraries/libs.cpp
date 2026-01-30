@@ -5,7 +5,7 @@
 #include "core/libraries/ajm/ajm.h"
 #include "core/libraries/app_content/app_content.h"
 #include "core/libraries/audio/audioin.h"
-#include "core/libraries/audio/audioout.h"
+#include "core/libraries/audio/audio_out.h"
 #include "core/libraries/audio3d/audio3d.h"
 #include "core/libraries/avplayer/avplayer.h"
 #include "core/libraries/camera/camera.h"

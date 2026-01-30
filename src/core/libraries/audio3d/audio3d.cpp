@@ -6,7 +6,7 @@
 
 #include "common/assert.h"
 #include "common/logging/log.h"
-#include "core/libraries/audio/audioout.h"
+#include "core/libraries/audio/audio_out.h"
 #include "core/libraries/audio/audioout_error.h"
 #include "core/libraries/audio3d/audio3d.h"
 #include "core/libraries/audio3d/audio3d_error.h"
