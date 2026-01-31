@@ -6,8 +6,9 @@
 #include <optional>
 #include <queue>
 
+#include <unordered_map>
 #include "common/types.h"
-#include "core/libraries/audio/audioout.h"
+#include "core/libraries/audio/audio_out.h"
 
 namespace Core::Loader {
 class SymbolsResolver;
