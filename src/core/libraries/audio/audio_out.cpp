@@ -223,24 +223,23 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
         return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
     }
 
-    if ((param_raw & 0x8FFcff00) != 0) {
+    if ((param_raw & 0x8FFCFF00) != 0) {
         return ORBIS_AUDIO_OUT_ERROR_INVALID_FORMAT;
     }
 
     /*
      * Validate port type + sample rate
      */
-    u32 utype = static_cast<u32>(port_type);
 
-    switch (utype) {
-    case static_cast<u32>(OrbisAudioOutPort::Main):
-    case static_cast<u32>(OrbisAudioOutPort::Bgm):
-    case static_cast<u32>(OrbisAudioOutPort::Voice):
-    case static_cast<u32>(OrbisAudioOutPort::Personal):
-    case static_cast<u32>(OrbisAudioOutPort::PadSpk):
-    case static_cast<u32>(OrbisAudioOutPort::Aux):
-    case static_cast<u32>(OrbisAudioOutPort::Audio3d):
-    case static_cast<u32>(OrbisAudioOutPort::Unk1):
+    switch (port_type) {
+    case OrbisAudioOutPort::Main:
+    case OrbisAudioOutPort::Bgm:
+    case OrbisAudioOutPort::Voice:
+    case OrbisAudioOutPort::Personal:
+    case OrbisAudioOutPort::PadSpk:
+    case OrbisAudioOutPort::Aux:
+    case OrbisAudioOutPort::Audio3d:
+    case OrbisAudioOutPort::Unk1:
         if (sample_rate != 48000) {
             return ORBIS_AUDIO_OUT_ERROR_INVALID_SAMPLE_FREQ;
         }
@@ -248,23 +247,22 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
     default:
         return ORBIS_AUDIO_OUT_ERROR_INVALID_PORT_TYPE;
     }
+    s32 type = static_cast<s32>(port_type);
 
-    /* clear high bit of port type */
-    utype &= 0x7FFFFFFF;
+    /* clear high bit of port type if exists*/
+    type &= 0x7FFFFFFF;
 
     /*
      * Open backend port
      * (stubbed for now)
      */
     // mtx_lock(&g_port_lock);
-    s32 port_index = 1; /* temporary stub */
-    // s32 port_index = _out_open(user_id, utype, length, param_type);
+    s32 result = 1; /* temporary stub */
+    // s32 result = _out_open(user_id, type, length, param_type);
     // mtx_unlock(&g_port_lock);
 
-    
-
-    if (port_index < 0) {
-        return port_index;
+    if (result < 0) {
+        return result;
     }
 
     /*
@@ -273,10 +271,10 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
      *  bits 28..16 : port type
      *  bits 15..0  : port index
      */
-    s32 handle =
-        static_cast<s32>((utype << 16) | (static_cast<u32>(port_index) & 0xFFFF) | 0x20000000);
+    // Construct handle
+    result = ((type << 16) | (result & 0xFF) | 0x20000000);
 
-    return handle;
+    return result;
 }
 
 s32 PS4_SYSV_ABI sceAudioOutOpenEx() {
