@@ -114,6 +114,7 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     vk::ImageViewType final_view_type = requested_view_type;
 
     // Check compatibility and fix if needed
+    bool view_type_fixed = false;
     if (!IsViewTypeCompatible(info.type, image.info.type)) {
         LOG_ERROR(Render_Vulkan, "Image view type {} is incompatible with image type {}",
                   magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
@@ -150,6 +151,53 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
 
         LOG_WARNING(Render_Vulkan, "  -> Forcing view type from {} to {}",
                     vk::to_string(requested_view_type), vk::to_string(final_view_type));
+        view_type_fixed = true;
+    }
+
+    // Validate and clamp subresource range
+    u32 max_layers = 1;
+    u32 max_levels = image.info.resources.levels;
+
+    // Determine max layers based on image type
+    switch (image.info.type) {
+    case AmdGpu::ImageType::Color1DArray:
+    case AmdGpu::ImageType::Color2DArray:
+    case AmdGpu::ImageType::Color2DMsaaArray:
+        max_layers = image.info.resources.layers;
+        break;
+    case AmdGpu::ImageType::Cube:
+        max_layers = 6; // Cube maps always have 6 layers
+        break;
+   // case AmdGpu::ImageType::CubeArray:
+     //   max_layers = image.info.resources.layers; // Cube array has multiple cubes (each 6 layers)
+     //   break;
+    default:
+        max_layers = 1;
+        break;
+    }
+
+    // Clamp the subresource range to valid values
+    u32 base_layer = std::min(info.range.base.layer, max_layers - 1);
+    u32 layer_count = std::min(info.range.extent.layers, max_layers - base_layer);
+    u32 base_level = std::min(info.range.base.level, max_levels - 1);
+    u32 level_count = std::min(info.range.extent.levels, max_levels - base_level);
+
+    // Log if clamping occurred
+    if (view_type_fixed || base_layer != info.range.base.layer ||
+        layer_count != info.range.extent.layers || base_level != info.range.base.level ||
+        level_count != info.range.extent.levels) {
+
+        if (base_layer != info.range.base.layer || layer_count != info.range.extent.layers) {
+            LOG_WARNING(Render_Vulkan, "Clamped layer range: {}+{} -> {}+{} (max layers: {})",
+                        info.range.base.layer, info.range.extent.layers, base_layer, layer_count,
+                        max_layers);
+        }
+
+        if (base_level != info.range.base.level || level_count != info.range.extent.levels) {
+            LOG_WARNING(Render_Vulkan, "Clamped mip level range: {}+{} -> {}+{} (max levels: {})",
+                        info.range.base.level, info.range.extent.levels, base_level, level_count,
+                        max_levels);
+        }
     }
 
     const vk::ImageViewCreateInfo image_view_ci = {
@@ -160,10 +208,10 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         .components = info.mapping,
         .subresourceRange{
             .aspectMask = aspect,
-            .baseMipLevel = info.range.base.level,
-            .levelCount = info.range.extent.levels,
-            .baseArrayLayer = info.range.base.layer,
-            .layerCount = info.range.extent.layers,
+            .baseMipLevel = base_level,
+            .levelCount = level_count,
+            .baseArrayLayer = base_layer,
+            .layerCount = layer_count,
         },
     };
 
@@ -175,12 +223,11 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
     const auto view_aspect = aspect & vk::ImageAspectFlagBits::eDepth     ? "Depth"
                              : aspect & vk::ImageAspectFlagBits::eStencil ? "Stencil"
                                                                           : "Color";
-    Vulkan::SetObjectName(
-        instance.GetDevice(), *image_view, "ImageView {}x{}x{} {:#x}:{:#x} {}:{} {}:{} ({})",
-        image.info.size.width, image.info.size.height, image.info.size.depth,
-        image.info.guest_address, image.info.guest_size, info.range.base.level,
-        info.range.base.level + info.range.extent.levels - 1, info.range.base.layer,
-        info.range.base.layer + info.range.extent.layers - 1, view_aspect);
+    Vulkan::SetObjectName(instance.GetDevice(), *image_view,
+                          "ImageView {}x{}x{} {:#x}:{:#x} {}:{} {}:{} ({})", image.info.size.width,
+                          image.info.size.height, image.info.size.depth, image.info.guest_address,
+                          image.info.guest_size, base_level, base_level + level_count - 1,
+                          base_layer, base_layer + layer_count - 1, view_aspect);
 }
 ImageView::~ImageView() = default;
 

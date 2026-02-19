@@ -477,6 +477,17 @@ void Image::CopyImage(Image& src_image) {
 
     auto [test_src_layers, test_dst_layers] = SanitizeCopyLayers(src_info, info, base_depth);
 
+    if (test_src_layers == 0 || test_dst_layers == 0) {
+        LOG_ERROR(Render_Vulkan, "Invalid layer counts after sanitization: src={}, dst={}",
+                  test_src_layers, test_dst_layers);
+        return; // Skip the copy
+    }
+
+    if (test_src_layers != test_dst_layers) {
+        LOG_WARNING(Render_Vulkan, "Layer count mismatch after sanitization: src={}, dst={}",
+                    test_src_layers, test_dst_layers);
+        // Decide whether to proceed or skip
+    }
     ASSERT(test_src_layers == test_dst_layers || num_mips == 1 ||
            (ConvertImageType(src_info.type) != ConvertImageType(info.type) &&
             (test_src_layers == 1 || test_dst_layers == 1)));
