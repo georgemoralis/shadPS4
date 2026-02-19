@@ -109,10 +109,53 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         aspect = vk::ImageAspectFlagBits::eStencil;
     }
 
+    // Get the requested view type
+    vk::ImageViewType requested_view_type = ConvertImageViewType(info.type);
+    vk::ImageViewType final_view_type = requested_view_type;
+
+    // Check compatibility and fix if needed
+    if (!IsViewTypeCompatible(info.type, image.info.type)) {
+        LOG_ERROR(Render_Vulkan, "Image view type {} is incompatible with image type {}",
+                  magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
+
+        // Fix the view type based on the actual image type
+        switch (image.info.type) {
+        case AmdGpu::ImageType::Color1D:
+            final_view_type = vk::ImageViewType::e1D;
+            break;
+        case AmdGpu::ImageType::Color1DArray:
+            final_view_type = vk::ImageViewType::e1DArray;
+            break;
+        case AmdGpu::ImageType::Color2D:
+        case AmdGpu::ImageType::Color2DMsaa:
+            final_view_type = vk::ImageViewType::e2D;
+            break;
+        case AmdGpu::ImageType::Color2DArray:
+        case AmdGpu::ImageType::Color2DMsaaArray:
+            final_view_type = vk::ImageViewType::e2DArray;
+            break;
+        case AmdGpu::ImageType::Color3D:
+            final_view_type = vk::ImageViewType::e3D;
+            break;
+        case AmdGpu::ImageType::Cube:
+            final_view_type = vk::ImageViewType::eCube;
+            break;
+        default:
+            LOG_CRITICAL(Render_Vulkan, "Unhandled image type {} for view compatibility fix",
+                         static_cast<int>(image.info.type));
+            // Fall back to requested type and hope for the best
+            final_view_type = requested_view_type;
+            break;
+        }
+
+        LOG_WARNING(Render_Vulkan, "  -> Forcing view type from {} to {}",
+                    vk::to_string(requested_view_type), vk::to_string(final_view_type));
+    }
+
     const vk::ImageViewCreateInfo image_view_ci = {
         .pNext = &usage_ci,
         .image = image.GetImage(),
-        .viewType = ConvertImageViewType(info.type),
+        .viewType = final_view_type,
         .format = instance.GetSupportedFormat(format, image.format_features),
         .components = info.mapping,
         .subresourceRange{
@@ -123,10 +166,6 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
             .layerCount = info.range.extent.layers,
         },
     };
-    if (!IsViewTypeCompatible(info.type, image.info.type)) {
-        LOG_ERROR(Render_Vulkan, "image view type {} is incompatible with image type {}",
-                  magic_enum::enum_name(info.type), magic_enum::enum_name(image.info.type));
-    }
 
     auto [view_result, view] = instance.GetDevice().createImageViewUnique(image_view_ci);
     ASSERT_MSG(view_result == vk::Result::eSuccess, "Failed to create image view: {}",
@@ -143,7 +182,6 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         info.range.base.level + info.range.extent.levels - 1, info.range.base.layer,
         info.range.base.layer + info.range.extent.layers - 1, view_aspect);
 }
-
 ImageView::~ImageView() = default;
 
 } // namespace VideoCore

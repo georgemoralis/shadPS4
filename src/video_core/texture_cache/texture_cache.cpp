@@ -459,6 +459,201 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
                   merged_image_id.index, static_cast<int>(binding), scheduler.CurrentTick(),
                   scheduler.CurrentTick() - cache_image.tick_accessed_last);
 
+            // If all properties match but new image is ~1.42x larger, it's likely mipmaps with padding
+        if (image_info.guest_size > cache_image.info.guest_size &&
+            image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.type == cache_image.info.type &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.pitch == cache_image.info.pitch) {
+
+            u64 base_size = static_cast<u64>(image_info.size.width) *
+                            static_cast<u64>(image_info.size.height) *
+                            static_cast<u64>(image_info.size.depth) * (image_info.num_bits / 8);
+
+            double ratio = static_cast<double>(image_info.guest_size) / base_size;
+
+            // The 1.42x ratio we're seeing (between 1.40 and 1.45)
+            if (ratio > 1.40 && ratio < 1.45) {
+                u32 max_mips =
+                    static_cast<u32>(std::log2(std::max(
+                        {image_info.size.width, image_info.size.height, image_info.size.depth}))) +
+                    1;
+
+                LOG_WARNING(Render_Vulkan,
+                            "Detected mipmapped texture at {:#x} (ratio: {:.2f}x, mips: {})",
+                            image_info.guest_address, ratio, max_mips);
+
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.levels = max_mips;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+        }
+
+        // We have existing mipmaps, now getting a request with fewer mips but larger size
+        if (image_info.guest_size > cache_image.info.guest_size &&
+            image_info.resources.levels < cache_image.info.resources.levels) {
+
+            u64 base_size = static_cast<u64>(image_info.size.width) *
+                            static_cast<u64>(image_info.size.height) * (image_info.num_bits / 8);
+
+            double ratio_to_base = static_cast<double>(image_info.guest_size) / base_size;
+            double size_ratio = static_cast<double>(image_info.guest_size) /
+                                static_cast<double>(cache_image.info.guest_size);
+
+            LOG_WARNING(Render_Vulkan,
+                        "Image at {:#x} evolving:\n"
+                        "  Previously: {} mips, {} bytes\n"
+                        "  Now: {} mips, {} bytes\n"
+                        "  Size ratio (new/old): {:.2f}x\n"
+                        "  Ratio to base: {:.2f}x",
+                        image_info.guest_address, cache_image.info.resources.levels,
+                        cache_image.info.guest_size, image_info.resources.levels,
+                        image_info.guest_size, size_ratio, ratio_to_base);
+
+            // Check for array layers
+            double layers_double = std::round(ratio_to_base);
+            if (std::abs(ratio_to_base - layers_double) < 0.1) {
+                u32 probable_layers = static_cast<u32>(layers_double);
+                LOG_INFO(Render_Vulkan, "  -> Detected array with {} layers", probable_layers);
+
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.layers = probable_layers;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+
+            // Calculate full mip chain size
+            u64 full_mip_size = 0;
+            u32 max_possible_mips = cache_image.info.resources.levels;
+            for (u32 mip = 0; mip < max_possible_mips; mip++) {
+                u32 mip_width = std::max(image_info.size.width >> mip, 1u);
+                u32 mip_height = std::max(image_info.size.height >> mip, 1u);
+                u32 mip_depth = std::max(image_info.size.depth >> mip, 1u);
+                full_mip_size += static_cast<u64>(mip_width) * mip_height * mip_depth *
+                                 (image_info.num_bits / 8);
+            }
+
+            double ratio_to_full_mip = static_cast<double>(image_info.guest_size) / full_mip_size;
+
+            LOG_INFO(Render_Vulkan,
+                     "Array/mipmap detection:\n"
+                     "  Full mip chain size: {} bytes\n"
+                     "  Ratio to full mip: {:.2f}x\n"
+                     "  Ratio to base: {:.2f}x",
+                     full_mip_size, ratio_to_full_mip, ratio_to_base);
+
+            // Check for 2 layers with base only (ratio ~2.0)
+            if (std::abs(ratio_to_base - 2.0) < 0.2) {
+                LOG_INFO(Render_Vulkan, "Detected 2-layer array (base only)");
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.layers = 2;
+                corrected_info.resources.levels = 1;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+
+            // Check for 2 layers with full mipmaps (ratio ~2.66)
+            if (std::abs(ratio_to_base - 2.66) < 0.2) {
+                LOG_INFO(Render_Vulkan, "Detected 2-layer array with full mipmaps");
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.layers = 2;
+                corrected_info.resources.levels = max_possible_mips;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+
+            // Check if it's a multiple of full mip size (array with full mipmaps)
+            double layers_from_full = std::round(ratio_to_full_mip);
+            if (std::abs(ratio_to_full_mip - layers_from_full) < 0.2 && layers_from_full >= 2.0) {
+                u32 probable_layers = static_cast<u32>(layers_from_full);
+                LOG_INFO(Render_Vulkan, "Detected {} layers with full mipmaps", probable_layers);
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.layers = probable_layers;
+                corrected_info.resources.levels = max_possible_mips;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+
+            // Check for cube map (6 layers) with base only
+            if (std::abs(ratio_to_base - 6.0) < 0.5) {
+                LOG_INFO(Render_Vulkan, "Detected cube map (6 layers, base only)");
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.layers = 6;
+                corrected_info.resources.levels = 1;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+
+            // Check for cube map with full mipmaps (6 * 1.33 = 8.0)
+            if (std::abs(ratio_to_base - 8.0) < 0.5) {
+                LOG_INFO(Render_Vulkan, "Detected cube map with full mipmaps");
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.layers = 6;
+                corrected_info.resources.levels = max_possible_mips;
+                return {ExpandImage(corrected_info, cache_image_id), -1, -1};
+            }
+
+            // Check if the new image is exactly 1.33x the full mip chain size
+            // This indicates a different tiling/alignment for the same content
+            if (std::abs(ratio_to_full_mip - 1.33) < 0.05) {
+                LOG_INFO(Render_Vulkan,
+                         "Detected same mip chain with different tiling/layout (ratio to full mip: "
+                         "{:.2f}x)",
+                         ratio_to_full_mip);
+
+                // Create new image with same mip count as cached
+                ImageInfo corrected_info = image_info;
+                corrected_info.resources.levels = cache_image.info.resources.levels;
+                ImageId new_image_id = ExpandImage(corrected_info, cache_image_id);
+
+                if (safe_to_delete) {
+                    LOG_INFO(Render_Vulkan, "Old image not recently used, safe to delete");
+                    FreeImage(cache_image_id);
+                }
+
+                return {new_image_id, -1, -1};
+            }
+        }
+        // General fallback for any size increase with matching properties
+        if (image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.type == cache_image.info.type &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.pitch == cache_image.info.pitch &&
+            image_info.guest_size > cache_image.info.guest_size) {
+
+            u64 expected_size = (static_cast<u64>(image_info.size.width) *
+                                 static_cast<u64>(image_info.size.height) *
+                                 static_cast<u64>(image_info.size.depth) *
+                                 static_cast<u64>(image_info.num_bits) / 8);
+
+            LOG_WARNING(Render_Vulkan,
+                        "General fallback: image at {:#x} has same properties but larger size\n"
+                        "  Old: {:#x} ({:.2f}x expected)\n"
+                        "  New: {:#x} ({:.2f}x expected)\n"
+                        "  Ratio new/old: {:.2f}x\n"
+                        "  Creating new image with size {:#x}",
+                        image_info.guest_address, cache_image.info.guest_size,
+                        static_cast<double>(cache_image.info.guest_size) / expected_size,
+                        image_info.guest_size,
+                        static_cast<double>(image_info.guest_size) / expected_size,
+                        static_cast<double>(image_info.guest_size) / cache_image.info.guest_size,
+                        image_info.guest_size);
+
+            // OPTION 1: Try to use the old image as parent if it's valid
+            ImageId new_image_id;
+            if (cache_image_id.index != -1 && cache_image_id.index != 0xffffffff) {
+                // Use the old image as parent
+                new_image_id = ExpandImage(image_info, cache_image_id);
+            } else {
+                // Can't create new image safely
+                LOG_CRITICAL(Render_Vulkan, "Cannot create new image - no valid parent");
+                return {merged_image_id, -1, -1};
+            }
+
+            // Validate the new ID
+            if (new_image_id.index == -1 || new_image_id.index == 0xffffffff) {
+                LOG_CRITICAL(Render_Vulkan, "ExpandImage returned invalid ID!");
+                return {merged_image_id, -1, -1};
+            }
+
+            // Don't free the old image - let the cache manage it
+            return {new_image_id, -1, -1};
+        }
         UNREACHABLE_MSG("Encountered unresolvable image overlap with equal memory address.");
     }
 
