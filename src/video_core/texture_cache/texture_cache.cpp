@@ -504,48 +504,77 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             }
         }
         // General fallback for any size increase with matching properties
+        // ==================== GENERIC FALLBACK FOR ALL OVERLAP CASES ====================
+        // This catches any case where all properties match but the new image is larger
+        // Place this RIGHT AFTER the tile_mode check and BEFORE the LOG_ERROR
+
         if (image_info.pixel_format == cache_image.info.pixel_format &&
             image_info.type == cache_image.info.type &&
             image_info.tile_mode == cache_image.info.tile_mode &&
             image_info.pitch == cache_image.info.pitch &&
+            image_info.BlockDim() == cache_image.info.BlockDim() &&
+            image_info.num_bits == cache_image.info.num_bits &&
             image_info.guest_size > cache_image.info.guest_size) {
 
-            u64 expected_size = (static_cast<u64>(image_info.size.width) *
-                                 static_cast<u64>(image_info.size.height) *
-                                 static_cast<u64>(image_info.size.depth) *
-                                 static_cast<u64>(image_info.num_bits) / 8);
+            // Calculate expected size for a single layer based on dimensions
+            u64 expected_size_per_layer = (static_cast<u64>(image_info.size.width) *
+                                           static_cast<u64>(image_info.size.height) *
+                                           static_cast<u64>(image_info.size.depth) *
+                                           static_cast<u64>(image_info.num_bits) / 8);
+
+            // Calculate ratios for logging
+            double ratio_to_expected =
+                static_cast<double>(image_info.guest_size) / expected_size_per_layer;
+            double ratio_to_old =
+                static_cast<double>(image_info.guest_size) / cache_image.info.guest_size;
+            double old_ratio_to_expected =
+                static_cast<double>(cache_image.info.guest_size) / expected_size_per_layer;
 
             LOG_WARNING(Render_Vulkan,
-                        "General fallback: image at {:#x} has same properties but larger size\n"
-                        "  Old: {:#x} ({:.2f}x expected)\n"
-                        "  New: {:#x} ({:.2f}x expected)\n"
+                        "\n========== GENERIC FALLBACK TRIGGERED ==========\n"
+                        "Image at {:#x} has matching properties but larger size\n"
+                        "  Old size: {:#x} ({:.2f}x expected)\n"
+                        "  New size: {:#x} ({:.2f}x expected)\n"
                         "  Ratio new/old: {:.2f}x\n"
-                        "  Creating new image with size {:#x}",
+                        "  Creating new image with size {:#x}\n"
+                        "=================================================",
                         image_info.guest_address, cache_image.info.guest_size,
-                        static_cast<double>(cache_image.info.guest_size) / expected_size,
-                        image_info.guest_size,
-                        static_cast<double>(image_info.guest_size) / expected_size,
-                        static_cast<double>(image_info.guest_size) / cache_image.info.guest_size,
-                        image_info.guest_size);
+                        old_ratio_to_expected, image_info.guest_size, ratio_to_expected,
+                        ratio_to_old, image_info.guest_size);
 
-            // OPTION 1: Try to use the old image as parent if it's valid
+            // Determine if this is likely an array texture
+            u32 probable_layers = 1;
+            if (expected_size_per_layer > 0 &&
+                image_info.guest_size % expected_size_per_layer == 0) {
+                probable_layers = image_info.guest_size / expected_size_per_layer;
+                if (probable_layers > 1) {
+                    LOG_INFO(Render_Vulkan, "  -> Detected probable array texture with {} layers",
+                             probable_layers);
+                }
+            }
+
+            // Create corrected image info with proper layer count if needed
+            ImageInfo corrected_info = image_info;
+            if (probable_layers > 1 && image_info.resources.layers == 1) {
+                corrected_info.resources.layers = probable_layers;
+                LOG_INFO(Render_Vulkan, "  -> Corrected layer count from 1 to {}", probable_layers);
+            }
+
+            // Try to use the old image as parent first
             ImageId new_image_id;
             if (cache_image_id.index != -1 && cache_image_id.index != 0xffffffff) {
-                // Use the old image as parent
-                new_image_id = ExpandImage(image_info, cache_image_id);
+                new_image_id = ExpandImage(corrected_info, cache_image_id);
             } else {
-                // Can't create new image safely
-                LOG_CRITICAL(Render_Vulkan, "Cannot create new image - no valid parent");
-                return {merged_image_id, -1, -1};
+                new_image_id = ExpandImage(corrected_info, ImageId{});
             }
 
             // Validate the new ID
             if (new_image_id.index == -1 || new_image_id.index == 0xffffffff) {
-                LOG_CRITICAL(Render_Vulkan, "ExpandImage returned invalid ID!");
+                LOG_CRITICAL(Render_Vulkan, "Failed to create new image!");
                 return {merged_image_id, -1, -1};
             }
 
-            // Don't free the old image - let the cache manage it
+            LOG_INFO(Render_Vulkan, "  -> Created new image with ID: {}", new_image_id.index);
             return {new_image_id, -1, -1};
         }
         // Enhanced debug logging for unreachable case
