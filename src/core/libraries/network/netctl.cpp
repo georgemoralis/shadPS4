@@ -13,8 +13,8 @@
 #endif
 
 #include <common/singleton.h>
-#include "core/emulator_settings.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net_ctl_codes.h"
@@ -180,8 +180,9 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         info->mtu = 1500; // default value
         break;
     case ORBIS_NET_CTL_INFO_LINK:
-        info->link = EmulatorSettings::GetInstance()->IsConnectedToNetwork() ? ORBIS_NET_CTL_LINK_CONNECTED
-                                                       : ORBIS_NET_CTL_LINK_DISCONNECTED;
+        info->link = EmulatorSettings::GetInstance()->IsConnectedToNetwork()
+                         ? ORBIS_NET_CTL_LINK_CONNECTED
+                         : ORBIS_NET_CTL_LINK_DISCONNECTED;
         break;
     case ORBIS_NET_CTL_INFO_IP_ADDRESS: {
         strcpy(info->ip_address,
