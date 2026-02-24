@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
@@ -13,9 +13,9 @@
 #endif
 
 #include "common/assert.h"
-#include "common/config.h"
 #include "common/path_util.h"
 #include "common/singleton.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/np/trophy_ui.h"
 #include "imgui/imgui_std.h"
 
@@ -36,9 +36,9 @@ TrophyUI::TrophyUI(const std::filesystem::path& trophyIconPath, const std::strin
                    const std::string_view& rarity)
     : trophy_name(trophyName), trophy_type(rarity) {
 
-    side = Config::sideTrophy();
+    side = EmulatorSettings::GetInstance()->GetTrophyNotificationSide();
 
-    trophy_timer = Config::getTrophyNotificationDuration();
+    trophy_timer = EmulatorSettings::GetInstance()->GetTrophyNotificationDuration();
 
     if (std::filesystem::exists(trophyIconPath)) {
         trophy_icon = RefCountedTexture::DecodePngFile(trophyIconPath);
@@ -98,7 +98,8 @@ TrophyUI::TrophyUI(const std::filesystem::path& trophyIconPath, const std::strin
         return;
     }
 
-    MIX_SetMasterGain(mixer, static_cast<float>(Config::getVolumeSlider() / 100.f));
+    MIX_SetMasterGain(
+        mixer, static_cast<float>(EmulatorSettings::GetInstance()->GetVolumeSlider() / 100.f));
     auto musicPathMp3 = CustomTrophy_Dir / "trophy.mp3";
     auto musicPathWav = CustomTrophy_Dir / "trophy.wav";
 
@@ -284,7 +285,7 @@ void AddTrophyToQueue(const std::filesystem::path& trophyIconPath, const std::st
                       const std::string_view& rarity) {
     std::lock_guard<std::mutex> lock(queueMtx);
 
-    if (Config::getisTrophyPopupDisabled()) {
+    if (EmulatorSettings::GetInstance()->IsTrophyPopupDisabled()) {
         return;
     } else if (current_trophy_ui.has_value()) {
         current_trophy_ui.reset();
