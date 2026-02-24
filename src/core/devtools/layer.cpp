@@ -311,7 +311,7 @@ static void LoadSettings(const char* line) {
 
 void L::SetupSettings() {
     frame_graph.is_open = true;
-    show_simple_fps = Config::getShowFpsCounter();
+    show_simple_fps = EmulatorSettings::GetInstance()->IsShowFpsCounter();
 
     using SettingLoader = void (*)(const char*);
 
@@ -472,7 +472,7 @@ void L::Draw() {
             if (ImGui::Begin("Volume Window", &show_volume,
                              ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoDecoration |
                                  ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoDocking)) {
-                Text("Volume: %d", Config::getVolumeSlider());
+                Text("Volume: %d", EmulatorSettings::GetInstance()->GetVolumeSlider());
             }
             End();
         }
