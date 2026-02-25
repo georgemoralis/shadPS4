@@ -57,6 +57,15 @@ enum class OrbisAudio3dBlocking : u32 {
     ORBIS_AUDIO3D_BLOCKING_SYNC = 1,
 };
 
+// World-space position (right-handed: +X right, +Y up, listener faces -Z).
+// Per SDK docs: position affects perceived direction only, not volume.
+// Distance attenuation must be applied by the game via the GAIN attribute.
+struct OrbisAudio3dPosition {
+    float fX;
+    float fY;
+    float fZ;
+};
+
 struct OrbisAudio3dPcm {
     OrbisAudio3dFormat format;
     void* sample_buffer;

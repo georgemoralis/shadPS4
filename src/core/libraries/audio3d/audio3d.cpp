@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -102,6 +103,43 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOutputs(AudioOut::OrbisAudioOutOutputParam* p
 // Store a raw copy of the PCM data in the queue. Format conversion to stereo S16 happens
 // later at mix time in PortAdvance, so that float ambisonics channels are summed in floating
 // point before being quantised — avoiding precision loss from 16 concurrent S16 conversions.
+// Computes left/right gain factors for stereo panning from a 3D position and spread.
+//
+// The PS4 SDK documents that POSITION does not affect volume — distance attenuation
+// must be applied by the game via the GAIN attribute. POSITION only affects the
+// perceived direction (azimuth) of the sound, and SPREAD controls stereo width.
+//
+// Implementation:
+//   1. Compute azimuth from listener to source in the horizontal plane (atan2 of X/Z).
+//   2. Apply equal-power (sin/cos) stereo panning from the azimuth.
+//   3. Blend toward center by the spread factor: spread=0 → full pan, spread=2π → mono center.
+//
+// Elevation (fY) is intentionally ignored — we output stereo, not binaural HRTF,
+// so vertical positioning cannot be faithfully reproduced.
+static void SpatialPan(const OrbisAudio3dPosition& pos, const float spread, float& out_left,
+                       float& out_right) {
+    // Azimuth: angle in the horizontal plane from listener's forward axis (-Z).
+    // atan2(X, -Z) gives 0 straight ahead, +π/2 hard right, -π/2 hard left.
+    const float azimuth = std::atan2(pos.fX, -pos.fZ);
+
+    // Equal-power pan: pan_angle maps [-π/2, +π/2] → [0, π/2] for the sin/cos pair.
+    // Clamp to ±90° — beyond that the sound is behind the listener; pan stays hard L/R.
+    constexpr float kHalfPi = 1.5707963267948966f;
+    const float pan_angle = std::clamp(azimuth, -kHalfPi, kHalfPi);
+    // Shift from [-π/2, π/2] to [0, π/2] for equal-power (sin=L, cos=R would swap).
+    const float t = (pan_angle + kHalfPi) * 0.5f; // [0, π/2]
+    const float pan_left = std::cos(t);           // 1 when hard left, 0 when hard right
+    const float pan_right = std::sin(t);          // 0 when hard left, 1 when hard right
+
+    // Spread blends between the panned signal and a centered (equal L/R) signal.
+    // spread=0 → pure pan; spread=2π → fully centered.
+    constexpr float k2Pi = 6.28318530717958647692f;
+    const float spread_t = std::clamp(spread / k2Pi, 0.0f, 1.0f);
+    constexpr float kCenter = 0.7071067811865476f; // 1/√2 — equal power center
+    out_left = pan_left + (kCenter - pan_left) * spread_t;
+    out_right = pan_right + (kCenter - pan_right) * spread_t;
+}
+
 // Validates type-specific constraints on object attribute values.
 // Returns ORBIS_OK if valid, ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER otherwise.
 // Per SDK defines table: GAIN must be a positive float; SPREAD must be in [0, 2*PI].
@@ -528,8 +566,8 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
         }
         if (attr.value && attr.value_size > 0) {
             // Validate type-specific constraints (GAIN >= 0, SPREAD in [0, 2*PI], etc.)
-            if (const auto ret = ValidateObjectAttributeValue(attr.attribute_id,
-                                                              attr.value, attr.value_size);
+            if (const auto ret =
+                    ValidateObjectAttributeValue(attr.attribute_id, attr.value, attr.value_size);
                 ret != ORBIS_OK) {
                 return ret;
             }
@@ -639,13 +677,13 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     if (!mix_float)
         return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
 
-    auto mix_in = [&](std::deque<AudioData>& queue, const float gain) {
+    auto mix_in = [&](std::deque<AudioData>& queue, const float gain_l, const float gain_r) {
         if (queue.empty())
             return;
 
         // Per SDK docs: default gain is 0.0 — objects with no GAIN set are silent.
         // Fast path: skip the conversion work entirely for silent objects.
-        if (gain == 0.0f) {
+        if (gain_l == 0.0f && gain_r == 0.0f) {
             AudioData data = queue.front();
             queue.pop_front();
             std::free(data.sample_buffer);
@@ -674,8 +712,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
                     right = src[i * channels + 1] / 32768.0f;
                 }
 
-                mix_float[i * 2 + 0] += left * gain;
-                mix_float[i * 2 + 1] += right * gain;
+                mix_float[i * 2 + 0] += left * gain_l;
+                mix_float[i * 2 + 1] += right * gain_r;
             }
         } else { // FLOAT input
             const float* src = reinterpret_cast<const float*>(data.sample_buffer);
@@ -692,20 +730,24 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
                     right = src[i * channels + 1];
                 }
 
-                mix_float[i * 2 + 0] += left * gain;
-                mix_float[i * 2 + 1] += right * gain;
+                mix_float[i * 2 + 0] += left * gain_l;
+                mix_float[i * 2 + 1] += right * gain_r;
             }
         }
 
         std::free(data.sample_buffer);
     };
 
-    // Bed is mixed at full gain (1.0) — there is no per-bed gain attribute.
-    mix_in(port.bed_queue, 1.0f);
+    // Bed is mixed at full gain to both channels — no per-bed position or gain attribute.
+    mix_in(port.bed_queue, 1.0f, 1.0f);
 
-    // Mix all object PCM queues, applying each object's GAIN persistent attribute.
-    // Per SDK docs: default gain is 0.0, so objects with no GAIN set produce silence.
+    // Mix all object PCM queues with spatialization.
+    // Per SDK docs:
+    //   GAIN  — scales output volume (default 0.0 = silent; game applies distance attenuation).
+    //   POSITION — sets 3D direction; does not affect volume, only stereo pan.
+    //   SPREAD — widens the stereo image toward center (0 = fully panned, 2π = centered).
     for (auto& [obj_id, obj] : port.objects) {
+        // Read GAIN (default 0.0 — silent until explicitly set).
         float gain = 0.0f;
         const auto gain_key =
             static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN);
@@ -715,7 +757,38 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
                 std::memcpy(&gain, blob.data(), sizeof(float));
             }
         }
-        mix_in(obj.pcm_queue, gain);
+
+        // Read POSITION and SPREAD to compute per-channel gain factors via SpatialPan.
+        float gain_l = gain;
+        float gain_r = gain;
+        if (gain > 0.0f) {
+            const auto pos_key =
+                static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_POSITION);
+            if (obj.persistent_attributes.contains(pos_key)) {
+                const auto& pos_blob = obj.persistent_attributes.at(pos_key);
+                if (pos_blob.size() >= sizeof(OrbisAudio3dPosition)) {
+                    OrbisAudio3dPosition pos{};
+                    std::memcpy(&pos, pos_blob.data(), sizeof(OrbisAudio3dPosition));
+
+                    float spread = 0.0f;
+                    const auto spread_key =
+                        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_SPREAD);
+                    if (obj.persistent_attributes.contains(spread_key)) {
+                        const auto& sp_blob = obj.persistent_attributes.at(spread_key);
+                        if (sp_blob.size() >= sizeof(float)) {
+                            std::memcpy(&spread, sp_blob.data(), sizeof(float));
+                        }
+                    }
+
+                    float pan_l, pan_r;
+                    SpatialPan(pos, spread, pan_l, pan_r);
+                    gain_l = gain * pan_l;
+                    gain_r = gain * pan_r;
+                }
+            }
+        }
+
+        mix_in(obj.pcm_queue, gain_l, gain_r);
         // Frame consumed — object is ready to accept new PCM next frame.
         obj.pcm_submitted_this_frame = false;
     }
@@ -984,27 +1057,28 @@ s32 PS4_SYSV_ABI sceAudio3dPortOpen(const Libraries::UserService::OrbisUserServi
     const u64 version = (parameters->size_this - 0x10) >> 3;
     switch (version) {
     case 0:
-        max_objects    = 512;
-        queue_depth    = 2;
-        num_beds       = 2;
+        max_objects = 512;
+        queue_depth = 2;
+        num_beds = 2;
         buffer_mode_raw = static_cast<u32>(OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_NO_ADVANCE);
         break;
     case 1:
-        max_objects    = parameters->max_objects;
-        queue_depth    = parameters->queue_depth;
-        num_beds       = 2;
-        buffer_mode_raw = static_cast<u32>(OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_ADVANCE_NO_PUSH);
+        max_objects = parameters->max_objects;
+        queue_depth = parameters->queue_depth;
+        num_beds = 2;
+        buffer_mode_raw =
+            static_cast<u32>(OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_ADVANCE_NO_PUSH);
         break;
     case 2:
-        max_objects    = parameters->max_objects;
-        queue_depth    = parameters->queue_depth;
-        num_beds       = 2;
+        max_objects = parameters->max_objects;
+        queue_depth = parameters->queue_depth;
+        num_beds = 2;
         buffer_mode_raw = static_cast<u32>(parameters->buffer_mode);
         break;
     case 3:
-        max_objects    = parameters->max_objects;
-        queue_depth    = parameters->queue_depth;
-        num_beds       = parameters->num_beds;
+        max_objects = parameters->max_objects;
+        queue_depth = parameters->queue_depth;
+        num_beds = parameters->num_beds;
         buffer_mode_raw = static_cast<u32>(parameters->buffer_mode);
         break;
     default:
@@ -1013,23 +1087,19 @@ s32 PS4_SYSV_ABI sceAudio3dPortOpen(const Libraries::UserService::OrbisUserServi
     }
 
     const u32 granularity = parameters->granularity;
-    const u32 rate        = static_cast<u32>(parameters->rate);
+    const u32 rate = static_cast<u32>(parameters->rate);
 
     // RE: full validation chain as seen in the binary.
     // rate must be 0 (48000 Hz), granularity >= 256 and a multiple of 256.
     // Queue depth limits per granularity, num_beds must be 2 or 3, buffer_mode <= 2.
-    bool invalid =
-        (rate != 0) ||
-        (granularity < 0x100) ||
-        ((granularity & 0xFF) != 0) ||
-        (max_objects == 0) ||
-        (queue_depth == 0) ||
-        (granularity == 0x100 && queue_depth > 0x40) ||
-        (granularity == 0x200 && queue_depth > 0x1F) ||
-        (granularity == 0x300 && queue_depth > 0x14) ||
-        (queue_depth > 0xF && granularity > 0x3FF) ||
-        ((num_beds & 0xFFFFFFFEu) != 2) ||  // only 2 or 3 are valid
-        (buffer_mode_raw > 2);
+    bool invalid = (rate != 0) || (granularity < 0x100) || ((granularity & 0xFF) != 0) ||
+                   (max_objects == 0) || (queue_depth == 0) ||
+                   (granularity == 0x100 && queue_depth > 0x40) ||
+                   (granularity == 0x200 && queue_depth > 0x1F) ||
+                   (granularity == 0x300 && queue_depth > 0x14) ||
+                   (queue_depth > 0xF && granularity > 0x3FF) ||
+                   ((num_beds & 0xFFFFFFFEu) != 2) || // only 2 or 3 are valid
+                   (buffer_mode_raw > 2);
 
     if (invalid) {
         LOG_ERROR(Lib_Audio3d,
@@ -1061,13 +1131,13 @@ s32 PS4_SYSV_ABI sceAudio3dPortOpen(const Libraries::UserService::OrbisUserServi
     auto& port = state->ports[id];
 
     // Copy the fields we've resolved (potentially with version-defaulted values).
-    port.parameters.size_this    = parameters->size_this;
-    port.parameters.granularity  = granularity;
-    port.parameters.rate         = parameters->rate;
-    port.parameters.max_objects  = max_objects;
-    port.parameters.queue_depth  = queue_depth;
-    port.parameters.buffer_mode  = static_cast<OrbisAudio3dBufferMode>(buffer_mode_raw);
-    port.parameters.num_beds     = num_beds;
+    port.parameters.size_this = parameters->size_this;
+    port.parameters.granularity = granularity;
+    port.parameters.rate = parameters->rate;
+    port.parameters.max_objects = max_objects;
+    port.parameters.queue_depth = queue_depth;
+    port.parameters.buffer_mode = static_cast<OrbisAudio3dBufferMode>(buffer_mode_raw);
+    port.parameters.num_beds = num_beds;
 
     return ORBIS_OK;
 }
