@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
-#include <SDL3/SDL_audio.h>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/assert.h"
@@ -490,7 +491,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     const u32 out_samples = granularity * AUDIO3D_OUTPUT_NUM_CHANNELS;
 
     // ---- FLOAT MIX BUFFER ----
-    float* mix_float = static_cast<float*>(SDL_calloc(out_samples, sizeof(float)));
+    float* mix_float = static_cast<float*>(std::calloc(out_samples, sizeof(float)));
 
     if (!mix_float)
         return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
@@ -563,7 +564,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     // Per SDK docs: default gain is 0.0, so objects with no GAIN set produce silence.
     for (auto& [obj_id, obj] : port.objects) {
         float gain = 0.0f;
-        const auto gain_key = static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN);
+        const auto gain_key =
+            static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN);
         if (obj.persistent_attributes.contains(gain_key)) {
             const auto& blob = obj.persistent_attributes.at(gain_key);
             if (blob.size() >= sizeof(float)) {
@@ -574,10 +576,10 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     }
 
     // ---- FINAL FLOAT → S16 CONVERSION ----
-    s16* mix_s16 = static_cast<s16*>(SDL_malloc(out_samples * sizeof(s16)));
+    s16* mix_s16 = static_cast<s16*>(std::malloc(out_samples * sizeof(s16)));
 
     if (!mix_s16) {
-        SDL_free(mix_float);
+        std::free(mix_float);
         return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
     }
 
@@ -586,7 +588,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         mix_s16[i] = static_cast<s16>(v * 32767.0f);
     }
 
-    SDL_free(mix_float);
+    std::free(mix_float);
 
     port.mixed_queue.push_back(AudioData{.sample_buffer = reinterpret_cast<u8*>(mix_s16),
                                          .num_samples = granularity,
@@ -729,7 +731,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortFlush(const OrbisAudio3dPortId port_id) {
         AudioData frame = port.mixed_queue.front();
         port.mixed_queue.pop_front();
         const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
-        SDL_free(frame.sample_buffer);
+        std::free(frame.sample_buffer);
         if (ret < 0) {
             return ret;
         }
@@ -882,7 +884,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortPush(const OrbisAudio3dPortId port_id,
         // OUTSIDE LOCK — important!
         const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
 
-        SDL_free(frame.sample_buffer);
+        std::free(frame.sample_buffer);
 
         if (ret < 0)
             return ret;
