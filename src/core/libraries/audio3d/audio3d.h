@@ -5,8 +5,8 @@
 
 #include <algorithm>
 #include <optional>
-#include <queue>
 #include <vector>
+#include <queue>
 
 #include "common/types.h"
 #include "core/libraries/audio/audioout.h"
@@ -69,7 +69,7 @@ enum class OrbisAudio3dAttributeId : u32 {
     ORBIS_AUDIO3D_ATTRIBUTE_PASSTHROUGH = 6,
     ORBIS_AUDIO3D_ATTRIBUTE_AMBISONICS = 7,
     ORBIS_AUDIO3D_ATTRIBUTE_APPLICATION_SPECIFIC = 8,
-    ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE = 9,     // Resets all attributes and internal state
+    ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE = 9, // Resets all attributes and internal state
     ORBIS_AUDIO3D_ATTRIBUTE_RESTRICTED = 10,
     ORBIS_AUDIO3D_ATTRIBUTE_OUTPUT_ROUTE = 11,
 };
@@ -88,8 +88,9 @@ struct OrbisAudio3dAttribute {
 struct AudioData {
     u8* sample_buffer;
     u32 num_samples;
-    u32 num_channels{1};                         // channels in sample_buffer
-    OrbisAudio3dFormat format{OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16}; // format of sample_buffer
+    u32 num_channels{1}; // channels in sample_buffer
+    OrbisAudio3dFormat format{
+        OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16}; // format of sample_buffer
 };
 
 // Persistent per-object state: attributes set via sceAudio3dObjectSetAttribute survive
