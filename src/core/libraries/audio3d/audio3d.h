@@ -103,6 +103,9 @@ struct ObjectState {
     // Raw persistent attributes keyed by attribute ID (position, gain, spread, priority…).
     // Stored as byte blobs so we can forward them once spatialization is implemented.
     std::unordered_map<u32, std::vector<u8>> persistent_attributes;
+    // Set when PCM is submitted this frame; cleared by PortAdvance/PortFlush.
+    // Prevents RESET_STATE from being called after PCM in the same frame (NOT_READY).
+    bool pcm_submitted_this_frame{false};
 };
 
 struct Port {

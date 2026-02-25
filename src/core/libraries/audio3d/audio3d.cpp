@@ -330,27 +330,65 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttribute(const OrbisAudio3dPortId port_id,
     auto& port = state->ports[port_id];
     std::scoped_lock lock{port.mutex};
     if (!port.objects.contains(object_id)) {
-        LOG_DEBUG(Lib_Audio3d, "object_id {} not reserved (race with Unreserve?), no-op",
-                  object_id);
-        return ORBIS_OK;
-    }
-
-    if (!attribute_size &&
-        attribute_id != OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE) {
-        LOG_ERROR(Lib_Audio3d, "!attribute_size for non-reset attribute");
-        return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        LOG_ERROR(Lib_Audio3d, "object_id {} not reserved", object_id);
+        return ORBIS_AUDIO3D_ERROR_INVALID_OBJECT;
     }
 
     auto& obj = port.objects[object_id];
 
     // RESET_STATE clears all attributes and queued PCM; it takes no value.
     if (attribute_id == OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE) {
+        // Per SDK docs: "the state of an object cannot be reset after a PCM attribute has
+        // been set" in the same frame (prior to the next PortAdvance/PortFlush).
+        if (obj.pcm_submitted_this_frame) {
+            LOG_ERROR(Lib_Audio3d, "RESET_STATE called after PCM in same frame (NOT_READY)");
+            return ORBIS_AUDIO3D_ERROR_NOT_READY;
+        }
         for (auto& data : obj.pcm_queue) {
             std::free(data.sample_buffer);
         }
         obj.pcm_queue.clear();
         obj.persistent_attributes.clear();
         LOG_DEBUG(Lib_Audio3d, "RESET_STATE for object {}", object_id);
+        return ORBIS_OK;
+    }
+
+    if (!attribute || !attribute_size) {
+        LOG_ERROR(Lib_Audio3d, "!attribute || !attribute_size");
+        return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+    }
+
+    if (attribute_id == OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PCM) {
+        if (attribute_size < sizeof(OrbisAudio3dPcm)) {
+            LOG_ERROR(Lib_Audio3d, "PCM attribute value_size too small");
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        const auto* pcm = static_cast<const OrbisAudio3dPcm*>(attribute);
+
+        // Alignment check: S16 must be 2-byte aligned, float must be 4-byte aligned.
+        const uintptr_t buf_addr = reinterpret_cast<uintptr_t>(pcm->sample_buffer);
+        if (pcm->format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16) {
+            if (buf_addr & 1) {
+                LOG_ERROR(Lib_Audio3d, "S16 sample buffer not 2-byte aligned");
+                return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+            }
+        } else if (pcm->format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_FLOAT) {
+            if (buf_addr & 3) {
+                LOG_ERROR(Lib_Audio3d, "float sample buffer not 4-byte aligned");
+                return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+            }
+        }
+
+        // NOT_READY if the object's PCM queue is already full.
+        if (obj.pcm_queue.size() >= port.parameters.queue_depth) {
+            return ORBIS_AUDIO3D_ERROR_NOT_READY;
+        }
+
+        if (const auto ret = ConvertAndEnqueue(obj.pcm_queue, *pcm, 1, port.parameters.granularity);
+            ret != ORBIS_OK) {
+            return ret;
+        }
+        obj.pcm_submitted_this_frame = true;
         return ORBIS_OK;
     }
 
@@ -380,6 +418,21 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 
+    // Per SDK docs: passing the same attribute ID more than once returns INVALID_PARAMETER.
+    // Attribute IDs are 1-11, so a u32 bitmask covers all of them.
+    {
+        u32 seen_mask = 0;
+        for (u64 i = 0; i < num_attributes; i++) {
+            const u32 id = static_cast<u32>(attribute_array[i].attribute_id);
+            const u32 bit = (id < 32) ? (u32{1} << id) : 0;
+            if (bit && (seen_mask & bit)) {
+                LOG_ERROR(Lib_Audio3d, "duplicate attribute_id {:#x}", id);
+                return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+            }
+            seen_mask |= bit;
+        }
+    }
+
     auto& port = state->ports[port_id];
     std::scoped_lock lock{port.mutex};
     if (!port.objects.contains(object_id)) {
@@ -394,57 +447,85 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
 
     auto& obj = port.objects[object_id];
 
-    // Per SDK docs: "The order of the SCE_AUDIO3D_OBJECT_ATTRIBUTE_RESET_STATE attribute
-    // when calling sceAudio3dObjectSetAttributes() does not matter." This means RESET_STATE
-    // must execute BEFORE all other attributes in the same batch, regardless of its position
-    // in the array (the SDK example puts it last alongside PCM/POSITION/GAIN).
+    // Per SDK docs: processing order is always RESET_STATE first, PCM last, regardless of
+    // array order. Non-PCM non-RESET attributes are applied in between (pass 2).
+
+    // Pass 1: RESET_STATE
     for (u64 i = 0; i < num_attributes; i++) {
-        if (attribute_array[i].attribute_id ==
+        if (attribute_array[i].attribute_id !=
             OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE) {
-            for (auto& data : obj.pcm_queue) {
-                std::free(data.sample_buffer);
-            }
-            obj.pcm_queue.clear();
-            obj.persistent_attributes.clear();
-            LOG_DEBUG(Lib_Audio3d, "RESET_STATE for object {}", object_id);
-            break; // Only one reset is needed even if listed multiple times.
+            continue;
+        }
+        // Per SDK docs: RESET_STATE returns NOT_READY if PCM was already submitted this
+        // frame (prior to the next PortAdvance/PortFlush).
+        if (obj.pcm_submitted_this_frame) {
+            LOG_ERROR(Lib_Audio3d, "RESET_STATE called after PCM in same frame (NOT_READY)");
+            return ORBIS_AUDIO3D_ERROR_NOT_READY;
+        }
+        for (auto& data : obj.pcm_queue) {
+            std::free(data.sample_buffer);
+        }
+        obj.pcm_queue.clear();
+        obj.persistent_attributes.clear();
+        obj.pcm_submitted_this_frame = false;
+        LOG_DEBUG(Lib_Audio3d, "RESET_STATE for object {}", object_id);
+        break; // Duplicate check above ensures at most one RESET_STATE.
+    }
+
+    // Pass 2: all non-PCM, non-RESET_STATE attributes (POSITION, GAIN, SPREAD, etc.)
+    // Stored persistently — survives across frames until changed or object unreserved.
+    for (u64 i = 0; i < num_attributes; i++) {
+        const auto& attr = attribute_array[i];
+        if (attr.attribute_id == OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE ||
+            attr.attribute_id == OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PCM) {
+            continue;
+        }
+        if (attr.value && attr.value_size > 0) {
+            const auto* src = static_cast<const u8*>(attr.value);
+            obj.persistent_attributes[static_cast<u32>(attr.attribute_id)].assign(
+                src, src + attr.value_size);
+            LOG_DEBUG(Lib_Audio3d, "Stored attribute {:#x} for object {}",
+                      static_cast<u32>(attr.attribute_id), object_id);
         }
     }
 
-    // Second pass: apply all other attributes.
+    // Pass 3: PCM (always last per SDK docs).
     for (u64 i = 0; i < num_attributes; i++) {
-        const auto& attribute = attribute_array[i];
+        const auto& attr = attribute_array[i];
+        if (attr.attribute_id != OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PCM) {
+            continue;
+        }
+        if (attr.value_size < sizeof(OrbisAudio3dPcm)) {
+            LOG_ERROR(Lib_Audio3d, "PCM attribute value_size too small");
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        const auto* pcm = static_cast<const OrbisAudio3dPcm*>(attr.value);
 
-        switch (attribute.attribute_id) {
-        case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE:
-            break; // Already applied in first pass above.
-        case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PCM: {
-            if (attribute.value_size < sizeof(OrbisAudio3dPcm)) {
-                LOG_ERROR(Lib_Audio3d, "PCM attribute value_size too small");
-                continue;
+        // Alignment check: S16 must be 2-byte aligned, float must be 4-byte aligned.
+        const uintptr_t buf_addr = reinterpret_cast<uintptr_t>(pcm->sample_buffer);
+        if (pcm->format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16) {
+            if (buf_addr & 1) {
+                LOG_ERROR(Lib_Audio3d, "S16 sample buffer not 2-byte aligned");
+                return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
             }
-            const auto pcm = static_cast<OrbisAudio3dPcm*>(attribute.value);
-            // Object audio is always mono (1 channel).
-            if (const auto ret =
-                    ConvertAndEnqueue(obj.pcm_queue, *pcm, 1, port.parameters.granularity);
-                ret != ORBIS_OK) {
-                return ret;
+        } else if (pcm->format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_FLOAT) {
+            if (buf_addr & 3) {
+                LOG_ERROR(Lib_Audio3d, "float sample buffer not 4-byte aligned");
+                return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
             }
-            break;
         }
-        default: {
-            // POSITION, GAIN, SPREAD, PRIORITY, PASSTHROUGH, AMBISONICS, OUTPUT_ROUTE etc.
-            // Stored persistently — survives across frames until changed or object unreserved.
-            if (attribute.value && attribute.value_size > 0) {
-                const auto* src = static_cast<const u8*>(attribute.value);
-                obj.persistent_attributes[static_cast<u32>(attribute.attribute_id)].assign(
-                    src, src + attribute.value_size);
-            }
-            LOG_DEBUG(Lib_Audio3d, "Stored attribute {:#x} for object {}",
-                      static_cast<u32>(attribute.attribute_id), object_id);
-            break;
+
+        // NOT_READY if the object's PCM queue is already full.
+        if (obj.pcm_queue.size() >= port.parameters.queue_depth) {
+            return ORBIS_AUDIO3D_ERROR_NOT_READY;
         }
+
+        if (const auto ret = ConvertAndEnqueue(obj.pcm_queue, *pcm, 1, port.parameters.granularity);
+            ret != ORBIS_OK) {
+            return ret;
         }
+        obj.pcm_submitted_this_frame = true;
+        break; // Duplicate check above ensures at most one PCM attribute.
     }
 
     return ORBIS_OK;
@@ -583,6 +664,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
             }
         }
         mix_in(obj.pcm_queue, gain);
+        // Frame consumed — object is ready to accept new PCM next frame.
+        obj.pcm_submitted_this_frame = false;
     }
 
     // ---- FINAL FLOAT → S16 CONVERSION ----
