@@ -120,6 +120,10 @@ struct Port {
     std::vector<s32> audioout_handles;
     // Reserved objects and their state.
     std::unordered_map<OrbisAudio3dObjectId, ObjectState> objects;
+    // Monotonically increasing counter for generating unique object IDs within this port.
+    // Kept here (not as a global static) so IDs reset when the port is closed and reopened,
+    // and so that it's protected by port.mutex automatically.
+    OrbisAudio3dObjectId next_object_id{0};
     // Bed audio queue (from sceAudio3dBedWrite).
     std::deque<AudioData> bed_queue;
     // Mixed stereo frames ready to be consumed by sceAudio3dPortPush.

@@ -290,9 +290,16 @@ s32 PS4_SYSV_ABI sceAudio3dObjectReserve(const OrbisAudio3dPortId port_id,
         return ORBIS_AUDIO3D_ERROR_OUT_OF_RESOURCES;
     }
 
-    static OrbisAudio3dObjectId last_id = 0;
-    *object_id = ++last_id;
+    // ID counter lives in the Port so it resets when the port is closed and reopened,
+    // and is automatically protected by port.mutex. Skip 0 and OBJECT_INVALID (0xFFFFFFFF).
+    do {
+        ++port.next_object_id;
+    } while (port.next_object_id == 0 || port.next_object_id == ORBIS_AUDIO3D_OBJECT_INVALID ||
+             port.objects.contains(port.next_object_id));
+
+    *object_id = port.next_object_id;
     port.objects.emplace(*object_id, ObjectState{});
+    LOG_INFO(Lib_Audio3d, "reserved object_id = {}", *object_id);
 
     return ORBIS_OK;
 }
@@ -312,8 +319,9 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttribute(const OrbisAudio3dPortId port_id,
     auto& port = state->ports[port_id];
     std::scoped_lock lock{port.mutex};
     if (!port.objects.contains(object_id)) {
-        LOG_ERROR(Lib_Audio3d, "object_id not reserved");
-        return ORBIS_AUDIO3D_ERROR_INVALID_OBJECT;
+        LOG_DEBUG(Lib_Audio3d, "object_id {} not reserved (race with Unreserve?), no-op",
+                  object_id);
+        return ORBIS_OK;
     }
 
     if (!attribute_size &&
@@ -364,8 +372,13 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
     auto& port = state->ports[port_id];
     std::scoped_lock lock{port.mutex};
     if (!port.objects.contains(object_id)) {
-        LOG_ERROR(Lib_Audio3d, "object_id not reserved");
-        return ORBIS_AUDIO3D_ERROR_INVALID_OBJECT;
+        // On real hardware, the race window between ObjectUnreserve (main thread) and
+        // ObjectSetAttributes (audio thread) is a silent no-op, not a hard error.
+        // Returning INVALID_OBJECT causes the game to reach code paths marked unreachable
+        // on real HW. Log at debug level and return success.
+        LOG_DEBUG(Lib_Audio3d, "object_id {} not reserved (race with Unreserve?), no-op",
+                  object_id);
+        return ORBIS_OK;
     }
 
     auto& obj = port.objects[object_id];
