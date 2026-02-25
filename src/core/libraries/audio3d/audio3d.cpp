@@ -157,8 +157,10 @@ s32 PS4_SYSV_ABI sceAudio3dBedWrite2(const OrbisAudio3dPortId port_id, const u32
         return ORBIS_AUDIO3D_ERROR_INVALID_PORT;
     }
 
-    if (output_route > OrbisAudio3dOutputRoute::ORBIS_AUDIO3D_OUTPUT_BOTH) {
-        LOG_ERROR(Lib_Audio3d, "output_route > ORBIS_AUDIO3D_OUTPUT_BOTH");
+    if (output_route != OrbisAudio3dOutputRoute::ORBIS_AUDIO3D_OUTPUT_BOTH &&
+        output_route != OrbisAudio3dOutputRoute::ORBIS_AUDIO3D_OUTPUT_HMU_ONLY &&
+        output_route != OrbisAudio3dOutputRoute::ORBIS_AUDIO3D_OUTPUT_TV_ONLY) {
+        LOG_ERROR(Lib_Audio3d, "invalid output_route {}", static_cast<u32>(output_route));
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 
@@ -190,6 +192,14 @@ s32 PS4_SYSV_ABI sceAudio3dBedWrite2(const OrbisAudio3dPortId port_id, const u32
     }
 
     std::scoped_lock lock{state->ports[port_id].mutex};
+
+    // Per SDK docs: returns NOT_READY if all buffers are full.
+    // The bed queue depth matches the port's queue_depth (same as the mixed_queue).
+    const auto& port = state->ports[port_id];
+    if (port.bed_queue.size() >= port.parameters.queue_depth) {
+        return ORBIS_AUDIO3D_ERROR_NOT_READY;
+    }
+
     return ConvertAndEnqueue(state->ports[port_id].bed_queue,
                              OrbisAudio3dPcm{
                                  .format = format,
