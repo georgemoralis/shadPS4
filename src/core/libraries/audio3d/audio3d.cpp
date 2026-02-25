@@ -741,16 +741,73 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     // Bed is mixed at full gain to both channels — no per-bed position or gain attribute.
     mix_in(port.bed_queue, 1.0f, 1.0f);
 
-    // Mix all object PCM queues with spatialization.
+    // ---- PRIORITY-BASED OBJECT CULLING ----
+    // Per SDK docs: PRIORITY is a u32 where 0 = highest priority. When more objects have
+    // PCM queued this frame than max_objects allows, the lowest-priority ones are dropped
+    // (their PCM frame is consumed and discarded without mixing). Objects with no PCM
+    // queued this frame do not consume a slot — culling only applies to active objects.
+    const auto priority_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PRIORITY);
+    const auto gain_key = static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN);
+    const auto pos_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_POSITION);
+    const auto spread_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_SPREAD);
+
+    struct ObjPriority {
+        u32 priority;
+        OrbisAudio3dObjectId obj_id;
+    };
+
+    std::vector<ObjPriority> active_objects;
+    active_objects.reserve(port.objects.size());
+
+    for (const auto& [obj_id, obj] : port.objects) {
+        if (obj.pcm_queue.empty())
+            continue;
+        u32 priority = 0xFFFFFFFFu; // Default: lowest possible if PRIORITY not set.
+        if (obj.persistent_attributes.contains(priority_key)) {
+            const auto& blob = obj.persistent_attributes.at(priority_key);
+            if (blob.size() >= sizeof(u32)) {
+                std::memcpy(&priority, blob.data(), sizeof(u32));
+            }
+        }
+        active_objects.push_back({priority, obj_id});
+    }
+
+    // Stable sort ascending — priority 0 (highest) first.
+    std::stable_sort(
+        active_objects.begin(), active_objects.end(),
+        [](const ObjPriority& a, const ObjPriority& b) { return a.priority < b.priority; });
+
+    const u32 mix_limit = port.parameters.max_objects;
+    const u32 active_count = static_cast<u32>(active_objects.size());
+
+    if (active_count > mix_limit) {
+        LOG_DEBUG(Lib_Audio3d, "culling {} low-priority objects ({} active, limit {})",
+                  active_count - mix_limit, active_count, mix_limit);
+    }
+
+    // ---- SPATIALISED MIX ----
     // Per SDK docs:
-    //   GAIN  — scales output volume (default 0.0 = silent; game applies distance attenuation).
+    //   GAIN     — scales output volume (default 0.0 = silent).
     //   POSITION — sets 3D direction; does not affect volume, only stereo pan.
-    //   SPREAD — widens the stereo image toward center (0 = fully panned, 2π = centered).
-    for (auto& [obj_id, obj] : port.objects) {
+    //   SPREAD   — widens the stereo image toward center (0 = fully panned, 2π = centered).
+    for (u32 slot = 0; slot < active_count; slot++) {
+        const OrbisAudio3dObjectId obj_id = active_objects[slot].obj_id;
+        auto& obj = port.objects[obj_id];
+
+        if (slot >= mix_limit) {
+            // Culled: consume the PCM frame without mixing so the queue stays in sync.
+            AudioData dropped = obj.pcm_queue.front();
+            obj.pcm_queue.pop_front();
+            std::free(dropped.sample_buffer);
+            obj.pcm_submitted_this_frame = false;
+            continue;
+        }
+
         // Read GAIN (default 0.0 — silent until explicitly set).
         float gain = 0.0f;
-        const auto gain_key =
-            static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN);
         if (obj.persistent_attributes.contains(gain_key)) {
             const auto& blob = obj.persistent_attributes.at(gain_key);
             if (blob.size() >= sizeof(float)) {
@@ -761,36 +818,36 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         // Read POSITION and SPREAD to compute per-channel gain factors via SpatialPan.
         float gain_l = gain;
         float gain_r = gain;
-        if (gain > 0.0f) {
-            const auto pos_key =
-                static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_POSITION);
-            if (obj.persistent_attributes.contains(pos_key)) {
-                const auto& pos_blob = obj.persistent_attributes.at(pos_key);
-                if (pos_blob.size() >= sizeof(OrbisAudio3dPosition)) {
-                    OrbisAudio3dPosition pos{};
-                    std::memcpy(&pos, pos_blob.data(), sizeof(OrbisAudio3dPosition));
+        if (gain > 0.0f && obj.persistent_attributes.contains(pos_key)) {
+            const auto& pos_blob = obj.persistent_attributes.at(pos_key);
+            if (pos_blob.size() >= sizeof(OrbisAudio3dPosition)) {
+                OrbisAudio3dPosition pos{};
+                std::memcpy(&pos, pos_blob.data(), sizeof(OrbisAudio3dPosition));
 
-                    float spread = 0.0f;
-                    const auto spread_key =
-                        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_SPREAD);
-                    if (obj.persistent_attributes.contains(spread_key)) {
-                        const auto& sp_blob = obj.persistent_attributes.at(spread_key);
-                        if (sp_blob.size() >= sizeof(float)) {
-                            std::memcpy(&spread, sp_blob.data(), sizeof(float));
-                        }
+                float spread = 0.0f;
+                if (obj.persistent_attributes.contains(spread_key)) {
+                    const auto& sp_blob = obj.persistent_attributes.at(spread_key);
+                    if (sp_blob.size() >= sizeof(float)) {
+                        std::memcpy(&spread, sp_blob.data(), sizeof(float));
                     }
-
-                    float pan_l, pan_r;
-                    SpatialPan(pos, spread, pan_l, pan_r);
-                    gain_l = gain * pan_l;
-                    gain_r = gain * pan_r;
                 }
+
+                float pan_l, pan_r;
+                SpatialPan(pos, spread, pan_l, pan_r);
+                gain_l = gain * pan_l;
+                gain_r = gain * pan_r;
             }
         }
 
         mix_in(obj.pcm_queue, gain_l, gain_r);
-        // Frame consumed — object is ready to accept new PCM next frame.
         obj.pcm_submitted_this_frame = false;
+    }
+
+    // Objects with no PCM this frame still need their flag cleared.
+    for (auto& [obj_id, obj] : port.objects) {
+        if (obj.pcm_queue.empty()) {
+            obj.pcm_submitted_this_frame = false;
+        }
     }
 
     // ---- FINAL FLOAT → S16 CONVERSION ----
