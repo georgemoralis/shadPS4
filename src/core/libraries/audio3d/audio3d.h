@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <mutex>
 #include <optional>
 #include <vector>
 #include <queue>
@@ -16,6 +17,8 @@ class SymbolsResolver;
 }
 
 namespace Libraries::Audio3d {
+
+constexpr int ORBIS_AUDIO3D_OBJECT_INVALID = 0xFFFFFFFF;
 
 enum class OrbisAudio3dRate : u32 {
     ORBIS_AUDIO3D_RATE_48000 = 0,
@@ -103,6 +106,11 @@ struct ObjectState {
 };
 
 struct Port {
+    // Guards all mutable fields accessed from multiple threads.
+    // On real hardware the Audio3d library is internally thread-safe: games are documented
+    // to call ObjectReserve/Unreserve from one thread while rendering audio from another.
+    // recursive_mutex allows PortFlush to call PortAdvance internally without deadlocking.
+    mutable std::recursive_mutex mutex;
     OrbisAudio3dOpenParameters parameters{};
     // Internal handle used by the advance/push model (sceAudio3dPortPush).
     // Opened lazily on the first sceAudio3dPortPush call.

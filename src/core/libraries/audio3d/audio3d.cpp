@@ -31,6 +31,7 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutClose(const s32 handle) {
     // Remove from any port that was tracking this handle.
     if (state) {
         for (auto& [port_id, port] : state->ports) {
+            std::scoped_lock lock{port.mutex};
             auto& handles = port.audioout_handles;
             handles.erase(std::remove(handles.begin(), handles.end(), handle), handles.end());
         }
@@ -52,6 +53,7 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOpen(
         return ORBIS_AUDIO3D_ERROR_INVALID_PORT;
     }
 
+    std::scoped_lock lock{state->ports[port_id].mutex};
     if (len != state->ports[port_id].parameters.granularity) {
         LOG_ERROR(Lib_Audio3d, "len != state->ports[port_id].parameters.granularity");
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
@@ -186,6 +188,7 @@ s32 PS4_SYSV_ABI sceAudio3dBedWrite2(const OrbisAudio3dPortId port_id, const u32
         }
     }
 
+    std::scoped_lock lock{state->ports[port_id].mutex};
     return ConvertAndEnqueue(state->ports[port_id].bed_queue,
                              OrbisAudio3dPcm{
                                  .format = format,
@@ -278,6 +281,7 @@ s32 PS4_SYSV_ABI sceAudio3dObjectReserve(const OrbisAudio3dPortId port_id,
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
 
     // Enforce the max_objects limit set at PortOpen time.
     if (port.objects.size() >= port.parameters.max_objects) {
@@ -306,6 +310,7 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttribute(const OrbisAudio3dPortId port_id,
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
     if (!port.objects.contains(object_id)) {
         LOG_ERROR(Lib_Audio3d, "object_id not reserved");
         return ORBIS_AUDIO3D_ERROR_INVALID_OBJECT;
@@ -357,6 +362,7 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
     if (!port.objects.contains(object_id)) {
         LOG_ERROR(Lib_Audio3d, "object_id not reserved");
         return ORBIS_AUDIO3D_ERROR_INVALID_OBJECT;
@@ -430,6 +436,7 @@ s32 PS4_SYSV_ABI sceAudio3dObjectUnreserve(const OrbisAudio3dPortId port_id,
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
 
     if (!port.objects.contains(object_id)) {
         LOG_ERROR(Lib_Audio3d, "object_id not reserved");
@@ -460,6 +467,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
 
     // Refuse if the mixed queue is already full (game should check GetQueueLevel first).
     if (port.mixed_queue.size() >= port.parameters.queue_depth) {
@@ -565,36 +573,39 @@ s32 PS4_SYSV_ABI sceAudio3dPortClose(const OrbisAudio3dPortId port_id) {
     }
 
     auto& port = state->ports[port_id];
+    {
+        std::scoped_lock lock{port.mutex};
 
-    // Close the internal push-model audio handle if it was opened.
-    if (port.audio_out_handle >= 0) {
-        AudioOut::sceAudioOutClose(port.audio_out_handle);
-        port.audio_out_handle = -1;
-    }
+        // Close the internal push-model audio handle if it was opened.
+        if (port.audio_out_handle >= 0) {
+            AudioOut::sceAudioOutClose(port.audio_out_handle);
+            port.audio_out_handle = -1;
+        }
 
-    // Per SDK docs: "the call to sceAudio3dPortClose() will close all associated AudioOut
-    // ports that are still open." Close any game-managed handles the game forgot to close.
-    for (const s32 handle : port.audioout_handles) {
-        AudioOut::sceAudioOutClose(handle);
-    }
-    port.audioout_handles.clear();
+        // Per SDK docs: "the call to sceAudio3dPortClose() will close all associated AudioOut
+        // ports that are still open." Close any game-managed handles the game forgot to close.
+        for (const s32 handle : port.audioout_handles) {
+            AudioOut::sceAudioOutClose(handle);
+        }
+        port.audioout_handles.clear();
 
-    // Free all pending mixed frames.
-    for (auto& data : port.mixed_queue) {
-        std::free(data.sample_buffer);
-    }
-
-    // Free all queued bed audio.
-    for (auto& data : port.bed_queue) {
-        std::free(data.sample_buffer);
-    }
-
-    // Free all queued object PCM audio.
-    for (auto& [obj_id, obj] : port.objects) {
-        for (auto& data : obj.pcm_queue) {
+        // Free all pending mixed frames.
+        for (auto& data : port.mixed_queue) {
             std::free(data.sample_buffer);
         }
-    }
+
+        // Free all queued bed audio.
+        for (auto& data : port.bed_queue) {
+            std::free(data.sample_buffer);
+        }
+
+        // Free all queued object PCM audio.
+        for (auto& [obj_id, obj] : port.objects) {
+            for (auto& data : obj.pcm_queue) {
+                std::free(data.sample_buffer);
+            }
+        }
+    } // lock released here — mutex must not be held when erase destroys the Port
 
     state->ports.erase(port_id);
     return ORBIS_OK;
@@ -619,6 +630,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortFlush(const OrbisAudio3dPortId port_id) {
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
 
     // PortFlush has three usage modes depending on SDK version and port configuration
     // (per SDK docs Table 8 / Buffering Strategies):
@@ -730,6 +742,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortGetQueueLevel(const OrbisAudio3dPortId port_id, u
     }
 
     const auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
     const size_t size = port.mixed_queue.size();
 
     if (queue_level) {
@@ -797,6 +810,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortPush(const OrbisAudio3dPortId port_id,
     }
 
     auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
     if (port.parameters.buffer_mode !=
         OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_ADVANCE_AND_PUSH) {
         LOG_ERROR(Lib_Audio3d, "port doesn't have push capability");
