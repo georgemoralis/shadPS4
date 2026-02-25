@@ -606,11 +606,27 @@ s32 PS4_SYSV_ABI sceAudio3dPortFlush(const OrbisAudio3dPortId port_id) {
         return ORBIS_AUDIO3D_ERROR_INVALID_PORT;
     }
 
-    const auto& port = state->ports[port_id];
+    auto& port = state->ports[port_id];
 
-    // Sync by calling output(nullptr) on all game-managed handles, which blocks
-    // for one granularity each until the audio system has consumed the submitted buffers.
+    // PortFlush has three usage modes depending on SDK version and port configuration
+    // (per SDK docs Table 8 / Buffering Strategies):
+    //
+    // Mode A — Standalone (SDK 1.0, deprecated, buffer_mode = ANY):
+    //   PortFlush alone replaces Advance+Push. It must mix all queued audio and output
+    //   it, blocking until the device consumes the buffer. No game-managed AudioOut.
+    //
+    // Mode B — Advance + Flush (SDK 2.0, deprecated, buffer_mode = ADVANCE_NO_PUSH):
+    //   PortAdvance already mixed audio into mixed_queue. PortFlush just outputs it.
+    //   Still no game-managed AudioOut in this mode.
+    //
+    // Mode C — Combined AudioOut mode (SDK 2.0+):
+    //   Game has AudioOut handles from sceAudio3dAudioOutOpen. PortFlush synchronizes
+    //   those AudioOut ports by blocking until their pending buffers are consumed.
+
     if (!port.audioout_handles.empty()) {
+        // Mode C: synchronize all associated game-managed AudioOut ports.
+        // Per SDK docs: "In addition to synchronizing the objects and the bed passed to
+        // the Audio3d port, these calls also synchronize all associated AudioOut ports."
         for (const s32 handle : port.audioout_handles) {
             const s32 ret = AudioOut::sceAudioOutOutput(handle, nullptr);
             if (ret < 0) {
@@ -620,12 +636,50 @@ s32 PS4_SYSV_ABI sceAudio3dPortFlush(const OrbisAudio3dPortId port_id) {
         return ORBIS_OK;
     }
 
-    // Fallback: push-model port with no game-managed handles.
-    if (port.audio_out_handle >= 0) {
-        return AudioOut::sceAudioOutOutput(port.audio_out_handle, nullptr);
+    // Mode A or B: no game-managed AudioOut handles. Mix if needed (Mode A), then output.
+
+    // If mixed_queue is empty, the game hasn't called PortAdvance — we're in Mode A
+    // (standalone flush) and must do the mix step ourselves.
+    if (port.mixed_queue.empty()) {
+        // Only mix if there's actually something to mix.
+        if (!port.bed_queue.empty() ||
+            std::any_of(port.objects.begin(), port.objects.end(),
+                        [](const auto& kv) { return !kv.second.pcm_queue.empty(); })) {
+            const s32 ret = sceAudio3dPortAdvance(port_id);
+            if (ret != ORBIS_OK && ret != ORBIS_AUDIO3D_ERROR_NOT_READY) {
+                return ret;
+            }
+        }
     }
 
-    LOG_WARNING(Lib_Audio3d, "sceAudio3dPortFlush: no audio handle available for sync");
+    if (port.mixed_queue.empty()) {
+        // Nothing to output.
+        return ORBIS_OK;
+    }
+
+    // Lazily open the internal audio output handle.
+    if (port.audio_out_handle < 0) {
+        AudioOut::OrbisAudioOutParamExtendedInformation ext_info{};
+        ext_info.data_format.Assign(AUDIO3D_OUTPUT_FORMAT);
+        port.audio_out_handle =
+            AudioOut::sceAudioOutOpen(0xFF, AudioOut::OrbisAudioOutPort::Audio3d, 0,
+                                      port.parameters.granularity, AUDIO3D_SAMPLE_RATE, ext_info);
+        if (port.audio_out_handle < 0) {
+            return port.audio_out_handle;
+        }
+    }
+
+    // Drain all queued mixed frames, blocking on each until consumed.
+    while (!port.mixed_queue.empty()) {
+        AudioData frame = port.mixed_queue.front();
+        port.mixed_queue.pop_front();
+        const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
+        SDL_free(frame.sample_buffer);
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
     return ORBIS_OK;
 }
 
