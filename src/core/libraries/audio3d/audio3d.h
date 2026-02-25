@@ -81,6 +81,17 @@ using OrbisAudio3dPortId = u32;
 using OrbisAudio3dObjectId = u32;
 using OrbisAudio3dAmbisonics = u32; // Ambisonics channel index (0-15 for 3rd-order)
 
+// Sentinel values: ((SceAudio3dPortId)-1) per SDK defines table.
+// Guaranteed never returned by PortOpen on success.
+constexpr int ORBIS_AUDIO3D_PORT_INVALID = 0xFFFFFFFF;
+
+// Port-level attribute IDs (used with sceAudio3dPortSetAttribute).
+enum class OrbisAudio3dPortAttributeId : u32 {
+    ORBIS_AUDIO3D_PORT_ATTRIBUTE_LATE_REVERB_LEVEL = 1,           // float [0, 1]
+    ORBIS_AUDIO3D_PORT_ATTRIBUTE_DOWNMIX_SPREAD_RADIUS = 2,       // float, metres
+    ORBIS_AUDIO3D_PORT_ATTRIBUTE_DOWNMIX_SPREAD_HEIGHT_AWARE = 3, // bool
+};
+
 struct OrbisAudio3dAttribute {
     OrbisAudio3dAttributeId attribute_id;
     int : 32;

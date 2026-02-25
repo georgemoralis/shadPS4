@@ -102,6 +102,46 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOutputs(AudioOut::OrbisAudioOutOutputParam* p
 // Store a raw copy of the PCM data in the queue. Format conversion to stereo S16 happens
 // later at mix time in PortAdvance, so that float ambisonics channels are summed in floating
 // point before being quantised — avoiding precision loss from 16 concurrent S16 conversions.
+// Validates type-specific constraints on object attribute values.
+// Returns ORBIS_OK if valid, ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER otherwise.
+// Per SDK defines table: GAIN must be a positive float; SPREAD must be in [0, 2*PI].
+static s32 ValidateObjectAttributeValue(const OrbisAudio3dAttributeId attribute_id,
+                                        const void* value, const u64 size) {
+    if (!value || !size) {
+        return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+    }
+    switch (attribute_id) {
+    case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN: {
+        if (size < sizeof(float)) {
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        float gain;
+        std::memcpy(&gain, value, sizeof(float));
+        if (gain < 0.0f) {
+            LOG_ERROR(Lib_Audio3d, "GAIN must be a positive float, got {}", gain);
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        break;
+    }
+    case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_SPREAD: {
+        if (size < sizeof(float)) {
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        float spread;
+        std::memcpy(&spread, value, sizeof(float));
+        constexpr float k2Pi = 6.28318530717958647692f;
+        if (spread < 0.0f || spread > k2Pi) {
+            LOG_ERROR(Lib_Audio3d, "SPREAD must be in [0, 2*PI], got {}", spread);
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        break;
+    }
+    default:
+        break;
+    }
+    return ORBIS_OK;
+}
+
 // Per SDK docs: if the game submits fewer samples than granularity, the remainder is padded
 // with silence. If it submits too many, the extra samples are dropped.
 static s32 ConvertAndEnqueue(std::deque<AudioData>& queue, const OrbisAudio3dPcm& pcm,
@@ -392,6 +432,12 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttribute(const OrbisAudio3dPortId port_id,
         return ORBIS_OK;
     }
 
+    // Validate type-specific value constraints (GAIN >= 0, SPREAD in [0, 2*PI], etc.)
+    if (const auto ret = ValidateObjectAttributeValue(attribute_id, attribute, attribute_size);
+        ret != ORBIS_OK) {
+        return ret;
+    }
+
     // Store the attribute persistently on the object. It survives across frames
     // until changed again or the object is unreserved.
     const auto* src = static_cast<const u8*>(attribute);
@@ -481,6 +527,12 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
             continue;
         }
         if (attr.value && attr.value_size > 0) {
+            // Validate type-specific constraints (GAIN >= 0, SPREAD in [0, 2*PI], etc.)
+            if (const auto ret = ValidateObjectAttributeValue(attr.attribute_id,
+                                                              attr.value, attr.value_size);
+                ret != ORBIS_OK) {
+                return ret;
+            }
             const auto* src = static_cast<const u8*>(attr.value);
             obj.persistent_attributes[static_cast<u32>(attr.attribute_id)].assign(
                 src, src + attr.value_size);
@@ -899,28 +951,123 @@ s32 PS4_SYSV_ABI sceAudio3dPortOpen(const Libraries::UserService::OrbisUserServi
     LOG_INFO(Lib_Audio3d, "called, user_id = {}, parameters = {}, id = {}", user_id,
              static_cast<const void*>(parameters), static_cast<void*>(port_id));
 
+    // RE: only SCE_USER_SERVICE_USER_ID_SYSTEM (0xFF) is accepted. All other user IDs,
+    // or null pId/pParameters, jump straight to the INVALID_PARAMETER path.
+    if (user_id != 0xFF || !port_id || !parameters) {
+        if (port_id) {
+            *port_id = ORBIS_AUDIO3D_PORT_INVALID;
+        }
+        return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+    }
+
+    // Per SDK docs: on failure, *port_id receives ORBIS_AUDIO3D_PORT_INVALID.
+    *port_id = ORBIS_AUDIO3D_PORT_INVALID;
+
     if (!state) {
         LOG_ERROR(Lib_Audio3d, "!initialized");
         return ORBIS_AUDIO3D_ERROR_NOT_READY;
     }
 
-    if (!parameters || !port_id) {
-        LOG_ERROR(Lib_Audio3d, "!parameters || !id");
+    // RE: size_this encodes the SDK version of the struct. The switch is effectively
+    // (size_this - 0x10) >> 3, selecting which fields exist in the caller's struct.
+    // Older SDK sizes get hardcoded defaults for fields that didn't exist yet.
+    //   case 0: size=0x10 — granularity+rate only; max_objects=512, queue_depth=2,
+    //                        num_beds=2, buffer_mode=NO_ADVANCE
+    //   case 1: size=0x18 — adds max_objects+queue_depth; num_beds=2, buffer_mode=ADVANCE_NO_PUSH
+    //   case 2: size=0x20 — adds buffer_mode; num_beds=2
+    //   case 3: size=0x28 — full struct including num_beds
+    u32 max_objects;
+    u32 queue_depth;
+    u32 num_beds;
+    u32 buffer_mode_raw;
+
+    const u64 version = (parameters->size_this - 0x10) >> 3;
+    switch (version) {
+    case 0:
+        max_objects    = 512;
+        queue_depth    = 2;
+        num_beds       = 2;
+        buffer_mode_raw = static_cast<u32>(OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_NO_ADVANCE);
+        break;
+    case 1:
+        max_objects    = parameters->max_objects;
+        queue_depth    = parameters->queue_depth;
+        num_beds       = 2;
+        buffer_mode_raw = static_cast<u32>(OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_ADVANCE_NO_PUSH);
+        break;
+    case 2:
+        max_objects    = parameters->max_objects;
+        queue_depth    = parameters->queue_depth;
+        num_beds       = 2;
+        buffer_mode_raw = static_cast<u32>(parameters->buffer_mode);
+        break;
+    case 3:
+        max_objects    = parameters->max_objects;
+        queue_depth    = parameters->queue_depth;
+        num_beds       = parameters->num_beds;
+        buffer_mode_raw = static_cast<u32>(parameters->buffer_mode);
+        break;
+    default:
+        LOG_ERROR(Lib_Audio3d, "unrecognised size_this {:#x}", parameters->size_this);
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 
-    const int id = static_cast<int>(state->ports.size()) + 1;
+    const u32 granularity = parameters->granularity;
+    const u32 rate        = static_cast<u32>(parameters->rate);
 
-    if (id > 3) {
-        LOG_ERROR(Lib_Audio3d, "id > 3");
+    // RE: full validation chain as seen in the binary.
+    // rate must be 0 (48000 Hz), granularity >= 256 and a multiple of 256.
+    // Queue depth limits per granularity, num_beds must be 2 or 3, buffer_mode <= 2.
+    bool invalid =
+        (rate != 0) ||
+        (granularity < 0x100) ||
+        ((granularity & 0xFF) != 0) ||
+        (max_objects == 0) ||
+        (queue_depth == 0) ||
+        (granularity == 0x100 && queue_depth > 0x40) ||
+        (granularity == 0x200 && queue_depth > 0x1F) ||
+        (granularity == 0x300 && queue_depth > 0x14) ||
+        (queue_depth > 0xF && granularity > 0x3FF) ||
+        ((num_beds & 0xFFFFFFFEu) != 2) ||  // only 2 or 3 are valid
+        (buffer_mode_raw > 2);
+
+    if (invalid) {
+        LOG_ERROR(Lib_Audio3d,
+                  "invalid parameters: gran={}, rate={}, max_obj={}, depth={}, beds={}, mode={}",
+                  granularity, rate, max_objects, queue_depth, num_beds, buffer_mode_raw);
+        return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+    }
+
+    // RE: max_objects silently capped at 512 with a warning print.
+    if (max_objects > 512) {
+        LOG_WARNING(Lib_Audio3d, "[Audio3D] The uiMaxObjects is limit to 512");
+        max_objects = 512;
+    }
+
+    // RE: up to 4 ports (indices 0–3), scanned for the first free slot.
+    OrbisAudio3dPortId id = ORBIS_AUDIO3D_PORT_INVALID;
+    for (OrbisAudio3dPortId candidate = 0; candidate < 4; candidate++) {
+        if (!state->ports.contains(candidate)) {
+            id = candidate;
+            break;
+        }
+    }
+    if (id == static_cast<OrbisAudio3dPortId>(ORBIS_AUDIO3D_PORT_INVALID)) {
+        LOG_ERROR(Lib_Audio3d, "no free port slots");
         return ORBIS_AUDIO3D_ERROR_OUT_OF_RESOURCES;
     }
 
     *port_id = id;
     auto& port = state->ports[id];
-    std::memcpy(
-        &port.parameters, parameters,
-        std::min(parameters->size_this, static_cast<u64>(sizeof(OrbisAudio3dOpenParameters))));
+
+    // Copy the fields we've resolved (potentially with version-defaulted values).
+    port.parameters.size_this    = parameters->size_this;
+    port.parameters.granularity  = granularity;
+    port.parameters.rate         = parameters->rate;
+    port.parameters.max_objects  = max_objects;
+    port.parameters.queue_depth  = queue_depth;
+    port.parameters.buffer_mode  = static_cast<OrbisAudio3dBufferMode>(buffer_mode_raw);
+    port.parameters.num_beds     = num_beds;
 
     return ORBIS_OK;
 }
