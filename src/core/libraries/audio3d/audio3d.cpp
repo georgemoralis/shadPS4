@@ -495,9 +495,18 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     if (!mix_float)
         return ORBIS_AUDIO3D_ERROR_OUT_OF_MEMORY;
 
-    auto mix_in = [&](std::deque<AudioData>& queue) {
+    auto mix_in = [&](std::deque<AudioData>& queue, const float gain) {
         if (queue.empty())
             return;
+
+        // Per SDK docs: default gain is 0.0 — objects with no GAIN set are silent.
+        // Fast path: skip the conversion work entirely for silent objects.
+        if (gain == 0.0f) {
+            AudioData data = queue.front();
+            queue.pop_front();
+            std::free(data.sample_buffer);
+            return;
+        }
 
         AudioData data = queue.front();
         queue.pop_front();
@@ -521,8 +530,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
                     right = src[i * channels + 1] / 32768.0f;
                 }
 
-                mix_float[i * 2 + 0] += left;
-                mix_float[i * 2 + 1] += right;
+                mix_float[i * 2 + 0] += left * gain;
+                mix_float[i * 2 + 1] += right * gain;
             }
         } else { // FLOAT input
             const float* src = reinterpret_cast<const float*>(data.sample_buffer);
@@ -539,20 +548,29 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
                     right = src[i * channels + 1];
                 }
 
-                mix_float[i * 2 + 0] += left;
-                mix_float[i * 2 + 1] += right;
+                mix_float[i * 2 + 0] += left * gain;
+                mix_float[i * 2 + 1] += right * gain;
             }
         }
 
-        SDL_free(data.sample_buffer);
+        std::free(data.sample_buffer);
     };
 
-    // Mix bed first
-    mix_in(port.bed_queue);
+    // Bed is mixed at full gain (1.0) — there is no per-bed gain attribute.
+    mix_in(port.bed_queue, 1.0f);
 
-    // Mix all object PCM queues
+    // Mix all object PCM queues, applying each object's GAIN persistent attribute.
+    // Per SDK docs: default gain is 0.0, so objects with no GAIN set produce silence.
     for (auto& [obj_id, obj] : port.objects) {
-        mix_in(obj.pcm_queue);
+        float gain = 0.0f;
+        const auto gain_key = static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_GAIN);
+        if (obj.persistent_attributes.contains(gain_key)) {
+            const auto& blob = obj.persistent_attributes.at(gain_key);
+            if (blob.size() >= sizeof(float)) {
+                std::memcpy(&gain, blob.data(), sizeof(float));
+            }
+        }
+        mix_in(obj.pcm_queue, gain);
     }
 
     // ---- FINAL FLOAT → S16 CONVERSION ----
