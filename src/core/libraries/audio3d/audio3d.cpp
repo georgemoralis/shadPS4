@@ -823,72 +823,98 @@ s32 PS4_SYSV_ABI sceAudio3dPortPush(const OrbisAudio3dPortId port_id,
     }
 
     auto& port = state->ports[port_id];
-    std::scoped_lock lock{port.mutex};
+
     if (port.parameters.buffer_mode !=
         OrbisAudio3dBufferMode::ORBIS_AUDIO3D_BUFFER_ADVANCE_AND_PUSH) {
         LOG_ERROR(Lib_Audio3d, "port doesn't have push capability");
         return ORBIS_AUDIO3D_ERROR_NOT_SUPPORTED;
     }
 
-    if (port.mixed_queue.empty()) {
-        LOG_DEBUG(Lib_Audio3d, "Port push with no buffer ready");
-        return ORBIS_OK;
-    }
-
-    // Per SDK docs: "If there is already enough room available in the buffers, this
-    // operation will not block." If the queue isn't full, there's room — return immediately.
     const u32 depth = port.parameters.queue_depth;
-    if (port.mixed_queue.size() < depth) {
-        return ORBIS_OK;
-    }
 
-    // Lazily open the internal audio output handle on first push.
+    // Lazily open output handle
     if (port.audio_out_handle < 0) {
         AudioOut::OrbisAudioOutParamExtendedInformation ext_info{};
         ext_info.data_format.Assign(AUDIO3D_OUTPUT_FORMAT);
+
         port.audio_out_handle =
             AudioOut::sceAudioOutOpen(0xFF, AudioOut::OrbisAudioOutPort::Audio3d, 0,
                                       port.parameters.granularity, AUDIO3D_SAMPLE_RATE, ext_info);
-        if (port.audio_out_handle < 0) {
+
+        if (port.audio_out_handle < 0)
             return port.audio_out_handle;
-        }
     }
 
-    // The queue is full (size >= queue_depth). Drain frames until at least one slot is free,
-    // which unblocks the next PortAdvance call.
-    //
-    // BLOCKING_SYNC: output one frame with sceAudioOutOutput (blocking call) — it waits
-    //   until the device has consumed it, guaranteeing a free slot on return.
-    //
-    // BLOCKING_ASYNC: submit one frame and return immediately rather than looping.
-    //   The game must poll PortGetQueueLevel before calling PortAdvance again.
-    {
-        AudioData frame = port.mixed_queue.front();
-        port.mixed_queue.pop_front();
-        const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
-        SDL_free(frame.sample_buffer);
-        if (ret < 0) {
-            return ret;
-        }
-    }
+    // Function that submits exactly one frame (if available)
+    auto submit_one_frame = [&](bool& submitted) -> s32 {
+        AudioData frame;
 
-    // For BLOCKING_SYNC, continue draining any additional frames that have accumulated
-    // beyond queue_depth (e.g. multiple PortAdvance calls against a depth-1 semaphore).
-    if (blocking == OrbisAudio3dBlocking::ORBIS_AUDIO3D_BLOCKING_SYNC) {
-        while (port.mixed_queue.size() >= depth) {
-            AudioData frame = port.mixed_queue.front();
-            port.mixed_queue.pop_front();
-            const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
-            SDL_free(frame.sample_buffer);
-            if (ret < 0) {
-                return ret;
+        {
+            std::scoped_lock lock{port.mutex};
+
+            if (port.mixed_queue.empty()) {
+                submitted = false;
+                return ORBIS_OK;
             }
+
+            frame = port.mixed_queue.front();
+            port.mixed_queue.pop_front();
         }
+
+        // OUTSIDE LOCK — important!
+        const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
+
+        SDL_free(frame.sample_buffer);
+
+        if (ret < 0)
+            return ret;
+
+        submitted = true;
+        return ORBIS_OK;
+    };
+
+    // First quick check: if not full, return immediately
+    {
+        std::scoped_lock lock{port.mutex};
+        if (port.mixed_queue.size() < depth) {
+            return ORBIS_OK;
+        }
+    }
+
+    // Submit one frame to free space
+    bool submitted = false;
+    s32 ret = submit_one_frame(submitted);
+    if (ret < 0)
+        return ret;
+
+    if (!submitted)
+        return ORBIS_OK;
+
+    // ASYNC: free exactly one slot and return
+    if (blocking == OrbisAudio3dBlocking::ORBIS_AUDIO3D_BLOCKING_ASYNC) {
+        return ORBIS_OK;
+    }
+
+    // SYNC: ensure at least one slot is free
+    // (drain until size < depth)
+    while (true) {
+        {
+            std::scoped_lock lock{port.mutex};
+            if (port.mixed_queue.size() < depth)
+                break;
+        }
+
+        bool drained = false;
+        ret = submit_one_frame(drained);
+        if (ret < 0)
+            return ret;
+
+        if (!drained)
+            break;
     }
 
     return ORBIS_OK;
 }
-
 s32 PS4_SYSV_ABI sceAudio3dPortQueryDebug() {
     LOG_ERROR(Lib_Audio3d, "(STUBBED) called");
     return ORBIS_OK;
