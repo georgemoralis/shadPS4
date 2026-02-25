@@ -792,8 +792,14 @@ s32 PS4_SYSV_ABI sceAudio3dPortPush(const OrbisAudio3dPortId port_id,
     }
 
     if (port.mixed_queue.empty()) {
-        // Nothing to push.
         LOG_DEBUG(Lib_Audio3d, "Port push with no buffer ready");
+        return ORBIS_OK;
+    }
+
+    // Per SDK docs: "If there is already enough room available in the buffers, this
+    // operation will not block." If the queue isn't full, there's room — return immediately.
+    const u32 depth = port.parameters.queue_depth;
+    if (port.mixed_queue.size() < depth) {
         return ORBIS_OK;
     }
 
@@ -809,18 +815,35 @@ s32 PS4_SYSV_ABI sceAudio3dPortPush(const OrbisAudio3dPortId port_id,
         }
     }
 
-    // Drain ALL queued mixed frames. When the game uses a semaphore with maxVal=1 and
-    // calls PortAdvance multiple times before signaling once, frames accumulate in the
-    // queue and must all be output here. Output is blocking (sync) so we call
-    // sceAudioOutOutput once per frame — each call blocks until the device consumes it.
-    // TODO: Implement asynchronous (BLOCKING_ASYNC) mode.
-    while (!port.mixed_queue.empty()) {
+    // The queue is full (size >= queue_depth). Drain frames until at least one slot is free,
+    // which unblocks the next PortAdvance call.
+    //
+    // BLOCKING_SYNC: output one frame with sceAudioOutOutput (blocking call) — it waits
+    //   until the device has consumed it, guaranteeing a free slot on return.
+    //
+    // BLOCKING_ASYNC: submit one frame and return immediately rather than looping.
+    //   The game must poll PortGetQueueLevel before calling PortAdvance again.
+    {
         AudioData frame = port.mixed_queue.front();
         port.mixed_queue.pop_front();
         const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
         SDL_free(frame.sample_buffer);
         if (ret < 0) {
             return ret;
+        }
+    }
+
+    // For BLOCKING_SYNC, continue draining any additional frames that have accumulated
+    // beyond queue_depth (e.g. multiple PortAdvance calls against a depth-1 semaphore).
+    if (blocking == OrbisAudio3dBlocking::ORBIS_AUDIO3D_BLOCKING_SYNC) {
+        while (port.mixed_queue.size() >= depth) {
+            AudioData frame = port.mixed_queue.front();
+            port.mixed_queue.pop_front();
+            const s32 ret = AudioOut::sceAudioOutOutput(port.audio_out_handle, frame.sample_buffer);
+            SDL_free(frame.sample_buffer);
+            if (ret < 0) {
+                return ret;
+            }
         }
     }
 
