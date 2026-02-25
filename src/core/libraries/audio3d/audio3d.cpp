@@ -264,19 +264,31 @@ s32 PS4_SYSV_ABI sceAudio3dObjectReserve(const OrbisAudio3dPortId port_id,
     LOG_INFO(Lib_Audio3d, "called, port_id = {}, object_id = {}", port_id,
              static_cast<void*>(object_id));
 
-    if (!state->ports.contains(port_id)) {
-        LOG_ERROR(Lib_Audio3d, "!state->ports.contains(port_id)");
-        return ORBIS_AUDIO3D_ERROR_INVALID_PORT;
-    }
-
     if (!object_id) {
         LOG_ERROR(Lib_Audio3d, "!object_id");
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 
-    static int last_id = 0;
+    // Per SDK docs: if the operation fails, SCE_AUDIO3D_OBJECT_INVALID must be returned.
+    *object_id = ORBIS_AUDIO3D_OBJECT_INVALID;
+
+    if (!state->ports.contains(port_id)) {
+        LOG_ERROR(Lib_Audio3d, "!state->ports.contains(port_id)");
+        return ORBIS_AUDIO3D_ERROR_INVALID_PORT;
+    }
+
+    auto& port = state->ports[port_id];
+
+    // Enforce the max_objects limit set at PortOpen time.
+    if (port.objects.size() >= port.parameters.max_objects) {
+        LOG_ERROR(Lib_Audio3d, "port has no available objects (max_objects = {})",
+                  port.parameters.max_objects);
+        return ORBIS_AUDIO3D_ERROR_OUT_OF_RESOURCES;
+    }
+
+    static OrbisAudio3dObjectId last_id = 0;
     *object_id = ++last_id;
-    state->ports[port_id].objects.emplace(*object_id, ObjectState{});
+    port.objects.emplace(*object_id, ObjectState{});
 
     return ORBIS_OK;
 }
