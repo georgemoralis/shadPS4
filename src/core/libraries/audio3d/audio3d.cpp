@@ -352,20 +352,30 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
 
     auto& obj = port.objects[object_id];
 
+    // Per SDK docs: "The order of the SCE_AUDIO3D_OBJECT_ATTRIBUTE_RESET_STATE attribute
+    // when calling sceAudio3dObjectSetAttributes() does not matter." This means RESET_STATE
+    // must execute BEFORE all other attributes in the same batch, regardless of its position
+    // in the array (the SDK example puts it last alongside PCM/POSITION/GAIN).
     for (u64 i = 0; i < num_attributes; i++) {
-        const auto& attribute = attribute_array[i];
-
-        switch (attribute.attribute_id) {
-        case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE: {
-            // Clear all persistent attributes and discard any queued PCM for this object.
+        if (attribute_array[i].attribute_id ==
+            OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE) {
             for (auto& data : obj.pcm_queue) {
                 std::free(data.sample_buffer);
             }
             obj.pcm_queue.clear();
             obj.persistent_attributes.clear();
             LOG_DEBUG(Lib_Audio3d, "RESET_STATE for object {}", object_id);
-            break;
+            break; // Only one reset is needed even if listed multiple times.
         }
+    }
+
+    // Second pass: apply all other attributes.
+    for (u64 i = 0; i < num_attributes; i++) {
+        const auto& attribute = attribute_array[i];
+
+        switch (attribute.attribute_id) {
+        case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESET_STATE:
+            break; // Already applied in first pass above.
         case OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PCM: {
             if (attribute.value_size < sizeof(OrbisAudio3dPcm)) {
                 LOG_ERROR(Lib_Audio3d, "PCM attribute value_size too small");
@@ -381,8 +391,8 @@ s32 PS4_SYSV_ABI sceAudio3dObjectSetAttributes(const OrbisAudio3dPortId port_id,
             break;
         }
         default: {
-            // POSITION, GAIN, SPREAD, PRIORITY, PASSTHROUGH etc.
-            // Store as a per-frame override of the persistent attribute.
+            // POSITION, GAIN, SPREAD, PRIORITY, PASSTHROUGH, AMBISONICS, OUTPUT_ROUTE etc.
+            // Stored persistently — survives across frames until changed or object unreserved.
             if (attribute.value && attribute.value_size > 0) {
                 const auto* src = static_cast<const u8*>(attribute.value);
                 obj.persistent_attributes[static_cast<u32>(attribute.attribute_id)].assign(
@@ -501,8 +511,7 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         std::free(data.sample_buffer);
 
         const s16* src = reinterpret_cast<const s16*>(dst_data);
-        const u32 num =
-            std::min<u32>(out_samples, static_cast<u32>(dst_len) / static_cast<u32>(sizeof(s16)));
+        const u32 num = std::min<u32>(out_samples, static_cast<u32>(dst_len / sizeof(s16)));
         for (u32 i = 0; i < num; i++) {
             const int scaled = static_cast<int>(static_cast<float>(src[i]) * gain);
             mix[i] = static_cast<s16>(std::clamp(static_cast<int>(mix[i]) + scaled, -32768, 32767));
@@ -769,9 +778,9 @@ s32 PS4_SYSV_ABI sceAudio3dPortQueryDebug() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceAudio3dPortSetAttribute(OrbisAudio3dPortId port_id,
-                                            OrbisAudio3dAttributeId attribute_id, void* attribute,
-                                            u64 attribute_size) {
+s32 PS4_SYSV_ABI sceAudio3dPortSetAttribute(const OrbisAudio3dPortId port_id,
+                                            const OrbisAudio3dAttributeId attribute_id,
+                                            void* attribute, const u64 attribute_size) {
     LOG_INFO(Lib_Audio3d,
              "called, port_id = {}, attribute_id = {}, attribute = {}, attribute_size = {}",
              port_id, static_cast<u32>(attribute_id), attribute, attribute_size);
