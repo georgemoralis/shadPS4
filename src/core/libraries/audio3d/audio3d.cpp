@@ -327,6 +327,21 @@ s32 PS4_SYSV_ABI sceAudio3dBedWrite2(const OrbisAudio3dPortId port_id, const u32
         return ORBIS_AUDIO3D_ERROR_NOT_READY;
     }
 
+    // Bed restricted flag: restricted audio must not be heard by the local listener.
+    // Same semantics as the per-object RESTRICTED attribute — silently succeed without
+    // enqueueing so the game's queue-depth accounting remains correct.
+    if (restricted) {
+        LOG_DEBUG(Lib_Audio3d, "bed restricted, skipping enqueue");
+        return ORBIS_OK;
+    }
+
+    // On PC there is only one output (TV equivalent). Beds routed HMU_ONLY are
+    // silently discarded; BOTH and TV_ONLY enqueue normally.
+    if (output_route == OrbisAudio3dOutputRoute::ORBIS_AUDIO3D_OUTPUT_HMU_ONLY) {
+        LOG_DEBUG(Lib_Audio3d, "bed HMU_ONLY on TV output, skipping enqueue");
+        return ORBIS_OK;
+    }
+
     return ConvertAndEnqueue(state->ports[port_id].bed_queue,
                              OrbisAudio3dPcm{
                                  .format = format,
