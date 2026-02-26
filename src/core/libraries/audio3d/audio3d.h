@@ -66,6 +66,16 @@ struct OrbisAudio3dPosition {
     float fZ;
 };
 
+// Per SDK defines table: when set to any value other than NONE, the values of
+// priority, position, gain, and spread attributes are all ignored and the object
+// is routed dry to the output (no spatialization). Used for UI audio and music.
+enum class OrbisAudio3dPassthrough : u32 {
+    ORBIS_AUDIO3D_PASSTHROUGH_NONE = 0,
+    ORBIS_AUDIO3D_PASSTHROUGH_LEFT = 1,
+    ORBIS_AUDIO3D_PASSTHROUGH_RIGHT = 2,
+    ORBIS_AUDIO3D_PASSTHROUGH_STEREO = 3,
+};
+
 struct OrbisAudio3dPcm {
     OrbisAudio3dFormat format;
     void* sample_buffer;

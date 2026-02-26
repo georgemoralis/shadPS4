@@ -753,6 +753,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_POSITION);
     const auto spread_key =
         static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_SPREAD);
+    const auto passthrough_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PASSTHROUGH);
 
     struct ObjPriority {
         u32 priority;
@@ -765,6 +767,22 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
     for (const auto& [obj_id, obj] : port.objects) {
         if (obj.pcm_queue.empty())
             continue;
+
+        // Per SDK docs: PASSTHROUGH objects bypass priority culling — they are always
+        // mixed dry and do not consume a slot from the max_objects budget.
+        OrbisAudio3dPassthrough passthrough =
+            OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_NONE;
+        if (obj.persistent_attributes.contains(passthrough_key)) {
+            const auto& blob = obj.persistent_attributes.at(passthrough_key);
+            if (blob.size() >= sizeof(u32)) {
+                u32 raw = 0;
+                std::memcpy(&raw, blob.data(), sizeof(u32));
+                passthrough = static_cast<OrbisAudio3dPassthrough>(raw);
+            }
+        }
+        if (passthrough != OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_NONE)
+            continue; // Mixed in the passthrough pass below.
+
         u32 priority = 0xFFFFFFFFu; // Default: lowest possible if PRIORITY not set.
         if (obj.persistent_attributes.contains(priority_key)) {
             const auto& blob = obj.persistent_attributes.at(priority_key);
@@ -848,6 +866,50 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         if (obj.pcm_queue.empty()) {
             obj.pcm_submitted_this_frame = false;
         }
+    }
+
+    // ---- PASSTHROUGH OBJECTS ----
+    // Per SDK docs: when PASSTHROUGH != NONE, position/gain/spread/priority are all ignored.
+    // The PCM is mixed dry at unity gain, routed according to the passthrough mode:
+    //   LEFT   — mono signal to left channel only.
+    //   RIGHT  — mono signal to right channel only.
+    //   STEREO — dry stereo (or mono duplicated to both channels) at unity gain.
+    for (auto& [obj_id, obj] : port.objects) {
+        if (obj.pcm_queue.empty())
+            continue;
+        if (!obj.persistent_attributes.contains(passthrough_key))
+            continue;
+
+        const auto& blob = obj.persistent_attributes.at(passthrough_key);
+        if (blob.size() < sizeof(u32))
+            continue;
+
+        u32 raw = 0;
+        std::memcpy(&raw, blob.data(), sizeof(u32));
+        const auto passthrough = static_cast<OrbisAudio3dPassthrough>(raw);
+        if (passthrough == OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_NONE)
+            continue;
+
+        float gain_l = 0.0f;
+        float gain_r = 0.0f;
+        switch (passthrough) {
+        case OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_LEFT:
+            gain_l = 1.0f;
+            gain_r = 0.0f;
+            break;
+        case OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_RIGHT:
+            gain_l = 0.0f;
+            gain_r = 1.0f;
+            break;
+        case OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_STEREO:
+        default:
+            gain_l = 1.0f;
+            gain_r = 1.0f;
+            break;
+        }
+
+        mix_in(obj.pcm_queue, gain_l, gain_r);
+        obj.pcm_submitted_this_frame = false;
     }
 
     // ---- FINAL FLOAT → S16 CONVERSION ----
