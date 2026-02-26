@@ -111,33 +111,54 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOutputs(AudioOut::OrbisAudioOutOutputParam* p
 //
 // Implementation:
 //   1. Compute azimuth from listener to source in the horizontal plane (atan2 of X/Z).
-//   2. Apply equal-power (sin/cos) stereo panning from the azimuth.
-//   3. Blend toward center by the spread factor: spread=0 → full pan, spread=2π → mono center.
+//   2. Apply equal-power (sin/cos) stereo panning from the azimuth, clamped to ±90°.
+//   3. Apply rear attenuation for sounds behind the listener (|azimuth| > 90°).
+//   4. Blend toward center by the spread factor: spread=0 → full pan, spread=2π → mono center.
 //
 // Elevation (fY) is intentionally ignored — we output stereo, not binaural HRTF,
 // so vertical positioning cannot be faithfully reproduced.
+//
+// Rear attenuation rationale:
+//   The human pinna (outer ear) filters sounds arriving from behind, making them
+//   perceptibly quieter and duller than frontal sounds. Without HRTF filtering we
+//   cannot reproduce the timbral change, but we can approximate the loudness drop.
+//   The attenuation ramps from 0 dB at 90° (side) to -6 dB at 180° (directly behind),
+//   applied as a linear gain scalar: rear_gain = 1.0 - 0.5 * rear_t, where rear_t is
+//   0 at ±90° and 1 at ±180°. This matches the ~6 dB pinna shadowing measured in
+//   standard head-related transfer function data sets.
 static void SpatialPan(const OrbisAudio3dPosition& pos, const float spread, float& out_left,
                        float& out_right) {
-    // Azimuth: angle in the horizontal plane from listener's forward axis (-Z).
-    // atan2(X, -Z) gives 0 straight ahead, +π/2 hard right, -π/2 hard left.
-    const float azimuth = std::atan2(pos.fX, -pos.fZ);
-
-    // Equal-power pan: pan_angle maps [-π/2, +π/2] → [0, π/2] for the sin/cos pair.
-    // Clamp to ±90° — beyond that the sound is behind the listener; pan stays hard L/R.
     constexpr float kHalfPi = 1.5707963267948966f;
+    constexpr float kPi = 3.1415926535897932f;
+    constexpr float k2Pi = 6.2831853071795865f;
+
+    // Azimuth: angle in the horizontal plane from listener's forward axis (-Z).
+    // atan2(X, -Z) gives 0 straight ahead, +π/2 hard right, -π/2 hard left,
+    // ±π directly behind.
+    const float azimuth = std::atan2(pos.fX, -pos.fZ);
+    const float abs_azimuth = std::abs(azimuth);
+
+    // Equal-power pan: clamp azimuth to ±90° for the pan law.
+    // Sounds beyond 90° stay hard-panned to the nearer side.
     const float pan_angle = std::clamp(azimuth, -kHalfPi, kHalfPi);
-    // Shift from [-π/2, π/2] to [0, π/2] for equal-power (sin=L, cos=R would swap).
-    const float t = (pan_angle + kHalfPi) * 0.5f; // [0, π/2]
-    const float pan_left = std::cos(t);           // 1 when hard left, 0 when hard right
-    const float pan_right = std::sin(t);          // 0 when hard left, 1 when hard right
+    const float t = (pan_angle + kHalfPi) * 0.5f; // remap [-π/2, π/2] → [0, π/2]
+    const float pan_left = std::cos(t);           // 1.0 at hard left, 0.0 at hard right
+    const float pan_right = std::sin(t);          // 0.0 at hard left, 1.0 at hard right
+
+    // Rear attenuation: ramps from 1.0 at ±90° (side) to 0.5 at ±180° (behind).
+    // rear_t is 0 for frontal/side sounds, 1 directly behind.
+    float rear_gain = 1.0f;
+    if (abs_azimuth > kHalfPi) {
+        const float rear_t = (abs_azimuth - kHalfPi) / kHalfPi; // [0, 1]
+        rear_gain = 1.0f - 0.5f * rear_t;                       // [1.0, 0.5]
+    }
 
     // Spread blends between the panned signal and a centered (equal L/R) signal.
     // spread=0 → pure pan; spread=2π → fully centered.
-    constexpr float k2Pi = 6.28318530717958647692f;
+    constexpr float kCenter = 0.7071067811865476f; // 1/√2 — equal-power center
     const float spread_t = std::clamp(spread / k2Pi, 0.0f, 1.0f);
-    constexpr float kCenter = 0.7071067811865476f; // 1/√2 — equal power center
-    out_left = pan_left + (kCenter - pan_left) * spread_t;
-    out_right = pan_right + (kCenter - pan_right) * spread_t;
+    out_left = (pan_left + (kCenter - pan_left) * spread_t) * rear_gain;
+    out_right = (pan_right + (kCenter - pan_right) * spread_t) * rear_gain;
 }
 
 // Validates type-specific constraints on object attribute values.
