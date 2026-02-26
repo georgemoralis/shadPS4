@@ -111,9 +111,11 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOutputs(AudioOut::OrbisAudioOutOutputParam* p
 //
 // Implementation:
 //   1. Compute azimuth from listener to source in the horizontal plane (atan2 of X/Z).
-//   2. Apply equal-power (sin/cos) stereo panning from the azimuth, clamped to ±90°.
-//   3. Apply rear attenuation for sounds behind the listener (|azimuth| > 90°).
-//   4. Blend toward center by the spread factor: spread=0 → full pan, spread=2π → mono center.
+//   2. Compute distance and derive an implicit distance spread addition.
+//   3. Combine game-provided spread with distance spread (clamped to 2π).
+//   4. Apply equal-power (sin/cos) stereo panning from the azimuth, clamped to ±90°.
+//   5. Apply rear attenuation for sounds behind the listener (|azimuth| > 90°).
+//   6. Blend toward center by the effective spread.
 //
 // Elevation (fY) is intentionally ignored — we output stereo, not binaural HRTF,
 // so vertical positioning cannot be faithfully reproduced.
@@ -122,15 +124,42 @@ s32 PS4_SYSV_ABI sceAudio3dAudioOutOutputs(AudioOut::OrbisAudioOutOutputParam* p
 //   The human pinna (outer ear) filters sounds arriving from behind, making them
 //   perceptibly quieter and duller than frontal sounds. Without HRTF filtering we
 //   cannot reproduce the timbral change, but we can approximate the loudness drop.
-//   The attenuation ramps from 0 dB at 90° (side) to -6 dB at 180° (directly behind),
-//   applied as a linear gain scalar: rear_gain = 1.0 - 0.5 * rear_t, where rear_t is
-//   0 at ±90° and 1 at ±180°. This matches the ~6 dB pinna shadowing measured in
-//   standard head-related transfer function data sets.
+//   The attenuation ramps from 0 dB at ±90° (side) to -6 dB at ±180° (behind).
+//
+// Distance-dependent spread rationale:
+//   A sound source very close to the listener (< 1 m) has a sharp, precise stereo
+//   position. As distance increases, inter-aural time and level differences shrink,
+//   making the source progressively harder to localize — it perceptually widens and
+//   drifts toward center. We model this as an additive spread term that starts at 0
+//   for sources within kSpreadNearDistance and reaches 2π (fully centered) at
+//   kSpreadFarDistance. The ramp uses a square-root curve so the widening is
+//   perceptually more uniform (loudness perception is roughly logarithmic, so a
+//   sqrt ramp in linear distance gives a more even subjective rate of change).
+//   These thresholds are tunable and represent typical in-game world scales.
 static void SpatialPan(const OrbisAudio3dPosition& pos, const float spread, float& out_left,
                        float& out_right) {
     constexpr float kHalfPi = 1.5707963267948966f;
-    constexpr float kPi = 3.1415926535897932f;
     constexpr float k2Pi = 6.2831853071795865f;
+
+    // Distance from listener origin in world units (Y included for full 3D distance).
+    const float dist = std::sqrt(pos.fX * pos.fX + pos.fY * pos.fY + pos.fZ * pos.fZ);
+
+    // Distance-dependent spread: sounds far from the listener widen toward center.
+    // kSpreadNearDistance — within this radius the implicit spread addition is 0.
+    // kSpreadFarDistance  — at this distance and beyond the implicit spread is 2π (fully centered).
+    // sqrt ramp gives a more perceptually uniform rate of widening than a linear ramp.
+    constexpr float kSpreadNearDistance = 1.0f; // metres (or game units)
+    constexpr float kSpreadFarDistance = 50.0f; // metres (or game units)
+    float distance_spread = 0.0f;
+    if (dist > kSpreadNearDistance) {
+        const float ramp = std::min(
+            (dist - kSpreadNearDistance) / (kSpreadFarDistance - kSpreadNearDistance), 1.0f);
+        distance_spread = k2Pi * std::sqrt(ramp);
+    }
+
+    // Effective spread is the sum of game-set spread and distance spread, clamped to 2π.
+    // The game's explicit spread value still takes effect at close range.
+    const float effective_spread = std::min(spread + distance_spread, k2Pi);
 
     // Azimuth: angle in the horizontal plane from listener's forward axis (-Z).
     // atan2(X, -Z) gives 0 straight ahead, +π/2 hard right, -π/2 hard left,
@@ -146,7 +175,6 @@ static void SpatialPan(const OrbisAudio3dPosition& pos, const float spread, floa
     const float pan_right = std::sin(t);          // 0.0 at hard left, 1.0 at hard right
 
     // Rear attenuation: ramps from 1.0 at ±90° (side) to 0.5 at ±180° (behind).
-    // rear_t is 0 for frontal/side sounds, 1 directly behind.
     float rear_gain = 1.0f;
     if (abs_azimuth > kHalfPi) {
         const float rear_t = (abs_azimuth - kHalfPi) / kHalfPi; // [0, 1]
@@ -154,9 +182,9 @@ static void SpatialPan(const OrbisAudio3dPosition& pos, const float spread, floa
     }
 
     // Spread blends between the panned signal and a centered (equal L/R) signal.
-    // spread=0 → pure pan; spread=2π → fully centered.
+    // effective_spread=0 → pure pan; effective_spread=2π → fully centered.
     constexpr float kCenter = 0.7071067811865476f; // 1/√2 — equal-power center
-    const float spread_t = std::clamp(spread / k2Pi, 0.0f, 1.0f);
+    const float spread_t = std::clamp(effective_spread / k2Pi, 0.0f, 1.0f);
     out_left = (pan_left + (kCenter - pan_left) * spread_t) * rear_gain;
     out_right = (pan_right + (kCenter - pan_right) * spread_t) * rear_gain;
 }
