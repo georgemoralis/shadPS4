@@ -806,6 +806,10 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PASSTHROUGH);
     const auto ambisonics_key =
         static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_AMBISONICS);
+    const auto restricted_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_RESTRICTED);
+    const auto output_route_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_OUTPUT_ROUTE);
 
     struct ObjPriority {
         u32 priority;
@@ -887,6 +891,39 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
             std::free(dropped.sample_buffer);
             obj.pcm_submitted_this_frame = false;
             continue;
+        }
+
+        // RESTRICTED: when true the object must not be heard by the local listener.
+        // Per SDK docs this is for network-licensed content — on PC/emulator there is
+        // only one listener so restricted objects are simply muted (frame consumed silently).
+        if (obj.persistent_attributes.contains(restricted_key)) {
+            const auto& blob = obj.persistent_attributes.at(restricted_key);
+            if (blob.size() >= sizeof(bool) && *reinterpret_cast<const bool*>(blob.data())) {
+                AudioData dropped = obj.pcm_queue.front();
+                obj.pcm_queue.pop_front();
+                std::free(dropped.sample_buffer);
+                obj.pcm_submitted_this_frame = false;
+                continue;
+            }
+        }
+
+        // OUTPUT_ROUTE: on real hardware HMU = headset, TV = main output.
+        // On PC we only have one output (TV equivalent). Objects routed HMU_ONLY
+        // are consumed silently; BOTH and TV_ONLY are mixed normally.
+        if (obj.persistent_attributes.contains(output_route_key)) {
+            const auto& blob = obj.persistent_attributes.at(output_route_key);
+            if (blob.size() >= sizeof(u32)) {
+                u32 raw = 0;
+                std::memcpy(&raw, blob.data(), sizeof(u32));
+                if (static_cast<OrbisAudio3dOutputRoute>(raw) ==
+                    OrbisAudio3dOutputRoute::ORBIS_AUDIO3D_OUTPUT_HMU_ONLY) {
+                    AudioData dropped = obj.pcm_queue.front();
+                    obj.pcm_queue.pop_front();
+                    std::free(dropped.sample_buffer);
+                    obj.pcm_submitted_this_frame = false;
+                    continue;
+                }
+            }
         }
 
         // Read GAIN (default 0.0 — silent until explicitly set).
