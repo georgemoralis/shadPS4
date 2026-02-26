@@ -961,6 +961,20 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         obj.pcm_submitted_this_frame = false;
     }
 
+    // ---- LATE REVERB ----
+    // Applied to the fully-mixed float buffer before conversion. Bypassed when level == 0
+    // (the common case) so there is no processing cost when reverb is unused.
+    if (port.reverb.level > 0.0f) {
+        for (u32 i = 0; i < granularity; i++) {
+            const float dry_l = mix_float[i * 2 + 0];
+            const float dry_r = mix_float[i * 2 + 1];
+            float wet_l, wet_r;
+            port.reverb.processSample(dry_l, dry_r, wet_l, wet_r);
+            mix_float[i * 2 + 0] = dry_l + wet_l;
+            mix_float[i * 2 + 1] = dry_r + wet_r;
+        }
+    }
+
     // ---- FINAL FLOAT → S16 CONVERSION ----
     s16* mix_s16 = static_cast<s16*>(std::malloc(out_samples * sizeof(s16)));
 
@@ -1307,6 +1321,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortOpen(const Libraries::UserService::OrbisUserServi
     port.parameters.buffer_mode = static_cast<OrbisAudio3dBufferMode>(buffer_mode_raw);
     port.parameters.num_beds = num_beds;
 
+    port.reverb.init();
+
     return ORBIS_OK;
 }
 
@@ -1435,7 +1451,44 @@ s32 PS4_SYSV_ABI sceAudio3dPortSetAttribute(const OrbisAudio3dPortId port_id,
         return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
     }
 
-    // TODO
+    auto& port = state->ports[port_id];
+    std::scoped_lock lock{port.mutex};
+
+    // Port-level attributes are separate from object attributes.
+    // Cast to OrbisAudio3dPortAttributeId since PortSetAttribute uses port-specific IDs.
+    const auto port_attr_id =
+        static_cast<OrbisAudio3dPortAttributeId>(static_cast<u32>(attribute_id));
+
+    switch (port_attr_id) {
+    case OrbisAudio3dPortAttributeId::ORBIS_AUDIO3D_PORT_ATTRIBUTE_LATE_REVERB_LEVEL: {
+        // Per SDK docs: value is a float in [0, 1].
+        if (attribute_size < sizeof(float)) {
+            LOG_ERROR(Lib_Audio3d, "LATE_REVERB_LEVEL attribute_size too small");
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        float level;
+        std::memcpy(&level, attribute, sizeof(float));
+        if (level < 0.0f || level > 1.0f) {
+            LOG_ERROR(Lib_Audio3d, "LATE_REVERB_LEVEL must be in [0, 1], got {}", level);
+            return ORBIS_AUDIO3D_ERROR_INVALID_PARAMETER;
+        }
+        port.reverb.level = level;
+        LOG_DEBUG(Lib_Audio3d, "LATE_REVERB_LEVEL set to {} for port {}", level, port_id);
+        break;
+    }
+    case OrbisAudio3dPortAttributeId::ORBIS_AUDIO3D_PORT_ATTRIBUTE_DOWNMIX_SPREAD_RADIUS:
+    case OrbisAudio3dPortAttributeId::ORBIS_AUDIO3D_PORT_ATTRIBUTE_DOWNMIX_SPREAD_HEIGHT_AWARE:
+        // Stored for completeness but not yet acted on — these affect downmix speaker
+        // spread for TV output, which requires per-speaker routing beyond stereo.
+        LOG_DEBUG(Lib_Audio3d, "port attribute {:#x} stored (not yet implemented)",
+                  static_cast<u32>(attribute_id));
+        break;
+    default:
+        // Per SDK docs: unsupported port attributes are silently ignored.
+        LOG_DEBUG(Lib_Audio3d, "unknown port attribute {:#x}, ignoring",
+                  static_cast<u32>(attribute_id));
+        break;
+    }
 
     return ORBIS_OK;
 }

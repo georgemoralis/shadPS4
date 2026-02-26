@@ -138,6 +138,105 @@ struct ObjectState {
     bool pcm_submitted_this_frame{false};
 };
 
+// Schroeder reverb (Freeverb topology): 8 parallel comb filters feeding 4 series allpass filters,
+// one network per stereo channel. Provides a simple but convincing late reverberation tail.
+// All delay lengths are prime-ish and slightly offset between L/R to decorrelate channels.
+// Sample rate assumed: 48000 Hz (matching ORBIS_AUDIO3D_RATE_48000).
+struct SchroederReverb {
+    // ----- Comb filter -----
+    // y[n] = x[n - delay] + feedback * y[n - delay]   (feedback comb / IIR comb)
+    struct CombFilter {
+        std::vector<float> buf;
+        u32 pos{0};
+        float feedback{0.0f};
+        float store{0.0f}; // damping low-pass state
+
+        void init(u32 delay_samples, float fb) {
+            buf.assign(delay_samples, 0.0f);
+            feedback = fb;
+            pos = 0;
+            store = 0.0f;
+        }
+
+        float process(float input, float damp) {
+            float output = buf[pos];
+            store = output * (1.0f - damp) + store * damp; // one-pole LPF in feedback path
+            buf[pos] = input + store * feedback;
+            pos = (pos + 1 < static_cast<u32>(buf.size())) ? pos + 1 : 0;
+            return output;
+        }
+    };
+
+    // ----- Allpass filter -----
+    // y[n] = -x[n] + x[n - delay] + g * y[n - delay]   (Schroeder allpass)
+    struct AllpassFilter {
+        std::vector<float> buf;
+        u32 pos{0};
+
+        void init(u32 delay_samples) {
+            buf.assign(delay_samples, 0.0f);
+            pos = 0;
+        }
+
+        float process(float input) {
+            constexpr float kGain = 0.5f;
+            float bufout = buf[pos];
+            buf[pos] = input + bufout * kGain;
+            pos = (pos + 1 < static_cast<u32>(buf.size())) ? pos + 1 : 0;
+            return bufout - input;
+        }
+    };
+
+    // Freeverb uses 8 comb + 4 allpass per channel at 44100 Hz; we scale to 48000 Hz.
+    // Delay lengths (in samples at 48k) — L channel, R channel offset by +23 samples.
+    static constexpr u32 kNumCombs = 8;
+    static constexpr u32 kNumAllpass = 4;
+    static constexpr u32 kStereoSpread = 23;
+
+    static constexpr u32 kCombDelays[kNumCombs] = {1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617};
+    static constexpr u32 kAllpassDelays[kNumAllpass] = {556, 441, 341, 225};
+
+    CombFilter combs_l[kNumCombs], combs_r[kNumCombs];
+    AllpassFilter aps_l[kNumAllpass], aps_r[kNumAllpass];
+
+    float level{0.0f};     // LATE_REVERB_LEVEL [0, 1] — 0 means reverb is bypassed entirely
+    float feedback{0.84f}; // room size proxy
+    float damp{0.2f};      // high-frequency damping in comb feedback path
+
+    void init() {
+        for (u32 i = 0; i < kNumCombs; i++) {
+            combs_l[i].init(kCombDelays[i], feedback);
+            combs_r[i].init(kCombDelays[i] + kStereoSpread, feedback);
+        }
+        for (u32 i = 0; i < kNumAllpass; i++) {
+            aps_l[i].init(kAllpassDelays[i]);
+            aps_r[i].init(kAllpassDelays[i] + kStereoSpread);
+        }
+        level = 0.0f;
+    }
+
+    // Process one stereo sample pair. Returns wet signal; caller mixes dry + wet.
+    void processSample(float in_l, float in_r, float& out_l, float& out_r) {
+        // Sum mono input into both comb networks (standard Freeverb input routing).
+        const float mono = (in_l + in_r) * 0.5f;
+
+        float sum_l = 0.0f, sum_r = 0.0f;
+        for (u32 i = 0; i < kNumCombs; i++) {
+            sum_l += combs_l[i].process(mono, damp);
+            sum_r += combs_r[i].process(mono, damp);
+        }
+
+        // Series allpass diffusion.
+        for (u32 i = 0; i < kNumAllpass; i++) {
+            sum_l = aps_l[i].process(sum_l);
+            sum_r = aps_r[i].process(sum_r);
+        }
+
+        out_l = sum_l * level;
+        out_r = sum_r * level;
+    }
+};
+
 struct Port {
     // Guards all mutable fields accessed from multiple threads.
     // On real hardware the Audio3d library is internally thread-safe: games are documented
@@ -162,6 +261,9 @@ struct Port {
     // Mixed stereo frames ready to be consumed by sceAudio3dPortPush.
     // Supports queue_depth > 1 (double/triple buffering).
     std::deque<AudioData> mixed_queue;
+    // Late reverb applied to the final mix. Level controlled by sceAudio3dPortSetAttribute
+    // with LATE_REVERB_LEVEL. Bypassed entirely when level == 0.
+    SchroederReverb reverb;
 };
 
 struct Audio3dState {
