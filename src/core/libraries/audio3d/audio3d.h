@@ -98,7 +98,32 @@ enum class OrbisAudio3dAttributeId : u32 {
 
 using OrbisAudio3dPortId = u32;
 using OrbisAudio3dObjectId = u32;
-using OrbisAudio3dAmbisonics = u32; // Ambisonics channel index (0-15 for 3rd-order)
+
+// B-format ambisonics channel assignment in ACN (Ambisonics Channel Number) ordering
+// with SN3D normalization. Each Audio3D object carrying ambisonics PCM stores one channel.
+// When set to any value other than NONE, position/spread/priority are all ignored per SDK docs.
+enum class OrbisAudio3dAmbisonics : u32 {
+    ORBIS_AUDIO3D_AMBISONICS_NONE = 0,
+    // First order (4 channels)
+    ORBIS_AUDIO3D_AMBISONICS_ACN_0 = 1, // W — omnidirectional
+    ORBIS_AUDIO3D_AMBISONICS_ACN_1 = 2, // Y — left/right  (+Y = left in listener frame)
+    ORBIS_AUDIO3D_AMBISONICS_ACN_2 = 3, // Z — up/down
+    ORBIS_AUDIO3D_AMBISONICS_ACN_3 = 4, // X — front/back (+X = right in listener frame)
+    // Second order (9 channels total, ACN 4-8)
+    ORBIS_AUDIO3D_AMBISONICS_ACN_4 = 5,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_5 = 6,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_6 = 7,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_7 = 8,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_8 = 9,
+    // Third order (16 channels total, ACN 9-15)
+    ORBIS_AUDIO3D_AMBISONICS_ACN_9 = 10,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_10 = 11,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_11 = 12,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_12 = 13,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_13 = 14,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_14 = 15,
+    ORBIS_AUDIO3D_AMBISONICS_ACN_15 = 16,
+};
 
 // Sentinel values: ((SceAudio3dPortId)-1) per SDK defines table.
 // Guaranteed never returned by PortOpen on success.

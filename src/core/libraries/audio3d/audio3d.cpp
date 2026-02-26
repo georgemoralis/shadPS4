@@ -804,6 +804,8 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_SPREAD);
     const auto passthrough_key =
         static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_PASSTHROUGH);
+    const auto ambisonics_key =
+        static_cast<u32>(OrbisAudio3dAttributeId::ORBIS_AUDIO3D_ATTRIBUTE_AMBISONICS);
 
     struct ObjPriority {
         u32 priority;
@@ -831,6 +833,20 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
         }
         if (passthrough != OrbisAudio3dPassthrough::ORBIS_AUDIO3D_PASSTHROUGH_NONE)
             continue; // Mixed in the passthrough pass below.
+
+        // Per SDK docs: AMBISONICS objects also bypass priority culling — position/spread/
+        // priority are all ignored and the PCM is decoded from B-format directly.
+        OrbisAudio3dAmbisonics ambisonics = OrbisAudio3dAmbisonics::ORBIS_AUDIO3D_AMBISONICS_NONE;
+        if (obj.persistent_attributes.contains(ambisonics_key)) {
+            const auto& blob = obj.persistent_attributes.at(ambisonics_key);
+            if (blob.size() >= sizeof(u32)) {
+                u32 raw = 0;
+                std::memcpy(&raw, blob.data(), sizeof(u32));
+                ambisonics = static_cast<OrbisAudio3dAmbisonics>(raw);
+            }
+        }
+        if (ambisonics != OrbisAudio3dAmbisonics::ORBIS_AUDIO3D_AMBISONICS_NONE)
+            continue; // Decoded in the ambisonics pass below.
 
         u32 priority = 0xFFFFFFFFu; // Default: lowest possible if PRIORITY not set.
         if (obj.persistent_attributes.contains(priority_key)) {
@@ -959,6 +975,90 @@ s32 PS4_SYSV_ABI sceAudio3dPortAdvance(const OrbisAudio3dPortId port_id) {
 
         mix_in(obj.pcm_queue, gain_l, gain_r);
         obj.pcm_submitted_this_frame = false;
+    }
+
+    // ---- AMBISONICS OBJECTS ----
+    // Per SDK docs: when AMBISONICS != NONE, position/spread/priority are all ignored.
+    // Each object carries one ACN channel of B-format audio. We collect all channels into
+    // per-ACN float accumulators, then apply a first-order binaural decode to stereo.
+    //
+    // Decode matrix — virtual speakers at ±30° azimuth, elevation 0, SN3D normalization:
+    //   Left  = (1/√2)*W  +  0.5*Y  +  (√3/2)*(1/√2)*X
+    //   Right = (1/√2)*W  -  0.5*Y  +  (√3/2)*(1/√2)*X
+    //
+    // Higher-order channels (ACN 4-15) contribute nothing to a first-order decode and are
+    // consumed silently — their PCM frames are freed to keep the queue depth in sync.
+    // Z (ACN 2) is also discarded for stereo output (elevation cannot be reproduced).
+    {
+        constexpr u32 kMaxAcnChannels = 16;
+        // Stack-allocate per-channel accumulators; granularity is bounded by validation.
+        // Use a flat array indexed as [acn_channel * granularity + sample].
+        std::vector<float> acn_bufs(kMaxAcnChannels * granularity, 0.0f);
+        bool any_ambisonics = false;
+
+        for (auto& [obj_id, obj] : port.objects) {
+            if (obj.pcm_queue.empty())
+                continue;
+            if (!obj.persistent_attributes.contains(ambisonics_key))
+                continue;
+
+            const auto& blob = obj.persistent_attributes.at(ambisonics_key);
+            if (blob.size() < sizeof(u32))
+                continue;
+
+            u32 raw = 0;
+            std::memcpy(&raw, blob.data(), sizeof(u32));
+            const auto ambisonics = static_cast<OrbisAudio3dAmbisonics>(raw);
+            if (ambisonics == OrbisAudio3dAmbisonics::ORBIS_AUDIO3D_AMBISONICS_NONE)
+                continue;
+
+            // Enum value - 1 = ACN channel index (enum starts at 1 for ACN 0).
+            const u32 acn = static_cast<u32>(ambisonics) - 1u;
+
+            AudioData data = obj.pcm_queue.front();
+            obj.pcm_queue.pop_front();
+            obj.pcm_submitted_this_frame = false;
+
+            // Channels above first-order are decoded as silence — consume and free.
+            if (acn < kMaxAcnChannels) {
+                any_ambisonics = true;
+                float* dst = acn_bufs.data() + acn * granularity;
+                const u32 frames = std::min(granularity, data.num_samples);
+
+                if (data.format == OrbisAudio3dFormat::ORBIS_AUDIO3D_FORMAT_S16) {
+                    const s16* src = reinterpret_cast<const s16*>(data.sample_buffer);
+                    for (u32 i = 0; i < frames; i++) {
+                        dst[i] = src[i] / 32768.0f;
+                    }
+                } else {
+                    const float* src = reinterpret_cast<const float*>(data.sample_buffer);
+                    std::memcpy(dst, src, frames * sizeof(float));
+                }
+            }
+
+            std::free(data.sample_buffer);
+        }
+
+        if (any_ambisonics) {
+            // First-order binaural decode: W=ACN0, Y=ACN1, X=ACN3.
+            // Decode coefficients for virtual speakers at ±30° (SN3D normalization):
+            //   W coeff: 1/√2 ≈ 0.7071
+            //   Y coeff: ±0.5   (positive for left, negative for right)
+            //   X coeff: (√3/2) * (1/√2) = √(3/8) ≈ 0.6124  (same sign for both channels)
+            constexpr float kW = 0.7071067811865476f; // 1/√2
+            constexpr float kY = 0.5f;
+            constexpr float kX = 0.6123724356957946f; // √(3/8)
+
+            const float* W = acn_bufs.data() + 0 * granularity; // ACN 0
+            const float* Y = acn_bufs.data() + 1 * granularity; // ACN 1
+            const float* X = acn_bufs.data() + 3 * granularity; // ACN 3
+
+            for (u32 i = 0; i < granularity; i++) {
+                const float common = kW * W[i] + kX * X[i];
+                mix_float[i * 2 + 0] += common + kY * Y[i]; // Left
+                mix_float[i * 2 + 1] += common - kY * Y[i]; // Right
+            }
+        }
     }
 
     // ---- LATE REVERB ----
