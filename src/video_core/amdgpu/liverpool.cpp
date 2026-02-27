@@ -229,8 +229,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         ce_task = ProcessCeUpdate(ccb);
         RESUME_GFX(ce_task);
     }
-    const bool host_markers_enabled = rasterizer && Config::getVkHostMarkersEnabled();
-    const bool guest_markers_enabled = rasterizer && Config::getVkGuestMarkersEnabled();
+    const bool host_markers_enabled =
+        rasterizer && EmulatorSettings::GetInstance()->IsVkHostMarkersEnabled();
+    const bool guest_markers_enabled =
+        rasterizer && EmulatorSettings::GetInstance()->IsVkGuestMarkersEnabled();
 
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
@@ -877,7 +879,8 @@ template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
     auto& queue = asc_queues[{vqid}];
-    const bool host_markers_enabled = rasterizer && Config::getVkHostMarkersEnabled();
+    const bool host_markers_enabled =
+        rasterizer && EmulatorSettings::GetInstance()->IsVkHostMarkersEnabled();
 
     struct IndirectPatch {
         const PM4Header* header;
