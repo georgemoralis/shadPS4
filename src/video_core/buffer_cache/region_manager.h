@@ -95,7 +95,7 @@ public:
         }
         if constexpr (type == Type::CPU) {
             UpdateProtection<!enable, false>();
-        } else if (EmulatorSettings::GetInstance()->IsReadbacksEnabled()) {
+        } else if (Config::getReadbacksMode() == Config::GpuReadbacksMode::Precised) {
             UpdateProtection<enable, true>();
         }
     }
@@ -126,7 +126,7 @@ public:
             bits.UnsetRange(start_page, end_page);
             if constexpr (type == Type::CPU) {
                 UpdateProtection<true, false>();
-            } else if (EmulatorSettings::GetInstance()->IsReadbacksEnabled()) {
+            } else if (Config::getReadbacksMode() != Config::GpuReadbacksMode::Disabled) {
                 UpdateProtection<false, true>();
             }
         }
