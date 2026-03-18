@@ -230,43 +230,29 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "Game-specific config exists: {}", has_game_config);
 
     LOG_INFO(Config, "General LogType: {}", EmulatorSettings.GetLogType());
-    LOG_INFO(Config, "General isIdenticalLogGrouped: {}",
-             EmulatorSettings.IsIdenticalLogGrouped());
+    LOG_INFO(Config, "General isIdenticalLogGrouped: {}", EmulatorSettings.IsIdenticalLogGrouped());
     LOG_INFO(Config, "General isNeo: {}", EmulatorSettings.IsNeo());
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
-    LOG_INFO(Config, "General isConnectedToNetwork: {}",
-             EmulatorSettings.IsConnectedToNetwork());
+    LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
     LOG_INFO(Config, "General isPsnSignedIn: {}", EmulatorSettings.IsPSNSignedIn());
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
              EmulatorSettings.IsReadbackLinearImagesEnabled());
-    LOG_INFO(Config, "GPU directMemoryAccess: {}",
-             EmulatorSettings.IsDirectMemoryAccessEnabled());
+    LOG_INFO(Config, "GPU directMemoryAccess: {}", EmulatorSettings.IsDirectMemoryAccessEnabled());
     LOG_INFO(Config, "GPU shouldDumpShaders: {}", EmulatorSettings.IsDumpShaders());
-    LOG_INFO(Config, "GPU vblankFrequency: {}",
-             EmulatorSettings.GetVblankFrequency());
-    LOG_INFO(Config, "GPU shouldCopyGPUBuffers: {}",
-             EmulatorSettings.IsCopyGpuBuffers());
+    LOG_INFO(Config, "GPU vblankFrequency: {}", EmulatorSettings.GetVblankFrequency());
+    LOG_INFO(Config, "GPU shouldCopyGPUBuffers: {}", EmulatorSettings.IsCopyGpuBuffers());
     LOG_INFO(Config, "Vulkan gpuId: {}", EmulatorSettings.GetGpuId());
-    LOG_INFO(Config, "Vulkan vkValidation: {}",
-             EmulatorSettings.IsVkValidationEnabled());
-    LOG_INFO(Config, "Vulkan vkValidationCore: {}",
-             EmulatorSettings.IsVkValidationCoreEnabled());
-    LOG_INFO(Config, "Vulkan vkValidationSync: {}",
-             EmulatorSettings.IsVkValidationSyncEnabled());
-    LOG_INFO(Config, "Vulkan vkValidationGpu: {}",
-             EmulatorSettings.IsVkValidationGpuEnabled());
-    LOG_INFO(Config, "Vulkan crashDiagnostics: {}",
-             EmulatorSettings.IsVkCrashDiagnosticEnabled());
-    LOG_INFO(Config, "Vulkan hostMarkers: {}",
-             EmulatorSettings.IsVkHostMarkersEnabled());
-    LOG_INFO(Config, "Vulkan guestMarkers: {}",
-             EmulatorSettings.IsVkGuestMarkersEnabled());
-    LOG_INFO(Config, "Vulkan rdocEnable: {}",
-             EmulatorSettings.IsRenderdocEnabled());
-    LOG_INFO(Config, "Vulkan PipelineCacheEnabled: {}",
-             EmulatorSettings.IsPipelineCacheEnabled());
+    LOG_INFO(Config, "Vulkan vkValidation: {}", EmulatorSettings.IsVkValidationEnabled());
+    LOG_INFO(Config, "Vulkan vkValidationCore: {}", EmulatorSettings.IsVkValidationCoreEnabled());
+    LOG_INFO(Config, "Vulkan vkValidationSync: {}", EmulatorSettings.IsVkValidationSyncEnabled());
+    LOG_INFO(Config, "Vulkan vkValidationGpu: {}", EmulatorSettings.IsVkValidationGpuEnabled());
+    LOG_INFO(Config, "Vulkan crashDiagnostics: {}", EmulatorSettings.IsVkCrashDiagnosticEnabled());
+    LOG_INFO(Config, "Vulkan hostMarkers: {}", EmulatorSettings.IsVkHostMarkersEnabled());
+    LOG_INFO(Config, "Vulkan guestMarkers: {}", EmulatorSettings.IsVkGuestMarkersEnabled());
+    LOG_INFO(Config, "Vulkan rdocEnable: {}", EmulatorSettings.IsRenderdocEnabled());
+    LOG_INFO(Config, "Vulkan PipelineCacheEnabled: {}", EmulatorSettings.IsPipelineCacheEnabled());
     LOG_INFO(Config, "Vulkan PipelineCacheArchived: {}",
              EmulatorSettings.IsPipelineCacheArchived());
 
@@ -345,9 +331,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
-    window = std::make_unique<Frontend::WindowSDL>(
-        EmulatorSettings.GetWindowWidth(),
-        EmulatorSettings.GetWindowHeight(), controller, window_title);
+    window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
+                                                   EmulatorSettings.GetWindowHeight(), controller,
+                                                   window_title);
 
     g_window = window.get();
 
