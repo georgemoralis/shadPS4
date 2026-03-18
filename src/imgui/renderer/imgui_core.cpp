@@ -219,7 +219,7 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
         return;
     }
 
-    if (EmulatorSettings::GetInstance()->IsVkHostMarkersEnabled()) {
+    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.beginDebugUtilsLabelEXT(vk::DebugUtilsLabelEXT{
             .pLabelName = "ImGui Render",
         });
@@ -244,7 +244,7 @@ void Render(const vk::CommandBuffer& cmdbuf, const vk::ImageView& image_view,
     cmdbuf.beginRendering(render_info);
     Vulkan::RenderDrawData(*draw_data, cmdbuf);
     cmdbuf.endRendering();
-    if (EmulatorSettings::GetInstance()->IsVkHostMarkersEnabled()) {
+    if (EmulatorSettings.IsVkHostMarkersEnabled()) {
         cmdbuf.endDebugUtilsLabelEXT();
     }
 }
