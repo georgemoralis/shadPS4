@@ -13,12 +13,38 @@
 #include <nlohmann/json.hpp>
 #include "common/logging/log.h"
 #include "common/types.h"
-#include "core/user_manager.h"
+
+#define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
+
+enum HideCursorState : int {
+    Never,
+    Idle,
+    Always,
+};
+
+enum UsbBackendType : int {
+    Real,
+    SkylandersPortal,
+    InfinityBase,
+    DimensionsToypad,
+};
+
+enum GpuReadbacksMode : int {
+    Disabled,
+    Relaxed,
+    Precise,
+};
 
 enum class ConfigMode {
     Default,
     Global,
     Clean,
+};
+
+enum AudioBackend : int {
+    SDL,
+    OpenAL,
+    // Add more backends as needed
 };
 
 template <typename T>
@@ -202,6 +228,7 @@ struct DebugSettings {
     Setting<bool> debug_dump{false};               // specific
     Setting<bool> shader_collect{false};           // specific
     Setting<bool> log_enabled{true};               // specific
+    Setting<std::string> config_version{""};       // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -213,13 +240,11 @@ struct DebugSettings {
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DebugSettings, separate_logging_enabled, debug_dump,
-                                   shader_collect, log_enabled)
+                                   shader_collect, log_enabled, config_version)
 
 // -------------------------------
 // Input settings
 // -------------------------------
-enum HideCursorState : int { Never, Idle, Always };
-enum UsbBackendType : int { Real, SkylandersPortal, InfinityBase, DimensionsToypad };
 
 struct InputSettings {
     Setting<int> cursor_state{HideCursorState::Idle};      // specific
@@ -228,9 +253,10 @@ struct InputSettings {
     Setting<bool> use_special_pad{false};
     Setting<int> special_pad_class{1};
     Setting<bool> motion_controls_enabled{true}; // specific
-    Setting<bool> use_unified_Input_Config{true};
+    Setting<bool> use_unified_input_config{true};
     Setting<std::string> default_controller_id{""};
     Setting<bool> background_controller_input{false}; // specific
+    Setting<s32> camera_id{-1};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -241,39 +267,50 @@ struct InputSettings {
             make_override<InputSettings>("motion_controls_enabled",
                                          &InputSettings::motion_controls_enabled),
             make_override<InputSettings>("background_controller_input",
-                                         &InputSettings::background_controller_input)};
+                                         &InputSettings::background_controller_input),
+            make_override<InputSettings>("camera_id", &InputSettings::camera_id)};
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
                                    usb_device_backend, use_special_pad, special_pad_class,
-                                   motion_controls_enabled, use_unified_Input_Config,
-                                   default_controller_id, background_controller_input)
+                                   motion_controls_enabled, use_unified_input_config,
+                                   default_controller_id, background_controller_input, camera_id)
 // -------------------------------
 // Audio settings
 // -------------------------------
 struct AudioSettings {
-    Setting<std::string> mic_device{"Default Device"};
-    Setting<std::string> main_output_device{"Default Device"};
-    Setting<std::string> padSpk_output_device{"Default Device"};
+    Setting<u32> audio_backend{AudioBackend::SDL};
+    Setting<std::string> sdl_mic_device{"Default Device"};
+    Setting<std::string> sdl_main_output_device{"Default Device"};
+    Setting<std::string> sdl_padSpk_output_device{"Default Device"};
+    Setting<std::string> openal_mic_device{"Default Device"};
+    Setting<std::string> openal_main_output_device{"Default Device"};
+    Setting<std::string> openal_padSpk_output_device{"Default Device"};
 
-    // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
-            make_override<AudioSettings>("mic_device", &AudioSettings::mic_device),
-            make_override<AudioSettings>("main_output_device", &AudioSettings::main_output_device),
-            make_override<AudioSettings>("padSpk_output_device",
-                                         &AudioSettings::padSpk_output_device)};
+            make_override<AudioSettings>("audio_backend", &AudioSettings::audio_backend),
+            make_override<AudioSettings>("sdl_mic_device", &AudioSettings::sdl_mic_device),
+            make_override<AudioSettings>("sdl_main_output_device",
+                                         &AudioSettings::sdl_main_output_device),
+            make_override<AudioSettings>("sdl_padSpk_output_device",
+                                         &AudioSettings::sdl_padSpk_output_device),
+            make_override<AudioSettings>("openal_mic_device", &AudioSettings::openal_mic_device),
+            make_override<AudioSettings>("openal_main_output_device",
+                                         &AudioSettings::openal_main_output_device),
+            make_override<AudioSettings>("openal_padSpk_output_device",
+                                         &AudioSettings::openal_padSpk_output_device)};
     }
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, mic_device, main_output_device,
-                                   padSpk_output_device)
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
+                                   sdl_main_output_device, sdl_padSpk_output_device,
+                                   openal_mic_device, openal_main_output_device,
+                                   openal_padSpk_output_device)
 
 // -------------------------------
 // GPU settings
 // -------------------------------
-enum GpuReadbacksMode : int { Disabled, Relaxed, Precise };
-
 struct GPUSettings {
     Setting<u32> window_width{1280};
     Setting<u32> window_height{720};
@@ -281,7 +318,7 @@ struct GPUSettings {
     Setting<u32> internal_screen_height{720};
     Setting<bool> null_gpu{false};
     Setting<bool> copy_gpu_buffers{false};
-    Setting<int> readbacks_mode{GpuReadbacksMode::Disabled};
+    Setting<u32> readbacks_mode{GpuReadbacksMode::Disabled};
     Setting<bool> readback_linear_images_enabled{false};
     Setting<bool> direct_memory_access_enabled{false};
     Setting<bool> dump_shaders{false};
@@ -368,26 +405,22 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vk
                                    vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
                                    vkhost_markers, vkguest_markers, pipeline_cache_enabled,
                                    pipeline_cache_archived)
-// -------------------------------
-// User settings
-// -------------------------------
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(User, user_id, user_color, user_name, controller_port)
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Users, default_user_id, user)
 
 // -------------------------------
 // Main manager
 // -------------------------------
-class EmulatorSettings {
+class EmulatorSettingsImpl {
 public:
-    EmulatorSettings();
-    ~EmulatorSettings();
+    EmulatorSettingsImpl();
+    ~EmulatorSettingsImpl();
 
-    static std::shared_ptr<EmulatorSettings> GetInstance();
-    static void SetInstance(std::shared_ptr<EmulatorSettings> instance);
+    static std::shared_ptr<EmulatorSettingsImpl> GetInstance();
+    static void SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance);
 
-    bool Save(const std::string& serial = "") const;
+    bool Save(const std::string& serial = "");
     bool Load(const std::string& serial = "");
     void SetDefaultValues();
+    bool TransferSettings();
 
     // Config mode
     ConfigMode GetConfigMode() const {
@@ -423,11 +456,6 @@ public:
     std::filesystem::path GetFontsDir();
     void SetFontsDir(const std::filesystem::path& dir);
 
-    // user helpers
-    UserManager& GetUserManager() {
-        return m_userManager;
-    }
-
 private:
     GeneralSettings m_general{};
     DebugSettings m_debug{};
@@ -435,10 +463,9 @@ private:
     AudioSettings m_audio{};
     GPUSettings m_gpu{};
     VulkanSettings m_vulkan{};
-    UserManager m_userManager;
     ConfigMode m_configMode{ConfigMode::Default};
 
-    static std::shared_ptr<EmulatorSettings> s_instance;
+    static std::shared_ptr<EmulatorSettingsImpl> s_instance;
     static std::mutex s_mutex;
 
     /// Apply overrideable fields from groupJson into group.game_specific_value.
@@ -529,15 +556,20 @@ public:
     SETTING_FORWARD(m_general, ConsoleLanguage, console_language)
 
     // Audio settings
-    SETTING_FORWARD(m_audio, MicDevice, mic_device)
-    SETTING_FORWARD(m_audio, MainOutputDevice, main_output_device)
-    SETTING_FORWARD(m_audio, PadSpkOutputDevice, padSpk_output_device)
+    SETTING_FORWARD(m_audio, AudioBackend, audio_backend)
+    SETTING_FORWARD(m_audio, SDLMicDevice, sdl_mic_device)
+    SETTING_FORWARD(m_audio, SDLMainOutputDevice, sdl_main_output_device)
+    SETTING_FORWARD(m_audio, SDLPadSpkOutputDevice, sdl_padSpk_output_device)
+    SETTING_FORWARD(m_audio, OpenALMicDevice, openal_mic_device)
+    SETTING_FORWARD(m_audio, OpenALMainOutputDevice, openal_main_output_device)
+    SETTING_FORWARD(m_audio, OpenALPadSpkOutputDevice, openal_padSpk_output_device)
 
     // Debug settings
     SETTING_FORWARD_BOOL(m_debug, SeparateLoggingEnabled, separate_logging_enabled)
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)
     SETTING_FORWARD_BOOL(m_debug, ShaderCollect, shader_collect)
     SETTING_FORWARD_BOOL(m_debug, LogEnabled, log_enabled)
+    SETTING_FORWARD(m_debug, ConfigVersion, config_version)
 
     // GPU Settings
     SETTING_FORWARD_BOOL(m_gpu, NullGPU, null_gpu)
@@ -582,7 +614,8 @@ public:
     SETTING_FORWARD(m_input, DefaultControllerId, default_controller_id)
     SETTING_FORWARD_BOOL(m_input, UsingSpecialPad, use_special_pad)
     SETTING_FORWARD(m_input, SpecialPadClass, special_pad_class)
-    SETTING_FORWARD_BOOL(m_input, UseUnifiedInputConfig, use_unified_Input_Config)
+    SETTING_FORWARD_BOOL(m_input, UseUnifiedInputConfig, use_unified_input_config)
+    SETTING_FORWARD(m_input, CameraId, camera_id)
 
     // Vulkan settings
     SETTING_FORWARD(m_vulkan, GpuId, gpu_id)
