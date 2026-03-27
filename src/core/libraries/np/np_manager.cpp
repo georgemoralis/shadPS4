@@ -785,7 +785,8 @@ void DeregisterNpCallback(std::string key) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    g_signed_in = EmulatorSettings.IsPSNSignedIn();
+    g_signed_in = true;
+    //EmulatorSettings.IsPSNSignedIn();
 
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
     LIB_FUNCTION("eiqMCt9UshI", "libSceNpManager", 1, "libSceNpManager", sceNpCreateAsyncRequest);
