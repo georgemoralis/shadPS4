@@ -102,7 +102,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     // Libraries::Np::NpCommon::RegisterLib(sym);
     Libraries::Np::NpManager::RegisterLib(sym);
     // Libraries::Np::NpMatching2::RegisterLib(sym);
-    // Libraries::Np::NpScore::RegisterLib(sym);
+    Libraries::Np::NpScore::RegisterLib(sym);
     Libraries::Np::NpTrophy::RegisterLib(sym);
     // Libraries::Np::NpWebApi::RegisterLib(sym);
     // Libraries::Np::NpWebApi2::RegisterLib(sym);

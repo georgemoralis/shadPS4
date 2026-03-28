@@ -94,7 +94,7 @@ int main(int argc, char* argv[]) {
     // const char* const ebootPath = "D:/ps4/shadps4games/CUSA11616/eboot.bin"; // Reverie
     // const char* const ebootPath = "C:/ps4tests/CUSA00093/eboot.bin";//driveclub
     // const char* const ebootPath = "D:/ps4games/playable/CUSA05635/eboot.bin";//puyo tetris
-    const char* const ebootPath = "D:/ps4/shadps4games/CUSA02394/eboot.bin";//we are doomed
+    const char* const ebootPath = "C:/ps4/games/CUSA02394/eboot.bin";//we are doomed
 
     auto* emulator = Common::Singleton<Core::Emulator>::Instance();
     emulator->executableName = argv[0];
