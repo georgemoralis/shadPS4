@@ -225,7 +225,11 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByRangeAAsync(
     OrbisNpScoreRankDataA* rankArray, u64 rankArraySize, OrbisNpScoreComment* commentArray,
     u64 commentArraySize, OrbisNpScoreGameInfo* infoArray, u64 infoArraySize, u64 arrayNum,
     Rtc::OrbisRtcTick* lastSortDate, OrbisNpScoreRankNumber* totalRecord, void* option);
-int PS4_SYSV_ABI sceNpScoreGetRankingByRangeAsync();
+int PS4_SYSV_ABI sceNpScoreGetRankingByRangeAsync(
+    s32 reqId, OrbisNpScoreBoardId boardId, OrbisNpScoreRankNumber startSerialRank,
+    OrbisNpScoreRankData* rankArray, size_t rankArraySize, OrbisNpScoreComment* commentArray,
+    size_t commentArraySize, OrbisNpScoreGameInfo* infoArray, size_t infoArraySize, size_t arrayNum,
+    Rtc::OrbisRtcTick* lastSortDate, OrbisNpScoreRankNumber* totalRecord, void* option);
 int PS4_SYSV_ABI sceNpScoreGetRankingByRangeForCrossSave(
     s32 reqId, OrbisNpScoreBoardId boardId, OrbisNpScoreRankNumber startSerialRank,
     OrbisNpScoreRankDataForCrossSave* rankArray, u64 rankArraySize,

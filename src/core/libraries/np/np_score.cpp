@@ -233,7 +233,11 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByRangeAAsync(
     LOG_ERROR(Lib_NpScore, "(STUBBED) called");
     return ORBIS_OK;
 }
-int PS4_SYSV_ABI sceNpScoreGetRankingByRangeAsync() {
+int PS4_SYSV_ABI sceNpScoreGetRankingByRangeAsync(
+    s32 reqId, OrbisNpScoreBoardId boardId, OrbisNpScoreRankNumber startSerialRank,
+    OrbisNpScoreRankData* rankArray, size_t rankArraySize, OrbisNpScoreComment* commentArray,
+    size_t commentArraySize, OrbisNpScoreGameInfo* infoArray, size_t infoArraySize, size_t arrayNum,
+    Rtc::OrbisRtcTick* lastSortDate, OrbisNpScoreRankNumber* totalRecord, void* option) {
     LOG_ERROR(Lib_NpScore, "(STUBBED) called");
     return ORBIS_OK;
 }
