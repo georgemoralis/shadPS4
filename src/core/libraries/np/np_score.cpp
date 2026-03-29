@@ -5,8 +5,59 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_score.h"
+#include "core/libraries/np/object_manager.h"
+#include "np_error.h"
 
 namespace Libraries::Np::NpScore {
+
+// internal functions
+int PackReqId(int libCtxId, int reqId) {
+    return ((libCtxId & 0xFFFF) << 16) | (reqId & 0xFFFF);
+}
+
+std::pair<int, int> UnpackReqId(int reqId) {
+    return {reqId >> 16, reqId & 0xFFFF};
+}
+
+bool IsReqId(int id) {
+    return id > (1 << 16);
+}
+
+struct NpScoreRequest {
+    u32 pcId;
+};
+
+using NpScoreRequestManager =
+    ObjectManager<NpScoreRequest, 32, ORBIS_NP_COMMUNITY_ERROR_INVALID_ID,
+                  ORBIS_NP_COMMUNITY_ERROR_INVALID_ID, ORBIS_NP_COMMUNITY_ERROR_TOO_MANY_OBJECTS>;
+
+struct NpScoreTitleContext {
+    u32 serviceLabel;
+    OrbisNpId npId;
+    u32 pcId;
+    NpScoreRequestManager requestManager;
+
+    s32 GetRequest(int reqId, NpScoreRequest** out) {
+        NpScoreRequest* req = nullptr;
+        if (auto ret = requestManager.GetObject(reqId, &req); ret < 0) {
+            return ret;
+        }
+
+        *out = req;
+
+        return ORBIS_OK;
+    }
+
+    s32 DeleteRequest(int reqId) {
+        return requestManager.DeleteObject(reqId);
+    }
+};
+
+using NpScoreContextManager =
+    ObjectManager<NpScoreTitleContext, 32, ORBIS_NP_COMMUNITY_ERROR_INVALID_ID,
+                  ORBIS_NP_COMMUNITY_ERROR_INVALID_ID, ORBIS_NP_COMMUNITY_ERROR_TOO_MANY_OBJECTS>;
+
+static NpScoreContextManager ctxManager;
 
 // Helper macro to format pointer safely
 #define PTR(ptr) static_cast<const void*>(ptr)
@@ -33,20 +84,52 @@ int PS4_SYSV_ABI sceNpScoreChangeModeForOtherSaveDataOwners() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNpScoreCreateNpTitleCtx() {
-    LOG_INFO(Lib_NpScore, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNpScoreCreateNpTitleCtx(OrbisNpServiceLabel serviceLabel, OrbisNpId* npId) {
+    if (!npId) {
+        LOG_ERROR(Lib_NpScore, "npId is null");
+        return ORBIS_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT;
+    }
+    if (serviceLabel == ORBIS_NP_INVALID_SERVICE_LABEL) {
+        LOG_ERROR(Lib_NpScore, "Invalid service label: {}", serviceLabel);
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
+    }
+    LOG_INFO(Lib_NpScore, "serviceLabel = {}, npId->data = {}", serviceLabel, npId->handle.data);
+    return ctxManager.CreateObject(serviceLabel, *npId);
+}
+
+int PS4_SYSV_ABI sceNpScoreCreateRequest(s32 titleCtxId) {
+    LOG_INFO(Lib_NpScore, "libCtxId = {}", titleCtxId);
+
+    NpScoreTitleContext* ctx = nullptr;
+    if (auto ret = ctxManager.GetObject(titleCtxId, &ctx); ret < 0) {
+        return ret;
+    }
+
+    auto req = ctx->requestManager.CreateObject(ctx->pcId);
+    if (req < 0) {
+        return req;
+    }
+
+    return PackReqId(titleCtxId, req);
+}
+
+int PS4_SYSV_ABI sceNpScoreDeleteRequest(s32 reqId) {
+    LOG_INFO(Lib_NpScore, "requestId = {:#x}", reqId);
+
+    auto [ctxId, requestId] = UnpackReqId(reqId);
+
+    NpScoreTitleContext* ctx = nullptr;
+    if (auto ret = ctxManager.GetObject(ctxId, &ctx); ret < 0) {
+        return ret;
+    }
+
+    return ctx->DeleteRequest(requestId);
 }
 
 int PS4_SYSV_ABI sceNpScoreCreateNpTitleCtxA(OrbisNpServiceLabel npServiceLabel,
                                              UserService::OrbisUserServiceUserId selfId) {
     LOG_INFO(Lib_NpScore, "(STUBBED) called npServiceLabel={}, selfId={}",
              static_cast<u32>(npServiceLabel), selfId);
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNpScoreCreateRequest(s32 titleCtxId) {
-    LOG_INFO(Lib_NpScore, "(STUBBED) called titleCtxId={}", titleCtxId);
     return ORBIS_OK;
 }
 
@@ -57,11 +140,6 @@ int PS4_SYSV_ABI sceNpScoreCreateTitleCtx() {
 
 int PS4_SYSV_ABI sceNpScoreDeleteNpTitleCtx(s32 titleCtxId) {
     LOG_INFO(Lib_NpScore, "(STUBBED) called titleCtxId={}", titleCtxId);
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNpScoreDeleteRequest(s32 reqId) {
-    LOG_INFO(Lib_NpScore, "(STUBBED) called reqId={}", reqId);
     return ORBIS_OK;
 }
 
