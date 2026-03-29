@@ -171,7 +171,101 @@ int PS4_SYSV_ABI sceNpScoreGetFriendsRanking(s32 reqId, OrbisNpScoreBoardId boar
              reqId, boardId, includeSelf, PTR(rankArray), rankArraySize, PTR(commentArray),
              commentArraySize, PTR(infoArray), infoArraySize, arrayNum, PTR(lastSortDate),
              PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    // Validate the request ID
+    auto [ctxId, requestId] = UnpackReqId(reqId);
+    NpScoreTitleContext* ctx = nullptr;
+    if (auto ret = ctxManager.GetObject(ctxId, &ctx); ret < 0) {
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
+    }
+
+    NpScoreRequest* req = nullptr;
+    if (auto ret = ctx->GetRequest(requestId, &req); ret < 0) {
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
+    }
+
+    // Validate arrayNum (max 100 per documentation)
+    if (arrayNum > 100) {
+        LOG_ERROR(Lib_NpScore, "arrayNum={} exceeds maximum of 100", arrayNum);
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
+    }
+
+    // Validate required parameters
+    if (rankArray == nullptr || arrayNum == 0) {
+        LOG_ERROR(Lib_NpScore, "rankArray is null or arrayNum is 0");
+        return ORBIS_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT;
+    }
+
+    // Validate rankArraySize matches expected size
+    u64 expectedRankArraySize = arrayNum * sizeof(OrbisNpScoreRankData);
+    if (rankArraySize < expectedRankArraySize) {
+        LOG_ERROR(Lib_NpScore, "rankArraySize {} is too small, expected {}", rankArraySize,
+                  expectedRankArraySize);
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ALIGNMENT;
+    }
+
+    // Validate commentArraySize if commentArray is provided
+    if (commentArray != nullptr) {
+        u64 expectedCommentArraySize = arrayNum * sizeof(OrbisNpScoreComment);
+        if (commentArraySize < expectedCommentArraySize) {
+            LOG_ERROR(Lib_NpScore, "commentArraySize {} is too small, expected {}",
+                      commentArraySize, expectedCommentArraySize);
+            return ORBIS_NP_COMMUNITY_ERROR_INVALID_ALIGNMENT;
+        }
+    }
+
+    // Validate infoArraySize if infoArray is provided
+    if (infoArray != nullptr) {
+        u64 expectedInfoArraySize = arrayNum * sizeof(OrbisNpScoreGameInfo);
+        if (infoArraySize < expectedInfoArraySize) {
+            LOG_ERROR(Lib_NpScore, "infoArraySize {} is too small, expected {}", infoArraySize,
+                      expectedInfoArraySize);
+            return ORBIS_NP_COMMUNITY_ERROR_INVALID_ALIGNMENT;
+        }
+    }
+
+        // For stub implementation, simulate the user having a score
+    u64 entriesReturned = 0;
+
+    if (includeSelf && arrayNum > 0 && rankArray != nullptr) {
+        // Fill the first entry with the user's own ranking
+        OrbisNpScoreRankData* userRank = &rankArray[0];
+
+        // Initialize to zeros
+        memset(userRank, 0, sizeof(OrbisNpScoreRankData));
+
+        // Set realistic ranking data
+        userRank->serialRank = 1;    // Position in the ranking list
+        userRank->rank = 42;         // Actual rank (42nd place)
+        userRank->highestRank = 10;  // Highest rank achieved
+        userRank->scoreValue = 5000; // Score value
+        userRank->hasGameData = 0;   // No game data attached
+
+        // Copy NP ID from context if available
+        if (ctx != nullptr) {
+            userRank->npId = ctx->npId;
+        }
+
+        // Use fake current date (e.g., Jan 1 2024 00:00:00 UTC)
+        // OrbisRtcTick is in microseconds since 0001-01-01 00:00:00 UTC
+        // Fake date: 2024-01-01 00:00:00 UTC
+        // This is approximately 63844617600000000 microseconds
+        userRank->recordDate.tick = 63844617600000000ULL;
+
+        entriesReturned = 1;
+
+        // Set lastSortDate if provided
+        if (lastSortDate != nullptr) {
+            lastSortDate->tick = 63844617600000000ULL; // Same fake date
+        }
+
+        // Set totalRecord if provided (total players on leaderboard)
+        if (totalRecord != nullptr) {
+            *totalRecord = 100; // Simulate 100 total players
+        }
+    }
+
+    LOG_INFO(Lib_NpScore, "Returning {} entries", entriesReturned);
+    return entriesReturned;
 }
 
 int PS4_SYSV_ABI sceNpScoreGetFriendsRankingA(s32 reqId, OrbisNpScoreBoardId boardId,

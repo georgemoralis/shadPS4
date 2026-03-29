@@ -99,7 +99,7 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     Libraries::Posix::RegisterLib(sym);
     // Libraries::AudioIn::RegisterLib(sym);
     // Libraries::Np::NpCommerce::RegisterLib(sym);
-    // Libraries::Np::NpCommon::RegisterLib(sym);
+    Libraries::Np::NpCommon::RegisterLib(sym);
     Libraries::Np::NpManager::RegisterLib(sym);
     // Libraries::Np::NpMatching2::RegisterLib(sym);
     Libraries::Np::NpScore::RegisterLib(sym);

@@ -264,7 +264,7 @@ int PS4_SYSV_ABI scePadOpen(Libraries::UserService::OrbisUserServiceUserId userI
         if (type != ORBIS_PAD_PORT_TYPE_STANDARD && type != ORBIS_PAD_PORT_TYPE_REMOTE_CONTROL)
             return ORBIS_PAD_ERROR_DEVICE_NOT_CONNECTED;
     }
-    LOG_INFO(Lib_Pad, "(DUMMY) called user_id = {} type = {} index = {}", userId, type, index);
+    //LOG_INFO(Lib_Pad, "(DUMMY) called user_id = {} type = {} index = {}", userId, type, index);
     g_opened = true;
     scePadResetLightBar(userId);
     scePadResetOrientation(userId);
@@ -450,7 +450,7 @@ int PS4_SYSV_ABI scePadReadStateExt() {
 }
 
 int PS4_SYSV_ABI scePadResetLightBar(s32 handle) {
-    LOG_INFO(Lib_Pad, "(DUMMY) called");
+    //LOG_INFO(Lib_Pad, "(DUMMY) called");
     if (handle != 1) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
     }
@@ -471,7 +471,7 @@ int PS4_SYSV_ABI scePadResetLightBarAllByPortType() {
 }
 
 int PS4_SYSV_ABI scePadResetOrientation(s32 handle) {
-    LOG_INFO(Lib_Pad, "scePadResetOrientation called handle = {}", handle);
+    //LOG_INFO(Lib_Pad, "scePadResetOrientation called handle = {}", handle);
 
     if (handle != 1) {
         return ORBIS_PAD_ERROR_INVALID_HANDLE;
