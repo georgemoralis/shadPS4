@@ -66,9 +66,9 @@ struct OrbisNpScoreRankData {
     OrbisNpScoreRankNumber serialRank;
     OrbisNpScoreRankNumber rank;
     OrbisNpScoreRankNumber highestRank;
-    OrbisNpScoreValue scoreValue;
     s32 hasGameData;
     u8 pad1[4];
+    OrbisNpScoreValue scoreValue;
     Rtc::OrbisRtcTick recordDate;
 };
 
