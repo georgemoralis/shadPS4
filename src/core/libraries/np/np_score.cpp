@@ -157,6 +157,22 @@ int PS4_SYSV_ABI sceNpScoreGetBoardInfoAsync(s32 reqId, OrbisNpScoreBoardId boar
     return ORBIS_OK;
 }
 
+// Add this helper function at the top of the file after the includes
+static void FillFakeRankData(OrbisNpScoreRankData* rankData, const OrbisNpId& npId,
+                             OrbisNpScoreRankNumber rank, OrbisNpScoreValue score,
+                             OrbisNpScoreRankNumber serialRank) {
+    memset(rankData, 0, sizeof(OrbisNpScoreRankData));
+    rankData->serialRank = serialRank;
+    rankData->rank = rank;
+    rankData->highestRank = rank;
+    rankData->scoreValue = score;
+    rankData->hasGameData = 0;
+    rankData->npId = npId;
+    rankData->pcId = 0;
+    // Fake date: 2024-01-01 00:00:00 UTC
+    rankData->recordDate.tick = 63844617600000000ULL;
+}
+
 int PS4_SYSV_ABI sceNpScoreGetFriendsRanking(s32 reqId, OrbisNpScoreBoardId boardId,
                                              s32 includeSelf, OrbisNpScoreRankData* rankArray,
                                              u64 rankArraySize, OrbisNpScoreComment* commentArray,
@@ -223,49 +239,157 @@ int PS4_SYSV_ABI sceNpScoreGetFriendsRanking(s32 reqId, OrbisNpScoreBoardId boar
         }
     }
 
-        // For stub implementation, simulate the user having a score
-    u64 entriesReturned = 0;
+    // Determine how many entries to return (up to arrayNum)
+    u64 entriesToReturn = std::min(arrayNum, static_cast<u64>(10));
 
-    if (includeSelf && arrayNum > 0 && rankArray != nullptr) {
-        // Fill the first entry with the user's own ranking
-        OrbisNpScoreRankData* userRank = &rankArray[0];
+    // Create fake friend rankings
+    for (u64 i = 0; i < entriesToReturn; i++) {
+        // Create a fake NP ID for each friend
+        OrbisNpId fakeNpId;
+        memset(&fakeNpId, 0, sizeof(fakeNpId));
 
-        // Initialize to zeros
-        memset(userRank, 0, sizeof(OrbisNpScoreRankData));
-
-        // Set realistic ranking data
-        userRank->serialRank = 1;    // Position in the ranking list
-        userRank->rank = 42;         // Actual rank (42nd place)
-        userRank->highestRank = 10;  // Highest rank achieved
-        userRank->scoreValue = 5000; // Score value
-        userRank->hasGameData = 0;   // No game data attached
-
-        // Copy NP ID from context if available
-        if (ctx != nullptr) {
-            userRank->npId = ctx->npId;
+        if (i == 0 && includeSelf && ctx != nullptr) {
+            // First entry is the user themselves
+            fakeNpId = ctx->npId;
+        } else {
+            // Generate fake NP IDs for friends
+            snprintf(fakeNpId.handle.data, sizeof(fakeNpId.handle.data), "Friend%02d", (int)i);
+            fakeNpId.handle.term = 0;
         }
 
-        // Use fake current date (e.g., Jan 1 2024 00:00:00 UTC)
-        // OrbisRtcTick is in microseconds since 0001-01-01 00:00:00 UTC
-        // Fake date: 2024-01-01 00:00:00 UTC
-        // This is approximately 63844617600000000 microseconds
-        userRank->recordDate.tick = 63844617600000000ULL;
+        // Set different scores based on boardId and rank
+        OrbisNpScoreValue score = 0;
+        OrbisNpScoreRankNumber rank = 0;
 
-        entriesReturned = 1;
-
-        // Set lastSortDate if provided
-        if (lastSortDate != nullptr) {
-            lastSortDate->tick = 63844617600000000ULL; // Same fake date
+        switch (boardId) {
+        case 0: // First leaderboard
+            score = 1500 - (i * 50);
+            rank = static_cast<OrbisNpScoreRankNumber>(i + 1);
+            break;
+        case 1: // Second leaderboard
+            score = 875 - (i * 30);
+            rank = static_cast<OrbisNpScoreRankNumber>(i + 1);
+            break;
+        default:
+            score = 500 - (i * 10);
+            rank = static_cast<OrbisNpScoreRankNumber>(i + 1);
+            break;
         }
 
-        // Set totalRecord if provided (total players on leaderboard)
-        if (totalRecord != nullptr) {
-            *totalRecord = 100; // Simulate 100 total players
+        FillFakeRankData(&rankArray[i], fakeNpId, rank, score, rank);
+        LOG_INFO(Lib_NpScore, "Entry {}: rank={}, score={}, npId={}", i, rank, score,
+                 fakeNpId.handle.data);
+    }
+
+    // Set lastSortDate if provided
+    if (lastSortDate != nullptr) {
+        lastSortDate->tick = 63844617600000000ULL;
+    }
+
+    // Set totalRecord if provided
+    if (totalRecord != nullptr) {
+        *totalRecord = 250; // Simulate 250 total players
+    }
+
+    LOG_INFO(Lib_NpScore, "Returning {} entries", entriesToReturn);
+    return entriesToReturn;
+}
+
+int PS4_SYSV_ABI sceNpScoreGetRankingByRange(
+    s32 reqId, OrbisNpScoreBoardId boardId, OrbisNpScoreRankNumber startSerialRank,
+    OrbisNpScoreRankData* rankArray, u64 rankArraySize, OrbisNpScoreComment* commentArray,
+    u64 commentArraySize, OrbisNpScoreGameInfo* infoArray, u64 infoArraySize, u64 arrayNum,
+    Rtc::OrbisRtcTick* lastSortDate, OrbisNpScoreRankNumber* totalRecord, void* option) {
+    LOG_INFO(Lib_NpScore, "called reqId={}, boardId={}, startSerialRank={}, arrayNum={}", reqId,
+             boardId, startSerialRank, arrayNum);
+
+    // Validate the request ID
+    auto [ctxId, requestId] = UnpackReqId(reqId);
+    NpScoreTitleContext* ctx = nullptr;
+    if (auto ret = ctxManager.GetObject(ctxId, &ctx); ret < 0) {
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
+    }
+
+    if (rankArray == nullptr || arrayNum == 0) {
+        return ORBIS_NP_COMMUNITY_ERROR_INSUFFICIENT_ARGUMENT;
+    }
+
+    if (arrayNum > 100) {
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
+    }
+
+     // Determine how many entries to return (up to arrayNum)
+    u64 entriesToReturn = std::min(arrayNum, static_cast<u64>(50)); // Return up to 50 entries
+
+    // Fill ranking entries starting from startSerialRank
+    for (u64 i = 0; i < entriesToReturn; i++) {
+        // Create fake NP ID for each ranked player
+        OrbisNpId fakeNpId;
+        memset(&fakeNpId, 0, sizeof(fakeNpId));
+
+        if (i == 0 && ctx != nullptr && startSerialRank == 1) {
+            // If starting from rank 1 and first entry, optionally use context NP ID
+            fakeNpId = ctx->npId;
+        } else {
+            // Generate fake NP IDs for other players
+            snprintf(fakeNpId.handle.data, sizeof(fakeNpId.handle.data), "Player%03d",
+                     (int)(startSerialRank + i));
+            fakeNpId.handle.term = 0;
+        }
+
+        // Calculate current rank
+        OrbisNpScoreRankNumber currentRank =
+            static_cast<OrbisNpScoreRankNumber>(startSerialRank + i);
+
+        // Set scores based on boardId and rank (higher rank = higher score)
+        OrbisNpScoreValue score = 0;
+        switch (boardId) {
+        case 0: // First leaderboard
+            score = 2000 - ((currentRank - 1) * 100);
+            break;
+        case 1: // Second leaderboard
+            score = 1000 - ((currentRank - 1) * 50);
+            break;
+        default:
+            score = 500 - ((currentRank - 1) * 25);
+            break;
+        }
+
+        // Ensure score doesn't go negative
+        if (score < 0)
+            score = 0;
+
+        FillFakeRankData(&rankArray[i], fakeNpId, currentRank, score, currentRank);
+        LOG_INFO(Lib_NpScore, "Rank {}: score={}, player={}", currentRank, score,
+                 fakeNpId.handle.data);
+
+        // Fill comment if provided
+        if (commentArray != nullptr && i < entriesToReturn) {
+            memset(&commentArray[i], 0, sizeof(OrbisNpScoreComment));
+            snprintf(commentArray[i].utf8Comment, sizeof(commentArray[i].utf8Comment),
+                     "Great score!");
+        }
+
+        // Fill game info if provided
+        if (infoArray != nullptr && i < entriesToReturn) {
+            memset(&infoArray[i], 0, sizeof(OrbisNpScoreGameInfo));
+            infoArray[i].infoSize = 0; // No game info
         }
     }
 
-    LOG_INFO(Lib_NpScore, "Returning {} entries", entriesReturned);
-    return entriesReturned;
+    // Set lastSortDate if provided
+    if (lastSortDate != nullptr) {
+        lastSortDate->tick = 63844617600000000ULL;
+    }
+
+    // Set totalRecord if provided
+    if (totalRecord != nullptr) {
+        *totalRecord = 250; // Simulate 250 total players
+    }
+
+    LOG_INFO(Lib_NpScore, "Returning {} ranking entries from rank {}", entriesToReturn,
+             startSerialRank);
+    return entriesToReturn;
 }
 
 int PS4_SYSV_ABI sceNpScoreGetFriendsRankingA(s32 reqId, OrbisNpScoreBoardId boardId,
@@ -522,11 +646,6 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByNpIdPcId() {
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByNpIdPcIdAsync() {
-    LOG_INFO(Lib_NpScore, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceNpScoreGetRankingByRange() {
     LOG_INFO(Lib_NpScore, "(STUBBED) called");
     return ORBIS_OK;
 }
