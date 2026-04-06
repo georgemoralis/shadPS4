@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #pragma once
@@ -14,8 +14,23 @@ struct SDL_Gamepad;
 union SDL_Event;
 
 namespace Input {
-class GameController;
-}
+
+class SDLInputEngine : public Engine {
+public:
+    ~SDLInputEngine() override;
+    void Init() override;
+    void SetLightBarRGB(u8 r, u8 g, u8 b) override;
+    void SetVibration(u8 smallMotor, u8 largeMotor) override;
+    float GetGyroPollRate() const override;
+    float GetAccelPollRate() const override;
+    State ReadState() override;
+
+private:
+    float m_gyro_poll_rate = 0.0f;
+    float m_accel_poll_rate = 0.0f;
+};
+
+} // namespace Input
 
 namespace Frontend {
 
@@ -47,7 +62,7 @@ class WindowSDL {
     int keyboard_grab = 0;
 
 public:
-    explicit WindowSDL(s32 width, s32 height, Input::GameControllers* controllers,
+    explicit WindowSDL(s32 width, s32 height, Input::GameController* controller,
                        std::string_view window_title);
     ~WindowSDL();
 
@@ -85,7 +100,7 @@ private:
 private:
     s32 width;
     s32 height;
-    Input::GameControllers controllers{};
+    Input::GameController* controller;
     WindowSystemInfo window_info{};
     SDL_Window* window{};
     bool is_shown{};

@@ -93,6 +93,11 @@ struct OrbisNpCreateAsyncRequestParameter {
 void RegisterNpCallback(std::string key, std::function<void()> cb);
 void DeregisterNpCallback(std::string key);
 
+s32 PS4_SYSV_ABI sceNpNotifyPlusFeature(const OrbisNpCheckPlusParameter* param);
+
+s32 PS4_SYSV_ABI sceNpManagerIntGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
+                                        void* np_id_result);
+
 s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpId* np_id);
 s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id,

@@ -146,6 +146,10 @@ static ConfigEntry<string> userName("shadPS4");
 static ConfigEntry<bool> isShowSplash(false);
 static ConfigEntry<string> isSideTrophy("right");
 static ConfigEntry<bool> isConnectedToNetwork(false);
+static ConfigEntry<string> httpHostOverride("localhost");
+static ConfigEntry<string> np2ServerHost("http://localhost:18669");
+static ConfigEntry<string> signalingAddr("127.0.0.1");
+static ConfigEntry<u32> signalingPort(9307);
 static bool enableDiscordRPC = false;
 static std::filesystem::path sys_modules_path = {};
 static std::filesystem::path fonts_path = {};
@@ -338,6 +342,38 @@ std::string getPresentMode() {
 
 bool getisTrophyPopupDisabled() {
     return isTrophyPopupDisabled.get();
+}
+
+string GetHttpHostOverride() {
+    return httpHostOverride.get();
+}
+
+string GetNp2ServerHost() {
+    return np2ServerHost.get();
+}
+
+string GetSignalingAddr() {
+    return signalingAddr.get();
+}
+
+u16 GetSignalingPort() {
+    const auto port = signalingPort.get();
+    if (port == 0 || port > 65535) {
+        return 9307;
+    }
+    return static_cast<u16>(port);
+}
+
+void setSignalingAddr(string addr, bool is_game_specific) {
+    signalingAddr.set(addr, is_game_specific);
+}
+
+void setNp2ServerHost(string host, bool is_game_specific) {
+    np2ServerHost.set(host, is_game_specific);
+}
+
+void setSignalingPort(u16 port, bool is_game_specific) {
+    signalingPort.set(port, is_game_specific);
 }
 
 bool getEnableDiscordRPC() {
@@ -908,6 +944,10 @@ void load(const std::filesystem::path& path, bool is_game_specific) {
         isSideTrophy.setFromToml(general, "sideTrophy", is_game_specific);
 
         isConnectedToNetwork.setFromToml(general, "isConnectedToNetwork", is_game_specific);
+        httpHostOverride.setFromToml(general, "httpHostOverride", is_game_specific);
+        np2ServerHost.setFromToml(general, "np2serverhost", is_game_specific);
+        signalingAddr.setFromToml(general, "signalingAddr", is_game_specific);
+        signalingPort.setFromToml(general, "signalingPort", is_game_specific);
         defaultControllerID.setFromToml(general, "defaultControllerID", is_game_specific);
         sys_modules_path = toml::find_fs_path_or(general, "sysModulesPath", sys_modules_path);
         fonts_path = toml::find_fs_path_or(general, "fontsPath", fonts_path);
@@ -1102,6 +1142,10 @@ void save(const std::filesystem::path& path, bool is_game_specific) {
     }
     isPSNSignedIn.setTomlValue(data, "General", "isPSNSignedIn", is_game_specific);
     isConnectedToNetwork.setTomlValue(data, "General", "isConnectedToNetwork", is_game_specific);
+    httpHostOverride.setTomlValue(data, "General", "httpHostOverride", is_game_specific);
+    np2ServerHost.setTomlValue(data, "General", "np2serverhost", is_game_specific);
+    signalingAddr.setTomlValue(data, "General", "signalingAddr", is_game_specific);
+    signalingPort.setTomlValue(data, "General", "signalingPort", is_game_specific);
 
     cursorState.setTomlValue(data, "Input", "cursorState", is_game_specific);
     cursorHideTimeout.setTomlValue(data, "Input", "cursorHideTimeout", is_game_specific);
@@ -1226,6 +1270,10 @@ void setDefaultValues(bool is_game_specific) {
         isConnectedToNetwork.set(false, is_game_specific);
         directMemoryAccessEnabled.set(false, is_game_specific);
         extraDmemInMbytes.set(0, is_game_specific);
+        httpHostOverride.set("localhost", is_game_specific);
+        np2ServerHost.set("http://localhost:18669", is_game_specific);
+        signalingAddr.set("127.0.0.1", is_game_specific);
+        signalingPort.set(9307, is_game_specific);
     }
 
     // Entries with game-specific settings that are in both the game-specific and global GUI

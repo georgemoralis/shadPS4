@@ -689,13 +689,19 @@ int PosixSocket::GetPeerName(OrbisNetSockaddr* name, u32* namelen) {
     return ConvertReturnErrorCode(res);
 }
 
+int PosixSocket::Shutdown(int how) {
+    std::scoped_lock lock{m_mutex};
+    // Orbis how values match POSIX: 0=SHUT_RD, 1=SHUT_WR, 2=SHUT_RDWR
+    return ConvertReturnErrorCode(::shutdown(sock, how));
+}
+
 int PosixSocket::fstat(Libraries::Kernel::OrbisKernelStat* sb) {
 #ifdef _WIN32
     LOG_ERROR(Lib_Net, "(STUBBED) called");
     sb->st_mode = 0000777u | 0140000u;
     return 0;
 #else
-    struct stat st{};
+    struct stat st {};
     int result = ::fstat(sock, &st);
     sb->st_mode = 0000777u | 0140000u;
     sb->st_size = st.st_size;

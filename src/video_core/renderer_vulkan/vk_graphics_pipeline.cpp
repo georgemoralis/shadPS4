@@ -457,15 +457,13 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
             });
         }
         for (const auto& image : stage->images) {
-            const u32 num_bindings = image.NumBindings(*stage);
             bindings.push_back({
-                .binding = binding,
+                .binding = binding++,
                 .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
                                                    : vk::DescriptorType::eSampledImage,
-                .descriptorCount = num_bindings,
+                .descriptorCount = 1,
                 .stageFlags = stage_bit,
             });
-            binding += num_bindings;
         }
         for (const auto& sampler : stage->samplers) {
             bindings.push_back({

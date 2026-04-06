@@ -68,7 +68,6 @@ bool ParseFilterRule(Filter& instance, Iterator begin, Iterator end) {
     CLS(Common)                                                                                    \
     SUB(Common, Filesystem)                                                                        \
     SUB(Common, Memory)                                                                            \
-    CLS(KeyManager)                                                                                \
     CLS(Core)                                                                                      \
     SUB(Core, Linker)                                                                              \
     SUB(Core, Devices)                                                                             \
@@ -81,6 +80,7 @@ bool ParseFilterRule(Filter& instance, Iterator begin, Iterator end) {
     SUB(Kernel, Event)                                                                             \
     SUB(Kernel, Sce)                                                                               \
     CLS(Lib)                                                                                       \
+    SUB(Lib, LibC)                                                                                 \
     SUB(Lib, LibcInternal)                                                                         \
     SUB(Lib, Kernel)                                                                               \
     SUB(Lib, Pad)                                                                                  \
@@ -107,16 +107,19 @@ bool ParseFilterRule(Filter& instance, Iterator begin, Iterator end) {
     SUB(Lib, NpCommon)                                                                             \
     SUB(Lib, NpCommerce)                                                                           \
     SUB(Lib, NpManager)                                                                            \
-    SUB(Lib, NpMatching2)                                                                          \
     SUB(Lib, NpScore)                                                                              \
     SUB(Lib, NpTrophy)                                                                             \
     SUB(Lib, NpTus)                                                                                \
     SUB(Lib, NpWebApi)                                                                             \
     SUB(Lib, NpWebApi2)                                                                            \
     SUB(Lib, NpProfileDialog)                                                                      \
+    SUB(Lib, NpSignaling)                                                                          \
+    SUB(Lib, NpMatching2)                                                                          \
     SUB(Lib, NpSnsFacebookDialog)                                                                  \
     SUB(Lib, NpPartner)                                                                            \
+    SUB(Lib, NpUtility)                                                                            \
     SUB(Lib, Screenshot)                                                                           \
+    SUB(Lib, LibCInternal)                                                                         \
     SUB(Lib, AppContent)                                                                           \
     SUB(Lib, Rtc)                                                                                  \
     SUB(Lib, Rudp)                                                                                 \
@@ -162,6 +165,7 @@ bool ParseFilterRule(Filter& instance, Iterator begin, Iterator end) {
     CLS(ImGui)                                                                                     \
     CLS(Input)                                                                                     \
     CLS(Tty)                                                                                       \
+    CLS(KeyManager)                                                                                \
     CLS(Loader)
 
 // GetClassName is a macro defined by Windows.h, grrr...

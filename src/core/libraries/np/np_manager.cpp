@@ -1,17 +1,18 @@
-// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <variant>
 
-#include <core/user_settings.h>
+#include "common/config.h"
 #include "common/logging/log.h"
-#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_manager.h"
+#include "core/libraries/system/userservice.h"
 #include "core/tls.h"
 
 namespace Libraries::Np::NpManager {
@@ -622,6 +623,23 @@ s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUser
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpManagerIntGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
+                                        void* np_id_result) {
+    LOG_DEBUG(Lib_NpManager, "user_id {}", user_id);
+    if (np_id_result == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    struct IntNpIdResult {
+        OrbisNpId np_id;
+        u32 metadata;
+    };
+
+    auto* result = static_cast<IntNpIdResult*>(np_id_result);
+    result->metadata = 0;
+    return sceNpGetNpId(user_id, &result->np_id);
+}
+
 s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpId* np_id) {
     LOG_DEBUG(Lib_NpManager, "user_id {}", user_id);
@@ -632,8 +650,7 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     memset(np_id, 0, sizeof(OrbisNpId));
-    strncpy(np_id->handle.data, UserManagement.GetDefaultUser().user_name.c_str(),
-            sizeof(np_id->handle.data));
+    strncpy(np_id->handle.data, Config::getUserName().c_str(), sizeof(np_id->handle.data));
     return ORBIS_OK;
 }
 
@@ -647,8 +664,7 @@ s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     memset(online_id, 0, sizeof(OrbisNpOnlineId));
-    strncpy(online_id->data, UserManagement.GetDefaultUser().user_name.c_str(),
-            sizeof(online_id->data));
+    strncpy(online_id->data, Config::getUserName().c_str(), sizeof(online_id->data));
     return ORBIS_OK;
 }
 
@@ -710,12 +726,28 @@ struct NpStateCallback {
 
 NpStateCallback NpStateCb;
 
+static bool g_np_callback_dispatched = false;
+
 s32 PS4_SYSV_ABI sceNpCheckCallback() {
-    LOG_DEBUG(Lib_NpManager, "(STUBBED) called");
+    // Dispatch the registered NP state callback once when signed in.
+    // This fires on the first CheckCallback call after sign-in to notify
+    // listeners of the state change.
+    if (!g_np_callback_dispatched && g_signed_in) {
+        if (auto* cb = std::get_if<OrbisNpStateCallback>(&NpStateCb.func); cb && *cb) {
+            g_np_callback_dispatched = true;
+            Libraries::UserService::OrbisUserServiceUserId userId = 1;
+            Libraries::UserService::sceUserServiceGetInitialUser(&userId);
+            LOG_INFO(Lib_NpManager,
+                     "sceNpCheckCallback: dispatching NP state callback "
+                     "(userId={}, state=SignedIn, userdata={:p})",
+                     userId, NpStateCb.userdata);
+            (*cb)(userId, OrbisNpState::SignedIn, nullptr, NpStateCb.userdata);
+            LOG_INFO(Lib_NpManager, "sceNpCheckCallback: NP state callback returned");
+        }
+    }
 
     std::scoped_lock lk{g_np_callbacks_mutex};
-
-    for (auto i : g_np_callbacks) {
+    for (auto& i : g_np_callbacks) {
         (i.second)();
     }
 
@@ -729,10 +761,11 @@ s32 PS4_SYSV_ABI sceNpCheckCallbackForLib() {
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void* userdata) {
     static s32 id = 0;
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called, userdata = {}", userdata);
+    LOG_INFO(Lib_NpManager, "called callback={:p} userdata={:p}",
+             reinterpret_cast<void*>(callback), userdata);
     NpStateCb.func = callback;
     NpStateCb.userdata = userdata;
-
+    g_np_callback_dispatched = false; // reset so callback fires on next sceNpCheckCallback
     return id;
 }
 
@@ -741,7 +774,6 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, voi
     LOG_ERROR(Lib_NpManager, "(STUBBED) called, userdata = {}", userdata);
     NpStateCb.func = callback;
     NpStateCb.userdata = userdata;
-
     return id;
 }
 
@@ -770,6 +802,11 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpT
     return id;
 }
 
+s32 PS4_SYSV_ABI sceNpNotifyPlusFeature(const OrbisNpCheckPlusParameter* param) {
+    LOG_DEBUG(Lib_NpManager, "called param={}", reinterpret_cast<const void*>(param));
+    return ORBIS_OK;
+}
+
 void RegisterNpCallback(std::string key, std::function<void()> cb) {
     std::scoped_lock lk{g_np_callbacks_mutex};
 
@@ -787,7 +824,7 @@ void DeregisterNpCallback(std::string key) {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
-    g_signed_in = EmulatorSettings.IsPSNSignedIn();
+    g_signed_in = Config::getPSNSignedIn();
 
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
     LIB_FUNCTION("eiqMCt9UshI", "libSceNpManager", 1, "libSceNpManager", sceNpCreateAsyncRequest);
@@ -821,6 +858,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
 
     LIB_FUNCTION("a8R9-75u4iM", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountId);
     LIB_FUNCTION("rbknaUjpqWo", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountIdA);
+    LIB_FUNCTION("azEmYv5NqWo", "libSceNpManager", 1, "libSceNpManager", sceNpManagerIntGetNpId);
     LIB_FUNCTION("p-o74CnoNzY", "libSceNpManager", 1, "libSceNpManager", sceNpGetNpId);
     LIB_FUNCTION("XDncXQIJUSk", "libSceNpManager", 1, "libSceNpManager", sceNpGetOnlineId);
     LIB_FUNCTION("eQH7nWPcAgc", "libSceNpManager", 1, "libSceNpManager", sceNpGetState);
@@ -832,6 +870,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpRegisterStateCallback);
     LIB_FUNCTION("hw5KNqAAels", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterNpReachabilityStateCallback);
+    LIB_FUNCTION("Gaxrp3EWY-M", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpNotifyPlusFeature);
     LIB_FUNCTION("JELHf4xPufo", "libSceNpManagerForToolkit", 1, "libSceNpManager",
                  sceNpCheckCallbackForLib);
     LIB_FUNCTION("0c7HbXRKUt4", "libSceNpManagerForToolkit", 1, "libSceNpManager",

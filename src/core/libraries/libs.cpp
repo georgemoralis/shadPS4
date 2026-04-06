@@ -1,12 +1,12 @@
-// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "common/config.h"
 #include "core/libraries/ajm/ajm.h"
 #include "core/libraries/app_content/app_content.h"
 #include "core/libraries/audio/audioin.h"
 #include "core/libraries/audio/audioout.h"
 #include "core/libraries/audio3d/audio3d.h"
-#include "core/libraries/audio3d/audio3d_openal.h"
 #include "core/libraries/avplayer/avplayer.h"
 #include "core/libraries/camera/camera.h"
 #include "core/libraries/companion/companion_httpd.h"
@@ -40,9 +40,11 @@
 #include "core/libraries/np/np_party.h"
 #include "core/libraries/np/np_profile_dialog.h"
 #include "core/libraries/np/np_score.h"
+#include "core/libraries/np/np_signaling.h"
 #include "core/libraries/np/np_sns_facebook_dialog.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/np/np_tus.h"
+#include "core/libraries/np/np_utility.h"
 #include "core/libraries/np/np_web_api.h"
 #include "core/libraries/np/np_web_api2.h"
 #include "core/libraries/pad/pad.h"
@@ -63,6 +65,7 @@
 #include "core/libraries/system/posix.h"
 #include "core/libraries/system/systemservice.h"
 #include "core/libraries/system/userservice.h"
+#include "core/libraries/system_gesture/system_gesture.h"
 #include "core/libraries/ulobjmgr/ulobjmgr.h"
 #include "core/libraries/usbd/usbd.h"
 #include "core/libraries/videodec/videodec.h"
@@ -109,7 +112,9 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     Libraries::Np::NpSnsFacebookDialog::RegisterLib(sym);
     Libraries::Np::NpAuth::RegisterLib(sym);
     Libraries::Np::NpParty::RegisterLib(sym);
+    Libraries::Np::NpSignaling::RegisterLib(sym);
     Libraries::Np::NpPartner::RegisterLib(sym);
+    Libraries::Np::NpUtility::RegisterLib(sym);
     Libraries::Np::NpTus::RegisterLib(sym);
     Libraries::ScreenShot::RegisterLib(sym);
     Libraries::AppContent::RegisterLib(sym);
@@ -119,17 +124,14 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
     Libraries::Random::RegisterLib(sym);
     Libraries::Usbd::RegisterLib(sym);
     Libraries::Pad::RegisterLib(sym);
+    Libraries::SystemGesture::RegisterLib(sym);
     Libraries::Ajm::RegisterLib(sym);
     Libraries::ErrorDialog::RegisterLib(sym);
     Libraries::ImeDialog::RegisterLib(sym);
     Libraries::AvPlayer::RegisterLib(sym);
     Libraries::Videodec::RegisterLib(sym);
     Libraries::Videodec2::RegisterLib(sym);
-    if (EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL) {
-        Libraries::Audio3dOpenAL::RegisterLib(sym);
-    } else {
-        Libraries::Audio3d::RegisterLib(sym);
-    }
+    Libraries::Audio3d::RegisterLib(sym);
     Libraries::Ime::RegisterLib(sym);
     Libraries::GameLiveStreaming::RegisterLib(sym);
     Libraries::SharePlay::RegisterLib(sym);

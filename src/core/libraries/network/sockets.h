@@ -10,8 +10,8 @@
 #include <iphlpapi.h>
 #include <mstcpip.h>
 #include <winsock2.h>
-typedef SOCKET net_socket;
-typedef int socklen_t;
+using net_socket = SOCKET;
+using socklen_t = int;
 #ifndef LPFN_WSASENDMSG
 typedef INT(PASCAL* LPFN_WSASENDMSG)(SOCKET s, LPWSAMSG lpMsg, DWORD dwFlags,
                                      LPDWORD lpNumberOfBytesSent, LPWSAOVERLAPPED lpOverlapped,
@@ -40,8 +40,9 @@ static const GUID WSAID_WSARECVMSG = {
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-typedef int net_socket;
+using net_socket = int;
 #endif
+#include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -55,7 +56,7 @@ namespace Libraries::Net {
 
 struct Socket;
 
-typedef std::shared_ptr<Socket> SocketPtr;
+using SocketPtr = std::shared_ptr<Socket>;
 
 struct OrbisNetLinger {
     s32 l_onoff;
@@ -82,6 +83,19 @@ struct Socket {
     virtual int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) = 0;
     virtual int fstat(Libraries::Kernel::OrbisKernelStat* stat) = 0;
     virtual std::optional<net_socket> Native() = 0;
+    virtual bool HasQueuedData() {
+        return false;
+    }
+    // Abort a pending operation on this socket (sceNetSocketAbort).
+    // P2P override clears the vport receive queue; others call OS shutdown.
+    virtual int Abort(int flags) {
+        return 0;
+    }
+    // Half-close the socket (sceNetShutdown).
+    // P2P sockets are connectionless so this is a no-op for them.
+    virtual int Shutdown(int how) {
+        return 0;
+    }
     std::mutex m_mutex;
     std::mutex receive_mutex;
     int socket_type;
@@ -120,16 +134,23 @@ struct PosixSocket : public Socket {
     int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
     int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
     int fstat(Libraries::Kernel::OrbisKernelStat* stat) override;
+    int Shutdown(int how) override;
     std::optional<net_socket> Native() override {
         return sock;
     }
 };
 
 struct P2PSocket : public Socket {
-    explicit P2PSocket(int domain, int type, int protocol) : Socket(domain, type, protocol) {}
-    bool IsValid() const override {
-        return true;
-    }
+    net_socket sock_;          // shared UDP transport fd (DGRAM) or owned TCP fd (STREAM)
+    u16 bound_vport_{0};       // bound virtual port (network byte order)
+    int sockopt_so_nbio_{0};   // non-blocking mode flag
+    bool is_stream_{false};    // true = STREAM_P2P: owns a real TCP fd
+    bool is_connected_{false}; // true = accepted/connected TCP stream socket
+
+    explicit P2PSocket(int domain, int type, int protocol);
+    // Internal: construct an already-accepted TCP stream socket
+    explicit P2PSocket(net_socket accepted_fd, u16 peer_vport);
+    bool IsValid() const override;
     int Close() override;
     int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;
     int GetSocketOptions(int level, int optname, void* optval, u32* optlen) override;
@@ -145,10 +166,37 @@ struct P2PSocket : public Socket {
     int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
     int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
     int fstat(Libraries::Kernel::OrbisKernelStat* stat) override;
+    bool HasQueuedData() override;
+    int Abort(int flags) override;
     std::optional<net_socket> Native() override {
+        if (IsValid())
+            return sock_;
         return {};
     }
 };
+
+// Drain the shared P2P transport socket into per-vport queues.
+// Call this before checking HasQueuedData() on P2P sockets.
+void DrainP2PTransport();
+// Returns the actual UDP port the shared P2P transport is bound to (host byte order).
+// Returns 0 if the transport has not been initialized yet.
+u16 GetP2PBoundPort();
+// Returns the port the shared P2P transport is configured to bind to (from config).
+// Safe to call before the transport is initialized.
+u16 GetP2PConfiguredPort();
+// Returns the signaling address configured for the P2P transport (from config).
+std::string GetP2PConfiguredAddr();
+// Returns true if the P2P shared transport socket is ready.
+bool P2PTransportIsReady();
+// Send raw signaling data through the P2P shared transport socket.
+// dest_addr and dest_port must be in network byte order.
+// Returns bytes sent, or -1 on failure.
+int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
+// Receive a signaling packet from the P2P shared transport.
+// Drains the socket first and returns the next queued signaling packet.
+// from_addr and from_port are filled in network byte order.
+// Returns bytes copied, or -1 if no signaling packet is available.
+int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
 
 struct UnixSocket : public Socket {
     net_socket sock;

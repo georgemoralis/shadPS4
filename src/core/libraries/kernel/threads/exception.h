@@ -12,11 +12,6 @@ class SymbolsResolver;
 namespace Libraries::Kernel {
 
 using OrbisKernelExceptionHandler = PS4_SYSV_ABI void (*)(int, void*);
-struct OrbisKernelExceptionHandlerStack {
-    void* ss_sp;
-    int ss_flags;
-    size_t ss_size;
-};
 
 constexpr s32 POSIX_SIGHUP = 1;
 constexpr s32 POSIX_SIGINT = 2;
@@ -52,7 +47,7 @@ constexpr s32 POSIX_SIGUSR2 = 31;
 constexpr s32 POSIX_SIGTHR = 32;
 constexpr s32 POSIX_SIGLIBRT = 33;
 
-#if defined(__linux__) || defined(__FreeBSD__)
+#ifdef __linux__
 constexpr s32 _SIGEMT = 128;
 constexpr s32 _SIGINFO = 129;
 #elif !defined(_WIN32)

@@ -48,15 +48,13 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
         });
     }
     for (const auto& image : info->images) {
-        const u32 num_bindings = image.NumBindings(*info);
         bindings.push_back({
-            .binding = binding,
+            .binding = binding++,
             .descriptorType = image.is_written ? vk::DescriptorType::eStorageImage
                                                : vk::DescriptorType::eSampledImage,
-            .descriptorCount = num_bindings,
+            .descriptorCount = 1,
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         });
-        binding += num_bindings;
     }
     for (const auto& sampler : info->samplers) {
         bindings.push_back({

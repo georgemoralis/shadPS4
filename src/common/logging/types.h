@@ -34,7 +34,6 @@ enum class Class : u8 {
     Common,                  ///< Library routines
     Common_Filesystem,       ///< Filesystem interface library
     Common_Memory,           ///< Memory mapping and management functions
-    KeyManager,              ///< Key management system
     Core,                    ///< LLE emulation core
     Core_Linker,             ///< The module linker
     Core_Devices,            ///< Devices emulation
@@ -45,9 +44,10 @@ enum class Class : u8 {
     Kernel_Fs,               ///< The filesystem implementation of the kernel.
     Kernel_Vmm,              ///< The virtual memory implementation of the kernel.
     Kernel_Event,            ///< The event management implementation of the kernel.
-    Kernel_Sce,              ///< The Sony-specific interfaces provided by the kernel.
+    Kernel_Sce,              ///< The sony specific interfaces provided by the kernel.
     Lib,                     ///< HLE implementation of system library. Each major library
                              ///< should have its own subclass.
+    Lib_LibC,                ///< The LibC implementation.
     Lib_LibcInternal,        ///< The LibcInternal implementation.
     Lib_Kernel,              ///< The LibKernel implementation.
     Lib_Pad,                 ///< The LibScePad implementation.
@@ -74,7 +74,6 @@ enum class Class : u8 {
     Lib_NpCommerce,          ///< The LibSceNpCommerce implementation
     Lib_NpAuth,              ///< The LibSceNpAuth implementation
     Lib_NpManager,           ///< The LibSceNpManager implementation
-    Lib_NpMatching2,         ///< The LibSceNpMatching2 implementation
     Lib_NpScore,             ///< The LibSceNpScore implementation
     Lib_NpTrophy,            ///< The LibSceNpTrophy implementation
     Lib_NpTus,               ///< The LibSceNpTus implementation
@@ -83,6 +82,7 @@ enum class Class : u8 {
     Lib_NpProfileDialog,     ///< The LibSceNpProfileDialog implementation
     Lib_NpSnsFacebookDialog, ///< The LibSceNpSnsFacebookDialog implementation
     Lib_Screenshot,          ///< The LibSceScreenshot implementation
+    Lib_LibCInternal,        ///< The LibCInternal implementation.
     Lib_AppContent,          ///< The LibSceAppContent implementation.
     Lib_Rtc,                 ///< The LibSceRtc implementation.
     Lib_Rudp,                ///< The LibSceRudp implementation.
@@ -111,7 +111,10 @@ enum class Class : u8 {
     Lib_Mouse,               ///< The LibSceMouse implementation
     Lib_WebBrowserDialog,    ///< The LibSceWebBrowserDialog implementation
     Lib_NpParty,             ///< The LibSceNpParty implementation
+    Lib_NpSignaling,         ///< The LibSceNpSignaling implementation
+    Lib_NpMatching2,         ///< The LibSceNpMatching2 implementation
     Lib_NpPartner,           ///< The LibSceNpPartner implementation
+    Lib_NpUtility,           ///< The LibSceNpUtility implementation
     Lib_Zlib,                ///< The LibSceZlib implementation.
     Lib_Hmd,                 ///< The LibSceHmd implementation.
     Lib_HmdSetupDialog,      ///< The LibSceHmdSetupDialog implementation.
@@ -130,6 +133,7 @@ enum class Class : u8 {
     Loader,                  ///< ROM loader
     Input,                   ///< Input emulation
     Tty,                     ///< Debug output from emu
+    KeyManager,              ///< Key management system
     Count                    ///< Total number of logging classes
 };
 

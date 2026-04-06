@@ -12,8 +12,8 @@
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/Build/${presetName}",
       "cacheVariables": {
-        "CMAKE_C_COMPILER": "clang-cl",
-        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_C_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
+        "CMAKE_CXX_COMPILER": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/Llvm/x64/bin/clang-cl.exe",
         "CMAKE_INSTALL_PREFIX": "${sourceDir}/Build/${presetName}"
       },
       "vendor": {
