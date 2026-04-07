@@ -12,9 +12,14 @@ namespace Libraries::Np::NpProfileDialog {
 
 static auto g_status = Libraries::CommonDialog::Status::NONE;
 
-s32 PS4_SYSV_ABI sceNpProfileDialogOpen() {
+Libraries::CommonDialog::Error PS4_SYSV_ABI sceNpProfileDialogOpen() {
+    if (g_status != Libraries::CommonDialog::Status::INITIALIZED &&
+        g_status != Libraries::CommonDialog::Status::FINISHED) {
+        LOG_INFO(Lib_MsgDlg, "called without initialize");
+        return Libraries::CommonDialog::Error::INVALID_STATE;
+    }
     LOG_ERROR(Lib_NpProfileDialog, "(STUBBED) called");
-    return ORBIS_OK;
+    return Libraries::CommonDialog::Error::OK;
 }
 
 s32 PS4_SYSV_ABI sceNpProfileDialogClose() {
@@ -33,12 +38,18 @@ Libraries::CommonDialog::Status PS4_SYSV_ABI sceNpProfileDialogGetStatus() {
 }
 
 Libraries::CommonDialog::Error PS4_SYSV_ABI sceNpProfileDialogInitialize() {
-    if (CommonDialog::g_isInitialized) {
-        LOG_INFO(Lib_NpProfileDialog, "already initialized");
-        return Libraries::CommonDialog::Error::ALREADY_SYSTEM_INITIALIZED;
+    if (!CommonDialog::g_isInitialized) {
+        return Libraries::CommonDialog::Error::NOT_SYSTEM_INITIALIZED;
     }
-    LOG_DEBUG(Lib_NpProfileDialog, "initialized");
-    CommonDialog::g_isInitialized = true;
+    if (g_status != Libraries::CommonDialog::Status::NONE) {
+        LOG_INFO(Lib_NpProfileDialog, "already initialized");
+        return Libraries::CommonDialog::Error::ALREADY_INITIALIZED;
+    }
+    if (CommonDialog::g_isUsed) {
+        return Libraries::CommonDialog::Error::BUSY;
+    }
+    g_status = Libraries::CommonDialog::Status::INITIALIZED;
+    CommonDialog::g_isUsed = true;
     return Libraries::CommonDialog::Error::OK;
 }
 

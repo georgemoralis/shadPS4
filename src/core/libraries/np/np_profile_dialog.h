@@ -12,7 +12,7 @@ class SymbolsResolver;
 
 namespace Libraries::Np::NpProfileDialog {
 
-s32 PS4_SYSV_ABI sceNpProfileDialogOpen();
+Libraries::CommonDialog::Error PS4_SYSV_ABI sceNpProfileDialogOpen();
 s32 PS4_SYSV_ABI sceNpProfileDialogClose();
 s32 PS4_SYSV_ABI sceNpProfileDialogGetResult();
 Libraries::CommonDialog::Status PS4_SYSV_ABI sceNpProfileDialogGetStatus();
