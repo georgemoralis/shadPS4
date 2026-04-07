@@ -352,25 +352,6 @@ using PthreadT = Pthread*;
 
 extern thread_local Pthread* g_curthread;
 
-int PS4_SYSV_ABI scePthreadMutexInit(PthreadMutexT* mutex, const PthreadMutexAttrT* mutex_attr,
-                                     const char* name);
-int PS4_SYSV_ABI posix_pthread_mutex_lock(PthreadMutexT* mutex);
-int PS4_SYSV_ABI posix_pthread_mutex_trylock(PthreadMutexT* mutex);
-int PS4_SYSV_ABI posix_pthread_mutex_unlock(PthreadMutexT* mutex);
-int PS4_SYSV_ABI posix_pthread_mutex_destroy(PthreadMutexT* mutex);
-int PS4_SYSV_ABI posix_pthread_mutexattr_init(PthreadMutexAttrT* attr);
-int PS4_SYSV_ABI posix_pthread_mutexattr_settype(PthreadMutexAttrT* attr, PthreadMutexType type);
-int PS4_SYSV_ABI posix_pthread_mutexattr_destroy(PthreadMutexAttrT* attr);
-int PS4_SYSV_ABI scePthreadCondInit(PthreadCondT* cond, const PthreadCondAttrT* cond_attr,
-                                    const char* name);
-int PS4_SYSV_ABI posix_pthread_cond_wait(PthreadCondT* cond, PthreadMutexT* mutex);
-int PS4_SYSV_ABI posix_pthread_cond_reltimedwait_np(PthreadCondT* cond, PthreadMutexT* mutex,
-                                                    u64 usec);
-int PS4_SYSV_ABI posix_pthread_cond_signal(PthreadCondT* cond);
-int PS4_SYSV_ABI posix_pthread_cond_destroy(PthreadCondT* cond);
-int PS4_SYSV_ABI posix_pthread_condattr_init(PthreadCondAttrT* attr);
-int PS4_SYSV_ABI posix_pthread_condattr_destroy(PthreadCondAttrT* attr);
-
 void RegisterMutex(Core::Loader::SymbolsResolver* sym);
 void RegisterCond(Core::Loader::SymbolsResolver* sym);
 void RegisterRwlock(Core::Loader::SymbolsResolver* sym);
