@@ -125,6 +125,7 @@ struct PortOut {
     std::condition_variable_any output_cv;
     bool output_ready = false;
     Kernel::Thread output_thread{};
+    std::atomic<bool> system_muted{false};
 
     OrbisAudioOutPort type;
     AudioFormatInfo format_info;
