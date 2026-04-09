@@ -78,10 +78,8 @@ Pthread* ThreadState::Alloc(Pthread* curthread) {
         }
         if (!free_threads.empty()) {
             std::scoped_lock lk{free_thread_lock};
-            if (!free_threads.empty()) {
-                thread = free_threads.back();
-                free_threads.pop_back();
-            }
+            thread = free_threads.back();
+            free_threads.pop_back();
         }
     }
     if (thread == nullptr) {
