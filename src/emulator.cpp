@@ -35,6 +35,7 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/np_handler.h"
 #include "core/libraries/np/np_trophy.h"
 #include "core/libraries/save_data/save_backup.h"
 #include "core/linker.h"
@@ -271,7 +272,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     LOG_INFO(Config, "General isNeo: {}", EmulatorSettings.IsNeo());
     LOG_INFO(Config, "General isDevKit: {}", EmulatorSettings.IsDevKit());
     LOG_INFO(Config, "General isConnectedToNetwork: {}", EmulatorSettings.IsConnectedToNetwork());
-    LOG_INFO(Config, "General isPsnSignedIn: {}", EmulatorSettings.IsPSNSignedIn());
+    LOG_INFO(Config, "General isShadNetEnabled: {}", EmulatorSettings.IsShadNetEnabled());
     LOG_INFO(Config, "GPU isNullGpu: {}", EmulatorSettings.IsNullGPU());
     LOG_INFO(Config, "GPU readbacksMode: {}", EmulatorSettings.GetReadbacksMode());
     LOG_INFO(Config, "GPU readbackLinearImages: {}",
@@ -535,6 +536,7 @@ void Emulator::Restart(std::filesystem::path eboot_path,
 
     LOG_INFO(Common, "Restarting the emulator with args: {}", fmt::join(args, " "));
     Libraries::SaveData::Backup::StopThread();
+    Libraries::Np::NpHandler::GetInstance().Shutdown();
     Common::Log::Denitializer();
 
     auto& ipc = IPC::Instance();
