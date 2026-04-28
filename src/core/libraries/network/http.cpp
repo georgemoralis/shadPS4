@@ -1,6 +1,14 @@
-// SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+// SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+#include <httplib.h>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -10,6 +18,149 @@
 namespace Libraries::Http {
 
 static bool g_isHttpInitialized = true; // TODO temp always inited
+
+// HTTP state machinery
+namespace {
+
+constexpr int kHttpConnectTimeoutSec = 5;
+constexpr int kHttpReadTimeoutSec = 30;
+
+struct HttpTemplate {
+    int libCtxId;
+    std::string userAgent;
+    int httpVerMajor = 1;
+    int httpVerMinor = 1;
+    bool autoRedirect = true;
+};
+
+struct HttpConnection {
+    int templateId;
+    std::string scheme; // "http" or "https"
+    std::string host;
+    int port;
+    bool keepAlive;
+    std::unique_ptr<httplib::Client> client;
+};
+
+struct HttpRequest {
+    int connectionId;
+    s32 method;
+    std::string path; // path + query, no scheme/host
+    u64 contentLength = 0;
+    std::vector<std::pair<std::string, std::string>> requestHeaders;
+
+    // Filled by sceHttpSendRequest.
+    bool sent = false;
+    int statusCode = 0;
+    std::string responseBody;
+    size_t readOffset = 0;
+    std::string responseHeadersBlob;
+};
+
+std::mutex g_state_mutex;
+std::map<int, HttpTemplate> g_templates;
+std::map<int, HttpConnection> g_connections;
+std::map<int, HttpRequest> g_requests;
+int g_next_template_id = 1;
+int g_next_connection_id = 1;
+int g_next_request_id = 1;
+
+// HTTP method enum matches OrbisNpWebApiHttpMethod ordering:
+// 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH.
+const char* MethodName(s32 method) {
+    switch (method) {
+    case 0:
+        return "GET";
+    case 1:
+        return "POST";
+    case 2:
+        return "PUT";
+    case 3:
+        return "DELETE";
+    case 4:
+        return "PATCH";
+    default:
+        return "GET";
+    }
+}
+
+// Minimal URL parser. Splits "scheme://host[:port][/path]" into parts.
+struct ParsedUrl {
+    std::string scheme;
+    std::string host;
+    int port = 0;
+    std::string path; // includes leading '/' and any '?query'
+};
+
+bool ParseUrl(const std::string& url, ParsedUrl& out) {
+    const auto schemeEnd = url.find("://");
+    if (schemeEnd == std::string::npos) {
+        return false;
+    }
+    out.scheme = url.substr(0, schemeEnd);
+    if (out.scheme != "http" && out.scheme != "https") {
+        return false;
+    }
+    const auto hostStart = schemeEnd + 3;
+    const auto pathStart = url.find('/', hostStart);
+    std::string hostPort;
+    if (pathStart == std::string::npos) {
+        hostPort = url.substr(hostStart);
+        out.path = "/";
+    } else {
+        hostPort = url.substr(hostStart, pathStart - hostStart);
+        out.path = url.substr(pathStart);
+    }
+    if (hostPort.empty()) {
+        return false;
+    }
+    const auto colonPos = hostPort.find(':');
+    if (colonPos == std::string::npos) {
+        out.host = hostPort;
+        out.port = (out.scheme == "https") ? 443 : 80;
+    } else {
+        out.host = hostPort.substr(0, colonPos);
+        try {
+            out.port = std::stoi(hostPort.substr(colonPos + 1));
+        } catch (...) {
+            return false;
+        }
+        if (out.port <= 0 || out.port > 65535) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Build a "Name: Value\r\nName: Value\r\n" blob from cpp-httplib headers.
+std::string SerializeHeadersBlob(const httplib::Headers& headers) {
+    std::string out;
+    for (const auto& [name, value] : headers) {
+        out.append(name);
+        out.append(": ");
+        out.append(value);
+        out.append("\r\n");
+    }
+    return out;
+}
+
+httplib::Client* GetOrCreateClient(HttpConnection& conn) {
+    if (!conn.client) {
+        if (conn.scheme == "https") {
+            LOG_ERROR(Lib_Http,
+                      "HTTPS requested but SSL client not compiled in; "
+                      "falling back to plain HTTP for {}:{}",
+                      conn.host, conn.port);
+        }
+        conn.client = std::make_unique<httplib::Client>(conn.host, conn.port);
+        conn.client->set_connection_timeout(std::chrono::seconds(kHttpConnectTimeoutSec));
+        conn.client->set_read_timeout(std::chrono::seconds(kHttpReadTimeoutSec));
+        conn.client->set_keep_alive(conn.keepAlive);
+    }
+    return conn.client.get();
+}
+
+} // namespace
 
 void NormalizeAndAppendPath(char* dest, char* src) {
     char* lastSlash;
@@ -64,8 +215,29 @@ int PS4_SYSV_ABI sceHttpAddQuery() {
 }
 
 int PS4_SYSV_ABI sceHttpAddRequestHeader(int id, const char* name, const char* value, s32 mode) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called id= {} name = {} value = {} mode = {}", id,
-              std::string(name), std::string(value), mode);
+    if (name == nullptr || value == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(id);
+    if (it == g_requests.end()) {
+        LOG_WARNING(Lib_Http, "sceHttpAddRequestHeader: req={} not found", id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    // mode: 0 = ADD (append), 1 = OVERWRITE (replace existing).
+    HttpRequest& req = it->second;
+    if (mode == 1) {
+        for (auto h = req.requestHeaders.begin(); h != req.requestHeaders.end();) {
+            if (h->first == name) {
+                h = req.requestHeaders.erase(h);
+            } else {
+                ++h;
+            }
+        }
+    }
+    req.requestHeaders.emplace_back(name, value);
+    LOG_DEBUG(Lib_Http, "sceHttpAddRequestHeader: req={} '{}: {}' (mode={})", id, name, value,
+              mode);
     return ORBIS_OK;
 }
 
@@ -115,9 +287,37 @@ int PS4_SYSV_ABI sceHttpCreateConnection() {
 }
 
 int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, bool enableKeepalive) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called tmpid = {} url = {} enableKeepalive = {}", tmplId,
-              std::string(url), enableKeepalive ? 1 : 0);
-    return ORBIS_OK;
+    if (url == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    ParsedUrl parsed;
+    if (!ParseUrl(url, parsed)) {
+        LOG_ERROR(Lib_Http, "sceHttpCreateConnectionWithURL: invalid URL '{}'", url);
+        return ORBIS_HTTP_ERROR_INVALID_URL;
+    }
+
+    std::scoped_lock lk{g_state_mutex};
+    // np_web_api in doesn't always create a template before a connection (sceHttpInit's return
+    // value gets re-used as a "context" id)
+    if (g_templates.find(tmplId) == g_templates.end()) {
+        LOG_DEBUG(Lib_Http,
+                  "sceHttpCreateConnectionWithURL: tmplId={} not registered, "
+                  "treating as default",
+                  tmplId);
+    }
+
+    const int id = g_next_connection_id++;
+    HttpConnection& conn = g_connections[id];
+    conn.templateId = tmplId;
+    conn.scheme = parsed.scheme;
+    conn.host = parsed.host;
+    conn.port = parsed.port;
+    conn.keepAlive = enableKeepalive;
+    // client constructed lazily on first send
+
+    LOG_INFO(Lib_Http, "sceHttpCreateConnectionWithURL: tmpl={} url='{}' -> conn={} ({}://{}:{})",
+             tmplId, url, id, parsed.scheme, parsed.host, parsed.port);
+    return id;
 }
 
 int PS4_SYSV_ABI sceHttpCreateEpoll() {
@@ -137,9 +337,35 @@ int PS4_SYSV_ABI sceHttpCreateRequest2() {
 
 int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int connId, s32 method, const char* url,
                                              u64 contentLength) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called connId = {} method = {} url={} contentLength={}", connId,
-              method, url, contentLength);
-    return ORBIS_OK;
+    if (url == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    ParsedUrl parsed;
+    if (!ParseUrl(url, parsed)) {
+        LOG_ERROR(Lib_Http, "sceHttpCreateRequestWithURL: invalid URL '{}'", url);
+        return ORBIS_HTTP_ERROR_INVALID_URL;
+    }
+
+    std::scoped_lock lk{g_state_mutex};
+    auto connIt = g_connections.find(connId);
+    if (connIt == g_connections.end()) {
+        LOG_ERROR(Lib_Http, "sceHttpCreateRequestWithURL: conn={} not found", connId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+
+    const int id = g_next_request_id++;
+    HttpRequest& req = g_requests[id];
+    req.connectionId = connId;
+    req.method = method;
+    // In Real SDK takes the host from the connection, but the URL passed to
+    // CreateRequestWithURL contains a full URL but we use the path part.
+    req.path = parsed.path;
+    req.contentLength = contentLength;
+
+    LOG_INFO(Lib_Http,
+             "sceHttpCreateRequestWithURL: conn={} method={} url='{}' contentLen={} -> req={}",
+             connId, MethodName(method), url, contentLength, id);
+    return id;
 }
 
 int PS4_SYSV_ABI sceHttpCreateRequestWithURL2() {
@@ -148,8 +374,11 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL2() {
 }
 
 int PS4_SYSV_ABI sceHttpCreateTemplate() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+    std::scoped_lock lk{g_state_mutex};
+    const int id = g_next_template_id++;
+    g_templates[id] = HttpTemplate{};
+    LOG_DEBUG(Lib_Http, "sceHttpCreateTemplate -> {}", id);
+    return id;
 }
 
 int PS4_SYSV_ABI sceHttpDbgEnableProfile() {
@@ -192,18 +421,39 @@ int PS4_SYSV_ABI sceHttpDbgShowStat() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpDeleteConnection() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpDeleteConnection(int connId) {
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_connections.find(connId);
+    if (it == g_connections.end()) {
+        LOG_WARNING(Lib_Http, "sceHttpDeleteConnection: id={} not found", connId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    g_connections.erase(it);
+    LOG_DEBUG(Lib_Http, "sceHttpDeleteConnection: id={} freed", connId);
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpDeleteRequest() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpDeleteRequest(int reqId) {
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        LOG_WARNING(Lib_Http, "sceHttpDeleteRequest: id={} not found", reqId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    g_requests.erase(it);
+    LOG_DEBUG(Lib_Http, "sceHttpDeleteRequest: id={} freed", reqId);
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpDeleteTemplate() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpDeleteTemplate(int tmplId) {
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_templates.find(tmplId);
+    if (it == g_templates.end()) {
+        LOG_WARNING(Lib_Http, "sceHttpDeleteTemplate: id={} not found", tmplId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    g_templates.erase(it);
+    LOG_DEBUG(Lib_Http, "sceHttpDeleteTemplate: id={} freed", tmplId);
     return ORBIS_OK;
 }
 
@@ -218,8 +468,22 @@ int PS4_SYSV_ABI sceHttpGetAcceptEncodingGZIPEnabled() {
 }
 
 int PS4_SYSV_ABI sceHttpGetAllResponseHeaders(int reqId, char** header, u64* headerSize) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_FAIL;
+    if (header == nullptr || headerSize == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    if (!req.sent) {
+        return ORBIS_HTTP_ERROR_BEFORE_SEND;
+    }
+    *header = req.responseHeadersBlob.empty() ? nullptr
+                                              : const_cast<char*>(req.responseHeadersBlob.data());
+    *headerSize = req.responseHeadersBlob.size();
+    return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceHttpGetAuthEnabled() {
@@ -288,38 +552,21 @@ int PS4_SYSV_ABI sceHttpGetResponseContentLength() {
 }
 
 int PS4_SYSV_ABI sceHttpGetStatusCode(int reqId, int* statusCode) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called reqId = {}", reqId);
-#if 0
-    if (!g_isHttpInitialized)
-        return ORBIS_HTTP_ERROR_BEFORE_INIT;
-
-    if (statusCode == nullptr)
+    if (statusCode == nullptr) {
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
-
-    int ret = 0;
-    // Lookup HttpRequestInternal by reqId
-    HttpRequestInternal* request = nullptr;
-    ret = HttpRequestInternal_Acquire(&request, reqId);
-    if (ret < 0)
-        return ret;
-    request->m_mutex.lock();
-    if (request->state > 0x11) {
-        if (request->state == 0x16) {
-            ret = request->errorCode;
-        } else {
-            *statusCode = request->httpStatusCode;
-            ret = 0;
-        }
-    } else {
-        ret = ORBIS_HTTP_ERROR_BEFORE_SEND;
     }
-    request->m_mutex.unlock();
-    HttpRequestInternal_Release(request);
-
-    return ret;
-#else
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        LOG_WARNING(Lib_Http, "sceHttpGetStatusCode: req={} not found", reqId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    if (!req.sent) {
+        return ORBIS_HTTP_ERROR_BEFORE_SEND;
+    }
+    *statusCode = req.statusCode;
     return ORBIS_OK;
-#endif
 }
 
 int PS4_SYSV_ABI sceHttpInit(int libnetMemId, int libsslCtxId, u64 poolSize) {
@@ -431,8 +678,28 @@ int PS4_SYSV_ABI sceHttpParseStatusLine(const char* statusLine, u64 lineLen, int
 }
 
 int PS4_SYSV_ABI sceHttpReadData(s32 reqId, void* data, u64 size) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called reqId = {} size = {}", reqId, size);
-    return ORBIS_OK;
+    if (data == nullptr || size == 0) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        LOG_WARNING(Lib_Http, "sceHttpReadData: req={} not found", reqId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    if (!req.sent) {
+        // Real SDK returns BEFORE_SEND if you try to read without sending.
+        return ORBIS_HTTP_ERROR_BEFORE_SEND;
+    }
+    const size_t available = req.responseBody.size() - req.readOffset;
+    const size_t toCopy = std::min<size_t>(static_cast<size_t>(size), available);
+    if (toCopy > 0) {
+        std::memcpy(data, req.responseBody.data() + req.readOffset, toCopy);
+        req.readOffset += toCopy;
+    }
+    // Returns bytes read; 0 signals end-of-stream to callers.
+    return static_cast<int>(toCopy);
 }
 
 int PS4_SYSV_ABI sceHttpRedirectCacheFlush() {
@@ -471,7 +738,114 @@ int PS4_SYSV_ABI sceHttpsEnableOptionPrivate() {
 }
 
 int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called reqId = {} size = {}", reqId, size);
+    HttpConnection* connPtr = nullptr;
+    std::string method;
+    std::string path;
+    std::vector<std::pair<std::string, std::string>> headers;
+    {
+        std::scoped_lock lk{g_state_mutex};
+        auto reqIt = g_requests.find(reqId);
+        if (reqIt == g_requests.end()) {
+            LOG_ERROR(Lib_Http, "sceHttpSendRequest: req={} not found", reqId);
+            return ORBIS_HTTP_ERROR_INVALID_ID;
+        }
+        HttpRequest& req = reqIt->second;
+        if (req.sent) {
+            LOG_WARNING(Lib_Http, "sceHttpSendRequest: req={} already sent", reqId);
+            return ORBIS_HTTP_ERROR_AFTER_SEND;
+        }
+        auto connIt = g_connections.find(req.connectionId);
+        if (connIt == g_connections.end()) {
+            LOG_ERROR(Lib_Http, "sceHttpSendRequest: req={} conn={} not found", reqId,
+                      req.connectionId);
+            return ORBIS_HTTP_ERROR_INVALID_ID;
+        }
+        connPtr = &connIt->second;
+        method = MethodName(req.method);
+        path = req.path;
+        headers = req.requestHeaders;
+        req.sent = true;
+    }
+
+    // Build the headers map cpp-httplib expects.
+    httplib::Headers httplibHeaders;
+    for (const auto& [name, value] : headers) {
+        httplibHeaders.emplace(name, value);
+    }
+
+    httplib::Client* cli = GetOrCreateClient(*connPtr);
+    httplib::Result res;
+
+    const std::string body =
+        (postData != nullptr && size > 0)
+            ? std::string(static_cast<const char*>(postData), static_cast<size_t>(size))
+            : std::string();
+
+    // Pull a Content-Type header out of the request's header list if the
+    // caller set one.Fall back to application/json which is what every shadnet endpoint expects.
+    std::string contentType = "application/json";
+    for (const auto& [name, value] : headers) {
+        if (name == "Content-Type" || name == "content-type") {
+            contentType = value;
+            break;
+        }
+    }
+
+    if (method == "GET") {
+        res = cli->Get(path, httplibHeaders);
+    } else if (method == "DELETE") {
+        res = cli->Delete(path, httplibHeaders);
+    } else if (method == "POST") {
+        res = cli->Post(path, httplibHeaders, body, contentType);
+    } else if (method == "PUT") {
+        res = cli->Put(path, httplibHeaders, body, contentType);
+    } else if (method == "PATCH") {
+        res = cli->Patch(path, httplibHeaders, body, contentType);
+    } else {
+        return ORBIS_HTTP_ERROR_UNKNOWN_METHOD;
+    }
+
+    if (!res) {
+        const auto err = res.error();
+        LOG_ERROR(Lib_Http, "sceHttpSendRequest: req={} {} {} network failure: {}", reqId, method,
+                  path, httplib::to_string(err));
+        switch (err) {
+        case httplib::Error::Connection:
+        case httplib::Error::ConnectionTimeout:
+            return ORBIS_HTTP_ERROR_NETWORK;
+        case httplib::Error::Read:
+        case httplib::Error::Write:
+            return ORBIS_HTTP_ERROR_BROKEN;
+        case httplib::Error::SSLConnection:
+        case httplib::Error::SSLLoadingCerts:
+        case httplib::Error::SSLServerVerification:
+            return ORBIS_HTTP_ERROR_SSL;
+        default:
+            return ORBIS_HTTP_ERROR_UNKNOWN;
+        }
+    }
+
+    // Stash the response on the request record so subsequent
+    // sceHttpReadData / sceHttpGetStatusCode / sceHttpGetAllResponseHeaders
+    // calls can read it.
+    {
+        std::scoped_lock lk{g_state_mutex};
+        auto reqIt = g_requests.find(reqId);
+        if (reqIt == g_requests.end()) {
+            // Request was deleted while we were on the wire. Drop the
+            // response cause nothing left to write into.
+            LOG_WARNING(Lib_Http, "sceHttpSendRequest: req={} deleted during send", reqId);
+            return ORBIS_HTTP_ERROR_INVALID_ID;
+        }
+        HttpRequest& req = reqIt->second;
+        req.statusCode = res->status;
+        req.responseBody = std::move(res->body);
+        req.readOffset = 0;
+        req.responseHeadersBlob = SerializeHeadersBlob(res->headers);
+    }
+
+    LOG_INFO(Lib_Http, "sceHttpSendRequest: req={} {} {} -> HTTP {} ({} body bytes)", reqId, method,
+             path, res->status, res->body.size());
     return ORBIS_OK;
 }
 
