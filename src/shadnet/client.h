@@ -71,6 +71,7 @@ enum class CommandType : u16 {
     GetScoreNpid = 36,
     GetScoreAccountId = 37,
     GetScoreGameDataByAccId = 38,
+    GetToken = 39,
 };
 
 enum class NotificationType : u16 {
@@ -191,6 +192,8 @@ public:
     u32 GetNumFriends() const;
     std::optional<std::string> GetFriendNpid(u32 index) const;
 
+    std::string GetBearerToken() const;
+
     // Callbacks
     std::function<void(const LoginResult&)> onLoginResult;
     std::function<void(const NotifyFriendQuery&)> onFriendQuery;
@@ -221,6 +224,7 @@ private:
     std::vector<u8> BuildPacket(CommandType cmd, u64 id, const std::vector<u8>& payload) const;
     void DispatchPacket(PacketType type, u16 cmd_raw, u64 pkt_id, const std::vector<u8>& payload);
     void HandleLoginReply(const std::vector<u8>& payload);
+    void HandleGetTokenReply(const std::vector<u8>& payload);
     void HandleNotification(u16 cmd_raw, const std::vector<u8>& payload);
 
     // Helper: read a u32-LE-prefixed proto blob from a byte vector at pos.
@@ -261,6 +265,8 @@ private:
 
     std::string m_avatar_url;
     u64 m_user_id = 0;
+    mutable std::mutex m_mutex_bearer;
+    std::string m_bearer_token;
     std::atomic<u32> m_addr_local{0};
 
     mutable std::mutex m_mutex_friends;

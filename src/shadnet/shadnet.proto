@@ -31,6 +31,12 @@ message LoginReply {
     repeated string      blocked                  = 6;
 }
 
+message GetTokenReply {
+    string token   = 1;
+    uint64 user_id = 2;
+    string npid    = 3;
+}
+
 message RegistrationRequest {
     string npid       = 1;
     string password   = 2;

@@ -141,6 +141,11 @@ std::optional<std::string> ShadNetClient::GetFriendNpid(u32 index) const {
     return m_friends[index].npid;
 }
 
+std::string ShadNetClient::GetBearerToken() const {
+    std::lock_guard lock(m_mutex_bearer);
+    return m_bearer_token;
+}
+
 // Threading
 
 void ShadNetClient::ConnectThread() {
@@ -450,6 +455,9 @@ void ShadNetClient::DispatchPacket(PacketType type, u16 cmd_raw, u64 pkt_id,
         case CommandType::Login:
             HandleLoginReply(payload);
             break;
+        case CommandType::GetToken:
+            HandleGetTokenReply(payload);
+            break;
         default:
             if (onAsyncReply) {
                 // Every reply body starts with an ErrorType byte.
@@ -517,9 +525,18 @@ void ShadNetClient::HandleLoginReply(const std::vector<u8>& payload) {
                     m_friends = res.friends;
                 }
                 m_authenticated = true;
-                m_sem_authenticated.release();
                 LOG_INFO(ShadNet, "Logged in npid='{}' userId={} friends={}", m_npid, m_user_id,
                          m_friends.size());
+
+                const u64 pkt_id = m_pkt_counter.fetch_add(1);
+                std::vector<u8> empty_payload;
+                std::vector<u8> pkt = BuildPacket(CommandType::GetToken, pkt_id, empty_payload);
+                {
+                    std::lock_guard lock(m_mutex_send_queue);
+                    m_send_queue.push_back(std::move(pkt));
+                }
+                m_cv_send_queue.notify_one();
+                LOG_DEBUG(ShadNet, "GetToken request fired pkt_id={}", pkt_id);
             } else {
                 res.error = ErrorType::Malformed;
                 LOG_ERROR(ShadNet, "Failed to parse LoginReply proto");
@@ -553,6 +570,37 @@ void ShadNetClient::HandleLoginReply(const std::vector<u8>& payload) {
 
     if (onLoginResult)
         onLoginResult(res);
+}
+
+void ShadNetClient::HandleGetTokenReply(const std::vector<u8>& payload) {
+    if (payload.empty()) {
+        LOG_ERROR(ShadNet, "Empty GetToken reply");
+        m_sem_authenticated.release();
+        return;
+    }
+    const ErrorType err = static_cast<ErrorType>(payload[0]);
+    if (err != ErrorType::NoError) {
+        LOG_WARNING(ShadNet,
+                    "GetToken returned error={} — WebAPI calls will be unauthenticated. "
+                    "(Server build may predate cmd 39.)",
+                    static_cast<int>(err));
+        m_sem_authenticated.release();
+        return;
+    }
+    shadnet::GetTokenReply pb;
+    const std::string blob = ExtractBlob(payload, 1);
+    if (blob.empty() || !pb.ParseFromString(blob)) {
+        LOG_ERROR(ShadNet, "Failed to parse GetTokenReply proto");
+        m_sem_authenticated.release();
+        return;
+    }
+    {
+        std::lock_guard lock(m_mutex_bearer);
+        m_bearer_token = pb.token();
+    }
+    LOG_INFO(ShadNet, "Bearer token captured ({} chars) for accountID={} canonical npid='{}'",
+             pb.token().size(), pb.user_id(), pb.npid());
+    m_sem_authenticated.release();
 }
 
 // Notifications
