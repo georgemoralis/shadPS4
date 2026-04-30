@@ -844,8 +844,16 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
         req.responseHeadersBlob = SerializeHeadersBlob(res->headers);
     }
 
+    size_t bodySize = 0;
+    {
+        std::scoped_lock lk{g_state_mutex};
+        auto it = g_requests.find(reqId);
+        if (it != g_requests.end()) {
+            bodySize = it->second.responseBody.size();
+        }
+    }
     LOG_INFO(Lib_Http, "sceHttpSendRequest: req={} {} {} -> HTTP {} ({} body bytes)", reqId, method,
-             path, res->status, res->body.size());
+             path, res->status, bodySize);
     return ORBIS_OK;
 }
 
