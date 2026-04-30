@@ -238,6 +238,12 @@ OrbisNpAccountId NpHandler::GetAccountId(s32 user_id) const {
     return it != m_clients.end() ? static_cast<OrbisNpAccountId>(it->second->GetUserId()) : 0;
 }
 
+std::string NpHandler::GetBearerToken(s32 user_id) const {
+    std::lock_guard lock(m_mutex_clients);
+    auto it = m_clients.find(user_id);
+    return it != m_clients.end() ? it->second->GetBearerToken() : std::string{};
+}
+
 u32 NpHandler::GetLocalIpAddr(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
     auto it = m_clients.find(user_id);

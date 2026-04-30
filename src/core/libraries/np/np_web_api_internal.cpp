@@ -7,6 +7,7 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/network/http.h"
+#include "core/libraries/np/np_handler.h"
 #include "np_web_api_internal.h"
 
 namespace Libraries::Np::NpWebApi {
@@ -650,6 +651,18 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
         if (!request->userContentType.empty()) {
             Libraries::Http::sceHttpAddRequestHeader(req_id, "Content-Type",
                                                      request->userContentType.c_str(), /*mode=*/0);
+        }
+
+        const std::string bearer = NpHandler::GetInstance().GetBearerToken(user_context->userId);
+        if (!bearer.empty()) {
+            const std::string auth_value = "Bearer " + bearer;
+            Libraries::Http::sceHttpAddRequestHeader(req_id, "Authorization", auth_value.c_str(),
+                                                     /*mode=*/0);
+        } else {
+            LOG_WARNING(Lib_NpWebApi,
+                        "sendRequest: no bearer token for user_id={}; request to '{}' will "
+                        "be unauthenticated (expect 401 from server)",
+                        user_context->userId, request->userPath);
         }
     }
 

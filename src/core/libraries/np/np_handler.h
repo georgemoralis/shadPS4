@@ -56,6 +56,9 @@ public:
     // 64-bit account ID assigned by the server.
     OrbisNpAccountId GetAccountId(s32 user_id) const;
 
+    // WebAPI bearer token
+    std::string GetBearerToken(s32 user_id) const;
+
     // Local IP address (network byte order) as seen at connect time.
     u32 GetLocalIpAddr(s32 user_id) const;
 
