@@ -190,6 +190,7 @@ struct GeneralSettings {
     Setting<int> console_language{1};
     Setting<int> big_picture_scale{1000};
     Setting<std::string> shadnet_server{""};
+    Setting<std::string> shadnet_webapi_server{""};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -218,7 +219,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_notification_duration, show_splash,
                                    trophy_notification_side, connected_to_network,
                                    discord_rpc_enabled, show_fps_counter, console_language,
-                                   big_picture_scale, shadnet_server)
+                                   big_picture_scale, shadnet_server, shadnet_webapi_server)
 
 // -------------------------------
 // Log settings
@@ -592,6 +593,7 @@ public:
     SETTING_FORWARD(m_general, ConsoleLanguage, console_language)
     SETTING_FORWARD(m_general, BigPictureScale, big_picture_scale)
     SETTING_FORWARD(m_general, ShadNetServer, shadnet_server)
+    SETTING_FORWARD(m_general, ShadNetWebApiServer, shadnet_webapi_server)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
