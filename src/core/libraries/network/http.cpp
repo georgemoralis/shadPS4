@@ -31,6 +31,27 @@ struct HttpTemplate {
     int httpVerMajor = 1;
     int httpVerMinor = 1;
     bool autoRedirect = true;
+    uint32_t connectTimeoutUs = 0;
+    uint32_t recvTimeoutUs = 0;
+    uint32_t sendTimeoutUs = 0;
+    uint32_t resolveTimeoutUs = 0;
+
+    bool acceptEncodingGzip = true;
+    bool inflateGzip = true;
+    bool chunkedTransfer = false;
+    bool nonblock = false;
+    bool authEnabled = false;
+    bool cookieEnabled = false;
+    int recvBlockSize = 0;         // 0 = httplib default
+    int responseHeaderMaxSize = 0; // 0 = no cap
+    uint32_t resolveRetry = 0;     // store-and-forget
+    int sslMinVersion = 0;         // 0 = library default
+    uint32_t sslFlags = 0;         // ORBIS_HTTPS_FLAG_*
+    // proxy
+    std::string proxyHost;
+    int proxyPort = 0;
+    int proxyMode = 0; // ORBIS_HTTP_PROXY_AUTO=0, MANUAL=1
+    int proxyVersion = 0;
 };
 
 struct HttpConnection {
@@ -40,6 +61,16 @@ struct HttpConnection {
     int port;
     bool keepAlive;
     std::unique_ptr<httplib::Client> client;
+
+    // Connection-level overrides of template settings.
+    bool autoRedirect = true;
+    bool nonblock = false;
+    bool cookieEnabled = false;
+    bool authEnabled = false;
+    uint32_t connectTimeoutUs = 0;
+    uint32_t recvTimeoutUs = 0;
+    uint32_t sendTimeoutUs = 0;
+    uint32_t resolveTimeoutUs = 0;
 };
 
 struct HttpRequest {
@@ -49,6 +80,9 @@ struct HttpRequest {
     u64 contentLength = 0;
     std::vector<std::pair<std::string, std::string>> requestHeaders;
 
+    // Cancellation flag set by sceHttpAbortRequest
+    bool aborted = false;
+
     // Filled by sceHttpSendRequest.
     bool sent = false;
     int statusCode = 0;
@@ -56,6 +90,12 @@ struct HttpRequest {
     size_t readOffset = 0;
     std::string responseHeadersBlob;
 };
+
+struct StoredCookie {
+    std::string url; // domain context the cookie applies to
+    std::string raw; // full "name=value; Path=/; Expires=..." string
+};
+std::vector<StoredCookie> g_cookies;
 
 std::mutex g_state_mutex;
 std::map<int, HttpTemplate> g_templates;
@@ -65,22 +105,28 @@ int g_next_template_id = 1;
 int g_next_connection_id = 1;
 int g_next_request_id = 1;
 
-// HTTP method enum matches OrbisNpWebApiHttpMethod ordering:
-// 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH.
 const char* MethodName(s32 method) {
     switch (method) {
-    case 0:
+    case 0: // SCE_HTTP_METHOD_GET
         return "GET";
-    case 1:
+    case 1: // SCE_HTTP_METHOD_POST
         return "POST";
-    case 2:
+    case 2: // SCE_HTTP_METHOD_HEAD
+        return "HEAD";
+    case 3: // SCE_HTTP_METHOD_OPTIONS
+        return "OPTIONS";
+    case 4: // SCE_HTTP_METHOD_PUT
         return "PUT";
-    case 3:
+    case 5: // SCE_HTTP_METHOD_DELETE
         return "DELETE";
-    case 4:
+    case 6: // SCE_HTTP_METHOD_TRACE
+        return "TRACE";
+    case 7: // SCE_HTTP_METHOD_CONNECT
+        return "CONNECT";
+    case 8: // out-of-band PATCH (SceHttpMethods doesn't define it)
         return "PATCH";
     default:
-        return "GET";
+        return nullptr;
     }
 }
 
@@ -144,6 +190,24 @@ std::string SerializeHeadersBlob(const httplib::Headers& headers) {
     return out;
 }
 
+void ApplyClientTimeouts(httplib::Client& cli, const HttpConnection& conn,
+                         const HttpTemplate* tmpl) {
+    auto resolveUs = [&](uint32_t connVal, uint32_t tmplVal, int defaultSec) {
+        if (connVal != 0)
+            return std::chrono::microseconds(connVal);
+        if (tmplVal != 0)
+            return std::chrono::microseconds(tmplVal);
+        return std::chrono::microseconds(defaultSec * 1'000'000ll);
+    };
+
+    cli.set_connection_timeout(resolveUs(conn.connectTimeoutUs, tmpl ? tmpl->connectTimeoutUs : 0,
+                                         kHttpConnectTimeoutSec));
+    cli.set_read_timeout(
+        resolveUs(conn.recvTimeoutUs, tmpl ? tmpl->recvTimeoutUs : 0, kHttpReadTimeoutSec));
+    cli.set_write_timeout(
+        resolveUs(conn.sendTimeoutUs, tmpl ? tmpl->sendTimeoutUs : 0, kHttpReadTimeoutSec));
+}
+
 httplib::Client* GetOrCreateClient(HttpConnection& conn) {
     if (!conn.client) {
         if (conn.scheme == "https") {
@@ -153,11 +217,48 @@ httplib::Client* GetOrCreateClient(HttpConnection& conn) {
                       conn.host, conn.port);
         }
         conn.client = std::make_unique<httplib::Client>(conn.host, conn.port);
-        conn.client->set_connection_timeout(std::chrono::seconds(kHttpConnectTimeoutSec));
-        conn.client->set_read_timeout(std::chrono::seconds(kHttpReadTimeoutSec));
+        const auto tmplIt = g_templates.find(conn.templateId);
+        const HttpTemplate* tmpl = (tmplIt != g_templates.end()) ? &tmplIt->second : nullptr;
+        ApplyClientTimeouts(*conn.client, conn, tmpl);
         conn.client->set_keep_alive(conn.keepAlive);
+        conn.client->set_follow_location(conn.autoRedirect);
+        if (tmpl && !tmpl->userAgent.empty()) {
+            conn.client->set_default_headers({{"User-Agent", tmpl->userAgent}});
+        }
     }
     return conn.client.get();
+}
+
+enum class SettingScope { None, Template, Connection, Request };
+
+struct SettingTarget {
+    SettingScope scope = SettingScope::None;
+    HttpTemplate* tmpl = nullptr;
+    HttpConnection* conn = nullptr;
+    HttpRequest* req = nullptr;
+};
+
+SettingTarget ResolveSettingsId(int id) {
+    SettingTarget out;
+    auto tIt = g_templates.find(id);
+    if (tIt != g_templates.end()) {
+        out.scope = SettingScope::Template;
+        out.tmpl = &tIt->second;
+        return out;
+    }
+    auto cIt = g_connections.find(id);
+    if (cIt != g_connections.end()) {
+        out.scope = SettingScope::Connection;
+        out.conn = &cIt->second;
+        return out;
+    }
+    auto rIt = g_requests.find(id);
+    if (rIt != g_requests.end()) {
+        out.scope = SettingScope::Request;
+        out.req = &rIt->second;
+        return out;
+    }
+    return out;
 }
 
 } // namespace
@@ -189,28 +290,57 @@ int HttpRequestInternal_Release(HttpRequestInternal* request) {
     return 0; // TODO dummy
 }
 
-int PS4_SYSV_ABI sceHttpAbortRequest() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpAbortRequest(int reqId) {
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    it->second.aborted = true;
+    LOG_DEBUG(Lib_Http, "sceHttpAbortRequest: req={} flagged for abort", reqId);
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpAbortRequestForce() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpAbortRequestForce(int reqId) {
+    return sceHttpAbortRequest(reqId);
+}
+
+int PS4_SYSV_ABI sceHttpAbortWaitRequest(int reqId) {
+    return sceHttpAbortRequest(reqId);
+}
+
+int PS4_SYSV_ABI sceHttpAddCookie(int libhttpCtxId, const char* url, const char* cookie,
+                                  u64 cookieLength) {
+    if (url == nullptr || cookie == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    StoredCookie c;
+    c.url.assign(url);
+    c.raw.assign(cookie, cookie + cookieLength);
+    g_cookies.push_back(std::move(c));
+    LOG_DEBUG(Lib_Http, "sceHttpAddCookie: stored cookie for url={} ({} chars)", url, cookieLength);
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpAbortWaitRequest() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpAddCookie() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpAddQuery() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpAddQuery(int reqId, const char* name, const char* value) {
+    if (name == nullptr || value == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    // Append "name=value" to the query portion of the path. Leading
+    // separator is ? if no query exists, & otherwise.
+    const bool hasQuery = req.path.find('?') != std::string::npos;
+    req.path += hasQuery ? '&' : '?';
+    req.path += name;
+    req.path += '=';
+    req.path += value;
+    LOG_DEBUG(Lib_Http, "sceHttpAddQuery: req={} {}={} -> path={}", reqId, name, value, req.path);
     return ORBIS_OK;
 }
 
@@ -241,49 +371,89 @@ int PS4_SYSV_ABI sceHttpAddRequestHeader(int id, const char* name, const char* v
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpAddRequestHeaderRaw() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpAddRequestHeaderRaw(int reqId, const char* raw, u64 rawLen) {
+    if (raw == nullptr || rawLen == 0) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::string s(raw, rawLen);
+    while (!s.empty() && (s.back() == '\r' || s.back() == '\n'))
+        s.pop_back();
+    const auto colon = s.find(':');
+    if (colon == std::string::npos) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::string name = s.substr(0, colon);
+    std::string value = s.substr(colon + 1);
+    while (!value.empty() && value.front() == ' ')
+        value.erase(value.begin());
+    return sceHttpAddRequestHeader(reqId, name.c_str(), value.c_str(),
+                                   /*mode=*/1 /*overwrite*/);
+}
+
+int PS4_SYSV_ABI sceHttpAuthCacheExport(int libhttpCtxId, void* buffer, u64 bufferSize,
+                                        u64* exportSize) {
+    if (exportSize) {
+        *exportSize = 0;
+    }
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpAuthCacheExport() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpAuthCacheFlush(int libhttpCtxId) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpAuthCacheFlush() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpAuthCacheImport(int libhttpCtxId, const void* buffer, u64 bufferSize) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpAuthCacheImport() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpCacheRedirectedConnectionEnabled(int id, int isEnable) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpCacheRedirectedConnectionEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpCookieExport(int libhttpCtxId, void* buffer, u64 bufferSize,
+                                     u64* exportSize) {
+    std::scoped_lock lk{g_state_mutex};
+    u64 total = 0;
+    for (const auto& c : g_cookies) {
+        total += c.raw.size();
+    }
+    if (exportSize) {
+        *exportSize = total;
+    }
+    if (buffer != nullptr && bufferSize >= total) {
+        char* dst = static_cast<char*>(buffer);
+        size_t off = 0;
+        for (const auto& c : g_cookies) {
+            std::memcpy(dst + off, c.raw.data(), c.raw.size());
+            off += c.raw.size();
+        }
+    }
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpCookieExport() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpCookieFlush(int libhttpCtxId) {
+    std::scoped_lock lk{g_state_mutex};
+    g_cookies.clear();
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpCookieFlush() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpCookieImport(int libhttpCtxId, const void* buffer, u64 bufferSize) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpCookieImport() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpCreateConnection() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpCreateConnection(int tmplId, const char* host, const char* scheme, u16 port,
+                                         bool enableKeepalive) {
+    if (host == nullptr || scheme == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::string url;
+    url.reserve(strlen(scheme) + 3 + strlen(host) + 8);
+    url.append(scheme);
+    url.append("://");
+    url.append(host);
+    url.append(":");
+    url.append(std::to_string(port));
+    return sceHttpCreateConnectionWithURL(tmplId, url.c_str(), enableKeepalive);
 }
 
 int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, bool enableKeepalive) {
@@ -320,19 +490,57 @@ int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, boo
     return id;
 }
 
-int PS4_SYSV_ABI sceHttpCreateEpoll() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpCreateEpoll(int libhttpCtxId, void* eh) {
+    return 1; // dummy
 }
 
-int PS4_SYSV_ABI sceHttpCreateRequest() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpCreateRequest(int connId, s32 method, const char* path, u64 contentLength) {
+    if (path == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto connIt = g_connections.find(connId);
+    if (connIt == g_connections.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    const int id = g_next_request_id++;
+    HttpRequest& req = g_requests[id];
+    req.connectionId = connId;
+    req.method = method;
+    req.path = path;
+    req.contentLength = contentLength;
+    LOG_INFO(Lib_Http, "sceHttpCreateRequest: conn={} method={} path='{}' contentLen={} -> req={}",
+             connId, MethodName(method), path, contentLength, id);
+    return id;
 }
 
-int PS4_SYSV_ABI sceHttpCreateRequest2() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpCreateRequest2(int connId, const char* method, const char* path,
+                                       u64 contentLength) {
+    if (path == nullptr || method == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    s32 m = 0; // GET
+    if (std::strcmp(method, "GET") == 0)
+        m = 0;
+    else if (std::strcmp(method, "POST") == 0)
+        m = 1;
+    else if (std::strcmp(method, "HEAD") == 0)
+        m = 2;
+    else if (std::strcmp(method, "OPTIONS") == 0)
+        m = 3;
+    else if (std::strcmp(method, "PUT") == 0)
+        m = 4;
+    else if (std::strcmp(method, "DELETE") == 0)
+        m = 5;
+    else if (std::strcmp(method, "TRACE") == 0)
+        m = 6;
+    else if (std::strcmp(method, "CONNECT") == 0)
+        m = 7;
+    else if (std::strcmp(method, "PATCH") == 0)
+        m = 8; // out-of-band PATCH marker; see sendRequest
+    else
+        return ORBIS_HTTP_ERROR_UNKNOWN_METHOD;
+    return sceHttpCreateRequest(connId, m, path, contentLength);
 }
 
 int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int connId, s32 method, const char* url,
@@ -357,8 +565,6 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int connId, s32 method, const char*
     HttpRequest& req = g_requests[id];
     req.connectionId = connId;
     req.method = method;
-    // In Real SDK takes the host from the connection, but the URL passed to
-    // CreateRequestWithURL contains a full URL but we use the path part.
     req.path = parsed.path;
     req.contentLength = contentLength;
 
@@ -368,9 +574,33 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int connId, s32 method, const char*
     return id;
 }
 
-int PS4_SYSV_ABI sceHttpCreateRequestWithURL2() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpCreateRequestWithURL2(int connId, const char* method, const char* url,
+                                              u64 contentLength) {
+    if (url == nullptr || method == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    s32 m;
+    if (std::strcmp(method, "GET") == 0)
+        m = 0;
+    else if (std::strcmp(method, "POST") == 0)
+        m = 1;
+    else if (std::strcmp(method, "HEAD") == 0)
+        m = 2;
+    else if (std::strcmp(method, "OPTIONS") == 0)
+        m = 3;
+    else if (std::strcmp(method, "PUT") == 0)
+        m = 4;
+    else if (std::strcmp(method, "DELETE") == 0)
+        m = 5;
+    else if (std::strcmp(method, "TRACE") == 0)
+        m = 6;
+    else if (std::strcmp(method, "CONNECT") == 0)
+        m = 7;
+    else if (std::strcmp(method, "PATCH") == 0)
+        m = 8; // out-of-band PATCH marker
+    else
+        return ORBIS_HTTP_ERROR_UNKNOWN_METHOD;
+    return sceHttpCreateRequestWithURL(connId, m, url, contentLength);
 }
 
 int PS4_SYSV_ABI sceHttpCreateTemplate() {
@@ -382,42 +612,27 @@ int PS4_SYSV_ABI sceHttpCreateTemplate() {
 }
 
 int PS4_SYSV_ABI sceHttpDbgEnableProfile() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgGetConnectionStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgGetRequestStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgSetPrintf() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgShowConnectionStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgShowMemoryPoolStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgShowRequestStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpDbgShowStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
 
@@ -457,14 +672,21 @@ int PS4_SYSV_ABI sceHttpDeleteTemplate(int tmplId) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpDestroyEpoll() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpDestroyEpoll(int libhttpCtxId, void* eh) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetAcceptEncodingGZIPEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpGetAcceptEncodingGZIPEnabled(int id, int* isEnable) {
+    if (isEnable == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        *isEnable = t.tmpl->acceptEncodingGzip ? 1 : 0;
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
 }
 
 int PS4_SYSV_ABI sceHttpGetAllResponseHeaders(int reqId, char** header, u64* headerSize) {
@@ -486,68 +708,158 @@ int PS4_SYSV_ABI sceHttpGetAllResponseHeaders(int reqId, char** header, u64* hea
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetAuthEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpGetAuthEnabled(int id, int* isEnable) {
+    if (isEnable == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        *isEnable = t.tmpl->authEnabled ? 1 : 0;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        *isEnable = t.conn->authEnabled ? 1 : 0;
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
 }
 
-int PS4_SYSV_ABI sceHttpGetAutoRedirect() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpGetAutoRedirect(int id, int* isEnable) {
+    if (isEnable == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        *isEnable = t.tmpl->autoRedirect ? 1 : 0;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        *isEnable = t.conn->autoRedirect ? 1 : 0;
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
 }
 
 int PS4_SYSV_ABI sceHttpGetConnectionStat() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetCookie() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpGetCookie(int libhttpCtxId, const char* url, char* cookie, u64* required,
+                                  u64 prepared, int isSecure) {
+    if (url == nullptr || required == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    // Pick the longest matching cookie (URL prefix-match). Real
+    // implementations parse Domain=/Path= attributes; we just match
+    // exact URL prefix, which is enough for "store and recover".
+    std::string match;
+    for (const auto& c : g_cookies) {
+        if (std::strstr(url, c.url.c_str()) != nullptr) {
+            if (!match.empty())
+                match += "; ";
+            match += c.raw;
+        }
+    }
+    *required = match.size() + 1; // null terminator
+    if (cookie != nullptr && prepared >= match.size() + 1) {
+        std::memcpy(cookie, match.data(), match.size());
+        cookie[match.size()] = '\0';
+    }
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetCookieEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpGetCookieEnabled(int id, int* isEnable) {
+    if (isEnable == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        *isEnable = t.tmpl->cookieEnabled ? 1 : 0;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        *isEnable = t.conn->cookieEnabled ? 1 : 0;
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
 }
 
-int PS4_SYSV_ABI sceHttpGetCookieStats() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpGetCookieStats(int libhttpCtxId, void* stats) {
+    if (stats != nullptr) {
+        std::memset(stats, 0, 24);
+    }
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceHttpGetEpoll() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
-
 int PS4_SYSV_ABI sceHttpGetEpollId() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetLastErrno() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpGetLastErrno(int reqId, int* errNum) {
+    if (errNum)
+        *errNum = 0;
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetMemoryPoolStats() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpGetMemoryPoolStats(int libhttpCtxId, void* stats) {
+    // Three u64 fields (poolSize, maxInuseSize, currentInuseSize). All zero.
+    if (stats != nullptr) {
+        std::memset(stats, 0, 24);
+    }
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetNonblock() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpGetNonblock(int id, int* isEnable) {
+    if (isEnable == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        *isEnable = t.tmpl->nonblock ? 1 : 0;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        *isEnable = t.conn->nonblock ? 1 : 0;
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+}
+
+int PS4_SYSV_ABI sceHttpGetRegisteredCtxIds(int* ids, u64* num) {
+    // No multi-context model — the global httpInit gives one ctx.
+    // Report empty list.
+    if (num)
+        *num = 0;
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpGetRegisteredCtxIds() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpGetResponseContentLength() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpGetResponseContentLength(int reqId, int* result, u64* contentLength) {
+    if (result == nullptr || contentLength == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    if (!req.sent) {
+        return ORBIS_HTTP_ERROR_BEFORE_SEND;
+    }
+    *result = 0; // ORBIS_HTTP_CONTENTLEN_EXIST
+    *contentLength = req.responseBody.size();
     return ORBIS_OK;
 }
 
@@ -579,8 +891,54 @@ int PS4_SYSV_ABI sceHttpInit(int libnetMemId, int libsslCtxId, u64 poolSize) {
 
 int PS4_SYSV_ABI sceHttpParseResponseHeader(const char* header, u64 headerLen, const char* fieldStr,
                                             const char** fieldValue, u64* valueLen) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+    if (header == nullptr || fieldStr == nullptr || fieldValue == nullptr || valueLen == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    const u64 fieldLen = std::strlen(fieldStr);
+    if (fieldLen == 0) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    auto ci_eq = [](char a, char b) {
+        if (a >= 'A' && a <= 'Z')
+            a = char(a + 32);
+        if (b >= 'A' && b <= 'Z')
+            b = char(b + 32);
+        return a == b;
+    };
+
+    const char* p = header;
+    const char* end = header + headerLen;
+    while (p < end) {
+        const char* lineEnd = p;
+        while (lineEnd < end && *lineEnd != '\n')
+            ++lineEnd;
+        if (static_cast<u64>(lineEnd - p) > fieldLen && p[fieldLen] == ':') {
+            bool match = true;
+            for (u64 i = 0; i < fieldLen; ++i) {
+                if (!ci_eq(p[i], fieldStr[i])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                const char* v = p + fieldLen + 1;
+                while (v < lineEnd && (*v == ' ' || *v == '\t'))
+                    ++v;
+                const char* vEnd = lineEnd;
+                while (vEnd > v && (vEnd[-1] == ' ' || vEnd[-1] == '\t' || vEnd[-1] == '\r'))
+                    --vEnd;
+                *fieldValue = v;
+                *valueLen = static_cast<u64>(vEnd - v);
+                return ORBIS_OK;
+            }
+        }
+        p = lineEnd + 1;
+    }
+
+    *fieldValue = nullptr;
+    *valueLen = 0;
+    return ORBIS_HTTP_ERROR_PARSE_HTTP_NOT_FOUND;
 }
 
 int PS4_SYSV_ABI sceHttpParseStatusLine(const char* statusLine, u64 lineLen, int32_t* httpMajorVer,
@@ -702,39 +1060,80 @@ int PS4_SYSV_ABI sceHttpReadData(s32 reqId, void* data, u64 size) {
     return static_cast<int>(toCopy);
 }
 
-int PS4_SYSV_ABI sceHttpRedirectCacheFlush() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpRedirectCacheFlush(int libhttpCtxId) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpRemoveRequestHeader() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpRemoveRequestHeader(int reqId, const char* name) {
+    if (name == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    for (auto h = req.requestHeaders.begin(); h != req.requestHeaders.end();) {
+        if (h->first == name) {
+            h = req.requestHeaders.erase(h);
+        } else {
+            ++h;
+        }
+    }
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpRequestGetAllHeaders() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpRequestGetAllHeaders(int reqId, char** header, u64* headerSize) {
+    if (header == nullptr || headerSize == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(reqId);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    HttpRequest& req = it->second;
+    std::string blob;
+    for (const auto& [k, v] : req.requestHeaders) {
+        blob += k;
+        blob += ": ";
+        blob += v;
+        blob += "\r\n";
+    }
+    req.responseHeadersBlob = std::move(blob);
+    *header = req.responseHeadersBlob.empty() ? nullptr
+                                              : const_cast<char*>(req.responseHeadersBlob.data());
+    *headerSize = req.responseHeadersBlob.size();
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsDisableOption() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpsDisableOption(int id, uint32_t sslFlags) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->sslFlags &= ~sslFlags;
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
 }
 
-int PS4_SYSV_ABI sceHttpsDisableOptionPrivate() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpsDisableOptionPrivate(int id, uint32_t sslFlags) {
+    return sceHttpsDisableOption(id, sslFlags);
 }
 
-int PS4_SYSV_ABI sceHttpsEnableOption() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpsEnableOption(int id, uint32_t sslFlags) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->sslFlags |= sslFlags;
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
 }
 
-int PS4_SYSV_ABI sceHttpsEnableOptionPrivate() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpsEnableOptionPrivate(int id, uint32_t sslFlags) {
+    return sceHttpsEnableOption(id, sslFlags);
 }
 
 int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
@@ -761,7 +1160,13 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             return ORBIS_HTTP_ERROR_INVALID_ID;
         }
         connPtr = &connIt->second;
-        method = MethodName(req.method);
+        const char* methodStr = MethodName(req.method);
+        if (methodStr == nullptr) {
+            LOG_WARNING(Lib_Http, "sceHttpSendRequest: req={} unknown method enum {}", reqId,
+                        req.method);
+            return ORBIS_HTTP_ERROR_UNKNOWN_METHOD;
+        }
+        method = methodStr;
         path = req.path;
         headers = req.requestHeaders;
         req.sent = true;
@@ -781,9 +1186,7 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             ? std::string(static_cast<const char*>(postData), static_cast<size_t>(size))
             : std::string();
 
-    // Pull a Content-Type header out of the request's header list if the
-    // caller set one.Fall back to application/json which is what every shadnet endpoint expects.
-    std::string contentType = "application/json";
+    std::string contentType;
     for (const auto& [name, value] : headers) {
         if (name == "Content-Type" || name == "content-type") {
             contentType = value;
@@ -795,6 +1198,10 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
         res = cli->Get(path, httplibHeaders);
     } else if (method == "DELETE") {
         res = cli->Delete(path, httplibHeaders);
+    } else if (method == "HEAD") {
+        res = cli->Head(path, httplibHeaders);
+    } else if (method == "OPTIONS") {
+        res = cli->Options(path, httplibHeaders);
     } else if (method == "POST") {
         res = cli->Post(path, httplibHeaders, body, contentType);
     } else if (method == "PUT") {
@@ -802,6 +1209,12 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
     } else if (method == "PATCH") {
         res = cli->Patch(path, httplibHeaders, body, contentType);
     } else {
+        LOG_WARNING(Lib_Http, "sceHttpSendRequest: req={} unsupported method '{}'", reqId, method);
+        std::scoped_lock lk{g_state_mutex};
+        auto reqIt = g_requests.find(reqId);
+        if (reqIt != g_requests.end()) {
+            reqIt->second.sent = false;
+        }
         return ORBIS_HTTP_ERROR_UNKNOWN_METHOD;
     }
 
@@ -857,173 +1270,242 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetAcceptEncodingGZIPEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+// Helper: simple boolean setter that toggles a per-template-or-connection
+// flag, dispatching via ResolveSettingsId. Used by all the SetXxxEnabled
+// functions below.
+static int SetBoolFlag(int id, int isEnable, bool HttpTemplate::* tmplField,
+                       bool HttpConnection::* connField) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        if (tmplField)
+            t.tmpl->*tmplField = (isEnable != 0);
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        if (connField)
+            t.conn->*connField = (isEnable != 0);
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+}
+
+int PS4_SYSV_ABI sceHttpSetAcceptEncodingGZIPEnabled(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::acceptEncodingGzip, nullptr);
+}
+
+int PS4_SYSV_ABI sceHttpSetAuthEnabled(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::authEnabled, &HttpConnection::authEnabled);
+}
+
+int PS4_SYSV_ABI sceHttpSetAuthInfoCallback(int id, void* cbfunc, void* userArg) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetAuthEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetAutoRedirect(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::autoRedirect, &HttpConnection::autoRedirect);
+}
+
+int PS4_SYSV_ABI sceHttpSetChunkedTransferEnabled(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::chunkedTransfer, nullptr);
+}
+
+int PS4_SYSV_ABI sceHttpSetConnectTimeOut(int id, uint32_t usec) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        t.tmpl->connectTimeoutUs = usec;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        t.conn->connectTimeoutUs = usec;
+        if (t.conn->client) {
+            t.conn->client->set_connection_timeout(std::chrono::microseconds(usec));
+        }
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+}
+
+int PS4_SYSV_ABI sceHttpSetCookieEnabled(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::cookieEnabled, &HttpConnection::cookieEnabled);
+}
+
+int PS4_SYSV_ABI sceHttpSetCookieMaxNum(int libhttpCtxId, uint32_t num) {
+    return ORBIS_OK;
+}
+int PS4_SYSV_ABI sceHttpSetCookieMaxNumPerDomain(int libhttpCtxId, uint32_t num) {
+    return ORBIS_OK;
+}
+int PS4_SYSV_ABI sceHttpSetCookieMaxSize(int libhttpCtxId, uint32_t size) {
+    return ORBIS_OK;
+}
+int PS4_SYSV_ABI sceHttpSetCookieRecvCallback(int id, void* cbfunc, void* userArg) {
+    return ORBIS_OK;
+}
+int PS4_SYSV_ABI sceHttpSetCookieSendCallback(int id, void* cbfunc, void* userArg) {
+    return ORBIS_OK;
+}
+int PS4_SYSV_ABI sceHttpSetCookieTotalMaxSize(int libhttpCtxId, uint32_t size) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetAuthInfoCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetDefaultAcceptEncodingGZIPEnabled(int libhttpCtxId, int isEnable) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetAutoRedirect() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetDelayBuildRequestEnabled(int id, int isEnable) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetChunkedTransferEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetEpoll(int id, void* eh, void* hints) {
+    return ORBIS_OK;
+}
+int PS4_SYSV_ABI sceHttpSetEpollId(int id, void* eh) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetConnectTimeOut() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetHttp09Enabled(int id, int isEnable) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetInflateGZIPEnabled(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::inflateGzip, nullptr);
+}
+
+int PS4_SYSV_ABI sceHttpSetNonblock(int id, int isEnable) {
+    return SetBoolFlag(id, isEnable, &HttpTemplate::nonblock, &HttpConnection::nonblock);
+}
+
+int PS4_SYSV_ABI sceHttpSetPolicyOption(int libhttpCtxId, int policy) {
+    // Connection-policy hints (use IPv6, prefer keepalive, etc.). No
+    // direct httplib equivalent for most; ignore.
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieMaxNum() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetPriorityOption(int libhttpCtxId, int priority) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieMaxNumPerDomain() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetProxy(int id, int mode, int version, const char* host, u16 port) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->proxyMode = mode;
+        t.tmpl->proxyVersion = version;
+        t.tmpl->proxyHost = host ? std::string(host) : std::string{};
+        t.tmpl->proxyPort = port;
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
+}
+
+int PS4_SYSV_ABI sceHttpSetRecvBlockSize(int id, uint32_t blockSize) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->recvBlockSize = static_cast<int>(blockSize);
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
+}
+
+int PS4_SYSV_ABI sceHttpSetRecvTimeOut(int id, uint32_t usec) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        t.tmpl->recvTimeoutUs = usec;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        t.conn->recvTimeoutUs = usec;
+        if (t.conn->client) {
+            t.conn->client->set_read_timeout(std::chrono::microseconds(usec));
+        }
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+}
+
+int PS4_SYSV_ABI sceHttpSetRedirectCallback(int id, void* cbfunc, void* userArg) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieMaxSize() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetRequestContentLength(int id, u64 contentLength) {
+    std::scoped_lock lk{g_state_mutex};
+    auto it = g_requests.find(id);
+    if (it == g_requests.end()) {
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    it->second.contentLength = contentLength;
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieRecvCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetRequestStatusCallback(int id, void* cbfunc, void* userArg) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieSendCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpSetResolveRetry(int id, int retry) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->resolveRetry = static_cast<uint32_t>(retry);
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
+}
+
+int PS4_SYSV_ABI sceHttpSetResolveTimeOut(int id, uint32_t usec) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        t.tmpl->resolveTimeoutUs = usec;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        t.conn->resolveTimeoutUs = usec;
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+}
+
+int PS4_SYSV_ABI sceHttpSetResponseHeaderMaxSize(int id, u64 headerSize) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->responseHeaderMaxSize = static_cast<int>(headerSize);
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
+}
+
+int PS4_SYSV_ABI sceHttpSetSendTimeOut(int id, uint32_t usec) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    switch (t.scope) {
+    case SettingScope::Template:
+        t.tmpl->sendTimeoutUs = usec;
+        return ORBIS_OK;
+    case SettingScope::Connection:
+        t.conn->sendTimeoutUs = usec;
+        if (t.conn->client) {
+            t.conn->client->set_write_timeout(std::chrono::microseconds(usec));
+        }
+        return ORBIS_OK;
+    default:
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+}
+
+int PS4_SYSV_ABI sceHttpSetSocketCreationCallback(int libhttpCtxId, void* cbfunc, void* userArg) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpSetCookieTotalMaxSize() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetDefaultAcceptEncodingGZIPEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetDelayBuildRequestEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetEpoll() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetEpollId() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetHttp09Enabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetInflateGZIPEnabled() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetNonblock() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetPolicyOption() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetPriorityOption() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetProxy() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetRecvBlockSize() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetRecvTimeOut() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetRedirectCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetRequestContentLength() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetRequestStatusCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetResolveRetry() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetResolveTimeOut() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetResponseHeaderMaxSize() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetSendTimeOut() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpSetSocketCreationCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpsFreeCaList() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpsFreeCaList(int libhttpCtxId, void* caList) {
     return ORBIS_OK;
 }
 
@@ -1033,64 +1515,149 @@ int PS4_SYSV_ABI sceHttpsGetCaList(int httpCtxId, OrbisHttpsCaList* list) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsGetSslError() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpsGetSslError(int id, int* errNum, uint32_t* detail) {
+    if (errNum)
+        *errNum = 0;
+    if (detail)
+        *detail = 0;
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsLoadCert() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpsLoadCert(int libhttpCtxId, int caCertNum, const void** caList,
+                                  const void* cert, const void* privKey) {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsSetMinSslVersion() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpsSetMinSslVersion(int id, int version) {
+    std::scoped_lock lk{g_state_mutex};
+    auto t = ResolveSettingsId(id);
+    if (t.scope == SettingScope::Template) {
+        t.tmpl->sslMinVersion = version;
+        return ORBIS_OK;
+    }
+    return ORBIS_HTTP_ERROR_INVALID_ID;
+}
+
+int PS4_SYSV_ABI sceHttpsSetSslCallback(int id, void* cbfunc, void* userArg) {
+    // Game-side cert verification callback. No HTTPS path to call it on.
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsSetSslCallback() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpsSetSslVersion(int id, int version) {
+    return sceHttpsSetMinSslVersion(id, version);
+}
+
+int PS4_SYSV_ABI sceHttpsUnloadCert(int libhttpCtxId) {
+    // Symmetric with sceHttpsLoadCert. No state to free.
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsSetSslVersion() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpTerm(int libhttpCtxId) {
+    std::scoped_lock lk{g_state_mutex};
+    g_requests.clear();
+    g_connections.clear();
+    g_templates.clear();
+    g_cookies.clear();
+    g_next_template_id = 1;
+    g_next_connection_id = 1;
+    g_next_request_id = 1;
+    g_isHttpInitialized = false;
+    LOG_INFO(Lib_Http, "sceHttpTerm: state cleared");
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpsUnloadCert() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpTryGetNonblock(int id, int* isEnable) {
+    return sceHttpGetNonblock(id, isEnable);
 }
 
-int PS4_SYSV_ABI sceHttpTerm() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceHttpTrySetNonblock(int id, int isEnable) {
+    return sceHttpSetNonblock(id, isEnable);
 }
 
-int PS4_SYSV_ABI sceHttpTryGetNonblock() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpTrySetNonblock() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-int PS4_SYSV_ABI sceHttpUnsetEpoll() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpUnsetEpoll(int id) {
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
                                  const OrbisHttpUriElement* srcElement, u32 option) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+    if (require == nullptr || srcElement == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    const u32 OPT_SCHEME = 0x01, OPT_HOSTNAME = 0x02, OPT_PORT = 0x04, OPT_PATH = 0x08,
+              OPT_USERNAME = 0x10, OPT_PASSWORD = 0x20, OPT_QUERY = 0x40, OPT_FRAGMENT = 0x80;
+
+    std::string built;
+    if ((option & OPT_SCHEME) && srcElement->scheme) {
+        built.append(srcElement->scheme);
+        built.append("://");
+    }
+    if ((option & OPT_USERNAME) && srcElement->username) {
+        built.append(srcElement->username);
+        if ((option & OPT_PASSWORD) && srcElement->password) {
+            built.append(":");
+            built.append(srcElement->password);
+        }
+        built.append("@");
+    }
+    if ((option & OPT_HOSTNAME) && srcElement->hostname) {
+        built.append(srcElement->hostname);
+    }
+    if ((option & OPT_PORT) && srcElement->port != 0) {
+        built.append(":");
+        built.append(std::to_string(srcElement->port));
+    }
+    if ((option & OPT_PATH) && srcElement->path) {
+        built.append(srcElement->path);
+    }
+    if ((option & OPT_QUERY) && srcElement->query) {
+        built.append(srcElement->query);
+    }
+    if ((option & OPT_FRAGMENT) && srcElement->fragment) {
+        built.append(srcElement->fragment);
+    }
+    *require = built.size() + 1;
+    if (out != nullptr) {
+        if (prepare < built.size() + 1) {
+            return ORBIS_HTTP_ERROR_OUT_OF_SIZE;
+        }
+        std::memcpy(out, built.data(), built.size());
+        out[built.size()] = '\0';
+    }
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceHttpUriCopy() {
-    LOG_ERROR(Lib_Http, "(STUBBED) called");
+int PS4_SYSV_ABI sceHttpUriCopy(OrbisHttpUriElement* dest, const OrbisHttpUriElement* src,
+                                void* pool, u64* require, u64 prepare) {
+    if (src == nullptr || require == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    auto strLen = [](const char* s) -> u64 { return s ? (std::strlen(s) + 1) : 0; };
+    const u64 needed = strLen(src->scheme) + strLen(src->username) + strLen(src->password) +
+                       strLen(src->hostname) + strLen(src->path) + strLen(src->query) +
+                       strLen(src->fragment);
+    *require = needed;
+    if (dest == nullptr || pool == nullptr || prepare < needed) {
+        return ORBIS_OK;
+    }
+
+    char* p = static_cast<char*>(pool);
+    auto put = [&](const char* s) -> char* {
+        if (!s)
+            return nullptr;
+        const u64 n = std::strlen(s) + 1;
+        std::memcpy(p, s, n);
+        char* out = p;
+        p += n;
+        return out;
+    };
+    *dest = *src;
+    dest->scheme = put(src->scheme);
+    dest->username = put(src->username);
+    dest->password = put(src->password);
+    dest->hostname = put(src->hostname);
+    dest->path = put(src->path);
+    dest->query = put(src->query);
+    dest->fragment = put(src->fragment);
     return ORBIS_OK;
 }
 
