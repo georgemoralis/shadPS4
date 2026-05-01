@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <magic_enum/magic_enum.hpp>
 #include "common/elf_info.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/network/http.h"
+#include "core/libraries/np/np_handler.h"
 #include "np_web_api_internal.h"
-
-#include <magic_enum/magic_enum.hpp>
 
 namespace Libraries::Np::NpWebApi {
 
@@ -456,7 +456,6 @@ s32 createRequest(s32 titleUserCtxId, const char* pApiGroup, const char* pPath,
     while (user_context->requests.contains(request_id)) {
         request_id--;
     }
-    // Real library would hang if this assert fails.
     ASSERT_MSG(request_id > (user_ctx_id << 0x20), "Too many requests!");
     user_context->requests[request_id] = new OrbisNpWebApiRequest{};
 
@@ -613,11 +612,103 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
         return ORBIS_NP_WEBAPI_ERROR_NOT_SIGNED_IN;
     }
 
-    LOG_ERROR(Lib_NpWebApi,
-              "(STUBBED) called, requestId = {:#x}, pApiGroup = '{}', pPath = '{}', pContentType = "
-              "'{}', method = {}, multipart = {}",
-              requestId, request->userApiGroup, request->userPath, request->userContentType,
-              magic_enum::enum_name(request->userMethod), request->multipart);
+    if (request->http_request_id == 0) {
+        std::string base_url = EmulatorSettings.GetShadNetWebApiServer();
+        const int conn_id = Libraries::Http::sceHttpCreateConnectionWithURL(
+            context->libHttpCtxId, base_url.c_str(), /*enableKeepalive=*/true);
+        if (conn_id < 0) {
+            LOG_ERROR(Lib_NpWebApi, "sendRequest: sceHttpCreateConnectionWithURL failed: {:#x}",
+                      conn_id);
+            releaseRequest(request);
+            releaseUserContext(user_context);
+            releaseContext(context);
+            return conn_id;
+        }
+        request->http_connection_id = conn_id;
+
+        // Convert the WebAPI method enum to libhttp's SceHttpMethods
+        // enum. The two enums have different orderings:
+        //
+        //   OrbisNpWebApiHttpMethod: GET=0, POST=1, PUT=2, DELETE=3, PATCH=4
+        //   SceHttpMethods:          GET=0, POST=1, HEAD=2, OPTIONS=3,
+        //                            PUT=4, DELETE=5, TRACE=6, CONNECT=7
+        s32 sceMethod;
+        switch (request->userMethod) {
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_GET:
+            sceMethod = 0;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_POST:
+            sceMethod = 1;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_PUT:
+            sceMethod = 4;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_DELETE:
+            sceMethod = 5;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_PATCH:
+            sceMethod = 8; // out-of-band PATCH marker recognised by libhttp
+            break;
+        default:
+            LOG_ERROR(Lib_NpWebApi, "sendRequest: unknown method enum value {}",
+                      static_cast<int>(request->userMethod));
+            releaseRequest(request);
+            releaseUserContext(user_context);
+            releaseContext(context);
+            return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+        }
+        const std::string full_url = base_url + request->userPath;
+        const int req_id = Libraries::Http::sceHttpCreateRequestWithURL(
+            conn_id, sceMethod, full_url.c_str(), request->userContentLength);
+        if (req_id < 0) {
+            LOG_ERROR(Lib_NpWebApi, "sendRequest: sceHttpCreateRequestWithURL failed: {:#x}",
+                      req_id);
+            Libraries::Http::sceHttpDeleteConnection(conn_id);
+            request->http_connection_id = 0;
+            releaseRequest(request);
+            releaseUserContext(user_context);
+            releaseContext(context);
+            return req_id;
+        }
+        request->http_request_id = req_id;
+
+        // Add Content-Type if the caller specified one.
+        // adds Accept-Encoding, User-Agent, OAuth Authorization , etc ....
+        // TODO check if we need to add them
+        if (!request->userContentType.empty()) {
+            Libraries::Http::sceHttpAddRequestHeader(req_id, "Content-Type",
+                                                     request->userContentType.c_str(), /*mode=*/0);
+        }
+
+        const std::string bearer = NpHandler::GetInstance().GetBearerToken(user_context->userId);
+        if (!bearer.empty()) {
+            const std::string auth_value = "Bearer " + bearer;
+            Libraries::Http::sceHttpAddRequestHeader(req_id, "Authorization", auth_value.c_str(),
+                                                     /*mode=*/0);
+        } else {
+            LOG_WARNING(Lib_NpWebApi,
+                        "sendRequest: no bearer token for user_id={}; request to '{}' will "
+                        "be unauthenticated (expect 401 from server)",
+                        user_context->userId, request->userPath);
+        }
+    }
+
+    setRequestState(request, 4);
+
+    const s32 send_err =
+        Libraries::Http::sceHttpSendRequest(request->http_request_id, pData, dataSize);
+    if (send_err < 0) {
+        LOG_ERROR(Lib_NpWebApi, "sendRequest: sceHttpSendRequest failed: {:#x}", send_err);
+        releaseRequest(request);
+        releaseUserContext(user_context);
+        releaseContext(context);
+        return send_err;
+    }
+
+    LOG_INFO(Lib_NpWebApi,
+             "sendRequest OK requestId={:#x} apiGroup='{}' path='{}' method={} httpReqId={}",
+             requestId, request->userApiGroup, request->userPath,
+             magic_enum::enum_name(request->userMethod), request->http_request_id);
 
     releaseRequest(request);
     releaseUserContext(user_context);
@@ -709,6 +800,17 @@ s32 deleteRequest(s64 requestId) {
     }
 
     releaseRequest(request);
+    // Drop the underlying sceHttp request + connection if sendRequest
+    // ever bound them. A connection is created per np_web_api request
+    // TODO check if we have to pool them
+    if (request->http_request_id != 0) {
+        Libraries::Http::sceHttpDeleteRequest(request->http_request_id);
+        request->http_request_id = 0;
+    }
+    if (request->http_connection_id != 0) {
+        Libraries::Http::sceHttpDeleteConnection(request->http_connection_id);
+        request->http_connection_id = 0;
+    }
     user_context->requests.erase(request->requestId);
 
     releaseUserContext(user_context);
@@ -1371,10 +1473,13 @@ s32 unregisterExtdPushEventCallback(s32 titleUserCtxId, s32 callbackId) {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI getHttpRequestIdFromRequest(OrbisNpWebApiRequest* request)
-
-{
-    return request->requestId;
+s32 PS4_SYSV_ABI getHttpRequestIdFromRequest(OrbisNpWebApiRequest* request) {
+    // Returns 0 if sendRequest hasn't yet bound the HTTP layer; that's
+    // the cue for the create-connection / create-request path. Once
+    // bound, this is the sceHttp request handle that all subsequent
+    // sceHttp* calls (Send / GetStatusCode / GetAllResponseHeaders /
+    // ReadData) operate on.
+    return request->http_request_id;
 }
 
 s32 PS4_SYSV_ABI getHttpStatusCodeInternal(s64 requestId, s32* out_status_code) {

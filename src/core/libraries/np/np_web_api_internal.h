@@ -7,8 +7,8 @@
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
+#include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_web_api.h"
-#include "core/libraries/np/np_web_api_error.h"
 
 namespace Libraries::Np::NpWebApi {
 
@@ -70,11 +70,12 @@ struct OrbisNpWebApiRequest {
     u32 requestTimeout;
     u64 requestEndTime;
     bool timedOut;
-    // not sure Stephen
     u8 requestState;
     u64 remainingData;
     u32 readOffset;
     char data[64];
+    s32 http_connection_id = 0;
+    s32 http_request_id = 0;
 };
 
 struct OrbisNpWebApiHandle {
