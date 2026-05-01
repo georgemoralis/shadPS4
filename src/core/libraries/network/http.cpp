@@ -754,9 +754,6 @@ int PS4_SYSV_ABI sceHttpGetCookie(int libhttpCtxId, const char* url, char* cooki
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
     }
     std::scoped_lock lk{g_state_mutex};
-    // Pick the longest matching cookie (URL prefix-match). Real
-    // implementations parse Domain=/Path= attributes; we just match
-    // exact URL prefix, which is enough for "store and recover".
     std::string match;
     for (const auto& c : g_cookies) {
         if (std::strstr(url, c.url.c_str()) != nullptr) {
