@@ -613,11 +613,7 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
     }
 
     if (request->http_request_id == 0) {
-        // First call: bind the request to a fresh sceHttp connection +
-        // request. shadnet has one base URL so we hardcode it; real PSN
-        // would resolve api_group to base via sceNpAsmClientGetServiceBaseUrlA.
-        const std::string base_url = "http://127.0.0.1:31315"; // TODO make it configurable
-
+        std::string base_url = EmulatorSettings.GetShadNetWebApiServer();
         const int conn_id = Libraries::Http::sceHttpCreateConnectionWithURL(
             context->libHttpCtxId, base_url.c_str(), /*enableKeepalive=*/true);
         if (conn_id < 0) {
@@ -630,9 +626,40 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
         }
         request->http_connection_id = conn_id;
 
-        const std::string full_url = base_url + request->userPath;
+        // Convert the WebAPI method enum to libhttp's SceHttpMethods
+        // enum. The two enums have different orderings:
+        //
+        //   OrbisNpWebApiHttpMethod: GET=0, POST=1, PUT=2, DELETE=3, PATCH=4
+        //   SceHttpMethods:          GET=0, POST=1, HEAD=2, OPTIONS=3,
+        //                            PUT=4, DELETE=5, TRACE=6, CONNECT=7
+        s32 sceMethod;
+        switch (request->userMethod) {
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_GET:
+            sceMethod = 0;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_POST:
+            sceMethod = 1;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_PUT:
+            sceMethod = 4;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_DELETE:
+            sceMethod = 5;
+            break;
+        case ORBIS_NP_WEBAPI_HTTP_METHOD_PATCH:
+            sceMethod = 8; // out-of-band PATCH marker recognised by libhttp
+            break;
+        default:
+            LOG_ERROR(Lib_NpWebApi, "sendRequest: unknown method enum value {}",
+                      static_cast<int>(request->userMethod));
+            releaseRequest(request);
+            releaseUserContext(user_context);
+            releaseContext(context);
+            return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+        }
+
         const int req_id = Libraries::Http::sceHttpCreateRequestWithURL(
-            conn_id, request->userMethod, full_url.c_str(), request->userContentLength);
+            conn_id, sceMethod, full_url.c_str(), request->userContentLength);
         if (req_id < 0) {
             LOG_ERROR(Lib_NpWebApi, "sendRequest: sceHttpCreateRequestWithURL failed: {:#x}",
                       req_id);
