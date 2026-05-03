@@ -95,9 +95,7 @@ struct HttpState {
     std::mutex m_mutex;
     bool inited = false;
     int next_ctx_id = 0;
-    int next_tmpl_id = 0;
-    int next_conn_id = 0;
-    int next_req_id = 0;
+    int next_obj_id = 0;
     std::unordered_set<int> active_contexts;
     std::unordered_map<int, HttpTemplate> templates;
     std::unordered_map<int, HttpConnection> connections;
@@ -260,7 +258,7 @@ int PS4_SYSV_ABI sceHttpCreateConnection(int tmplId, const char* serverName, con
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
     }
 
-    int conn_id = ++g_state.next_conn_id;
+    int conn_id = ++g_state.next_obj_id;
     HttpConnection conn;
     conn.tmpl_id = tmplId;
     conn.scheme = scheme_str;
@@ -330,7 +328,7 @@ int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, boo
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
 
-    int conn_id = ++g_state.next_conn_id;
+    int conn_id = ++g_state.next_obj_id;
     HttpConnection conn;
     conn.tmpl_id = tmplId;
     conn.url = url;
@@ -466,7 +464,7 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int connId, s32 method, const char*
         return ORBIS_HTTP_ERROR_INVALID_URL;
     }
 
-    int req_id = ++g_state.next_req_id;
+    int req_id = ++g_state.next_obj_id;
     HttpRequest req;
     req.conn_id = connId;
     req.method = method;
@@ -554,7 +552,7 @@ int PS4_SYSV_ABI sceHttpCreateTemplate(int libhttpCtxId, const char* userAgent, 
         return ORBIS_HTTP_ERROR_INVALID_VERSION;
     }
 
-    int tmpl_id = ++g_state.next_tmpl_id;
+    int tmpl_id = ++g_state.next_obj_id;
     HttpTemplate tmpl;
     tmpl.user_agent = userAgent;
     tmpl.http_version = httpVer;
