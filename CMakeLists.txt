@@ -1255,6 +1255,15 @@ if (WIN32)
     target_sources(shadps4 PRIVATE src/shadps4.rc)
 endif()
 
+if (WIN32 AND OPENSSL_RUNTIME_DLLS)
+    foreach(dll ${OPENSSL_RUNTIME_DLLS})
+        add_custom_command(TARGET shadps4 POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${dll}" "$<TARGET_FILE_DIR:shadps4>"
+            COMMENT "Copying OpenSSL runtime DLL: ${dll}")
+    endforeach()
+endif()
+
 add_compile_definitions(BOOST_ASIO_STANDALONE)
 
 target_include_directories(shadps4 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
