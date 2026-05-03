@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cctype>
+
 #include "common/elf_info.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -24,6 +26,39 @@ static s32 g_registered_callback_count = 0;
 static s64 g_request_count = 0;
 static u64 g_last_timeout_check = 0;
 static s32 g_sdk_ver = 0;
+
+static std::string ResolveApiGroupBaseUrl(const std::string& api_group) {
+    // Strip the "sdk:" prefix if present so the hostname looks tidy in logs.
+    std::string cleaned = api_group;
+    if (cleaned.starts_with("sdk:")) {
+        cleaned = cleaned.substr(4);
+    }
+    // Replace any non-DNS-friendly characters with '-'.
+    for (char& c : cleaned) {
+        if (!isalnum(static_cast<unsigned char>(c))) {
+            c = '-';
+        }
+    }
+    if (cleaned.empty()) {
+        cleaned = "default";
+    }
+    return "https://" + cleaned + ".mock-psn.shadps4.invalid";
+}
+
+static s32 NpMethodToHttpMethod(OrbisNpWebApiHttpMethod method) {
+    switch (method) {
+    case ORBIS_NP_WEBAPI_HTTP_METHOD_GET:
+        return 0; // ORBIS_HTTP_METHOD_GET
+    case ORBIS_NP_WEBAPI_HTTP_METHOD_POST:
+        return 1; // ORBIS_HTTP_METHOD_POST
+    case ORBIS_NP_WEBAPI_HTTP_METHOD_PUT:
+        return 4; // ORBIS_HTTP_METHOD_PUT
+    case ORBIS_NP_WEBAPI_HTTP_METHOD_DELETE:
+        return 5; // ORBIS_HTTP_METHOD_DELETE
+    default:
+        return -1; // unknown / Patch (would need sceHttpCreateRequestWithURL2)
+    }
+}
 
 s32 initializeLibrary() {
     return Kernel::sceKernelGetCompiledSdkVersion(&g_sdk_ver);
@@ -284,7 +319,27 @@ s32 createUserContext(s32 libCtxId, Libraries::UserService::OrbisUserServiceUser
     user_context->userCtxId = user_ctx_id;
     user_context->deleted = false;
 
-    // TODO: Internal structs related to libSceHttp use are initialized here.
+    char user_agent[64] = {0};
+    if (context->name.empty()) {
+        snprintf(user_agent, sizeof(user_agent), "NpWebApi/%08x", g_sdk_ver);
+    } else {
+        snprintf(user_agent, sizeof(user_agent), "NpWebApi/%08x (%s)", g_sdk_ver,
+                 context->name.c_str());
+    }
+    s32 template_id = Libraries::Http::sceHttpCreateTemplate(context->libHttpCtxId, user_agent,
+                                                             /*httpVer=*/2,
+                                                             /*isAutoProxyConf=*/0);
+    if (template_id <= 0) {
+        LOG_ERROR(Lib_NpWebApi,
+                  "sceHttpCreateTemplate failed for libHttpCtxId={}: error={:#x} — user "
+                  "context will be created but no http requests will work",
+                  context->libHttpCtxId, template_id);
+        user_context->template_id = 0;
+    } else {
+        user_context->template_id = template_id;
+        LOG_INFO(Lib_NpWebApi, "user_ctx_id={} -> http template_id={}", user_ctx_id, template_id);
+    }
+
     releaseContext(context);
     return user_ctx_id;
 }
@@ -415,6 +470,25 @@ s32 deleteUserContext(s32 titleUserCtxId) {
     user_context->servicePushEventCallbacks.clear();
     user_context->pushEventCallbacks.clear();
     user_context->requests.clear();
+
+    for (auto& [api_group, http_conn_id] : user_context->http_connections_by_api_group) {
+        s32 ret = Libraries::Http::sceHttpDeleteConnection(http_conn_id);
+        if (ret < 0) {
+            LOG_ERROR(Lib_NpWebApi,
+                      "sceHttpDeleteConnection failed for connId={} (api_group={}): {:#x}",
+                      http_conn_id, api_group, ret);
+        }
+    }
+    user_context->http_connections_by_api_group.clear();
+    if (user_context->template_id != 0) {
+        s32 ret = Libraries::Http::sceHttpDeleteTemplate(user_context->template_id);
+        if (ret < 0) {
+            LOG_ERROR(Lib_NpWebApi, "sceHttpDeleteTemplate failed for tmplId={}: {:#x}",
+                      user_context->template_id, ret);
+        }
+        user_context->template_id = 0;
+    }
+
     context->userContexts.erase(titleUserCtxId);
 
     unlockContext(context);
@@ -613,11 +687,100 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
         return ORBIS_NP_WEBAPI_ERROR_NOT_SIGNED_IN;
     }
 
-    LOG_ERROR(Lib_NpWebApi,
-              "(STUBBED) called, requestId = {:#x}, pApiGroup = '{}', pPath = '{}', pContentType = "
-              "'{}', method = {}, multipart = {}",
-              requestId, request->userApiGroup, request->userPath, request->userContentType,
-              magic_enum::enum_name(request->userMethod), request->multipart);
+    LOG_INFO(Lib_NpWebApi,
+             "called, requestId = {:#x}, pApiGroup = '{}', pPath = '{}', pContentType = '{}', "
+             "method = {}, multipart = {}, dataSize = {}",
+             requestId, request->userApiGroup, request->userPath, request->userContentType,
+             magic_enum::enum_name(request->userMethod), request->multipart, dataSize);
+
+    s32 http_conn_id = 0;
+    {
+        std::scoped_lock lk{user_context->parentContext->contextLock};
+        auto it = user_context->http_connections_by_api_group.find(request->userApiGroup);
+        if (it != user_context->http_connections_by_api_group.end()) {
+            http_conn_id = it->second;
+        } else {
+            if (user_context->template_id == 0) {
+                LOG_ERROR(Lib_NpWebApi,
+                          "user context has no http template (createUserContext failed?)"
+                          " — cannot create connection for api_group='{}'",
+                          request->userApiGroup);
+                releaseRequest(request);
+                releaseUserContext(user_context);
+                releaseContext(context);
+                return ORBIS_NP_WEBAPI_ERROR_NOT_SIGNED_IN;
+            }
+            std::string base_url = ResolveApiGroupBaseUrl(request->userApiGroup);
+            s32 ret = Libraries::Http::sceHttpCreateConnectionWithURL(user_context->template_id,
+                                                                      base_url.c_str(),
+                                                                      /*enableKeepalive=*/true);
+            if (ret <= 0) {
+                LOG_ERROR(Lib_NpWebApi,
+                          "sceHttpCreateConnectionWithURL failed for api_group='{}' (url='{}'): "
+                          "{:#x}",
+                          request->userApiGroup, base_url, ret);
+                releaseRequest(request);
+                releaseUserContext(user_context);
+                releaseContext(context);
+                return ORBIS_NP_WEBAPI_ERROR_ABORTED;
+            }
+            http_conn_id = ret;
+            user_context->http_connections_by_api_group[request->userApiGroup] = http_conn_id;
+            LOG_INFO(Lib_NpWebApi, "created http connection connId={} for api_group='{}' url='{}'",
+                     http_conn_id, request->userApiGroup, base_url);
+        }
+    }
+    request->active_http_connection = http_conn_id;
+    std::string full_url = ResolveApiGroupBaseUrl(request->userApiGroup) + request->userPath;
+    s32 http_method = NpMethodToHttpMethod(request->userMethod);
+    s32 http_req_id = 0;
+    if (http_method >= 0) {
+        http_req_id = Libraries::Http::sceHttpCreateRequestWithURL(
+            http_conn_id, http_method, full_url.c_str(), request->userContentLength);
+    } else {
+        const char* method_str = magic_enum::enum_name(request->userMethod).data();
+        LOG_ERROR(Lib_NpWebApi,
+                  "Unsupported method {} for sendRequest — sceHttpCreateRequestWithURL2 not"
+                  " yet wired up; treating as failure",
+                  method_str ? method_str : "(null)");
+        releaseRequest(request);
+        releaseUserContext(user_context);
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+    }
+    if (http_req_id <= 0) {
+        LOG_ERROR(Lib_NpWebApi, "sceHttpCreateRequestWithURL failed for url='{}': {:#x}", full_url,
+                  http_req_id);
+        releaseRequest(request);
+        releaseUserContext(user_context);
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_ABORTED;
+    }
+    request->http_request_id = http_req_id;
+    LOG_INFO(Lib_NpWebApi, "created http request httpReqId={} for url='{}'", http_req_id, full_url);
+
+    // Step 5: Content-Type if specified.
+    if (!request->userContentType.empty()) {
+        s32 ret = Libraries::Http::sceHttpAddRequestHeader(http_req_id, "Content-Type",
+                                                           request->userContentType.c_str(),
+                                                           /*mode=OVERWRITE=*/0);
+        if (ret < 0) {
+            LOG_ERROR(Lib_NpWebApi,
+                      "sceHttpAddRequestHeader(Content-Type) failed for httpReqId={}: {:#x}",
+                      http_req_id, ret);
+            // Don't bail — header failure is non-fatal in mock mode.
+        }
+    }
+
+    s32 send_ret = Libraries::Http::sceHttpSendRequest(http_req_id, pData, dataSize);
+    if (send_ret < 0) {
+        LOG_ERROR(Lib_NpWebApi, "sceHttpSendRequest failed for httpReqId={}: {:#x}", http_req_id,
+                  send_ret);
+        releaseRequest(request);
+        releaseUserContext(user_context);
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_ABORTED;
+    }
 
     releaseRequest(request);
     releaseUserContext(user_context);
@@ -706,6 +869,15 @@ s32 deleteRequest(s64 requestId) {
         unlockContext(context);
         Kernel::sceKernelUsleep(50000);
         lockContext(context);
+    }
+
+    if (request->http_request_id != 0) {
+        s32 ret = Libraries::Http::sceHttpDeleteRequest(request->http_request_id);
+        if (ret < 0) {
+            LOG_ERROR(Lib_NpWebApi, "sceHttpDeleteRequest failed for httpReqId={}: {:#x}",
+                      request->http_request_id, ret);
+        }
+        request->http_request_id = 0;
     }
 
     releaseRequest(request);
@@ -1374,7 +1546,7 @@ s32 unregisterExtdPushEventCallback(s32 titleUserCtxId, s32 callbackId) {
 s32 PS4_SYSV_ABI getHttpRequestIdFromRequest(OrbisNpWebApiRequest* request)
 
 {
-    return request->requestId;
+    return request->http_request_id;
 }
 
 s32 PS4_SYSV_ABI getHttpStatusCodeInternal(s64 requestId, s32* out_status_code) {

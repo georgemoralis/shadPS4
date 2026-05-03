@@ -53,6 +53,8 @@ struct OrbisNpWebApiUserContext {
     bool deleted;
     OrbisNpWebApiNotificationCallback notificationCallbackFunction;
     void* pNotificationCallbackUserArgs;
+    s32 template_id = 0;
+    std::map<std::string, s32> http_connections_by_api_group;
 };
 
 struct OrbisNpWebApiRequest {
@@ -70,11 +72,12 @@ struct OrbisNpWebApiRequest {
     u32 requestTimeout;
     u64 requestEndTime;
     bool timedOut;
-    // not sure Stephen
     u8 requestState;
     u64 remainingData;
     u32 readOffset;
     char data[64];
+    s32 active_http_connection = 0;
+    s32 http_request_id = 0;
 };
 
 struct OrbisNpWebApiHandle {
