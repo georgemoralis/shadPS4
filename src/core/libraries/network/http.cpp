@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include <unordered_set>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -97,6 +98,7 @@ struct HttpState {
     int next_tmpl_id = 0;
     int next_conn_id = 0;
     int next_req_id = 0;
+    std::unordered_set<int> active_contexts;
     std::unordered_map<int, HttpTemplate> templates;
     std::unordered_map<int, HttpConnection> connections;
     std::unordered_map<int, HttpRequest> requests;
@@ -539,6 +541,10 @@ int PS4_SYSV_ABI sceHttpCreateTemplate(int libhttpCtxId, const char* userAgent, 
         LOG_ERROR(Lib_Http, "Not initialized");
         return ORBIS_HTTP_ERROR_BEFORE_INIT;
     }
+    if (!g_state.active_contexts.contains(libhttpCtxId)) {
+        LOG_ERROR(Lib_Http, "Invalid libhttpCtxId={} (not in active contexts)", libhttpCtxId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
     if (!userAgent) {
         LOG_ERROR(Lib_Http, "userAgent is null");
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
@@ -770,17 +776,15 @@ int PS4_SYSV_ABI sceHttpInit(int libnetMemId, int libsslCtxId, u64 poolSize) {
     LOG_INFO(Lib_Http, "called libnetMemId={}, libsslCtxId={}, poolSize={}", libnetMemId,
              libsslCtxId, poolSize);
     std::lock_guard<std::mutex> lock(g_state.m_mutex);
-    if (g_state.inited) {
-        LOG_ERROR(Lib_Http, "Already initialized");
-        return ORBIS_HTTP_ERROR_ALREADY_INITED;
-    }
     if (poolSize == 0) {
         LOG_ERROR(Lib_Http, "poolSize is 0");
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
     }
-    g_state.inited = true;
     int ctx_id = ++g_state.next_ctx_id;
-    LOG_INFO(Lib_Http, "initialized -> ctxId={}", ctx_id);
+    g_state.active_contexts.insert(ctx_id);
+    g_state.inited = true; // True as long as ANY context is alive.
+    LOG_INFO(Lib_Http, "initialized -> ctxId={} (active contexts: {})", ctx_id,
+             g_state.active_contexts.size());
     return ctx_id;
 }
 
@@ -1194,10 +1198,22 @@ int PS4_SYSV_ABI sceHttpTerm(int libhttpCtxId) {
         LOG_ERROR(Lib_Http, "Not initialized");
         return ORBIS_HTTP_ERROR_BEFORE_INIT;
     }
-    g_state.requests.clear();
-    g_state.connections.clear();
-    g_state.templates.clear();
-    g_state.inited = false;
+    if (g_state.active_contexts.erase(libhttpCtxId) == 0) {
+        LOG_ERROR(Lib_Http, "Invalid or already-terminated ctxId={}", libhttpCtxId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    if (g_state.active_contexts.empty()) {
+        // Last context gone — drop everything. std::map / std::string destructors
+        // free the headers and URL strings; future stages will close sockets here.
+        LOG_INFO(Lib_Http, "last context terminated, clearing state");
+        g_state.requests.clear();
+        g_state.connections.clear();
+        g_state.templates.clear();
+        g_state.inited = false;
+    } else {
+        LOG_INFO(Lib_Http, "ctxId={} terminated, {} contexts still active", libhttpCtxId,
+                 g_state.active_contexts.size());
+    }
     return ORBIS_OK;
 }
 
