@@ -785,7 +785,7 @@ int PS4_SYSV_ABI sceHttpUriCopy() {
 //***********************************
 int PS4_SYSV_ABI sceHttpUriEscape(char* out, u64* require, u64 prepare, const char* in) {
     LOG_TRACE(Lib_Http, "called out={}, require={}, prepare={}, in={}", fmt::ptr(out),
-             fmt::ptr(require), prepare, in ? in : "(null)");
+              fmt::ptr(require), prepare, in ? in : "(null)");
 
     if (!in) {
         LOG_ERROR(Lib_Http, "Invalid input string");
@@ -846,9 +846,9 @@ int PS4_SYSV_ABI sceHttpUriEscape(char* out, u64* require, u64 prepare, const ch
 int PS4_SYSV_ABI sceHttpUriMerge(char* mergedUrl, char* url, char* relativeUri, u64* require,
                                  u64 prepare, u32 option) {
     LOG_TRACE(Lib_Http,
-             "called mergedUrl={}, url={}, relativeUri={}, require={}, prepare={}, option={:#x}",
-             fmt::ptr(mergedUrl), url ? url : "(null)", relativeUri ? relativeUri : "(null)",
-             fmt::ptr(require), prepare, option);
+              "called mergedUrl={}, url={}, relativeUri={}, require={}, prepare={}, option={:#x}",
+              fmt::ptr(mergedUrl), url ? url : "(null)", relativeUri ? relativeUri : "(null)",
+              fmt::ptr(require), prepare, option);
 
     u64 requiredLength;
     int returnValue;
@@ -943,7 +943,7 @@ int PS4_SYSV_ABI sceHttpUriMerge(char* mergedUrl, char* url, char* relativeUri, 
 int PS4_SYSV_ABI sceHttpUriParse(OrbisHttpUriElement* out, const char* srcUri, void* pool,
                                  u64* require, u64 prepare) {
     LOG_TRACE(Lib_Http, "called out={}, srcUri={}, pool={}, require={}, prepare={}", fmt::ptr(out),
-             srcUri ? srcUri : "(null)", fmt::ptr(pool), fmt::ptr(require), prepare);
+              srcUri ? srcUri : "(null)", fmt::ptr(pool), fmt::ptr(require), prepare);
     if (!srcUri) {
         LOG_ERROR(Lib_Http, "invalid url: srcUri is null");
         return ORBIS_HTTP_ERROR_INVALID_URL;
@@ -1228,7 +1228,7 @@ int PS4_SYSV_ABI sceHttpUriParse(OrbisHttpUriElement* out, const char* srcUri, v
 
 int PS4_SYSV_ABI sceHttpUriSweepPath(char* dst, const char* src, u64 srcSize) {
     LOG_TRACE(Lib_Http, "called dst={}, src={}, srcSize={}", fmt::ptr(dst), src ? src : "(null)",
-             srcSize);
+              srcSize);
 
     if (!dst || !src) {
         LOG_ERROR(Lib_Http, "Invalid parameters: dst={}, src={}", fmt::ptr(dst), fmt::ptr(src));
@@ -1321,7 +1321,7 @@ int PS4_SYSV_ABI sceHttpUriSweepPath(char* dst, const char* src, u64 srcSize) {
 
 int PS4_SYSV_ABI sceHttpUriUnescape(char* out, u64* require, u64 prepare, const char* in) {
     LOG_TRACE(Lib_Http, "called out={}, require={}, prepare={}, in={}", fmt::ptr(out),
-             fmt::ptr(require), prepare, in ? in : "(null)");
+              fmt::ptr(require), prepare, in ? in : "(null)");
 
     if (!in) {
         LOG_ERROR(Lib_Http, "Invalid input string");
