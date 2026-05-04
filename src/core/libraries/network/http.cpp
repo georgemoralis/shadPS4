@@ -712,7 +712,14 @@ int PS4_SYSV_ABI sceHttpCreateRequest(int connId, int method, const char* path, 
             LOG_ERROR(Lib_Http, "path is null");
             return ORBIS_HTTP_ERROR_INVALID_VALUE;
         }
-        url = it->second.url;
+        const auto& conn = it->second;
+        url = conn.scheme + "://" + conn.hostname + ":" + std::to_string(conn.port);
+        if (path[0] != '\0') {
+            if (path[0] != '/') {
+                url.push_back('/');
+            }
+            url.append(path);
+        }
     }
     return sceHttpCreateRequestWithURL(connId, method, url.c_str(), contentLength);
 }
@@ -766,7 +773,14 @@ int PS4_SYSV_ABI sceHttpCreateRequest2(int connId, const char* method, const cha
             LOG_ERROR(Lib_Http, "Invalid connId={}", connId);
             return ORBIS_HTTP_ERROR_INVALID_ID;
         }
-        url = it->second.url;
+        const auto& conn = it->second;
+        url = conn.scheme + "://" + conn.hostname + ":" + std::to_string(conn.port);
+        if (path[0] != '\0') {
+            if (path[0] != '/') {
+                url.push_back('/');
+            }
+            url.append(path);
+        }
     }
     int reqId = sceHttpCreateRequestWithURL(connId, int_method, url.c_str(), contentLength);
     if (reqId > 0 && method) {
