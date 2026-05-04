@@ -281,7 +281,7 @@ static bool ExecuteRealRequest(const RealRequestPlan& plan, HttpResponse& out_re
         cli.set_connection_timeout(std::chrono::seconds(10));
         cli.set_read_timeout(std::chrono::seconds(30));
         cli.set_write_timeout(std::chrono::seconds(30));
-        //auto-follow redirects
+        // auto-follow redirects
         cli.set_follow_location(true);
 
         auto headers = BuildHttplibHeaders(plan.headers);
