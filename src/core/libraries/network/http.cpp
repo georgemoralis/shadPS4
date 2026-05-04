@@ -2005,7 +2005,7 @@ int PS4_SYSV_ABI sceHttpUriCopy() {
 //***********************************
 // URI functions
 //***********************************
-int PS4_SYSV_ABI sceHttpUriBuild(char* out, size_t* require, size_t prepare,
+int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
                                  const OrbisHttpUriElement* srcElement, u32 option) {
     LOG_INFO(Lib_Http,
              "sceHttpUriBuild: called out={}, require={}, prepare={}, "
