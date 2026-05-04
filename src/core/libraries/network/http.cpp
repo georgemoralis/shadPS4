@@ -563,8 +563,15 @@ int PS4_SYSV_ABI sceHttpCreateConnection(int tmplId, const char* serverName, con
         return ORBIS_HTTP_ERROR_INVALID_URL;
     }
     if (port == 0) {
-        LOG_ERROR(Lib_Http, "port is 0");
-        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+        if (scheme && std::strcmp(scheme, "https") == 0) {
+            port = 443;
+        } else if (scheme && std::strcmp(scheme, "http") == 0) {
+            port = 80;
+        } else {
+            LOG_ERROR(Lib_Http, "sceHttpCreateConnection: port is 0 and scheme '{}' has no default",
+                      scheme ? scheme : "(null)");
+            return ORBIS_HTTP_ERROR_INVALID_VALUE;
+        }
     }
 
     int conn_id = ++g_state.next_obj_id;
