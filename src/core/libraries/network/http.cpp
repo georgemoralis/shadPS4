@@ -281,8 +281,8 @@ static bool ExecuteRealRequest(const RealRequestPlan& plan, HttpResponse& out_re
         cli.set_connection_timeout(std::chrono::seconds(10));
         cli.set_read_timeout(std::chrono::seconds(30));
         cli.set_write_timeout(std::chrono::seconds(30));
-        // Don't auto-follow redirects
-        cli.set_follow_location(false);
+        //auto-follow redirects
+        cli.set_follow_location(true);
 
         auto headers = BuildHttplibHeaders(plan.headers);
         std::string content_type;
@@ -1233,10 +1233,8 @@ int PS4_SYSV_ABI sceHttpInit(int libnetMemId, int libsslCtxId, u64 poolSize) {
     if (!g_state.ssl_status_logged) {
         g_state.ssl_status_logged = true;
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
-        LOG_INFO(Lib_Http,
-                 "cpp-httplib was built with OpenSSL — https:// real-network "
-                 "requests will be attempted. Set kRealNetworkEnabled=false in http.cpp to "
-                 "force mock-only behavior.");
+        LOG_INFO(Lib_Http, "cpp-httplib was built with OpenSSL,https:// real-network "
+                           "requests will be attempted");
 #else
         LOG_INFO(Lib_Http, "cpp-httplib was built WITHOUT OpenSSL,every https:// real-"
                            "network request will throw and be caught and fall back to mock.");
