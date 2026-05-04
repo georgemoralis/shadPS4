@@ -13,6 +13,17 @@ class SymbolsResolver;
 
 namespace Libraries::Http {
 
+enum OrbisUriBuild : s32 {
+    ORBIS_HTTP_URI_BUILD_WITH_SCHEME = 0x01,
+    ORBIS_HTTP_URI_BUILD_WITH_HOSTNAME = 0x02,
+    ORBIS_HTTP_URI_BUILD_WITH_PORT = 0x04,
+    ORBIS_HTTP_URI_BUILD_WITH_PATH = 0x08,
+    ORBIS_HTTP_URI_BUILD_WITH_USERNAME = 0x10,
+    ORBIS_HTTP_URI_BUILD_WITH_PASSWORD = 0x20,
+    ORBIS_HTTP_URI_BUILD_WITH_QUERY = 0x40,
+    ORBIS_HTTP_URI_BUILD_WITH_FRAGMENT = 0x80
+};
+
 struct OrbisHttpUriElement {
     bool opaque;
     char* scheme;
@@ -212,12 +223,13 @@ int PS4_SYSV_ABI sceHttpTrySetNonblock(int id, int isEnable);
 int PS4_SYSV_ABI sceHttpUnsetEpoll(int id);
 int PS4_SYSV_ABI sceHttpWaitRequest(OrbisHttpEpollHandle eh, OrbisHttpNBEvent* nbev, int maxevents,
                                     int timeout);
-int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
-                                 const OrbisHttpUriElement* srcElement, u32 option);
+
 int PS4_SYSV_ABI sceHttpUriCopy();
 //***********************************
 // URI functions
 //***********************************
+int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
+                                 const OrbisHttpUriElement* srcElement, u32 option);
 int PS4_SYSV_ABI sceHttpUriEscape(char* out, u64* require, u64 prepare, const char* in);
 int PS4_SYSV_ABI sceHttpUriMerge(char* mergedUrl, char* url, char* relativeUri, u64* require,
                                  u64 prepare, u32 option);

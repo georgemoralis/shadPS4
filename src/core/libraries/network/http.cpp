@@ -1976,14 +1976,6 @@ int PS4_SYSV_ABI sceHttpWaitRequest(OrbisHttpEpollHandle eh, OrbisHttpNBEvent* n
     return count;
 }
 
-int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
-                                 const OrbisHttpUriElement* srcElement, u32 option) {
-    LOG_ERROR(Lib_Http,
-              "(STUBBED) called out={}, require={}, prepare={}, srcElement={}, option={:#x}",
-              fmt::ptr(out), fmt::ptr(require), prepare, fmt::ptr(srcElement), option);
-    return ORBIS_OK;
-}
-
 int PS4_SYSV_ABI sceHttpUriCopy() {
     LOG_ERROR(Lib_Http, "(STUBBED) called");
     return ORBIS_OK;
@@ -1992,6 +1984,98 @@ int PS4_SYSV_ABI sceHttpUriCopy() {
 //***********************************
 // URI functions
 //***********************************
+s32 PS4_SYSV_ABI sceHttpUriBuild(char* out, size_t* require, size_t prepare,
+                                 const OrbisHttpUriElement* srcElement, u32 option) {
+    LOG_INFO(Lib_Http,
+             "sceHttpUriBuild: called out={}, require={}, prepare={}, "
+             "srcElement={}, option=0x{:x}",
+             fmt::ptr(out), fmt::ptr(require), prepare, fmt::ptr(srcElement), option);
+
+    if (srcElement == nullptr || require == nullptr) {
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+
+    std::string built;
+    built.reserve(256);
+
+    auto append_if = [&](u32 bit, std::string_view s, std::string_view sep_before = {},
+                         std::string_view sep_after = {}) {
+        if ((option & bit) && !s.empty()) {
+            built.append(sep_before);
+            built.append(s);
+            built.append(sep_after);
+        }
+    };
+
+    // Scheme
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_SCHEME) && srcElement->scheme[0]) {
+        built.append(srcElement->scheme);
+        built.append("://");
+    }
+
+    // Userinfo (username[:password]@)
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_USERNAME) && srcElement->username[0]) {
+        built.append(srcElement->username);
+        if ((option & ORBIS_HTTP_URI_BUILD_WITH_PASSWORD) && srcElement->password[0]) {
+            built.push_back(':');
+            built.append(srcElement->password);
+        }
+        built.push_back('@');
+    }
+
+    // Host
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_HOSTNAME) && srcElement->hostname[0]) {
+        built.append(srcElement->hostname);
+    }
+
+    // Port (only if not the scheme's default)
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_PORT) && srcElement->port != 0) {
+        const bool is_default_https =
+            std::string_view(srcElement->scheme) == "https" && srcElement->port == 443;
+        const bool is_default_http =
+            std::string_view(srcElement->scheme) == "http" && srcElement->port == 80;
+        if (!is_default_https && !is_default_http) {
+            built.push_back(':');
+            built.append(std::to_string(srcElement->port));
+        }
+    }
+
+    // Path
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_PATH) && srcElement->path[0]) {
+        if (srcElement->path[0] != '/')
+            built.push_back('/');
+        built.append(srcElement->path);
+    }
+
+    // Query (?...)
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_QUERY) && srcElement->query[0]) {
+        built.push_back('?');
+        built.append(srcElement->query);
+    }
+
+    // Fragment (#...)
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_FRAGMENT) && srcElement->fragment[0]) {
+        built.push_back('#');
+        built.append(srcElement->fragment);
+    }
+
+    // include null terminator in the required size.
+    const size_t need = built.size() + 1;
+    *require = need;
+
+    if (out == nullptr || prepare == 0) {
+        // Size query mode,return success without copying.
+        return ORBIS_OK;
+    }
+
+    if (prepare < need) {
+        return ORBIS_HTTP_ERROR_OUT_OF_SIZE; // buffer too small
+    }
+
+    std::memcpy(out, built.c_str(), need);
+    return ORBIS_OK;
+}
+
 int PS4_SYSV_ABI sceHttpUriEscape(char* out, u64* require, u64 prepare, const char* in) {
     LOG_TRACE(Lib_Http, "called out={}, require={}, prepare={}, in={}", fmt::ptr(out),
               fmt::ptr(require), prepare, in ? in : "(null)");
