@@ -2012,7 +2012,7 @@ s32 PS4_SYSV_ABI sceHttpUriBuild(char* out, size_t* require, size_t prepare,
              "srcElement={}, option=0x{:x}",
              fmt::ptr(out), fmt::ptr(require), prepare, fmt::ptr(srcElement), option);
 
-    if (srcElement == nullptr || require == nullptr) {
+    if (srcElement == nullptr) {
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
     }
 
@@ -2068,24 +2068,29 @@ s32 PS4_SYSV_ABI sceHttpUriBuild(char* out, size_t* require, size_t prepare,
         built.append(srcElement->path);
     }
 
-    // Query (?...)
     if ((option & ORBIS_HTTP_URI_BUILD_WITH_QUERY) && srcElement->query[0]) {
-        built.push_back('?');
+        if (srcElement->query[0] != '?') {
+            built.push_back('?');
+        }
         built.append(srcElement->query);
     }
 
-    // Fragment (#...)
+    // Fragment
     if ((option & ORBIS_HTTP_URI_BUILD_WITH_FRAGMENT) && srcElement->fragment[0]) {
-        built.push_back('#');
+        if (srcElement->fragment[0] != '#') {
+            built.push_back('#');
+        }
         built.append(srcElement->fragment);
     }
 
     // include null terminator in the required size.
     const size_t need = built.size() + 1;
-    *require = need;
+    if (require) {
+        *require = need;
+    }
 
-    if (out == nullptr || prepare == 0) {
-        // Size query mode,return success without copying.
+    if (out == nullptr) {
+        // Size query mode (no buffer provided).
         return ORBIS_OK;
     }
 
