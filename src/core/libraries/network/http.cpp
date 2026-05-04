@@ -2269,11 +2269,18 @@ int PS4_SYSV_ABI sceHttpUriParse(OrbisHttpUriElement* out, const char* srcUri, v
 
     if (out && pool) {
         memset(out, 0, sizeof(OrbisHttpUriElement));
-        out->scheme = (char*)pool;
+        char* empty = (char*)pool;
+        *empty = '\0';
+        out->scheme = (char*)pool + 1; // scheme storage follows the sentinel
+        out->username = empty;
+        out->password = empty;
+        out->hostname = empty;
+        out->path = empty;
+        out->query = empty;
+        out->fragment = empty;
     }
 
-    // Track the total required buffer size
-    u64 requiredSize = 0;
+    u64 requiredSize = 1;
 
     // Parse the scheme (e.g., "http:", "https:", "file:")
     u64 schemeLength = 0;
@@ -2285,7 +2292,7 @@ int PS4_SYSV_ABI sceHttpUriParse(OrbisHttpUriElement* out, const char* srcUri, v
         schemeLength++;
     }
 
-    if (pool && prepare < schemeLength + 1) {
+    if (pool && prepare < requiredSize + schemeLength + 1) {
         LOG_ERROR(Lib_Http, "out of memory while writing scheme");
         return ORBIS_HTTP_ERROR_OUT_OF_MEMORY;
     }
@@ -2483,13 +2490,13 @@ int PS4_SYSV_ABI sceHttpUriParse(OrbisHttpUriElement* out, const char* srcUri, v
         offset += pathLength;
     }
 
-    // Parse the query (if present)
     if (srcUri[offset] == '?') {
-        char* queryStart = (char*)srcUri + offset + 1;
+        char* queryStart = (char*)srcUri + offset;
         u64 queryLength = 0;
-        while (queryStart[queryLength] && queryStart[queryLength] != '#') {
+        while (queryStart[queryLength + 1] && queryStart[queryLength + 1] != '#') {
             queryLength++;
         }
+        queryLength++;
 
         requiredSize += queryLength + 1;
 
@@ -2504,17 +2511,16 @@ int PS4_SYSV_ABI sceHttpUriParse(OrbisHttpUriElement* out, const char* srcUri, v
             out->query[queryLength] = '\0';
         }
 
-        // Move past the query
-        offset += queryLength + 1;
+        offset += queryLength;
     }
 
-    // Parse the fragment (if present)
     if (srcUri[offset] == '#') {
-        char* fragmentStart = (char*)srcUri + offset + 1;
+        char* fragmentStart = (char*)srcUri + offset;
         u64 fragmentLength = 0;
-        while (fragmentStart[fragmentLength]) {
+        while (fragmentStart[fragmentLength + 1]) {
             fragmentLength++;
         }
+        fragmentLength++;
 
         requiredSize += fragmentLength + 1;
 
