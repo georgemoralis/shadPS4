@@ -2016,45 +2016,46 @@ s32 PS4_SYSV_ABI sceHttpUriBuild(char* out, size_t* require, size_t prepare,
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
     }
 
+    auto field = [](const char* p) -> std::string_view {
+        return p ? std::string_view(p) : std::string_view{};
+    };
+
+    const std::string_view scheme = field(srcElement->scheme);
+    const std::string_view username = field(srcElement->username);
+    const std::string_view password = field(srcElement->password);
+    const std::string_view hostname = field(srcElement->hostname);
+    const std::string_view path = field(srcElement->path);
+    const std::string_view query = field(srcElement->query);
+    const std::string_view fragment = field(srcElement->fragment);
+
     std::string built;
     built.reserve(256);
 
-    auto append_if = [&](u32 bit, std::string_view s, std::string_view sep_before = {},
-                         std::string_view sep_after = {}) {
-        if ((option & bit) && !s.empty()) {
-            built.append(sep_before);
-            built.append(s);
-            built.append(sep_after);
-        }
-    };
-
     // Scheme
-    if ((option & ORBIS_HTTP_URI_BUILD_WITH_SCHEME) && srcElement->scheme[0]) {
-        built.append(srcElement->scheme);
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_SCHEME) && !scheme.empty()) {
+        built.append(scheme);
         built.append("://");
     }
 
     // Userinfo (username[:password]@)
-    if ((option & ORBIS_HTTP_URI_BUILD_WITH_USERNAME) && srcElement->username[0]) {
-        built.append(srcElement->username);
-        if ((option & ORBIS_HTTP_URI_BUILD_WITH_PASSWORD) && srcElement->password[0]) {
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_USERNAME) && !username.empty()) {
+        built.append(username);
+        if ((option & ORBIS_HTTP_URI_BUILD_WITH_PASSWORD) && !password.empty()) {
             built.push_back(':');
-            built.append(srcElement->password);
+            built.append(password);
         }
         built.push_back('@');
     }
 
     // Host
-    if ((option & ORBIS_HTTP_URI_BUILD_WITH_HOSTNAME) && srcElement->hostname[0]) {
-        built.append(srcElement->hostname);
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_HOSTNAME) && !hostname.empty()) {
+        built.append(hostname);
     }
 
     // Port (only if not the scheme's default)
     if ((option & ORBIS_HTTP_URI_BUILD_WITH_PORT) && srcElement->port != 0) {
-        const bool is_default_https =
-            std::string_view(srcElement->scheme) == "https" && srcElement->port == 443;
-        const bool is_default_http =
-            std::string_view(srcElement->scheme) == "http" && srcElement->port == 80;
+        const bool is_default_https = (scheme == "https" && srcElement->port == 443);
+        const bool is_default_http = (scheme == "http" && srcElement->port == 80);
         if (!is_default_https && !is_default_http) {
             built.push_back(':');
             built.append(std::to_string(srcElement->port));
@@ -2062,25 +2063,26 @@ s32 PS4_SYSV_ABI sceHttpUriBuild(char* out, size_t* require, size_t prepare,
     }
 
     // Path
-    if ((option & ORBIS_HTTP_URI_BUILD_WITH_PATH) && srcElement->path[0]) {
-        if (srcElement->path[0] != '/')
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_PATH) && !path.empty()) {
+        if (path.front() != '/')
             built.push_back('/');
-        built.append(srcElement->path);
+        built.append(path);
     }
 
-    if ((option & ORBIS_HTTP_URI_BUILD_WITH_QUERY) && srcElement->query[0]) {
-        if (srcElement->query[0] != '?') {
+    // Query
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_QUERY) && !query.empty()) {
+        if (query.front() != '?') {
             built.push_back('?');
         }
-        built.append(srcElement->query);
+        built.append(query);
     }
 
     // Fragment
-    if ((option & ORBIS_HTTP_URI_BUILD_WITH_FRAGMENT) && srcElement->fragment[0]) {
-        if (srcElement->fragment[0] != '#') {
+    if ((option & ORBIS_HTTP_URI_BUILD_WITH_FRAGMENT) && !fragment.empty()) {
+        if (fragment.front() != '#') {
             built.push_back('#');
         }
-        built.append(srcElement->fragment);
+        built.append(fragment);
     }
 
     // include null terminator in the required size.
