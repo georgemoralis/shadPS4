@@ -6,15 +6,17 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-
+#include <httplib.h>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
@@ -23,7 +25,7 @@
 
 namespace Libraries::Http {
 
-static bool g_isHttpInitialized = true; // TODO temp always inited
+static bool g_isHttpInitialized = true;
 
 void NormalizeAndAppendPath(char* dest, char* src) {
     char* lastSlash;
@@ -62,12 +64,21 @@ constexpr s32 SCE_HTTP_HEADER_ADD = 1;
 constexpr int SCE_HTTP_VERSION_1_0 = 1;
 constexpr int SCE_HTTP_VERSION_1_1 = 2;
 
+constexpr u32 SCE_HTTP_NB_EVENT_SOCK_ERR = 0x01;
+constexpr u32 SCE_HTTP_NB_EVENT_RESOLVED = 0x02;
+constexpr u32 SCE_HTTP_NB_EVENT_IN = 0x04;  // Response data ready to read.
+constexpr u32 SCE_HTTP_NB_EVENT_OUT = 0x08; // Ready to send (request can write).
+constexpr u32 SCE_HTTP_NB_EVENT_ICM = 0x10;
+constexpr u32 SCE_HTTP_NB_EVENT_HUP = 0x20;
+
 struct HttpTemplate {
     std::string user_agent;
     int http_version;
     int auto_proxy_conf;
     std::map<std::string, std::string> headers;
     bool nonblock = false;
+    int epoll_id = 0;
+    void* epoll_user_arg = nullptr;
 };
 
 struct HttpConnection {
@@ -81,6 +92,8 @@ struct HttpConnection {
     bool is_secure = false;  // True if scheme == "https".
     std::map<std::string, std::string> headers;
     bool nonblock = false;
+    int epoll_id = 0;
+    void* epoll_user_arg = nullptr;
 };
 
 enum class HttpRequestState {
@@ -119,6 +132,16 @@ struct HttpRequest {
     std::condition_variable cv;
     bool nonblock = false;
     bool deleted = false;
+    int epoll_id = 0;
+    void* epoll_user_arg = nullptr;
+};
+
+struct Epoll {
+    int ctx_id = 0; // Owning libhttpCtxId ,validated at Destroy.
+    std::deque<OrbisHttpNBEvent> events;
+    std::condition_variable cv;
+    bool destroyed = false;
+    bool abort_requested = false;
 };
 
 struct HttpState {
@@ -130,13 +153,195 @@ struct HttpState {
     std::unordered_map<int, HttpTemplate> templates;
     std::unordered_map<int, HttpConnection> connections;
     std::unordered_map<int, std::shared_ptr<HttpRequest>> requests;
+    std::unordered_map<int, std::shared_ptr<Epoll>> epolls;
     std::atomic<bool> shutting_down{false};
+    bool ssl_status_logged = false; // flag to check if ssl is enabled
 };
 
 static HttpState g_state;
 
-// simulated latency for the mock response.
 constexpr auto kMockLatency = std::chrono::milliseconds(50);
+constexpr bool kRealNetworkEnabled = true;
+
+// placeholder for webapi TODO fix me
+constexpr std::string_view kMockPsnHostSuffix = ".mock-psn.shadps4.invalid";
+
+static bool IsMockPsnHost(const std::string& host) {
+    if (host.size() < kMockPsnHostSuffix.size()) {
+        return false;
+    }
+    return std::string_view(host).substr(host.size() - kMockPsnHostSuffix.size()) ==
+           kMockPsnHostSuffix;
+}
+
+struct RealRequestPlan {
+    std::string scheme;     // "http" or "https"
+    std::string host;       // hostname only (no port)
+    u16 port = 0;           // numeric port (80 / 443 if scheme-default)
+    std::string path;       // path + query string (the part cpp-httplib wants)
+    int method = 0;         // SCE_HTTP_METHOD_*
+    std::string method_str; // populated for the *2 variants if `method` is invalid
+    std::map<std::string, std::string> headers;
+    std::vector<u8> body;
+};
+
+// Parse the request's URL into scheme/host/port/path.
+static bool ParseRequestUrl(const std::string& url, std::string& scheme, std::string& host,
+                            u16& port, std::string& path_with_query) {
+    auto scheme_end = url.find("://");
+    if (scheme_end == std::string::npos) {
+        return false;
+    }
+    scheme = url.substr(0, scheme_end);
+    auto authority_start = scheme_end + 3;
+    auto authority_end = url.find('/', authority_start);
+    std::string authority;
+    if (authority_end == std::string::npos) {
+        authority = url.substr(authority_start);
+        path_with_query = "/";
+    } else {
+        authority = url.substr(authority_start, authority_end - authority_start);
+        path_with_query = url.substr(authority_end);
+    }
+    auto colon = authority.find(':');
+    if (colon == std::string::npos) {
+        host = authority;
+        port = (scheme == "https") ? 443 : 80;
+    } else {
+        host = authority.substr(0, colon);
+        try {
+            port = static_cast<u16>(std::stoi(authority.substr(colon + 1)));
+        } catch (...) {
+            return false;
+        }
+    }
+    return !host.empty();
+}
+
+// Convert our integer SCE_HTTP_METHOD_* into a verb string usable for httplib
+static const char* HttpMethodName(int method) {
+    switch (method) {
+    case SCE_HTTP_METHOD_GET:
+        return "GET";
+    case SCE_HTTP_METHOD_POST:
+        return "POST";
+    case SCE_HTTP_METHOD_HEAD:
+        return "HEAD";
+    case SCE_HTTP_METHOD_OPTIONS:
+        return "OPTIONS";
+    case SCE_HTTP_METHOD_PUT:
+        return "PUT";
+    case SCE_HTTP_METHOD_DELETE:
+        return "DELETE";
+    case SCE_HTTP_METHOD_TRACE:
+        return "TRACE";
+    case SCE_HTTP_METHOD_CONNECT:
+        return "CONNECT";
+    default:
+        return "UNKNOWN";
+    }
+}
+
+// Convert our headers map into cpp-httplib's Headers (multimap).
+static httplib::Headers BuildHttplibHeaders(const std::map<std::string, std::string>& src) {
+    httplib::Headers out;
+    for (const auto& [k, v] : src) {
+        out.emplace(k, v);
+    }
+    return out;
+}
+
+// Convert cpp-httplib's response back into HttpResponse fields
+static void PopulateRealResponse(HttpResponse& res, const httplib::Result& result) {
+    res.status_code = result->status;
+    res.reason_phrase = result->reason.empty() ? "OK" : result->reason;
+    res.headers.clear();
+    for (const auto& [k, v] : result->headers) {
+        res.headers[k] = v;
+    }
+    res.all_headers_blob.clear();
+    for (const auto& [k, v] : res.headers) {
+        res.all_headers_blob += k + ": " + v + "\r\n";
+    }
+    res.all_headers_blob += "\r\n";
+    res.body.assign(result->body.begin(), result->body.end());
+    res.content_length = res.body.size();
+    res.content_length_result = 0;
+    res.read_cursor = 0;
+}
+
+static bool ExecuteRealRequest(const RealRequestPlan& plan, HttpResponse& out_res) {
+    try {
+        std::string base_url = plan.scheme + "://" + plan.host;
+        if ((plan.scheme == "https" && plan.port != 443) ||
+            (plan.scheme == "http" && plan.port != 80)) {
+            base_url += ":" + std::to_string(plan.port);
+        }
+        httplib::Client cli(base_url);
+        cli.set_connection_timeout(std::chrono::seconds(10));
+        cli.set_read_timeout(std::chrono::seconds(30));
+        cli.set_write_timeout(std::chrono::seconds(30));
+        // Don't auto-follow redirects
+        cli.set_follow_location(false);
+
+        auto headers = BuildHttplibHeaders(plan.headers);
+        std::string content_type;
+        if (auto it = plan.headers.find("Content-Type"); it != plan.headers.end()) {
+            content_type = it->second;
+        }
+        const char* body_ptr =
+            plan.body.empty() ? "" : reinterpret_cast<const char*>(plan.body.data());
+        size_t body_size = plan.body.size();
+
+        auto result = [&]() {
+            switch (plan.method) {
+            case SCE_HTTP_METHOD_GET:
+                return cli.Get(plan.path, headers);
+            case SCE_HTTP_METHOD_POST:
+                return cli.Post(plan.path, headers, body_ptr, body_size, content_type);
+            case SCE_HTTP_METHOD_HEAD:
+                return cli.Head(plan.path, headers);
+            case SCE_HTTP_METHOD_OPTIONS:
+                return cli.Options(plan.path, headers);
+            case SCE_HTTP_METHOD_PUT:
+                return cli.Put(plan.path, headers, body_ptr, body_size, content_type);
+            case SCE_HTTP_METHOD_DELETE:
+                return cli.Delete(plan.path, headers, body_ptr, body_size, content_type);
+            default:
+                LOG_ERROR(Lib_Http, "Unsupported method {} ({}); falling back to mock", plan.method,
+                          HttpMethodName(plan.method));
+                return cli.Get("");
+            }
+        }();
+        if (!result) {
+            LOG_ERROR(Lib_Http, "cpp-httplib request failed (host={}, path={}): error={}",
+                      plan.host, plan.path, static_cast<int>(result.error()));
+            return false;
+        }
+        PopulateRealResponse(out_res, result);
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR(Lib_Http,
+                  "cpp-httplib threw exception for {}://{}{}: {} (probably no SSL "
+                  "support; falling back to mock)",
+                  plan.scheme, plan.host, plan.path, e.what());
+        return false;
+    } catch (...) {
+        LOG_ERROR(Lib_Http,
+                  "cpp-httplib threw unknown exception for {}://{}{}; falling back "
+                  "to mock",
+                  plan.scheme, plan.host, plan.path);
+        return false;
+    }
+}
+
+static OrbisHttpEpollHandle EncodeEpollHandle(int id) {
+    return reinterpret_cast<OrbisHttpEpollHandle>(static_cast<intptr_t>(id));
+}
+
+static int DecodeEpollHandle(OrbisHttpEpollHandle eh) {
+    return static_cast<int>(reinterpret_cast<intptr_t>(eh));
+}
 
 static int WaitForResponseReady(HttpRequest& req, std::unique_lock<std::mutex>& lock) {
     if (req.state == HttpRequestState::Aborted) {
@@ -161,24 +366,24 @@ static int WaitForResponseReady(HttpRequest& req, std::unique_lock<std::mutex>& 
     return ORBIS_OK;
 }
 
-// helper: populate a request's HttpResponse with a canned 200 OK response.
-static void SynthesizeMockResponse(HttpRequest& req) {
-    req.res.status_code = 200;
-    req.res.reason_phrase = "OK";
-    req.res.headers.clear();
-    req.res.headers["Content-Length"] = "0";
-    req.res.headers["Content-Type"] = "application/octet-stream";
-    req.res.headers["Server"] = "shadPS4-mock-libSceHttp";
-    req.res.all_headers_blob.clear();
-    for (const auto& [k, v] : req.res.headers) {
-        req.res.all_headers_blob += k + ": " + v + "\r\n";
+// added fake response in case http-lib throws an exception
+static void SynthesizeMockResponse(HttpResponse& res) {
+    res.status_code = 200;
+    res.reason_phrase = "OK";
+    res.headers.clear();
+    res.headers["Content-Length"] = "0";
+    res.headers["Content-Type"] = "application/octet-stream";
+    res.headers["Server"] = "shadPS4-mock-libSceHttp";
+    res.all_headers_blob.clear();
+    for (const auto& [k, v] : res.headers) {
+        res.all_headers_blob += k + ": " + v + "\r\n";
     }
-    req.res.all_headers_blob += "\r\n";
-    req.res.content_length = 0;
-    req.res.content_length_result = 0; // 0 = value is valid (Content-Length header
-                                       //     present and parsed successfully).
-    req.res.body.clear();
-    req.res.read_cursor = 0;
+    res.all_headers_blob += "\r\n";
+    res.content_length = 0;
+    res.content_length_result = 0; // 0 = value is valid (Content-Length header
+                                   //     present and parsed successfully).
+    res.body.clear();
+    res.read_cursor = 0;
 }
 
 } // namespace
@@ -208,7 +413,20 @@ int PS4_SYSV_ABI sceHttpAbortRequestForce(int reqId) {
 }
 
 int PS4_SYSV_ABI sceHttpAbortWaitRequest(OrbisHttpEpollHandle eh) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called eh={}", fmt::ptr(eh));
+    LOG_INFO(Lib_Http, "called eh={}", fmt::ptr(eh));
+    int epoll_id = DecodeEpollHandle(eh);
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    auto it = g_state.epolls.find(epoll_id);
+    if (it == g_state.epolls.end()) {
+        LOG_ERROR(Lib_Http, "Invalid epoll handle (id={})", epoll_id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    it->second->abort_requested = true;
+    it->second->cv.notify_all();
     return ORBIS_OK;
 }
 
@@ -360,6 +578,8 @@ int PS4_SYSV_ABI sceHttpCreateConnection(int tmplId, const char* serverName, con
     conn.url = scheme_str + "://" + serverName + ":" + std::to_string(port);
     if (auto tmpl_it = g_state.templates.find(tmplId); tmpl_it != g_state.templates.end()) {
         conn.nonblock = tmpl_it->second.nonblock;
+        conn.epoll_id = tmpl_it->second.epoll_id;
+        conn.epoll_user_arg = tmpl_it->second.epoll_user_arg;
     }
     g_state.connections.emplace(conn_id, std::move(conn));
     LOG_INFO(Lib_Http, "created connection connId={} url={}", conn_id,
@@ -433,6 +653,8 @@ int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, boo
     conn.is_secure = is_secure;
     if (auto tmpl_it = g_state.templates.find(tmplId); tmpl_it != g_state.templates.end()) {
         conn.nonblock = tmpl_it->second.nonblock;
+        conn.epoll_id = tmpl_it->second.epoll_id;
+        conn.epoll_user_arg = tmpl_it->second.epoll_user_arg;
     }
     g_state.connections.emplace(conn_id, std::move(conn));
     LOG_INFO(Lib_Http, "created connection connId={} host={} port={} scheme={}", conn_id,
@@ -443,12 +665,24 @@ int PS4_SYSV_ABI sceHttpCreateConnectionWithURL(int tmplId, const char* url, boo
 int PS4_SYSV_ABI sceHttpCreateEpoll(int libhttpCtxId, OrbisHttpEpollHandle* eh) {
     LOG_INFO(Lib_Http, "called libhttpCtxId={}, eh={}", libhttpCtxId, fmt::ptr(eh));
     if (!eh) {
-        LOG_ERROR(Lib_Http, "(STUBBED) eh output pointer is null");
+        LOG_ERROR(Lib_Http, "eh output pointer is null");
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
     }
-    static std::atomic<uintptr_t> epoll_counter{0};
-    *eh = reinterpret_cast<OrbisHttpEpollHandle>(++epoll_counter);
-    LOG_ERROR(Lib_Http, "(STUBBED) returning placeholder handle *eh={}", fmt::ptr(*eh));
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    if (!g_state.active_contexts.contains(libhttpCtxId)) {
+        LOG_ERROR(Lib_Http, "Invalid libhttpCtxId={}", libhttpCtxId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    int epoll_id = ++g_state.next_obj_id;
+    auto epoll = std::make_shared<Epoll>();
+    epoll->ctx_id = libhttpCtxId;
+    g_state.epolls.emplace(epoll_id, std::move(epoll));
+    *eh = EncodeEpollHandle(epoll_id);
+    LOG_INFO(Lib_Http, "created epoll id={} (handle={})", epoll_id, fmt::ptr(*eh));
     return ORBIS_OK;
 }
 
@@ -568,6 +802,8 @@ int PS4_SYSV_ABI sceHttpCreateRequestWithURL(int connId, s32 method, const char*
     req->url = url;
     req->content_length = contentLength;
     req->nonblock = conn_it->second.nonblock;
+    req->epoll_id = conn_it->second.epoll_id;
+    req->epoll_user_arg = conn_it->second.epoll_user_arg;
 
     auto tmpl_it = g_state.templates.find(conn_it->second.tmpl_id);
     if (tmpl_it != g_state.templates.end()) {
@@ -727,7 +963,7 @@ int PS4_SYSV_ABI sceHttpDeleteRequest(int reqId) {
         LOG_ERROR(Lib_Http, "Invalid reqId={}", reqId);
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
-    auto req_ptr = it->second;
+    auto req_ptr = it->second; // shared_ptr copy keeps it alive past erase.
     req_ptr->deleted = true;
     if (req_ptr->state == HttpRequestState::Created) {
         req_ptr->state = HttpRequestState::Aborted;
@@ -754,7 +990,27 @@ int PS4_SYSV_ABI sceHttpDeleteTemplate(int tmplId) {
 }
 
 int PS4_SYSV_ABI sceHttpDestroyEpoll(int libhttpCtxId, OrbisHttpEpollHandle eh) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called libhttpCtxId={}, eh={}", libhttpCtxId, fmt::ptr(eh));
+    LOG_INFO(Lib_Http, "called libhttpCtxId={}, eh={}", libhttpCtxId, fmt::ptr(eh));
+    int epoll_id = DecodeEpollHandle(eh);
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    auto it = g_state.epolls.find(epoll_id);
+    if (it == g_state.epolls.end()) {
+        LOG_ERROR(Lib_Http, "Invalid epoll handle (id={})", epoll_id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    if (it->second->ctx_id != libhttpCtxId) {
+        LOG_ERROR(Lib_Http, "ctxId mismatch: epoll ctx_id={} but caller passed {}",
+                  it->second->ctx_id, libhttpCtxId);
+    }
+    auto epoll_ptr = it->second;
+    epoll_ptr->destroyed = true;
+    epoll_ptr->cv.notify_all();
+    g_state.epolls.erase(it);
+    LOG_INFO(Lib_Http, "destroyed epoll id={}", epoll_id);
     return ORBIS_OK;
 }
 
@@ -829,8 +1085,34 @@ int PS4_SYSV_ABI sceHttpGetCookieStats(int libhttpCtxId, OrbisHttpCookieStats* s
 }
 
 int PS4_SYSV_ABI sceHttpGetEpoll(int id, OrbisHttpEpollHandle* eh, void** userArg) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called id={}, eh={}, userArg={}", id, fmt::ptr(eh),
-              fmt::ptr(userArg));
+    LOG_INFO(Lib_Http, "called id={}, eh={}, userArg={}", id, fmt::ptr(eh), fmt::ptr(userArg));
+    if (!eh || !userArg) {
+        LOG_ERROR(Lib_Http, "eh or userArg output pointer is null");
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    const int* src_epoll_id = nullptr;
+    void* const* src_user_arg = nullptr;
+    if (auto it = g_state.templates.find(id); it != g_state.templates.end()) {
+        src_epoll_id = &it->second.epoll_id;
+        src_user_arg = &it->second.epoll_user_arg;
+    } else if (auto it = g_state.connections.find(id); it != g_state.connections.end()) {
+        src_epoll_id = &it->second.epoll_id;
+        src_user_arg = &it->second.epoll_user_arg;
+    } else if (auto it = g_state.requests.find(id); it != g_state.requests.end()) {
+        src_epoll_id = &it->second->epoll_id;
+        src_user_arg = &it->second->epoll_user_arg;
+    }
+    if (!src_epoll_id) {
+        LOG_ERROR(Lib_Http, "Invalid id={} (not a template, connection, or request)", id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    *eh = EncodeEpollHandle(*src_epoll_id);
+    *userArg = *src_user_arg;
     return ORBIS_OK;
 }
 
@@ -947,6 +1229,18 @@ int PS4_SYSV_ABI sceHttpInit(int libnetMemId, int libsslCtxId, u64 poolSize) {
     if (poolSize == 0) {
         LOG_ERROR(Lib_Http, "poolSize is 0");
         return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    if (!g_state.ssl_status_logged) {
+        g_state.ssl_status_logged = true;
+#ifdef CPPHTTPLIB_OPENSSL_SUPPORT
+        LOG_INFO(Lib_Http,
+                 "cpp-httplib was built with OpenSSL — https:// real-network "
+                 "requests will be attempted. Set kRealNetworkEnabled=false in http.cpp to "
+                 "force mock-only behavior.");
+#else
+        LOG_INFO(Lib_Http, "cpp-httplib was built WITHOUT OpenSSL,every https:// real-"
+                           "network request will throw and be caught and fall back to mock.");
+#endif
     }
     int ctx_id = ++g_state.next_ctx_id;
     g_state.active_contexts.insert(ctx_id);
@@ -1160,7 +1454,13 @@ int PS4_SYSV_ABI sceHttpsEnableOptionPrivate(int id, u32 sslFlags) {
 
 int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
     LOG_INFO(Lib_Http, "called reqId={}, postData={}, size={}", reqId, fmt::ptr(postData), size);
+    std::vector<u8> body_copy;
+    if (postData && size > 0) {
+        body_copy.assign(static_cast<const u8*>(postData), static_cast<const u8*>(postData) + size);
+    }
+
     std::shared_ptr<HttpRequest> req_ptr;
+    RealRequestPlan plan;
     {
         std::lock_guard<std::mutex> lock(g_state.m_mutex);
         if (!g_state.inited) {
@@ -1173,6 +1473,8 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             return ORBIS_HTTP_ERROR_INVALID_ID;
         }
         auto& req = *it->second;
+        // Send must happen exactly once per request — the SDK reports
+        // AFTER_SEND if a game sends twice on the same reqId.
         if (req.state == HttpRequestState::Sending || req.state == HttpRequestState::Sent) {
             LOG_ERROR(Lib_Http, "Request already sent (reqId={})", reqId);
             return ORBIS_HTTP_ERROR_AFTER_SEND;
@@ -1181,11 +1483,42 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             LOG_ERROR(Lib_Http, "Request was aborted (reqId={})", reqId);
             return ORBIS_HTTP_ERROR_ABORTED;
         }
+        // Transition to Sending. Game's getters will see this state and
+        // either block on cv (blocking mode) or return EAGAIN (non-blocking).
         req.state = HttpRequestState::Sending;
-        req_ptr = it->second; // bumps shared_ptr refcount.
+        req_ptr = it->second;
+        plan.method = req.method;
+        plan.method_str = req.method_str;
+        plan.headers = req.headers;
+        plan.body = std::move(body_copy);
+        ParseRequestUrl(req.url, plan.scheme, plan.host, plan.port, plan.path);
     }
-    std::thread([req_ptr, reqId]() {
-        std::this_thread::sleep_for(kMockLatency);
+
+    bool will_try_real = kRealNetworkEnabled && !plan.host.empty() && !IsMockPsnHost(plan.host) &&
+                         (plan.scheme == "http" || plan.scheme == "https");
+    if (will_try_real) {
+        LOG_INFO(Lib_Http, "reqId={} dispatched to async worker [REAL net: {} {}://{}:{}{}]", reqId,
+                 HttpMethodName(plan.method), plan.scheme, plan.host, plan.port, plan.path);
+    } else {
+        LOG_INFO(Lib_Http,
+                 "reqId={} dispatched to async worker [MOCK: latency ~{} ms, host={}, scheme={}]",
+                 reqId, kMockLatency.count(), plan.host, plan.scheme);
+    }
+
+    std::thread([req_ptr, reqId, plan = std::move(plan)]() {
+        bool try_real = kRealNetworkEnabled && !plan.host.empty() && !IsMockPsnHost(plan.host) &&
+                        (plan.scheme == "http" || plan.scheme == "https");
+        HttpResponse local_res;
+        bool got_real_response = false;
+
+        if (try_real) {
+            got_real_response = ExecuteRealRequest(plan, local_res);
+        }
+
+        if (!got_real_response) {
+            std::this_thread::sleep_for(kMockLatency);
+            SynthesizeMockResponse(local_res);
+        }
 
         std::lock_guard<std::mutex> lock(g_state.m_mutex);
         if (g_state.shutting_down.load() || req_ptr->deleted ||
@@ -1193,15 +1526,30 @@ int PS4_SYSV_ABI sceHttpSendRequest(int reqId, const void* postData, u64 size) {
             req_ptr->cv.notify_all();
             return;
         }
-        SynthesizeMockResponse(*req_ptr);
+        // Move the response into the request and advance state.
+        req_ptr->res = std::move(local_res);
         req_ptr->state = HttpRequestState::Sent;
-        LOG_INFO(Lib_Http, "(MOCK ASYNC) reqId={} -> {} {} (body {} bytes)", reqId,
+        const char* path_label = got_real_response ? "(REAL)" : "(MOCK ASYNC)";
+        LOG_INFO(Lib_Http, "{} reqId={} -> {} {} (body {} bytes)", path_label, reqId,
                  req_ptr->res.status_code, req_ptr->res.reason_phrase, req_ptr->res.body.size());
+        // Wake any getters blocked waiting for state to advance.
         req_ptr->cv.notify_all();
+        if (req_ptr->epoll_id != 0) {
+            auto epoll_it = g_state.epolls.find(req_ptr->epoll_id);
+            if (epoll_it != g_state.epolls.end() && !epoll_it->second->destroyed) {
+                OrbisHttpNBEvent ev{};
+                ev.events = SCE_HTTP_NB_EVENT_IN | SCE_HTTP_NB_EVENT_OUT;
+                ev.eventDetail = 0;
+                ev.id = reqId;
+                ev.userArg = req_ptr->epoll_user_arg;
+                epoll_it->second->events.push_back(ev);
+                epoll_it->second->cv.notify_all();
+                LOG_INFO(Lib_Http, "{} pushed epoll event for reqId={} on epoll={}", path_label,
+                         reqId, req_ptr->epoll_id);
+            }
+        }
     }).detach();
 
-    LOG_INFO(Lib_Http, "reqId={} dispatched to async worker (latency ~{} ms)", reqId,
-             kMockLatency.count());
     return ORBIS_OK;
 }
 
@@ -1287,8 +1635,41 @@ int PS4_SYSV_ABI sceHttpSetDelayBuildRequestEnabled(int id, int isEnable) {
 }
 
 int PS4_SYSV_ABI sceHttpSetEpoll(int id, OrbisHttpEpollHandle eh, void* userArg) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called id={}, eh={}, userArg={}", id, fmt::ptr(eh),
-              fmt::ptr(userArg));
+    LOG_INFO(Lib_Http, "called id={}, eh={}, userArg={}", id, fmt::ptr(eh), fmt::ptr(userArg));
+    int epoll_id = DecodeEpollHandle(eh);
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    if (!g_state.epolls.contains(epoll_id)) {
+        LOG_ERROR(Lib_Http, "Invalid epoll handle (id={})", epoll_id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    int* target_epoll_id = nullptr;
+    void** target_user_arg = nullptr;
+    const char* level = "";
+    if (auto it = g_state.templates.find(id); it != g_state.templates.end()) {
+        target_epoll_id = &it->second.epoll_id;
+        target_user_arg = &it->second.epoll_user_arg;
+        level = "template";
+    } else if (auto it = g_state.connections.find(id); it != g_state.connections.end()) {
+        target_epoll_id = &it->second.epoll_id;
+        target_user_arg = &it->second.epoll_user_arg;
+        level = "connection";
+    } else if (auto it = g_state.requests.find(id); it != g_state.requests.end()) {
+        target_epoll_id = &it->second->epoll_id;
+        target_user_arg = &it->second->epoll_user_arg;
+        level = "request";
+    }
+    if (!target_epoll_id) {
+        LOG_ERROR(Lib_Http, "Invalid id={} (not a template, connection, or request)", id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    *target_epoll_id = epoll_id;
+    *target_user_arg = userArg;
+    LOG_INFO(Lib_Http, "set epoll={} userArg={} at {} level (id={})", epoll_id, fmt::ptr(userArg),
+             level, id);
     return ORBIS_OK;
 }
 
@@ -1471,9 +1852,14 @@ int PS4_SYSV_ABI sceHttpTerm(int libhttpCtxId) {
             req_ptr->state = HttpRequestState::Aborted;
             req_ptr->cv.notify_all();
         }
+        for (auto& [id, epoll_ptr] : g_state.epolls) {
+            epoll_ptr->destroyed = true;
+            epoll_ptr->cv.notify_all();
+        }
         g_state.requests.clear();
         g_state.connections.clear();
         g_state.templates.clear();
+        g_state.epolls.clear();
         g_state.inited = false;
     } else {
         LOG_INFO(Lib_Http, "ctxId={} terminated, {} contexts still active", libhttpCtxId,
@@ -1493,15 +1879,103 @@ int PS4_SYSV_ABI sceHttpTrySetNonblock(int id, int isEnable) {
 }
 
 int PS4_SYSV_ABI sceHttpUnsetEpoll(int id) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called id={}", id);
+    LOG_INFO(Lib_Http, "called id={}", id);
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    int* target_epoll_id = nullptr;
+    void** target_user_arg = nullptr;
+    if (auto it = g_state.templates.find(id); it != g_state.templates.end()) {
+        target_epoll_id = &it->second.epoll_id;
+        target_user_arg = &it->second.epoll_user_arg;
+    } else if (auto it = g_state.connections.find(id); it != g_state.connections.end()) {
+        target_epoll_id = &it->second.epoll_id;
+        target_user_arg = &it->second.epoll_user_arg;
+    } else if (auto it = g_state.requests.find(id); it != g_state.requests.end()) {
+        target_epoll_id = &it->second->epoll_id;
+        target_user_arg = &it->second->epoll_user_arg;
+    }
+    if (!target_epoll_id) {
+        LOG_ERROR(Lib_Http, "Invalid id={} (not a template, connection, or request)", id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    *target_epoll_id = 0;
+    *target_user_arg = nullptr;
     return ORBIS_OK;
 }
 
 int PS4_SYSV_ABI sceHttpWaitRequest(OrbisHttpEpollHandle eh, OrbisHttpNBEvent* nbev, int maxevents,
                                     int timeout) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called eh={}, nbev={}, maxevents={}, timeout={}", fmt::ptr(eh),
-              fmt::ptr(nbev), maxevents, timeout);
-    return ORBIS_OK;
+    LOG_INFO(Lib_Http, "called eh={}, nbev={}, maxevents={}, timeout={}", fmt::ptr(eh),
+             fmt::ptr(nbev), maxevents, timeout);
+    if (!nbev || maxevents <= 0) {
+        LOG_ERROR(Lib_Http, "nbev null or maxevents<=0 (maxevents={})", maxevents);
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    int epoll_id = DecodeEpollHandle(eh);
+    std::unique_lock<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.inited) {
+        LOG_ERROR(Lib_Http, "Not initialized");
+        return ORBIS_HTTP_ERROR_BEFORE_INIT;
+    }
+    auto it = g_state.epolls.find(epoll_id);
+    if (it == g_state.epolls.end()) {
+        LOG_ERROR(Lib_Http, "Invalid epoll handle (id={})", epoll_id);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    auto epoll_ptr = it->second;
+
+    auto drain_into_output = [&]() -> int {
+        int count = 0;
+        while (count < maxevents && !epoll_ptr->events.empty()) {
+            nbev[count] = epoll_ptr->events.front();
+            epoll_ptr->events.pop_front();
+            ++count;
+        }
+        return count;
+    };
+
+    // events already queued. Drain and return immediately.
+    int already = drain_into_output();
+    if (already > 0) {
+        LOG_INFO(Lib_Http, "epoll id={} returned {} events (no wait)", epoll_id, already);
+        return already;
+    }
+
+    // No events queued. Behavior depends on timeout.
+    if (timeout == 0) {
+        // Poll mode: don't wait, just return 0.
+        return 0;
+    }
+    if (epoll_ptr->abort_requested || epoll_ptr->destroyed || g_state.shutting_down.load()) {
+        // Don't wait if we already know we'd be woken right away.
+        return 0;
+    }
+
+    // Wait.
+    auto predicate = [&]() {
+        return !epoll_ptr->events.empty() || epoll_ptr->destroyed || epoll_ptr->abort_requested ||
+               g_state.shutting_down.load();
+    };
+    if (timeout < 0) {
+        epoll_ptr->cv.wait(lock, predicate);
+    } else {
+        epoll_ptr->cv.wait_for(lock, std::chrono::microseconds(timeout), predicate);
+    }
+
+    // After waking drain whatever we have.
+    int count = drain_into_output();
+    if (epoll_ptr->destroyed) {
+        LOG_INFO(Lib_Http, "epoll id={} woken because destroyed; returning {} events", epoll_id,
+                 count);
+    } else if (epoll_ptr->abort_requested) {
+        LOG_INFO(Lib_Http, "epoll id={} woken by abort; returning {} events", epoll_id, count);
+    } else {
+        LOG_INFO(Lib_Http, "epoll id={} returned {} events after wait", epoll_id, count);
+    }
+    return count;
 }
 
 int PS4_SYSV_ABI sceHttpUriBuild(char* out, u64* require, u64 prepare,
