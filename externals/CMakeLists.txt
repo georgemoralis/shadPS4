@@ -331,7 +331,7 @@ endif()
 add_library(Cpp_Httplib INTERFACE)
 target_include_directories(Cpp_Httplib INTERFACE cpp-httplib/)
 
-if (APPLE)
+if (APPLE AND NOT OPENSSL_ROOT_DIR)
     execute_process(
         COMMAND brew --prefix openssl
         RESULT_VARIABLE BREW_RESULT
@@ -343,6 +343,11 @@ if (APPLE)
         set(OPENSSL_ROOT_DIR "${BREW_OPENSSL}")
         set(OPENSSL_USE_STATIC_LIBS TRUE)
     endif()
+elseif (APPLE AND OPENSSL_ROOT_DIR)
+    if (NOT DEFINED OPENSSL_USE_STATIC_LIBS)
+        set(OPENSSL_USE_STATIC_LIBS TRUE)
+    endif()
+    message(STATUS "macOS: using caller-supplied OPENSSL_ROOT_DIR=${OPENSSL_ROOT_DIR}")
 endif()
 
 find_package(OpenSSL QUIET)
@@ -379,7 +384,6 @@ if (OPENSSL_FOUND)
     target_compile_definitions(Cpp_Httplib INTERFACE CPPHTTPLIB_OPENSSL_SUPPORT)
     message(STATUS "cpp-httplib: OpenSSL ${OPENSSL_VERSION} found at ${OPENSSL_INCLUDE_DIR}")
     message(STATUS "cpp-httplib: real HTTPS in libSceHttp enabled")
-
     if (WIN32 AND DEFINED OPENSSL_ROOT_DIR)
         file(GLOB OPENSSL_DLLS
              "${OPENSSL_ROOT_DIR}/bin/libssl-*.dll"
@@ -391,7 +395,9 @@ if (OPENSSL_FOUND)
             message(STATUS "cpp-httplib: ${OPENSSL_DLL_COUNT} OpenSSL DLL(s) staged in OPENSSL_RUNTIME_DLLS for post-build copy")
         endif()
     endif()
+    set(SHADPS4_OPENSSL_FOUND TRUE CACHE INTERNAL "OpenSSL was found and linked into Cpp_Httplib")
 else()
     message(STATUS "cpp-httplib: OpenSSL not available — libSceHttp HTTPS will fall back to mock at runtime.")
+    set(SHADPS4_OPENSSL_FOUND FALSE CACHE INTERNAL "OpenSSL was not found")
 endif()
 
