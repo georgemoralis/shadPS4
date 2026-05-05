@@ -109,7 +109,21 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install openssl@3
+          softwareupdate --install-rosetta --agree-to-license || true
+
+          if [ ! -x /usr/local/bin/brew ]; then
+            arch -x86_64 /bin/bash -c \
+              "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+          fi
+
+          arch -x86_64 /usr/local/bin/brew update
+          arch -x86_64 /usr/local/bin/brew install openssl@3
+
+          echo "=== x86_64 OpenSSL libraries ==="
+          file /usr/local/opt/openssl@3/lib/libssl.dylib   2>/dev/null || \
+            file /usr/local/opt/openssl@3/lib/libssl.a     2>/dev/null || true
+          file /usr/local/opt/openssl@3/lib/libcrypto.dylib 2>/dev/null || \
+            file /usr/local/opt/openssl@3/lib/libcrypto.a   2>/dev/null || true
 
       - name: Configure CMake
         run: |
@@ -119,7 +133,8 @@ jobs:
             -DCMAKE_BUILD_TYPE=Debug \
             -DENABLE_TESTS=ON \
             ${{ runner.os == 'Linux' && '-DCMAKE_CXX_FLAGS=-stdlib=libc++' || '' }} \
-            ${{ runner.os == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES=x86_64' || '' }}
+            ${{ runner.os == 'macOS' && '-DCMAKE_OSX_ARCHITECTURES=x86_64' || '' }} \
+            ${{ runner.os == 'macOS' && '-DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3' || '' }}
         shell: bash
 
       - name: Create shadPS4 user data directory (Linux)
@@ -179,11 +194,30 @@ jobs:
     - name: Stage Windows SDL artifact
       shell: pwsh
       run: |
-        New-Item -ItemType Directory -Force -Path "${{github.workspace}}/upload" | Out-Null
-        Copy-Item "${{github.workspace}}/build/shadPS4.exe" "${{github.workspace}}/upload/"
-        Get-ChildItem "${{github.workspace}}/build/libssl-*-x64.dll" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName "${{github.workspace}}/upload/" }
-        Get-ChildItem "${{github.workspace}}/build/libcrypto-*-x64.dll" -ErrorAction SilentlyContinue | ForEach-Object { Copy-Item $_.FullName "${{github.workspace}}/upload/" }
-        Get-ChildItem "${{github.workspace}}/upload/"
+        $build = "${{github.workspace}}/build"
+        $upload = "${{github.workspace}}/upload"
+        New-Item -ItemType Directory -Force -Path $upload | Out-Null
+
+        Write-Host "=== Build directory top-level .exe and .dll files ==="
+        Get-ChildItem -Path $build -Filter "*.exe" -ErrorAction SilentlyContinue |
+            ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)" }
+        $dlls = Get-ChildItem -Path $build -Filter "*.dll" -ErrorAction SilentlyContinue
+        $dlls | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)" }
+
+        Write-Host "=== Staging artifact ==="
+        Copy-Item "$build/shadPS4.exe" "$upload/"
+        Write-Host "  shadPS4.exe -> upload/"
+        foreach ($dll in $dlls) {
+            Copy-Item $dll.FullName "$upload/"
+            Write-Host "  $($dll.Name) -> upload/"
+        }
+
+        if (-not $dlls -or $dlls.Count -eq 0) {
+            Write-Warning "No DLLs alongside shadPS4.exe — if OpenSSL was found dynamically (typical on Windows), the POST_BUILD copy in the top-level CMakeLists should have placed libssl-3-x64.dll and libcrypto-3-x64.dll there. Check the 'Configure CMake' step log: look for 'cpp-httplib: OpenSSL X.Y.Z found' (success) or 'cpp-httplib: OpenSSL not available' (problem). If OpenSSL is correctly found but no DLLs were copied, the link is most likely static (vcpkg static triplet etc.) and that's fine — shadPS4.exe is self-contained."
+        }
+
+        Write-Host "=== Final upload directory contents ==="
+        Get-ChildItem -Path $upload | ForEach-Object { Write-Host "  $($_.Name)" }
 
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
@@ -203,6 +237,25 @@ jobs:
       uses: maxim-lobanov/setup-xcode@v1
       with:
         xcode-version: latest
+
+    - name: Install x86_64 OpenSSL via Rosetta Homebrew
+      run: |
+        set -e
+        softwareupdate --install-rosetta --agree-to-license || true
+
+        if [ ! -x /usr/local/bin/brew ]; then
+          arch -x86_64 /bin/bash -c \
+            "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\""
+        fi
+
+        arch -x86_64 /usr/local/bin/brew update
+        arch -x86_64 /usr/local/bin/brew install openssl@3
+
+        echo "=== x86_64 OpenSSL libraries ==="
+        file /usr/local/opt/openssl@3/lib/libssl.dylib   2>/dev/null || \
+          file /usr/local/opt/openssl@3/lib/libssl.a     2>/dev/null || true
+        file /usr/local/opt/openssl@3/lib/libcrypto.dylib 2>/dev/null || \
+          file /usr/local/opt/openssl@3/lib/libcrypto.a   2>/dev/null || true
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5
@@ -226,7 +279,7 @@ jobs:
         variant: sccache
 
     - name: Configure CMake
-      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_OSX_ARCHITECTURES=x86_64 -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+      run: cmake --fresh -B ${{github.workspace}}/build -DCMAKE_BUILD_TYPE=${{env.BUILD_TYPE}} -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOPENSSL_ROOT_DIR=/usr/local/opt/openssl@3 -DCMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE=ON -DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
 
     - name: Build
       run: cmake --build ${{github.workspace}}/build --config ${{env.BUILD_TYPE}} --parallel $(sysctl -n hw.ncpu)
