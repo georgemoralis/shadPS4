@@ -109,7 +109,10 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
+          set -e
+
           softwareupdate --install-rosetta --agree-to-license || true
+
 
           if [ ! -x /usr/local/bin/brew ]; then
             arch -x86_64 /bin/bash -c \
@@ -198,26 +201,63 @@ jobs:
         $upload = "${{github.workspace}}/upload"
         New-Item -ItemType Directory -Force -Path $upload | Out-Null
 
-        Write-Host "=== Build directory top-level .exe and .dll files ==="
+        Write-Host "=== Build directory: top-level .exe and .dll files ==="
         Get-ChildItem -Path $build -Filter "*.exe" -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)" }
-        $dlls = Get-ChildItem -Path $build -Filter "*.dll" -ErrorAction SilentlyContinue
-        $dlls | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)" }
+        $existingDlls = Get-ChildItem -Path $build -Filter "*.dll" -ErrorAction SilentlyContinue
+        $existingDlls | ForEach-Object { Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)" }
 
-        Write-Host "=== Staging artifact ==="
+        Write-Host "=== Staging shadPS4.exe ==="
         Copy-Item "$build/shadPS4.exe" "$upload/"
-        Write-Host "  shadPS4.exe -> upload/"
-        foreach ($dll in $dlls) {
-            Copy-Item $dll.FullName "$upload/"
-            Write-Host "  $($dll.Name) -> upload/"
+
+        foreach ($dll in $existingDlls) {
+            Copy-Item $dll.FullName "$upload/" -Force
+            Write-Host "  $($dll.Name) (from build dir)"
         }
 
-        if (-not $dlls -or $dlls.Count -eq 0) {
-            Write-Warning "No DLLs alongside shadPS4.exe — if OpenSSL was found dynamically (typical on Windows), the POST_BUILD copy in the top-level CMakeLists should have placed libssl-3-x64.dll and libcrypto-3-x64.dll there. Check the 'Configure CMake' step log: look for 'cpp-httplib: OpenSSL X.Y.Z found' (success) or 'cpp-httplib: OpenSSL not available' (problem). If OpenSSL is correctly found but no DLLs were copied, the link is most likely static (vcpkg static triplet etc.) and that's fine — shadPS4.exe is self-contained."
+        Write-Host "=== Searching for OpenSSL runtime DLLs on runner ==="
+        $sslSearchRoots = @(
+            "C:/Program Files/OpenSSL",
+            "C:/Program Files/OpenSSL-Win64",
+            "C:/OpenSSL-Win64",
+            "C:/ProgramData/chocolatey/lib/openssl/local/bin",
+            "$build/external/openssl/x64"
+        )
+        $sslPatterns = @("libssl*.dll", "libcrypto*.dll")
+        $foundSslDlls = @()
+        foreach ($root in $sslSearchRoots) {
+            if (-not (Test-Path $root)) { continue }
+            Write-Host "  searching: $root"
+            foreach ($pattern in $sslPatterns) {
+                $hits = @()
+                if (Test-Path "$root/bin") {
+                    $hits += Get-ChildItem -Path "$root/bin" -Filter $pattern `
+                        -ErrorAction SilentlyContinue
+                }
+                $hits += Get-ChildItem -Path $root -Filter $pattern `
+                    -ErrorAction SilentlyContinue
+                foreach ($hit in $hits) {
+                    if ($foundSslDlls.FullName -notcontains $hit.FullName) {
+                        $foundSslDlls += $hit
+                    }
+                }
+            }
         }
 
-        Write-Host "=== Final upload directory contents ==="
-        Get-ChildItem -Path $upload | ForEach-Object { Write-Host "  $($_.Name)" }
+        if ($foundSslDlls.Count -gt 0) {
+            Write-Host "=== Staging OpenSSL DLLs ==="
+            foreach ($dll in $foundSslDlls) {
+                Copy-Item $dll.FullName "$upload/" -Force
+                Write-Host "  $($dll.Name)  <-  $($dll.FullName)"
+            }
+        } else {
+            Write-Warning "No OpenSSL DLLs found on the runner. shadPS4.exe will fail to launch on user machines without OpenSSL installed system-wide. Check that 'C:/Program Files/OpenSSL/bin/' exists and contains libssl-3-x64.dll / libcrypto-3-x64.dll, or add the actual location to the sslSearchRoots list above."
+        }
+
+        Write-Host "=== Final upload directory ==="
+        Get-ChildItem -Path $upload | ForEach-Object {
+            Write-Host "  $($_.Name) ($([math]::Round($_.Length/1MB,2)) MB)"
+        }
 
     - name: Upload Windows SDL artifact
       uses: actions/upload-artifact@v7
