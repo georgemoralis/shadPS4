@@ -92,12 +92,28 @@ extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit
 // extern "C" linkage so the symbol matches what the (unreachable in this
 // mode) asm at fiber_context.s:120 expects, in case the asm is still
 // linked. Should never actually be called in runtime mode.
+//
+// The asm("_sceFiberForceQuit") forward-declaration immediately before
+// the definition is REQUIRED for macOS Clang. macOS prepends a leading
+// underscore to C symbols by default, so the C name `_sceFiberForceQuit`
+// would become the linker symbol `__sceFiberForceQuit` (double
+// underscore). The asm() declaration here overrides that to give the
+// literal symbol `_sceFiberForceQuit` (single underscore) that the
+// assembly file at fiber_context.s:120 calls into.
+//
+// On Linux/GCC, the asm() directive on the prior file-scope declaration
+// (above) would propagate to this definition automatically; on
+// macOS/Clang across the #ifdef boundary, that propagation appears to
+// be unreliable. Repeating the declaration immediately before the
+// definition is the portable fix.
+extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit");
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
     OrbisFiberContext* g_ctx = GetFiberContext();
     g_ctx->return_val = ret;
     _sceFiberLongJmp(g_ctx);  // stubbed: aborts with diagnostic
 }
 #else
+extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit");
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
     OrbisFiberContext* g_ctx = GetFiberContext();
     g_ctx->return_val = ret;
