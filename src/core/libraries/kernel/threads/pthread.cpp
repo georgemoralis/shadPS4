@@ -13,6 +13,7 @@
 #include "core/memory.h"
 
 #ifdef SHADPS4_USES_RUNTIME
+#include <cstdlib>
 #include "core/cpu_runtime/runtime.h"
 #endif
 
@@ -85,13 +86,46 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
     while (!curthread->cleanup.empty()) {
         PthreadCleanup* old = curthread->cleanup.front();
         curthread->cleanup.pop_front();
+        // NOTE: This cleanup invocation is NOT yet runtime-converted (PR 1.5d-1
+        // partial). The site has dual-context semantics — it's reached both from
+        // guest code calling pthread_exit mid-execution (caller has active
+        // GuestState) and from ThreadFunc after start_routine returns (no caller
+        // context). Correct conversion needs Runtime::CurrentGuestState() TLS
+        // infrastructure; see documents/SITE6_AUDIT.md and GUEST_ENTRY_STATUS.md.
         old->routine(old->routine_arg);
         if (old->onheap) {
             delete old;
         }
     }
     if (ThreadDtors) {
+#ifdef SHADPS4_USES_RUNTIME
+        // ThreadDtors is invoked from posix_pthread_exit, which reaches this
+        // code path either:
+        //   (a) from guest code calling pthread_exit (caller has active
+        //       GuestState — RARE in practice; most guests rely on start_routine
+        //       return)
+        //   (b) from ThreadFunc after start_routine returns (no caller GuestState;
+        //       start_routine has already exited the JIT)
+        //
+        // Case (b) is the dominant path. We handle it with a fresh CallGuestSimple
+        // on a malloc'd stack — same pattern as Module::Start. Case (a) doesn't
+        // crash here (we still allocate a fresh stack and the dtor runs to
+        // completion) but the dtor sees a fresh stack rather than continuing on
+        // the guest's. For ThreadDtors (the global libkernel destructor, called
+        // with no args), this is harmless: it doesn't touch caller stack state.
+        constexpr u64 kThreadDtorStackSize = 256 * 1024;  // 256 KB
+        void* guest_stack = std::malloc(kThreadDtorStackSize);
+        if (guest_stack != nullptr) {
+            void* guest_stack_top = static_cast<u8*>(guest_stack) + kThreadDtorStackSize;
+            Core::Runtime::Runtime::Instance().CallGuestSimple(
+                reinterpret_cast<u64>(ThreadDtors), guest_stack_top);
+            std::free(guest_stack);
+        } else {
+            LOG_ERROR(Lib_Kernel, "ThreadDtors: failed to allocate guest stack");
+        }
+#else
         (ThreadDtors)();
+#endif
     }
     ExitThread();
 }

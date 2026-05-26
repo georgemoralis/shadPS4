@@ -6,6 +6,11 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/libs.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include <cstdlib>
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 namespace Libraries::Kernel {
 
 static constexpr u32 PthreadKeysMax = 256;
@@ -85,7 +90,36 @@ void _thread_cleanupspecific() {
                  * destructor:
                  */
                 lk.unlock();
+#ifdef SHADPS4_USES_RUNTIME
+                // pthread-key-destructor invocation.
+                //
+                // Reached from _thread_cleanupspecific, which is called from
+                // ExitThread, which is called from posix_pthread_exit. As with
+                // the ThreadDtors site, this is reachable either mid-JIT (guest
+                // explicit pthread_exit) or post-JIT (start_routine returned).
+                // The dominant path is post-JIT, where there's no caller
+                // GuestState. We use a fresh CallGuestSimple with an allocated
+                // stack.
+                //
+                // The destructor takes one arg: `data` (const void*). PS4_SYSV_ABI
+                // puts it in RDI = gpr[7]. CallGuestSimple handles that.
+                constexpr u64 kKeyDtorStackSize = 256 * 1024;  // 256 KB
+                void* guest_stack = std::malloc(kKeyDtorStackSize);
+                if (guest_stack != nullptr) {
+                    void* guest_stack_top =
+                        static_cast<u8*>(guest_stack) + kKeyDtorStackSize;
+                    Core::Runtime::Runtime::Instance().CallGuestSimple(
+                        reinterpret_cast<u64>(destructor),
+                        guest_stack_top,
+                        reinterpret_cast<u64>(data));
+                    std::free(guest_stack);
+                } else {
+                    LOG_ERROR(Lib_Kernel,
+                              "pthread key destructor: failed to allocate guest stack");
+                }
+#else
                 destructor(data);
+#endif
                 lk.lock();
             }
         }
