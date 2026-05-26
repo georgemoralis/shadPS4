@@ -73,7 +73,7 @@ endif()
 # backend is not yet implemented in this initial drop; the build flag
 # is in place so subsequent PRs slot in cleanly.
 # ============================================================================
-set(SHADPS4_CPU_BACKEND "auto" CACHE STRING
+set(SHADPS4_CPU_BACKEND "runtime" CACHE STRING
     "CPU execution backend: native | runtime | auto")
 set_property(CACHE SHADPS4_CPU_BACKEND PROPERTY STRINGS native runtime auto)
 
