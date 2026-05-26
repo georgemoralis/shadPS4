@@ -12,6 +12,10 @@
 #include "core/libraries/libs.h"
 #include "core/memory.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func,
                                                  void* stackb) asm("_runOnAnotherStack");
 
@@ -217,7 +221,29 @@ static void* RunThread(void* arg) {
     /* Run the current thread's start routine with argument: */
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
+#ifdef SHADPS4_USES_RUNTIME
+    // Runtime path: call the guest start_routine via the JIT, on the
+    // guest stack the pthread machinery already allocated. Unlike the
+    // native path's _runOnAnotherStack, we don't switch the *host*
+    // stack — the JIT operates on the guest stack indirectly via
+    // GuestState::gpr[4] (RSP).
+    //
+    // The Windows TEB stack-check disable that the asm does is NOT
+    // replicated here: JIT-emitted code doesn't trigger Windows'
+    // stack-checking heuristics because it runs entirely within the
+    // host's own stack frame for this thread. If a guest function
+    // does something that the host views as suspicious (e.g.
+    // touching memory far below %rsp), it'll fault inside the JIT's
+    // code cache, which is handled by the signal/exception path
+    // rather than by the stack-check mechanism.
+    void* ret = reinterpret_cast<void*>(
+        Core::Runtime::Runtime::Instance().CallGuestSimple(
+            reinterpret_cast<u64>(curthread->start_routine),
+            stack,
+            reinterpret_cast<u64>(curthread->arg)));
+#else
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
+#endif
 
     /* Remove thread from tracking */
     DebugState.RemoveCurrentThreadFromGuestList();

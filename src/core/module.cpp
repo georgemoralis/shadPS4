@@ -16,6 +16,12 @@
 #include "core/module.h"
 #include "core/tls.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include <cstdlib>
+#include "core/cpu_runtime/guest_state.h"
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 namespace Core {
 
 using EntryFunc = PS4_SYSV_ABI int (*)(size_t args, const void* argp, void* param);
@@ -98,7 +104,31 @@ Module::~Module() = default;
 s32 Module::Start(u64 args, const void* argp, void* param) {
     LOG_INFO(Core_Linker, "Module started : {}", name);
     const VAddr addr = dynamic_info.init_virtual_addr + GetBaseAddress();
+#ifdef SHADPS4_USES_RUNTIME
+    // CPU runtime path. Allocate a guest stack, call the module init
+    // through the runtime, and free the stack.
+    //
+    // NOTE: malloc'd stack matches what RunMainEntryRuntime does. The
+    // proper fix is to use Memory::MapMemory to allocate in the user
+    // region; deferred until the memory-API choice is settled.
+    constexpr u64 kModuleInitStackSize = 1 * 1024 * 1024;  // 1 MB
+    void* guest_stack = std::malloc(kModuleInitStackSize);
+    ASSERT_MSG(guest_stack != nullptr,
+               "Module::Start: failed to allocate guest stack for module init");
+    void* guest_stack_top = static_cast<u8*>(guest_stack) + kModuleInitStackSize;
+
+    const s32 result = static_cast<s32>(
+        Runtime::Runtime::Instance().CallGuestSimple(
+            addr, guest_stack_top,
+            static_cast<u64>(args),
+            reinterpret_cast<u64>(argp),
+            reinterpret_cast<u64>(param)));
+
+    std::free(guest_stack);
+    return result;
+#else
     return reinterpret_cast<EntryFunc>(addr)(args, argp, param);
+#endif
 }
 
 void Module::LoadModuleToMemory(u32& max_tls_index) {

@@ -129,9 +129,9 @@ static PS4_SYSV_ABI void RunMainEntryRuntime [[noreturn]] (EntryParams* params) 
              "RunMainEntryRuntime: entering JIT at RIP={:#x}, RSP={:#x}",
              state.rip, state.gpr[4]);
 
-    // Run through the JIT.
-    Runtime::Runtime runtime;
-    runtime.Run(state);
+    // Run through the JIT singleton, shared with module init and
+    // other guest-entry sites.
+    Runtime::Runtime::Instance().Run(state);
 
     LOG_INFO(Core_Linker,
              "RunMainEntryRuntime: JIT exited (RIP={:#x}, exit_reason={})",

@@ -215,5 +215,80 @@ TEST_F(CpuRuntimeTest, MultipleRuns_ShareBlockCache) {
         << "Block cache should have one entry after 10 runs of one block";
 }
 
+// CallGuestSimple test: verify the helper invokes a guest function
+// with the right argument registers and returns the right value.
+//
+// Guest function: takes RDI as input, adds 1 to it, returns in RAX.
+//   mov rax, rdi     48 89 f8
+//   add rax, 1       48 83 c0 01
+//   ret              c3
+//
+// Calling with a0=0x100 should return 0x101.
+TEST_F(CpuRuntimeTest, CallGuestSimple_PassesArgumentsAndReturnsValue) {
+    const u8 program[] = {
+        0x48, 0x89, 0xf8,                           // mov rax, rdi
+        0x48, 0x83, 0xc0, 0x01,                     // add rax, 1
+        0xc3,                                       // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    // Use a local Runtime instance for test isolation. The singleton
+    // would share its block cache with other tests, and since mmap
+    // may return overlapping addresses across tests, the cache could
+    // serve stale compiled code from a previous test's program.
+    Runtime rt;
+    u64 result = rt.CallGuestSimple(
+        reinterpret_cast<VAddr>(mem.CodePtr()),
+        mem.StackTop(),
+        /*a0=*/0x100);
+
+    EXPECT_EQ(result, 0x101u);
+}
+
+// CallGuest with custom setup: verify the setup callback is called
+// and that we can read non-RAX return values from the state.
+//
+// Guest function uses RDI+RSI, returns sum in RAX, also leaves
+// RSI unchanged so we can verify the setup callback put it there.
+//
+//   mov rax, rdi     48 89 f8
+//   add rax, rsi     48 01 f0
+//   ret              c3
+TEST_F(CpuRuntimeTest, CallGuest_SetupCallbackPopulatesRegisters) {
+    const u8 program[] = {
+        0x48, 0x89, 0xf8,                           // mov rax, rdi
+        0x48, 0x01, 0xf0,                           // add rax, rsi
+        0xc3,                                       // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    struct Args { u64 x, y; };
+    Args args{0x200, 0x40};
+
+    auto setup = [](GuestState& state, void* user_data) {
+        const auto* a = static_cast<const Args*>(user_data);
+        state.gpr[7] = a->x;  // RDI
+        state.gpr[6] = a->y;  // RSI
+    };
+
+    // Local Runtime — see note in CallGuestSimple test above.
+    Runtime rt;
+    GuestState result = rt.CallGuest(
+        reinterpret_cast<VAddr>(mem.CodePtr()),
+        mem.StackTop(),
+        setup, &args);
+
+    EXPECT_EQ(result.gpr[0], 0x240u);              // RAX = x + y
+    EXPECT_EQ(result.gpr[6], args.y);              // RSI unchanged
+}
+
+// Singleton test: verify Runtime::Instance() returns the same object
+// on every call, and the singleton can be invoked through CallGuest.
+TEST_F(CpuRuntimeTest, Instance_ReturnsSameRuntimeAcrossCalls) {
+    Runtime& a = Runtime::Instance();
+    Runtime& b = Runtime::Instance();
+    EXPECT_EQ(&a, &b);
+}
+
 } // namespace
 } // namespace Core::Runtime

@@ -59,12 +59,14 @@ Runtime::Runtime()
 Runtime::~Runtime() = default;
 
 void Runtime::Run(GuestState& state) {
-    ASSERT_MSG(tl_active_runtime == nullptr,
-               "Runtime::Run already active on this thread "
-               "(re-entry not yet supported)");
+    // Save the previous active-runtime pointer for this thread. Setting
+    // tl_active_runtime is per-Run nesting, not a global lock: nested
+    // Run() calls (typical for HLE → guest callback → HLE → guest pattern)
+    // restore the outer Run's runtime pointer on exit.
+    Runtime* const saved = tl_active_runtime;
     tl_active_runtime = this;
     gateway_->Enter(state, &DispatcherTrampoline);
-    tl_active_runtime = nullptr;
+    tl_active_runtime = saved;
 }
 
 void Runtime::AsyncBreak() {
@@ -75,6 +77,89 @@ void Runtime::AsyncBreak() {
 
 void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
     return lifter_->CompileBlock(guest_rip);
+}
+
+// ============================================================================
+// Singleton
+// ============================================================================
+
+Runtime& Runtime::Instance() {
+    // Magic statics — C++11 guarantees thread-safe initialization.
+    static Runtime instance;
+    return instance;
+}
+
+// ============================================================================
+// CallGuest helpers
+// ============================================================================
+
+GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
+                              SetupFn setup, void* user_data) {
+    ASSERT_MSG(guest_fn != 0, "CallGuest: null guest_fn");
+    ASSERT_MSG(guest_stack_top != nullptr, "CallGuest: null guest_stack_top");
+
+    GuestState state{};
+
+    // Align guest stack to 16, misalign by 8 (PS4_SYSV_ABI: caller's
+    // stack pointer is 8-byte-misaligned at function entry, becoming
+    // 16-byte-aligned after the implicit return-address push).
+    u64 rsp = reinterpret_cast<u64>(guest_stack_top);
+    rsp &= ~static_cast<u64>(0xF);
+    rsp -= 8;
+
+    // Push a sentinel return address that will exit the runtime cleanly
+    // when the guest function executes its terminal RET. We use a
+    // recognizable invalid address; the lifter's RET handler will set
+    // state.rip to this value and exit_reason to BlockEnd, at which
+    // point we return.
+    constexpr u64 kReturnSentinel = 0xCB'CB'CB'CB'00'00'00'00ULL;
+    rsp -= 8;
+    *reinterpret_cast<u64*>(rsp) = kReturnSentinel;
+
+    state.gpr[4] = rsp;             // RSP
+    state.rip = guest_fn;
+
+    // Let the caller populate argument registers.
+    if (setup != nullptr) {
+        setup(state, user_data);
+    }
+
+    // Run.
+    Run(state);
+
+    // At this point state.rip should equal kReturnSentinel (clean RET)
+    // or some other value (unsupported instruction, fault). The caller
+    // inspects state to determine which.
+    return state;
+}
+
+namespace {
+// User-data struct for CallGuestSimple's setup callback.
+struct SimpleArgs {
+    u64 a0, a1, a2, a3, a4, a5;
+};
+
+// Populate registers per PS4_SYSV_ABI integer-argument convention.
+// First six pointer-sized args go in RDI, RSI, RDX, RCX, R8, R9
+// (GPR indices 7, 6, 2, 1, 8, 9 in canonical AMD64 ordering).
+void SimpleSetup(GuestState& state, void* user_data) {
+    const auto* args = static_cast<const SimpleArgs*>(user_data);
+    state.gpr[7] = args->a0;  // RDI
+    state.gpr[6] = args->a1;  // RSI
+    state.gpr[2] = args->a2;  // RDX
+    state.gpr[1] = args->a3;  // RCX
+    state.gpr[8] = args->a4;  // R8
+    state.gpr[9] = args->a5;  // R9
+}
+} // namespace
+
+u64 Runtime::CallGuestSimple(VAddr guest_fn, void* guest_stack_top,
+                             u64 a0, u64 a1, u64 a2,
+                             u64 a3, u64 a4, u64 a5) {
+    SimpleArgs args{a0, a1, a2, a3, a4, a5};
+    GuestState state = CallGuest(guest_fn, guest_stack_top,
+                                 &SimpleSetup, &args);
+    return state.gpr[0];  // RAX
 }
 
 } // namespace Core::Runtime
