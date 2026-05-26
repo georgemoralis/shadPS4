@@ -250,4 +250,54 @@ u64 Runtime::CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn,
     return caller.gpr[0];  // RAX
 }
 
+// ============================================================================
+// Host-vs-guest pointer discrimination
+// ============================================================================
+//
+// We use OS APIs to answer "is this address in a loaded host module?"
+//   - POSIX: dladdr(ptr, &info) returns non-zero if ptr is in any loaded
+//            shared object (executable or .so). 0 means not in any loaded
+//            module — which is the case for guest memory mapped via
+//            shadPS4's loader.
+//   - Windows: GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+//              ptr, &handle) succeeds if ptr is in any loaded module (.exe
+//              or .dll), fails otherwise.
+//
+// A naive address-range check (e.g. "ptr >= 0x800000000") was tempting
+// but wrong: under PIE+ASLR on Linux, host code itself often lives well
+// above that threshold. dladdr is the right primitive.
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
+bool Runtime::IsGuestPointer(const void* ptr) noexcept {
+    if (ptr == nullptr) {
+        return false;
+    }
+#ifdef _WIN32
+    HMODULE handle = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(ptr), &handle)) {
+        // ptr is inside a loaded host module — it's host code.
+        return false;
+    }
+    // Not in any loaded module — assume guest.
+    return true;
+#else
+    Dl_info info{};
+    if (dladdr(ptr, &info) != 0) {
+        // dladdr found a containing module — it's host code.
+        return false;
+    }
+    // dladdr returned 0 — ptr is not in any loaded host module.
+    // Assume guest.
+    return true;
+#endif
+}
+
 } // namespace Core::Runtime

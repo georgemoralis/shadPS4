@@ -8,6 +8,11 @@
 #include "core/libraries/avplayer/avplayer_state.h"
 #include "core/tls.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include <cstdlib>
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 #include <magic_enum/magic_enum.hpp>
 
 namespace Libraries::AvPlayer {
@@ -92,7 +97,51 @@ void AvPlayerState::DefaultEventCallback(void* opaque, AvPlayerEvents event_id, 
     const auto callback = self->m_event_replacement.event_callback;
     const auto ptr = self->m_event_replacement.object_ptr;
     if (callback != nullptr) {
+#ifdef SHADPS4_USES_RUNTIME
+        // Guest event callback invocation. Dual-context:
+        //   - Mid-JIT (if AvPlayer is processing on a thread that's
+        //     running guest code through the JIT — rare for the
+        //     controller thread, possible during synchronous calls):
+        //     use caller's stack via CallGuestSimpleOnCallerStack.
+        //   - Post-JIT (the typical case: this is invoked from the
+        //     controller thread which started on a host start_routine):
+        //     allocate a fresh stack.
+        //
+        // Signature: void (void* ptr, AvPlayerEvents event_id,
+        //                  s32 source_id (always 0 here), void* event_data)
+        // PS4_SYSV_ABI: RDI=ptr, RSI=event_id, RDX=source_id, RCX=event_data
+        Core::Runtime::GuestState* caller_state =
+            Core::Runtime::Runtime::CurrentGuestState();
+        if (caller_state != nullptr) {
+            Core::Runtime::Runtime::Instance().CallGuestSimpleOnCallerStack(
+                *caller_state,
+                reinterpret_cast<u64>(callback),
+                reinterpret_cast<u64>(ptr),
+                static_cast<u64>(event_id),
+                /*source_id=*/0,
+                reinterpret_cast<u64>(event_data));
+        } else {
+            constexpr u64 kEventCallbackStackSize = 256 * 1024;
+            void* guest_stack = std::malloc(kEventCallbackStackSize);
+            if (guest_stack != nullptr) {
+                void* guest_stack_top =
+                    static_cast<u8*>(guest_stack) + kEventCallbackStackSize;
+                Core::Runtime::Runtime::Instance().CallGuestSimple(
+                    reinterpret_cast<u64>(callback),
+                    guest_stack_top,
+                    reinterpret_cast<u64>(ptr),
+                    static_cast<u64>(event_id),
+                    /*source_id=*/0,
+                    reinterpret_cast<u64>(event_data));
+                std::free(guest_stack);
+            } else {
+                LOG_ERROR(Lib_AvPlayer,
+                          "DefaultEventCallback: failed to allocate guest stack");
+            }
+        }
+#else
         callback(ptr, event_id, 0, event_data);
+#endif
     }
 }
 

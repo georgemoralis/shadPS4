@@ -371,5 +371,31 @@ TEST_F(CpuRuntimeTest, CallGuestSimpleOnCallerStack_PassesArgsAndReturnsRax) {
     EXPECT_EQ(result, 0x501u);
 }
 
+// IsGuestPointer must correctly identify guest vs host code addresses.
+// Mechanism: dladdr() on POSIX, GetModuleHandleEx on Windows. A pointer
+// in any loaded host module is host; anything else is guest.
+TEST_F(CpuRuntimeTest, IsGuestPointer_DistinguishesAddressRanges) {
+    // A host pointer: any function in this test binary.
+    auto* host_fn = reinterpret_cast<void*>(&Runtime::Instance);
+    EXPECT_FALSE(Runtime::IsGuestPointer(host_fn))
+        << "Functions in the test executable should be classified as host";
+
+    // Another host pointer: a libc function. Definitely in a loaded .so.
+    auto* libc_fn = reinterpret_cast<void*>(&std::memcpy);
+    EXPECT_FALSE(Runtime::IsGuestPointer(libc_fn))
+        << "Functions in loaded shared libraries should be classified as host";
+
+    // Null is treated as host.
+    EXPECT_FALSE(Runtime::IsGuestPointer(nullptr));
+
+    // A synthetic address that's *very* unlikely to be in any loaded
+    // module: a value in the middle of the empty user-virtual range.
+    // dladdr returns 0 for this, so IsGuestPointer says true ("guest").
+    // (In real shadPS4 this would be a guest-mapped address.)
+    auto* synthetic_guest = reinterpret_cast<void*>(0x123456789abcULL);
+    EXPECT_TRUE(Runtime::IsGuestPointer(synthetic_guest))
+        << "Addresses not in any loaded host module are assumed guest";
+}
+
 } // namespace
 } // namespace Core::Runtime

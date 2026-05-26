@@ -169,6 +169,41 @@ public:
                                      u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
                                      u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
 
+    // ========================================================================
+    // Host-vs-guest function-pointer discrimination
+    //
+    // Several integration boundaries receive a function pointer of
+    // unknown origin: it could point to guest code (loaded by
+    // shadPS4's ELF loader into a mapped memory region) or host code
+    // (C++ thunks, HOST_CALL wrappers, etc., living in the host
+    // process's own .text segment or shared libraries).
+    //
+    // Under the runtime backend, guest pointers must be invoked
+    // through the JIT (via Run/CallGuest*); host pointers must be
+    // invoked natively (the JIT can't lift host bytes as guest
+    // instructions). The native backend doesn't care since both
+    // kinds are just function pointers, but the runtime backend
+    // needs to distinguish them.
+    //
+    // We use OS APIs to ask "is this address in a loaded host
+    // module?":
+    //   - POSIX: dladdr() succeeds for addresses in loaded .so/.exe
+    //   - Windows: GetModuleHandleExW with FROM_ADDRESS flag
+    // Addresses not in any loaded host module are assumed to be
+    // guest (shadPS4 maps guest code via its own loader, outside
+    // any host module registry).
+    //
+    // A naive address-range check (e.g. "ptr >= 0x800000000") was
+    // tempting but wrong: PIE+ASLR puts host code at high addresses
+    // too. dladdr is the right primitive.
+    // ========================================================================
+
+    /// Returns true if `ptr` points into guest-loaded code, false if
+    /// it points into a loaded host module (executable or shared
+    /// library), or is null. O(1) amortized via the OS's module
+    /// tables, thread-safe.
+    [[nodiscard]] static bool IsGuestPointer(const void* ptr) noexcept;
+
 private:
     std::unique_ptr<BlockCache> block_cache_;
     std::unique_ptr<CodeCache> code_cache_;

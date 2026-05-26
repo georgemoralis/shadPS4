@@ -280,25 +280,45 @@ static void* RunThread(void* arg) {
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
 #ifdef SHADPS4_USES_RUNTIME
-    // Runtime path: call the guest start_routine via the JIT, on the
-    // guest stack the pthread machinery already allocated. Unlike the
-    // native path's _runOnAnotherStack, we don't switch the *host*
-    // stack — the JIT operates on the guest stack indirectly via
-    // GuestState::gpr[4] (RSP).
+    // Runtime path: dispatch on whether start_routine points to guest
+    // code or host code.
     //
-    // The Windows TEB stack-check disable that the asm does is NOT
-    // replicated here: JIT-emitted code doesn't trigger Windows'
-    // stack-checking heuristics because it runs entirely within the
-    // host's own stack frame for this thread. If a guest function
-    // does something that the host views as suspicious (e.g.
-    // touching memory far below %rsp), it'll fault inside the JIT's
-    // code cache, which is handled by the signal/exception path
-    // rather than by the stack-check mechanism.
-    void* ret = reinterpret_cast<void*>(
-        Core::Runtime::Runtime::Instance().CallGuestSimple(
-            reinterpret_cast<u64>(curthread->start_routine),
-            stack,
-            reinterpret_cast<u64>(curthread->arg)));
+    //   - Guest start_routine (the common case — guest's main thread or
+    //     a pthread it explicitly created via sceKernelCreateThread):
+    //     call through the JIT on the guest stack.
+    //
+    //   - Host start_routine (a Kernel::Thread::RunWrapper or similar
+    //     HOST_CALL wrapper — used by HLE subsystems like AvPlayer that
+    //     spawn worker threads with C++ lambdas): call natively. The
+    //     JIT can't lift host x86_64 bytes, so we have to dispatch the
+    //     native call directly.
+    //
+    // Without this discrimination, host-function start_routines would
+    // be fed to the lifter as if they were guest instructions, which
+    // produces undefined behavior at best.
+    void* ret;
+    if (Core::Runtime::Runtime::IsGuestPointer(
+            reinterpret_cast<void*>(curthread->start_routine))) {
+        // Guest path: call via JIT. We don't switch the *host* stack
+        // — the JIT operates on the guest stack via GuestState::gpr[4]
+        // (RSP). Windows TEB stack-check disable from the asm is not
+        // replicated; JIT-emitted code doesn't trigger Windows'
+        // stack-checking heuristics.
+        ret = reinterpret_cast<void*>(
+            Core::Runtime::Runtime::Instance().CallGuestSimple(
+                reinterpret_cast<u64>(curthread->start_routine),
+                stack,
+                reinterpret_cast<u64>(curthread->arg)));
+    } else {
+        // Host path: call directly. The host C++ thunk knows how to
+        // handle the stack itself; we just invoke it on this thread's
+        // native (OS) stack. This matches what native shadPS4 does
+        // for HOST_CALL-wrapped start_routines once it has switched
+        // to the guest stack — but since we're not using the native
+        // asm's stack switch under the runtime, we keep running on
+        // the OS stack throughout.
+        ret = curthread->start_routine(curthread->arg);
+    }
 #else
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
 #endif
