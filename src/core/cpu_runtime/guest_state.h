@@ -1,0 +1,152 @@
+// SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
+// SPDX-License-Identifier: GPL-2.0-or-later
+
+#pragma once
+
+#include <array>
+#include <cstddef>
+#include "common/types.h"
+
+namespace Core::Runtime {
+
+/// PS4 guest CPU state. This struct is shared between all backends; its
+/// layout is part of the gateway ABI. Field offsets are used directly
+/// from hand-written assembly (gateway_x86.cpp, gateway_arm64.cpp) and
+/// from emitted JIT code. Changing the layout requires updating those
+/// callers.
+///
+/// Layout rationale:
+///
+///   1. Integer GPRs first, in canonical AMD64 order (RAX..R15). This
+///      lets backends compute a field address from a 0..15 register
+///      index via simple arithmetic, no branches.
+///   2. RIP next, hot in the dispatcher loop.
+///   3. RFLAGS as a single u64. Lazy-flag handling lifts the
+///      flag-producing operands into a side-band (see flag_op /
+///      flag_lhs / flag_rhs), so RFLAGS itself is only materialized
+///      when an instruction actually reads it.
+///   4. Segment bases (fs_base, gs_base). On hosts where the
+///      patch-on-fault model handled this, the values lived in TLS;
+///      here they're explicit so the JIT can fold them into addressing.
+///   5. SSE/AVX register file. Sized to 32 ymm registers (AVX-256)
+///      even on hosts that only have 16. This matches the prototype
+///      design and keeps the offsets stable across hosts.
+///
+/// The struct is intentionally trivial and aggregate-constructible.
+/// Constructors / destructors / virtual functions would all complicate
+/// the gateway path with no benefit.
+struct alignas(64) GuestState {
+    // ---- Integer registers ----
+    // Indexed in canonical AMD64 order. gpr[0] = RAX, gpr[4] = RSP,
+    // gpr[5] = RBP, gpr[7] = RDI, etc.
+    std::array<u64, 16> gpr;
+
+    // ---- Instruction pointer ----
+    u64 rip;
+
+    // ---- Flags ----
+    // Materialized RFLAGS value. See flag_op for lazy-flag scheme.
+    u64 rflags;
+
+    // ---- Lazy-flag side band ----
+    // flag_op encodes the most recent flag-producing operation. When an
+    // instruction reads flags, the runtime materializes rflags from
+    // (flag_op, flag_lhs, flag_rhs, flag_result). When an instruction
+    // both writes flags and is followed immediately by a consumer
+    // (fused jcc, etc.), the lifter can short-circuit and emit a
+    // direct branch without materializing rflags at all.
+    u32 flag_op;
+    u32 _pad_flag;
+    u64 flag_lhs;
+    u64 flag_rhs;
+    u64 flag_result;
+
+    // ---- Segment bases ----
+    // fs_base and gs_base are guest-visible. On x86 host, code that
+    // reads fs:[0] (or similar) is normally patched by cpu_patches.cpp
+    // to a sequence that loads from this field; in the runtime path
+    // the lifter does the same translation per-block.
+    u64 fs_base;
+    u64 gs_base;
+
+    // ---- SSE / AVX register file ----
+    // 32 lanes of 256 bits. xmm/ymm are aliases (xmm0 = low 128 of ymm0).
+    // On hosts that only have 16 ymm regs, lanes 16..31 are still
+    // reachable from the JIT via memory operands; we never assume the
+    // host has 32.
+    alignas(32) std::array<u64, 32 * 4> ymm;
+
+    // ---- MXCSR (SSE control/status) ----
+    u32 mxcsr;
+
+    // ---- Exit code ----
+    // Set by the dispatcher / helpers when guest execution should
+    // pause and return control to C++. Codes are in `ExitReason`.
+    u32 exit_reason;
+
+    // ---- Reserved / scratch ----
+    // Available for backends that need a small amount of state-adjacent
+    // scratch space (e.g. for save/restore around helper calls).
+    // Backends MUST NOT assume any specific value is preserved across
+    // dispatcher invocations.
+    std::array<u64, 4> scratch;
+};
+
+/// Reason the JIT exited and returned control to the dispatcher / host.
+enum class ExitReason : u32 {
+    /// Normal block boundary; dispatcher should look up the next block
+    /// and continue.
+    BlockEnd = 0,
+
+    /// Guest executed a HALT-equivalent (typically int3 at the
+    /// kernel entry-exit shim). Host should not re-enter.
+    Halt = 1,
+
+    /// Lifter encountered an instruction it cannot translate. Host
+    /// should log the guest RIP and the un-lifted bytes, then either
+    /// fall back to an interpreter (future work) or terminate.
+    UnsupportedInstruction = 2,
+
+    /// A helper-call out of the JIT returned a status indicating the
+    /// guest should stop (e.g. an HLE library said "exit").
+    HelperRequestedExit = 3,
+
+    /// Reserved for asynchronous events (debugger break-in, etc.).
+    AsyncBreak = 4,
+};
+
+/// Backend-visible field offsets. These mirror offsetof() but are
+/// expressed as constants so the assembly gateways can include this
+/// header and not have to mirror the struct definition.
+namespace Offsets {
+constexpr u32 Gpr = 0;
+constexpr u32 Rip = Gpr + 16 * 8;
+constexpr u32 Rflags = Rip + 8;
+constexpr u32 FlagOp = Rflags + 8;
+constexpr u32 FlagLhs = FlagOp + 8; // FlagOp is u32 + u32 pad = 8 bytes
+constexpr u32 FlagRhs = FlagLhs + 8;
+constexpr u32 FlagResult = FlagRhs + 8;
+constexpr u32 FsBase = FlagResult + 8;
+constexpr u32 GsBase = FsBase + 8;
+// Ymm is aligned to 32, so there may be padding between gs_base and ymm.
+// Compute via static_assert after the struct is fully defined; for
+// gateway code, use offsetof() rather than these constants for the
+// ymm and below fields.
+} // namespace Offsets
+
+// Sanity checks: field layout MUST match Offsets:: above. If a field
+// is reordered or its type changed, these fail at compile time and
+// force the gateway assembly to be updated.
+static_assert(offsetof(GuestState, gpr) == Offsets::Gpr);
+static_assert(offsetof(GuestState, rip) == Offsets::Rip);
+static_assert(offsetof(GuestState, rflags) == Offsets::Rflags);
+static_assert(offsetof(GuestState, flag_op) == Offsets::FlagOp);
+static_assert(offsetof(GuestState, flag_lhs) == Offsets::FlagLhs);
+static_assert(offsetof(GuestState, flag_rhs) == Offsets::FlagRhs);
+static_assert(offsetof(GuestState, flag_result) == Offsets::FlagResult);
+static_assert(offsetof(GuestState, fs_base) == Offsets::FsBase);
+static_assert(offsetof(GuestState, gs_base) == Offsets::GsBase);
+static_assert(sizeof(GuestState) % 16 == 0,
+              "GuestState size must be 16-byte aligned for gateway save area");
+
+} // namespace Core::Runtime

@@ -23,6 +23,12 @@
 #include "core/tls.h"
 #include "ipc/ipc.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include <cstdlib>
+#include "core/cpu_runtime/guest_state.h"
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 #ifndef _WIN32
 #include <signal.h>
 #endif
@@ -56,6 +62,90 @@ static PS4_SYSV_ABI void* RunMainEntry [[noreturn]] (EntryParams* params) {
     UNREACHABLE();
 }
 #endif
+
+#ifdef SHADPS4_USES_RUNTIME
+// Parallel to RunMainEntry but routes execution through the CPU runtime
+// (src/core/cpu_runtime/) instead of jumping directly to guest code.
+//
+// The native RunMainEntry above is `[[noreturn]]` because it `jmp`s
+// into the guest and never returns. This runtime version IS expected
+// to return — guest execution exits cleanly when the runtime hits a
+// halt-equivalent or an unsupported instruction. We still mark the
+// function `[[noreturn]]` from the caller's perspective: we exit the
+// process via std::exit() when the guest stops, matching the native
+// path's "no coming back" semantics.
+//
+// Stack setup contract (mirrors the inline-asm in RunMainEntry):
+//   - Allocate a guest stack.
+//   - Align guest RSP to 16, then misalign by 8 (videoout_basic
+//     requirement).
+//   - Push EntryParams' two halves at the top of the stack
+//     (OpenOrbis expects to find them there).
+//   - Set GPR[7]=RDI to params, GPR[6]=RSI to ProgramExitFunc.
+//   - Set RIP to the guest entry address.
+//
+// The stack is allocated via malloc here. Real shadPS4 should use the
+// AddressSpace-managed guest stack instead; see the inline NOTE.
+static PS4_SYSV_ABI void RunMainEntryRuntime [[noreturn]] (EntryParams* params) {
+    // NOTE: temporary stack allocation. The native path uses host
+    // %rsp, which is the OS-given thread stack — large, properly
+    // mapped, MMU-protected. For the runtime path we need *guest*
+    // stack memory that the JIT-emitted code can access without
+    // special handling. Real integration should request this via
+    // Memory::MapMemory / SearchFree in the user region, not malloc.
+    // Using malloc here is a placeholder that works for early
+    // bring-up where the guest never spawns threads or recurses
+    // deeply.
+    constexpr u64 kGuestStackSize = 8 * 1024 * 1024;
+    u8* guest_stack = static_cast<u8*>(std::malloc(kGuestStackSize));
+    ASSERT_MSG(guest_stack != nullptr,
+               "RunMainEntryRuntime: failed to allocate guest stack");
+
+    // Set up the guest stack to match what the inline-asm in
+    // RunMainEntry would have produced:
+    //   align to 16, misalign by 8, push high half of params,
+    //   push low half of params.
+    u64 rsp = reinterpret_cast<u64>(guest_stack + kGuestStackSize);
+    rsp &= ~static_cast<u64>(0xF);  // andq $-16, %rsp
+    rsp -= 8;                        // subq $8, %rsp
+    // pushq 8(%1) / pushq 0(%1): push the two qwords of params.
+    // We're pushing pointers worth of bytes; the native asm does
+    // 8 bytes each, regardless of architecture-pointer-width.
+    rsp -= 8;
+    *reinterpret_cast<u64*>(rsp) = *reinterpret_cast<u64*>(
+        reinterpret_cast<u8*>(params) + 8);
+    rsp -= 8;
+    *reinterpret_cast<u64*>(rsp) = *reinterpret_cast<u64*>(params);
+
+    // Build the GuestState. Zero-init everything; set the three
+    // fields the entry contract uses (RIP, RDI, RSI), plus RSP.
+    Runtime::GuestState state{};
+    state.rip = params->entry_addr;
+    state.gpr[4] = rsp;                                      // RSP
+    state.gpr[7] = reinterpret_cast<u64>(params);            // RDI = params
+    state.gpr[6] = reinterpret_cast<u64>(&ProgramExitFunc);  // RSI = exit_fn
+
+    LOG_INFO(Core_Linker,
+             "RunMainEntryRuntime: entering JIT at RIP={:#x}, RSP={:#x}",
+             state.rip, state.gpr[4]);
+
+    // Run through the JIT.
+    Runtime::Runtime runtime;
+    runtime.Run(state);
+
+    LOG_INFO(Core_Linker,
+             "RunMainEntryRuntime: JIT exited (RIP={:#x}, exit_reason={})",
+             state.rip, state.exit_reason);
+
+    // Mirror native path's "no coming back" semantics. The native
+    // path never returns because the guest jumps to ProgramExitFunc
+    // which logs an error and falls through to process termination.
+    // We do it explicitly.
+    std::free(guest_stack);
+    std::exit(state.exit_reason == static_cast<u32>(
+                  Runtime::ExitReason::BlockEnd) ? 0 : 1);
+}
+#endif  // SHADPS4_USES_RUNTIME
 
 Linker::Linker() : memory{Memory::Instance()} {}
 
@@ -166,7 +256,14 @@ void Linker::Execute(const std::vector<std::string>& args) {
 
         // Run the game's entry function
         params.entry_addr = module->GetEntryAddress();
+#ifdef SHADPS4_USES_RUNTIME
+        // CPU runtime path. Mutually exclusive with the native path.
+        // The native RunMainEntry above stays in the source for the
+        // x86_64 build but is not called when the runtime is active.
+        RunMainEntryRuntime(&params);
+#else
         RunMainEntry(&params);
+#endif
     });
 }
 

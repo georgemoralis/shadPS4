@@ -287,3 +287,101 @@ gtest_discover_tests(shadps4_http_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     PROPERTIES TIMEOUT 60
 )
+
+# ===========================================================================
+# CPU runtime tests (src/core/cpu_runtime/)
+# ===========================================================================
+# Built only when the runtime backend is compiled. Mirrors the structure
+# of the HTTP test block above.
+if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
+    set(CPU_RUNTIME_TEST_SOURCES
+        # Under test
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/block_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/code_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/runtime.cpp
+
+        # Required by logger
+        ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+
+        # Minimal common support
+        ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+        # Stubs that replace dependencies
+        stubs/common_stub.cpp
+        stubs/scm_rev_stub.cpp
+        stubs/sdl_stub.cpp
+
+        # Tests
+        test_cpu_runtime.cpp
+    )
+
+    if (ARCHITECTURE STREQUAL "x86_64")
+        list(APPEND CPU_RUNTIME_TEST_SOURCES
+            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/gateway/gateway_x86.cpp
+            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_x86_host.cpp)
+    endif()
+
+    add_executable(shadps4_cpu_runtime_test ${CPU_RUNTIME_TEST_SOURCES})
+    list(APPEND TEST_TARGETS shadps4_cpu_runtime_test)
+
+    target_include_directories(shadps4_cpu_runtime_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_compile_features(shadps4_cpu_runtime_test PRIVATE cxx_std_23)
+    target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+        BOOST_ASIO_STANDALONE
+        SHADPS4_USES_RUNTIME=1)
+
+    target_link_libraries(shadps4_cpu_runtime_test PRIVATE
+        GTest::gtest_main
+        fmt::fmt
+        magic_enum::magic_enum
+        nlohmann_json::nlohmann_json
+        toml11::toml11
+        tsl::robin_map
+        xbyak::xbyak
+        Zydis::Zydis
+        SDL3::SDL3
+        spdlog::spdlog
+    )
+
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+        CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+        include(CheckCXXSymbolExists)
+        check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+        if (LIBCPP)
+            target_compile_options(shadps4_cpu_runtime_test PRIVATE
+                -fexperimental-library)
+        endif()
+    endif()
+
+    if (WIN32)
+        target_link_libraries(shadps4_cpu_runtime_test PRIVATE onecore)
+        target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            NTDDI_VERSION=0x0A000006
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+        if (MSVC)
+            target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+                _CRT_SECURE_NO_WARNINGS
+                _CRT_NONSTDC_NO_DEPRECATE
+                _SCL_SECURE_NO_WARNINGS
+                _TIMESPEC_DEFINED
+            )
+        endif()
+    endif()
+
+    gtest_discover_tests(shadps4_cpu_runtime_test
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        PROPERTIES TIMEOUT 60
+    )
+endif()

@@ -55,6 +55,70 @@ else()
     message(FATAL_ERROR "Unsupported CPU architecture: ${BASE_ARCHITECTURE}")
 endif()
 
+# ============================================================================
+# CPU execution backend selector.
+#
+#   native   — execute guest code natively (x86_64 host only).
+#              Uses cpu_patches.cpp. Current behavior.
+#   runtime  — execute guest code via the CPU recompiler in
+#              src/core/cpu_runtime/. JIT path; required on ARM64.
+#   auto     — native on x86_64, runtime on ARM64. The default.
+#
+# On x86_64 hosts the 'runtime' backend is opt-in and currently lacks
+# block chaining and other optimizations; expect 3-15x slowdown vs
+# 'native'. The default ('auto') resolves to 'native' on x86_64 and
+# preserves current behavior.
+#
+# On ARM64 hosts the 'runtime' backend is the only option. The ARM64
+# backend is not yet implemented in this initial drop; the build flag
+# is in place so subsequent PRs slot in cleanly.
+# ============================================================================
+set(SHADPS4_CPU_BACKEND "auto" CACHE STRING
+    "CPU execution backend: native | runtime | auto")
+set_property(CACHE SHADPS4_CPU_BACKEND PROPERTY STRINGS native runtime auto)
+
+# Defensive check: this block depends on ARCHITECTURE being set, which
+# happens immediately above. If you see this error, the block was moved
+# earlier in the file and needs to come back down here.
+if (NOT DEFINED ARCHITECTURE OR ARCHITECTURE STREQUAL "")
+    message(FATAL_ERROR
+        "SHADPS4_CPU_BACKEND: ARCHITECTURE is not set. This block must "
+        "come AFTER the host-architecture detection block that sets "
+        "ARCHITECTURE to \"x86_64\" or \"arm64\". Do not move it.")
+endif()
+
+# Resolve 'auto' to a concrete value.
+if (SHADPS4_CPU_BACKEND STREQUAL "auto")
+    if (ARCHITECTURE STREQUAL "x86_64")
+        set(SHADPS4_CPU_BACKEND_RESOLVED "native")
+    elseif (ARCHITECTURE STREQUAL "arm64")
+        set(SHADPS4_CPU_BACKEND_RESOLVED "runtime")
+    else()
+        message(FATAL_ERROR
+            "SHADPS4_CPU_BACKEND=auto: unsupported architecture '${ARCHITECTURE}'")
+    endif()
+else()
+    set(SHADPS4_CPU_BACKEND_RESOLVED "${SHADPS4_CPU_BACKEND}")
+endif()
+
+# Reject 'native' on non-x86_64 hosts.
+if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "native" AND
+    NOT ARCHITECTURE STREQUAL "x86_64")
+    message(FATAL_ERROR
+        "SHADPS4_CPU_BACKEND=native requires x86_64 host. "
+        "On ARM64, use 'runtime' (or 'auto' which selects it).")
+endif()
+
+message(STATUS "CPU backend: ${SHADPS4_CPU_BACKEND_RESOLVED} "
+        "(SHADPS4_CPU_BACKEND=${SHADPS4_CPU_BACKEND}, ARCHITECTURE=${ARCHITECTURE})")
+
+if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
+    add_compile_definitions(SHADPS4_USES_RUNTIME=1)
+endif()
+# ============================================================================
+# End of CPU backend selector block
+# ============================================================================
+
 if (ARCHITECTURE STREQUAL "x86_64")
     # Target x86-64-v3 CPU architecture as this is a good balance between supporting performance critical
     # instructions like AVX2 and maintaining support for older CPUs.
@@ -906,6 +970,45 @@ if (ARCHITECTURE STREQUAL "x86_64")
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h)
 endif()
+
+# ============================================================================
+# CPU runtime (JIT). Compiled when the runtime backend is active.
+# This subsystem coexists with cpu_patches.cpp; selection happens at
+# the integration point in Linker::Execute (see the
+# SHADPS4_USES_RUNTIME branch in linker.cpp).
+#
+# Initial drop: only the main program entry (RunMainEntry) routes
+# through the runtime. Module init, pthread entry, fibers, signal
+# handlers, and HLE callbacks still go through native execution.
+# See RFC and README for the follow-up PR 1.5 sequence.
+# ============================================================================
+if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
+    set(CORE ${CORE}
+             src/core/cpu_runtime/block_cache.cpp
+             src/core/cpu_runtime/block_cache.h
+             src/core/cpu_runtime/code_cache.cpp
+             src/core/cpu_runtime/code_cache.h
+             src/core/cpu_runtime/guest_state.h
+             src/core/cpu_runtime/runtime.cpp
+             src/core/cpu_runtime/runtime.h
+             src/core/cpu_runtime/gateway/gateway.h
+             src/core/cpu_runtime/lifter/lifter.h)
+
+    if (ARCHITECTURE STREQUAL "x86_64")
+        set(CORE ${CORE}
+                 src/core/cpu_runtime/gateway/gateway_x86.cpp
+                 src/core/cpu_runtime/lifter/lifter_x86_host.cpp)
+    elseif (ARCHITECTURE STREQUAL "arm64")
+        # ARM64 backend lands in a follow-up PR.
+        message(FATAL_ERROR
+            "SHADPS4_CPU_BACKEND=runtime on arm64 not yet implemented; "
+            "the gateway_arm64.cpp and lifter_arm64_host.cpp files are "
+            "deferred to a follow-up PR.")
+    endif()
+endif()
+# ============================================================================
+# End of CPU runtime source list
+# ============================================================================
 
 set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/recompiler.cpp
