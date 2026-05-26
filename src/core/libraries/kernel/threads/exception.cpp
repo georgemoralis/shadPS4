@@ -261,7 +261,36 @@ void SigactionHandler(int native_signum, siginfo_t* inf, ucontext_t* raw_context
         ctx.uc_mcontext.mc_rip = (regs[REG_RIP]);
         ctx.uc_mcontext.mc_addr = reinterpret_cast<uint64_t>(inf->si_addr);
 #endif
+#ifdef SHADPS4_USES_RUNTIME
+        // Signal handling under SHADPS4_CPU_BACKEND=runtime is NOT
+        // implemented. Invoking the guest handler natively here would
+        // bypass the JIT and run guest x86_64 bytes directly, which is
+        // exactly what the runtime exists to prevent.
+        //
+        // Doing it correctly requires (see GUEST_ENTRY_STATUS.md):
+        //   1. Reverse-mapping the host RIP in `raw_context` back to a
+        //      guest RIP via Runtime::HostToGuestMap.
+        //   2. Translating host mcontext fields back to guest
+        //      GuestState fields (since the JIT may have hoisted values
+        //      out of GuestState into host registers mid-block).
+        //   3. Calling the guest handler through Runtime::CallGuest in
+        //      a signal-safe way (sigaltstack, no malloc).
+        //
+        // None of that is built yet. Aborting deliberately rather than
+        // calling the native handler is the safer failure mode: it tells
+        // the developer "your game uses signal handlers, signal-handler
+        // support requires PR 1.5c work" instead of running guest bytes
+        // natively (which would mostly work but eventually fault in
+        // hard-to-diagnose ways).
+        LOG_CRITICAL(Lib_Kernel,
+                     "Guest signal handler invocation not implemented under "
+                     "SHADPS4_CPU_BACKEND=runtime (signal {}). See "
+                     "documents/GUEST_ENTRY_STATUS.md for design and tracking.",
+                     native_signum);
+        UNREACHABLE_MSG("Guest signal handler under SHADPS4_USES_RUNTIME");
+#else
         handler(NativeToOrbisSignal(native_signum), &ctx);
+#endif
     } else {
         UNREACHABLE_MSG("Unhandled exception");
     }
@@ -292,7 +321,19 @@ void ExceptionHandler(void* arg1, void* arg2, void* arg3, PCONTEXT context) {
         ctx.uc_mcontext.mc_rsp = context->Rsp;
         ctx.uc_mcontext.mc_fs = context->SegFs;
         ctx.uc_mcontext.mc_gs = context->SegGs;
+#ifdef SHADPS4_USES_RUNTIME
+        // Same caveat as the POSIX SigactionHandler above. Guest signal
+        // handler invocation through the runtime is not implemented;
+        // abort rather than fall through to native invocation.
+        LOG_CRITICAL(Lib_Kernel,
+                     "Guest exception handler invocation not implemented under "
+                     "SHADPS4_CPU_BACKEND=runtime (signal {}). See "
+                     "documents/GUEST_ENTRY_STATUS.md.",
+                     native_signum);
+        UNREACHABLE_MSG("Guest exception handler under SHADPS4_USES_RUNTIME");
+#else
         handler(NativeToOrbisSignal(native_signum), &ctx);
+#endif
     } else {
         UNREACHABLE_MSG("Unhandled exception");
     }

@@ -23,17 +23,87 @@ OrbisFiberContext* GetFiberContext() {
     return Core::GetTcbBase()->tcb_fiber;
 }
 
+#ifdef SHADPS4_USES_RUNTIME
+// ============================================================================
+// Fiber asm stubs are NOT YET ADAPTED for SHADPS4_CPU_BACKEND=runtime.
+//
+// The four _sceFiber* helpers below save/restore *host* CPU registers via
+// hand-rolled assembly. In runtime mode, "the CPU" is the JIT — guest
+// register state lives in Core::Runtime::GuestState, not in real host
+// registers. Running the native asm would save garbage scratch state from
+// the JIT execution into the fiber context struct, and later restoring it
+// would corrupt JIT execution.
+//
+// Implementing the runtime path correctly requires (see GUEST_ENTRY_STATUS.md):
+//   1. A Runtime::CurrentGuestState() accessor (per-thread TLS pointing at
+//      the GuestState currently executing).
+//   2. A FiberSnapshot save/restore primitive that operates on GuestState
+//      and serializes to/from the PS4-defined OrbisFiberContext layout.
+//   3. C++ replacements for these four functions that use #1 and #2.
+//
+// Until that's built, we fail loud at the first call rather than silently
+// corrupting state. A game that doesn't use fibers (most don't) will never
+// hit this. A game that does (Bloodborne and other FromSoft titles) will
+// abort at the first sceFiberInitialize-related call, with a clear log
+// line indicating *why*.
+//
+// The native asm symbols are still linked in (fiber_context.s gets compiled
+// in both build modes), but unreachable through these stubs.
+// ============================================================================
+
+[[noreturn]] static void FiberStubNotImplemented(const char* fn) {
+    LOG_CRITICAL(Lib_Fiber,
+                 "{}: not implemented under SHADPS4_CPU_BACKEND=runtime. "
+                 "See documents/GUEST_ENTRY_STATUS.md for the design and "
+                 "tracking. This typically means the game uses fibers "
+                 "(sceFiber API); fiber support requires PR 1.5c work.",
+                 fn);
+    UNREACHABLE_MSG("Fiber asm helper {} called under SHADPS4_USES_RUNTIME", fn);
+}
+
+static s32 _sceFiberSetJmp(OrbisFiberContext*) {
+    FiberStubNotImplemented("_sceFiberSetJmp");
+}
+
+static s32 _sceFiberLongJmp(OrbisFiberContext*) {
+    FiberStubNotImplemented("_sceFiberLongJmp");
+}
+
+static void _sceFiberSwitchEntry(OrbisFiberData*, bool) {
+    FiberStubNotImplemented("_sceFiberSwitchEntry");
+}
+
+// _sceFiberForceQuit is defined below as a real function (it does C++ work
+// before calling into the asm path), so we only stub its asm dependency.
+
+#else  // !SHADPS4_USES_RUNTIME
+
 extern "C" s32 PS4_SYSV_ABI _sceFiberSetJmp(OrbisFiberContext* ctx) asm("_sceFiberSetJmp");
 extern "C" s32 PS4_SYSV_ABI _sceFiberLongJmp(OrbisFiberContext* ctx) asm("_sceFiberLongJmp");
 extern "C" void PS4_SYSV_ABI _sceFiberSwitchEntry(OrbisFiberData* data,
                                                   bool set_fpu) asm("_sceFiberSwitchEntry");
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit");
 
+#endif  // SHADPS4_USES_RUNTIME
+
+#ifdef SHADPS4_USES_RUNTIME
+// _sceFiberForceQuit: keep the C++ body (it does meaningful C++ work) but
+// the call to _sceFiberLongJmp inside it will hit the stub above. We keep
+// extern "C" linkage so the symbol matches what the (unreachable in this
+// mode) asm at fiber_context.s:120 expects, in case the asm is still
+// linked. Should never actually be called in runtime mode.
+extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
+    OrbisFiberContext* g_ctx = GetFiberContext();
+    g_ctx->return_val = ret;
+    _sceFiberLongJmp(g_ctx);  // stubbed: aborts with diagnostic
+}
+#else
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
     OrbisFiberContext* g_ctx = GetFiberContext();
     g_ctx->return_val = ret;
     _sceFiberLongJmp(g_ctx);
 }
+#endif
 
 void PS4_SYSV_ABI _sceFiberCheckStackOverflow(OrbisFiberContext* ctx) {
     u64* stack_base = reinterpret_cast<u64*>(ctx->current_fiber->addr_context);
