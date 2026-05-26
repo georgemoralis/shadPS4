@@ -290,5 +290,86 @@ TEST_F(CpuRuntimeTest, Instance_ReturnsSameRuntimeAcrossCalls) {
     EXPECT_EQ(&a, &b);
 }
 
+// CurrentGuestState should return nullptr when no JIT is active on
+// this thread.
+TEST_F(CpuRuntimeTest, CurrentGuestState_NullOutsideRun) {
+    EXPECT_EQ(Runtime::CurrentGuestState(), nullptr);
+}
+
+// CallGuestOnCallerStack preserves callee-saved registers and RSP.
+//
+// Guest function clobbers RBX (callee-saved) and RAX (caller-saved).
+// After CallGuestOnCallerStack, RBX should be restored to its pre-call
+// value but RAX should hold whatever the function put there.
+//
+// Encoding:
+//   mov rax, 0xdead       48 c7 c0 ad de 00 00
+//   mov rbx, 0xbeef       48 c7 c3 ef be 00 00
+//   ret                   c3
+TEST_F(CpuRuntimeTest, CallGuestOnCallerStack_PreservesCalleeSaved) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0xad, 0xde, 0x00, 0x00,    // mov rax, 0xdead
+        0x48, 0xc7, 0xc3, 0xef, 0xbe, 0x00, 0x00,    // mov rbx, 0xbeef
+        0xc3,                                         // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    Runtime rt;
+    // Set up a "caller" GuestState with known callee-saved values and a
+    // valid stack. The stack just has to be a real memory region the
+    // sentinel-push will write to.
+    GuestState caller{};
+    caller.gpr[3] = 0x1111'1111'1111'1111ULL;        // RBX (callee-saved)
+    caller.gpr[4] = reinterpret_cast<u64>(mem.StackTop());  // RSP
+    caller.gpr[5] = 0x2222'2222'2222'2222ULL;        // RBP (callee-saved)
+    caller.gpr[12] = 0x3333'3333'3333'3333ULL;       // R12 (callee-saved)
+    caller.gpr[0] = 0xcafe'cafe'cafe'cafeULL;        // RAX (caller-saved)
+    caller.rip = 0x4242'4242ULL;                     // Distinct RIP
+
+    const u64 saved_rsp = caller.gpr[4];
+    const u64 saved_rip = caller.rip;
+
+    rt.CallGuestOnCallerStack(
+        caller,
+        reinterpret_cast<VAddr>(mem.CodePtr()),
+        nullptr,  // no arg setup needed
+        nullptr);
+
+    // Callee-saved should be restored exactly:
+    EXPECT_EQ(caller.gpr[3], 0x1111'1111'1111'1111ULL);
+    EXPECT_EQ(caller.gpr[5], 0x2222'2222'2222'2222ULL);
+    EXPECT_EQ(caller.gpr[12], 0x3333'3333'3333'3333ULL);
+    EXPECT_EQ(caller.gpr[4], saved_rsp);
+    EXPECT_EQ(caller.rip, saved_rip);
+
+    // RAX (caller-saved) should hold the callback's value (0xdead),
+    // not the original (0xcafecafecafecafe).
+    EXPECT_EQ(caller.gpr[0], 0xdeadULL);
+}
+
+// CallGuestSimpleOnCallerStack convenience wrapper passes args and
+// returns RAX.
+//
+// Guest function: mov rax, rdi; add rax, 1; ret
+TEST_F(CpuRuntimeTest, CallGuestSimpleOnCallerStack_PassesArgsAndReturnsRax) {
+    const u8 program[] = {
+        0x48, 0x89, 0xf8,                           // mov rax, rdi
+        0x48, 0x83, 0xc0, 0x01,                     // add rax, 1
+        0xc3,                                       // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    Runtime rt;
+    GuestState caller{};
+    caller.gpr[4] = reinterpret_cast<u64>(mem.StackTop());
+
+    u64 result = rt.CallGuestSimpleOnCallerStack(
+        caller,
+        reinterpret_cast<VAddr>(mem.CodePtr()),
+        /*a0=*/0x500);
+
+    EXPECT_EQ(result, 0x501u);
+}
+
 } // namespace
 } // namespace Core::Runtime

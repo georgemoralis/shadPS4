@@ -86,13 +86,37 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
     while (!curthread->cleanup.empty()) {
         PthreadCleanup* old = curthread->cleanup.front();
         curthread->cleanup.pop_front();
-        // NOTE: This cleanup invocation is NOT yet runtime-converted (PR 1.5d-1
-        // partial). The site has dual-context semantics — it's reached both from
-        // guest code calling pthread_exit mid-execution (caller has active
-        // GuestState) and from ThreadFunc after start_routine returns (no caller
-        // context). Correct conversion needs Runtime::CurrentGuestState() TLS
-        // infrastructure; see documents/SITE6_AUDIT.md and GUEST_ENTRY_STATUS.md.
+#ifdef SHADPS4_USES_RUNTIME
+        // Cleanup invocation from posix_pthread_exit. Dual-context, see
+        // pthread_clean.cpp:posix_pthread_cleanup_pop for the same pattern:
+        //   - Mid-JIT (guest pthread_exit): use caller's stack
+        //   - Post-JIT (ThreadFunc cleanup): fresh stack
+        Core::Runtime::GuestState* caller_state =
+            Core::Runtime::Runtime::CurrentGuestState();
+        if (caller_state != nullptr) {
+            Core::Runtime::Runtime::Instance().CallGuestSimpleOnCallerStack(
+                *caller_state,
+                reinterpret_cast<u64>(old->routine),
+                reinterpret_cast<u64>(old->routine_arg));
+        } else {
+            constexpr u64 kCleanupStackSize = 256 * 1024;
+            void* guest_stack = std::malloc(kCleanupStackSize);
+            if (guest_stack != nullptr) {
+                void* guest_stack_top =
+                    static_cast<u8*>(guest_stack) + kCleanupStackSize;
+                Core::Runtime::Runtime::Instance().CallGuestSimple(
+                    reinterpret_cast<u64>(old->routine),
+                    guest_stack_top,
+                    reinterpret_cast<u64>(old->routine_arg));
+                std::free(guest_stack);
+            } else {
+                LOG_ERROR(Lib_Kernel,
+                          "pthread_exit cleanup: failed to allocate guest stack");
+            }
+        }
+#else
         old->routine(old->routine_arg);
+#endif
         if (old->onheap) {
             delete old;
         }

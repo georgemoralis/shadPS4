@@ -124,6 +124,51 @@ public:
                         u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
                         u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
 
+    // ========================================================================
+    // Caller-context infrastructure for HLE callbacks invoked from
+    // mid-JIT execution.
+    //
+    // When an HLE shim is called from JIT-executing guest code and the
+    // shim itself invokes a guest callback, the callback must run with
+    // the caller's RSP and (after return) leave the caller's callee-
+    // saved registers intact. Using CallGuestSimple here would lose
+    // the caller's stack chain.
+    //
+    // CurrentGuestState() returns the GuestState* of the JIT execution
+    // active on the calling thread, or nullptr if not inside a JIT
+    // call. Set by Run() on entry, restored on exit (handles nesting).
+    //
+    // CallGuestOnCallerStack invokes a guest function reusing the
+    // caller's GuestState. Per PS4_SYSV_ABI, callee-saved registers
+    // (RBX, RBP, R12-R15) and RSP/RIP are preserved across the call;
+    // caller-saved registers may be clobbered. The callback's return
+    // value lands in caller.gpr[0] (RAX) per the ABI.
+    //
+    // CallGuestSimpleOnCallerStack is the integer-args convenience
+    // wrapper, analogous to CallGuestSimple.
+    // ========================================================================
+
+    /// Returns the GuestState pointer for the JIT execution currently
+    /// active on the calling thread, or nullptr if no JIT execution
+    /// is active. Cheap (single TLS read).
+    [[nodiscard]] static GuestState* CurrentGuestState() noexcept;
+
+    /// Invoke a guest function on the caller's stack, preserving the
+    /// caller's callee-saved registers, RSP, and RIP per the
+    /// PS4_SYSV_ABI. The `setup` callback receives the caller's
+    /// GuestState; it should set up argument registers (RDI, RSI,
+    /// etc.) for the callback. Caller-saved registers (RAX, RCX,
+    /// RDX, RDI, RSI, R8-R11) may be clobbered after this call.
+    void CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn,
+                                SetupFn setup, void* user_data);
+
+    /// Convenience: invoke a guest function on the caller's stack
+    /// with up to 6 pointer-sized integer arguments. Returns the
+    /// callback's return value (caller.gpr[0] after the call).
+    u64 CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn,
+                                     u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
+                                     u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
+
 private:
     std::unique_ptr<BlockCache> block_cache_;
     std::unique_ptr<CodeCache> code_cache_;
