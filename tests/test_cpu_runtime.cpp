@@ -165,24 +165,22 @@ TEST_F(CpuRuntimeTest, MultipleRegistersAndOpcodes_ProduceCorrectValues) {
 // emits an exit sequence that sets exit_reason and stores the
 // un-lifted RIP so callers can diagnose where execution stopped.
 TEST_F(CpuRuntimeTest, UnsupportedOpcode_ExitsCleanly) {
-    // CMP is still unsupported in the current lifter slice (flag
-    // computation deferred). Use it to verify the unsupported-exit
-    // path still works. If/when CMP becomes supported, replace with
-    // another not-yet-supported instruction (CALL is a good
-    // long-term choice — it has block-terminator semantics that
-    // require dispatcher cooperation).
+    // CALL is still unsupported in the current lifter slice (needs
+    // block-chaining design). Use it to verify the unsupported-exit
+    // path still works. If/when CALL becomes supported, replace
+    // with another not-yet-supported instruction.
     const u8 program[] = {
         0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
-        0x48, 0x39, 0xc3,                           // cmp rbx, rax  (unsupported)
+        0xe8, 0x00, 0x00, 0x00, 0x00,              // call rel32=0 (unsupported)
         0xc3,                                       // ret  (unreached)
     };
     const auto r = RunProgram(program, sizeof(program), mem);
 
-    // RIP should point to the CMP instruction (at offset 7).
+    // RIP should point to the CALL instruction (at offset 7).
     EXPECT_EQ(r.state.rip, r.program_base + 7);
     EXPECT_EQ(r.state.exit_reason,
               static_cast<u32>(ExitReason::UnsupportedInstruction));
-    // MOV before CMP should have executed.
+    // MOV before CALL should have executed.
     EXPECT_EQ(r.state.gpr[0], 1u);
 }
 
@@ -636,6 +634,243 @@ TEST_F(CpuRuntimeTest, FullPrologueEpilogue_ProducesCorrectState) {
     EXPECT_EQ(state.gpr[4], rsp_initial + 8)
         << "RSP after RET should be entry+8 (return address popped)";
     EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ============================================================================
+// Flag and branch tests
+// ============================================================================
+//
+// Flag bit positions in x86 RFLAGS:
+//   CF = bit 0
+//   PF = bit 2
+//   ZF = bit 6
+//   SF = bit 7
+//   OF = bit 11
+
+constexpr u64 kCF = 1ULL << 0;
+constexpr u64 kPF = 1ULL << 2;
+constexpr u64 kZF = 1ULL << 6;
+constexpr u64 kSF = 1ULL << 7;
+constexpr u64 kOF = 1ULL << 11;
+
+// CMP with equal operands: ZF=1, SF=0, CF=0, OF=0.
+//
+//   mov rax, 0x42    48 c7 c0 42 00 00 00
+//   mov rbx, 0x42    48 c7 c3 42 00 00 00
+//   cmp rax, rbx     48 39 d8       (CMP r/m64, r64: 39 /r, rax=rbx form)
+//   ret              c3
+TEST_F(CpuRuntimeTest, CmpEqual_SetsZeroFlag) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x42, 0x00, 0x00, 0x00,
+        0x48, 0xc7, 0xc3, 0x42, 0x00, 0x00, 0x00,
+        0x48, 0x39, 0xd8,
+        0xc3,
+    };
+    auto result = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(result.state.rflags & kZF)  << "ZF should be set for equal";
+    EXPECT_FALSE(result.state.rflags & kSF) << "SF should be clear";
+    EXPECT_FALSE(result.state.rflags & kCF) << "CF should be clear";
+    EXPECT_FALSE(result.state.rflags & kOF) << "OF should be clear";
+}
+
+// CMP with greater lhs (unsigned): ZF=0, CF=0 (no borrow). Sign of
+// result is positive (0x100 - 0x42 > 0) so SF=0.
+//
+//   mov rax, 0x100   48 c7 c0 00 01 00 00
+//   mov rbx, 0x42    48 c7 c3 42 00 00 00
+//   cmp rax, rbx     48 39 d8
+//   ret              c3
+TEST_F(CpuRuntimeTest, CmpGreater_ClearsZeroFlag) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x01, 0x00, 0x00,
+        0x48, 0xc7, 0xc3, 0x42, 0x00, 0x00, 0x00,
+        0x48, 0x39, 0xd8,
+        0xc3,
+    };
+    auto result = RunProgram(program, sizeof(program), mem);
+    EXPECT_FALSE(result.state.rflags & kZF) << "ZF should be clear";
+    EXPECT_FALSE(result.state.rflags & kCF) << "CF should be clear (no borrow)";
+    EXPECT_FALSE(result.state.rflags & kSF) << "SF should be clear (positive result)";
+}
+
+// CMP with smaller lhs (unsigned): CF=1 because subtraction borrows.
+//
+//   mov rax, 0x10    48 c7 c0 10 00 00 00
+//   mov rbx, 0x100   48 c7 c3 00 01 00 00
+//   cmp rax, rbx     48 39 d8
+//   ret              c3
+TEST_F(CpuRuntimeTest, CmpSmaller_SetsCarryFlag) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x10, 0x00, 0x00, 0x00,
+        0x48, 0xc7, 0xc3, 0x00, 0x01, 0x00, 0x00,
+        0x48, 0x39, 0xd8,
+        0xc3,
+    };
+    auto result = RunProgram(program, sizeof(program), mem);
+    EXPECT_FALSE(result.state.rflags & kZF) << "ZF should be clear";
+    EXPECT_TRUE(result.state.rflags & kCF)  << "CF should be set (borrow)";
+    EXPECT_TRUE(result.state.rflags & kSF)  << "SF should be set (negative result)";
+}
+
+// TEST rax, rax with rax=0: ZF=1, CF=0, OF=0.
+//
+//   xor rax, rax     48 31 c0
+//   test rax, rax    48 85 c0
+//   ret              c3
+TEST_F(CpuRuntimeTest, TestZeroReg_SetsZeroFlag) {
+    const u8 program[] = {0x48, 0x31, 0xc0, 0x48, 0x85, 0xc0, 0xc3};
+    auto result = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(result.state.rflags & kZF);
+    EXPECT_FALSE(result.state.rflags & kCF);
+    EXPECT_FALSE(result.state.rflags & kOF);
+}
+
+// JZ taken: CMP that produces ZF=1, then JZ jumps over a fault.
+//
+//   xor rax, rax     48 31 c0
+//   jz  +0x10        74 10            ; if ZF, jump to byte 18
+//   <unreachable padding>
+//   ret              c3
+//
+// After CMP rax,rax (sets ZF), JZ should be taken. state.rip should
+// be set to (next_rip + 0x10) = start + 5 + 0x10 = start + 21.
+TEST_F(CpuRuntimeTest, Jz_TakenWhenZf) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc0,          // xor rax, rax       (offset 0-2)
+        0x74, 0x10,                // jz +0x10           (offset 3-4)
+        // Bytes 5..20 are unreachable when branch taken.
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    const u64 program_base = reinterpret_cast<u64>(mem.CodePtr());
+    state.rip = program_base;
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // After JZ: state.rip should be the branch target.
+    // jz +0x10 at offset 3 has next_rip = offset 5, target = 5 + 16 = 21.
+    EXPECT_EQ(state.rip, program_base + 21);
+    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// JZ not taken: with ZF=0, JZ falls through. state.rip should be the
+// fall-through (next instruction after the jz).
+//
+//   mov rax, 1       48 c7 c0 01 00 00 00
+//   test rax, rax    48 85 c0                ; ZF=0 since rax != 0
+//   jz  +0x10        74 10
+//   <fall-through point>
+TEST_F(CpuRuntimeTest, Jz_FallsThroughWhenNoZf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1   (offsets 0-6)
+        0x48, 0x85, 0xc0,                           // test rax,rax (offsets 7-9)
+        0x74, 0x10,                                 // jz  +0x10    (offsets 10-11)
+        // fall-through at offset 12.
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    const u64 program_base = reinterpret_cast<u64>(mem.CodePtr());
+    state.rip = program_base;
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // Fall-through target is offset 12 (the byte after the jz).
+    EXPECT_EQ(state.rip, program_base + 12);
+    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// JNZ: opposite of JZ. With ZF=0, JNZ should be taken.
+//
+//   mov rax, 1       48 c7 c0 01 00 00 00
+//   test rax, rax    48 85 c0
+//   jnz +0x10        75 10
+TEST_F(CpuRuntimeTest, Jnz_TakenWhenNoZf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
+        0x48, 0x85, 0xc0,                           // test rax,rax
+        0x75, 0x10,                                 // jnz +0x10
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    const u64 program_base = reinterpret_cast<u64>(mem.CodePtr());
+    state.rip = program_base;
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // jnz at offset 10, next_rip = 12, target = 12 + 0x10 = 28.
+    EXPECT_EQ(state.rip, program_base + 28);
+}
+
+// JMP unconditional rel32: state.rip should be the target regardless
+// of any flags.
+//
+//   jmp +0x100       e9 00 01 00 00
+TEST_F(CpuRuntimeTest, Jmp_DirectRel32_SetsRipToTarget) {
+    const u8 program[] = {0xe9, 0x00, 0x01, 0x00, 0x00};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    const u64 program_base = reinterpret_cast<u64>(mem.CodePtr());
+    state.rip = program_base;
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // jmp rel32 at offset 0 (5 bytes total). next_rip = 5, target = 5 + 0x100 = 261.
+    EXPECT_EQ(state.rip, program_base + 261);
+}
+
+// JL (signed less than): SF != OF. Test with a CMP that produces
+// SF=1, OF=0 — result negative, no overflow. SF != OF → branch taken.
+//
+//   mov rax, 1       48 c7 c0 01 00 00 00
+//   mov rbx, 2       48 c7 c3 02 00 00 00
+//   cmp rax, rbx     48 39 d8       ; 1 - 2 = -1, SF=1, OF=0
+//   jl  +0x10        7c 10          ; SF != OF → take
+TEST_F(CpuRuntimeTest, Jl_TakenWhenSignedLess) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0xc7, 0xc3, 0x02, 0x00, 0x00, 0x00,
+        0x48, 0x39, 0xd8,
+        0x7c, 0x10,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    const u64 program_base = reinterpret_cast<u64>(mem.CodePtr());
+    state.rip = program_base;
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // jl at offset 17, next_rip = 19, target = 19 + 0x10 = 35.
+    EXPECT_EQ(state.rip, program_base + 35);
 }
 
 } // namespace

@@ -239,11 +239,185 @@ bool EmitMov(const ZydisDecodedInstruction& insn,
     return false;
 }
 
-/// ADD r64, r64 / ADD r64, imm.
-/// Flag side-effects deferred — the lazy-flag scheme records the
-/// op and operands; flag consumers materialize on demand. For the
-/// initial slice we set the side-band fields but don't yet have
-/// flag consumers wired up, so the values are written and unused.
+// ============================================================================
+// Flag computation helpers (eager)
+//
+// We compute flag bits eagerly into state.rflags after every
+// flag-affecting operation. This is the simpler choice over lazy
+// flag evaluation; if profiling later shows flag computation is hot,
+// switching to lazy is a localized change (the consumers all read
+// `state.rflags`, so the source can be reformulated transparently).
+//
+// We compute five of the six "arithmetic" flags: ZF (zero), SF
+// (sign), CF (carry/borrow), OF (signed overflow), PF (parity of
+// low byte). AF (auxiliary carry, decimal-arithmetic helper) is
+// deliberately skipped — modern code essentially never reads it,
+// and the only consumer is the `JP/JPE/JPO` family for parity,
+// which uses PF not AF.
+//
+// Input register convention for these helpers:
+//   rcx = lhs (original destination value before the op)
+//   rdx = rhs (source value)
+//   rax = result (after the op)
+//
+// Scratch used:
+//   r8, r9, r10 internally (clobbered)
+//
+// Output:
+//   state.rflags has the five flag bits written, other bits
+//   preserved (well — preserved relative to whatever was there
+//   before, which is also from a previous flag-writing op).
+// ============================================================================
+
+namespace RflagsBits {
+constexpr u64 CF = 1ULL << 0;
+constexpr u64 PF = 1ULL << 2;
+constexpr u64 ZF = 1ULL << 6;
+constexpr u64 SF = 1ULL << 7;
+constexpr u64 OF = 1ULL << 11;
+constexpr u64 AllArith = CF | PF | ZF | SF | OF;
+}  // namespace RflagsBits
+
+/// Emit code that computes PF (parity of the low byte of rax) and
+/// writes the bit into r8 with rflags-position alignment.
+/// Uses r9 as additional scratch.
+///
+/// x86 already provides a way to compute parity: do an XOR or AND
+/// of the value with itself (which sets PF), then `setp` to extract.
+/// But we already have the result in rax — the original op that
+/// produced rax also set host PF (since we used a host instruction
+/// to produce it). However, host flags are not stable across the
+/// xbyak-emitted sequence (every host insn could alter them). So
+/// we recompute PF from scratch using AND.
+void EmitWritePF(Xbyak::CodeGenerator& c) {
+    // Set host PF from low byte of rax.
+    c.test(al, al);
+    // setp r8b sets the byte to 1 if PF, else 0.
+    c.setp(r8b);
+    c.movzx(r8, r8b);
+    c.shl(r8, 2);                       // r8 = PF_bit << 2 (PF is at bit 2)
+    // OR into rflags.
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+}
+
+/// Emit code that clears the five arithmetic flag bits in
+/// state.rflags. Caller then ORs in each computed bit.
+void EmitClearArithFlags(Xbyak::CodeGenerator& c) {
+    c.mov(r9, ~RflagsBits::AllArith);
+    c.and_(qword[r13 + Offsets::Rflags], r9);
+}
+
+/// Compute flags for a subtract (SUB, CMP).
+/// Inputs:
+///   rcx = lhs, rdx = rhs, rax = lhs - rhs
+/// Clobbers r8, r9, r10. Writes rflags.
+void EmitFlagsFromSubtract(Xbyak::CodeGenerator& c) {
+    EmitClearArithFlags(c);
+
+    // ZF: result == 0
+    c.test(rax, rax);
+    c.setz(r8b);
+    c.movzx(r8, r8b);
+    c.shl(r8, 6);                       // ZF at bit 6
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // SF: result >> 63
+    c.mov(r8, rax);
+    c.shr(r8, 63);
+    c.shl(r8, 7);                       // SF at bit 7
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // CF for subtract: lhs < rhs (unsigned).
+    c.cmp(rcx, rdx);
+    c.setb(r8b);                        // setb = "set if below", unsigned <
+    c.movzx(r8, r8b);
+    // CF is at bit 0; no shift needed.
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // OF for subtract: ((lhs ^ rhs) & (lhs ^ result)) >> 63
+    c.mov(r8, rcx);
+    c.xor_(r8, rdx);                    // r8 = lhs ^ rhs
+    c.mov(r9, rcx);
+    c.xor_(r9, rax);                    // r9 = lhs ^ result
+    c.and_(r8, r9);
+    c.shr(r8, 63);
+    c.shl(r8, 11);                      // OF at bit 11
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // PF: parity of low byte of result.
+    EmitWritePF(c);
+}
+
+/// Compute flags for an add (ADD).
+/// Inputs:
+///   rcx = lhs, rdx = rhs, rax = lhs + rhs
+/// Clobbers r8, r9, r10. Writes rflags.
+void EmitFlagsFromAdd(Xbyak::CodeGenerator& c) {
+    EmitClearArithFlags(c);
+
+    // ZF: result == 0
+    c.test(rax, rax);
+    c.setz(r8b);
+    c.movzx(r8, r8b);
+    c.shl(r8, 6);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // SF: result >> 63
+    c.mov(r8, rax);
+    c.shr(r8, 63);
+    c.shl(r8, 7);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // CF for add: result < lhs (unsigned add overflow).
+    c.cmp(rax, rcx);
+    c.setb(r8b);
+    c.movzx(r8, r8b);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // OF for add: (~(lhs ^ rhs) & (lhs ^ result)) >> 63
+    c.mov(r8, rcx);
+    c.xor_(r8, rdx);                    // r8 = lhs ^ rhs
+    c.not_(r8);                         // r8 = ~(lhs ^ rhs)
+    c.mov(r9, rcx);
+    c.xor_(r9, rax);                    // r9 = lhs ^ result
+    c.and_(r8, r9);
+    c.shr(r8, 63);
+    c.shl(r8, 11);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // PF: parity of low byte of result.
+    EmitWritePF(c);
+}
+
+/// Compute flags for a bitwise op (AND, TEST, XOR, OR).
+/// Inputs: rax = result. (lhs and rhs unused — CF and OF are
+/// always 0 for bitwise ops per x86 spec.)
+/// Clobbers r8, r9. Writes rflags.
+void EmitFlagsFromBitwise(Xbyak::CodeGenerator& c) {
+    EmitClearArithFlags(c);
+
+    // ZF: result == 0
+    c.test(rax, rax);
+    c.setz(r8b);
+    c.movzx(r8, r8b);
+    c.shl(r8, 6);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // SF: result >> 63
+    c.mov(r8, rax);
+    c.shr(r8, 63);
+    c.shl(r8, 7);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // CF, OF: always 0 for bitwise ops. Already cleared by
+    // EmitClearArithFlags above.
+
+    // PF: parity of low byte of result.
+    EmitWritePF(c);
+}
+
+/// ADD r64, r64 / ADD r64, imm32-sx.
+/// Writes ZF/SF/CF/OF/PF to state.rflags (eager flag computation).
 bool EmitAdd(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
@@ -259,42 +433,29 @@ bool EmitAdd(const ZydisDecodedInstruction& insn,
         const int src_idx = ZydisGprToIndex(src.reg.value);
         if (src_idx < 0) return false;
 
-        // Load inputs into scratch. rax = original dst, rcx = src.
-        // These are also the lazy-flag inputs.
-        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
-        c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
-
-        // Capture lhs/rhs into side-band BEFORE the add, so we don't
-        // need to re-derive them later.
-        c.mov(qword[r13 + Offsets::FlagLhs], rax);
-        c.mov(qword[r13 + Offsets::FlagRhs], rcx);
-
-        // Do the add. rax becomes the result.
-        c.add(rax, rcx);
-
-        // Store the new dst value AND the lazy-flag result.
+        // Load inputs: rcx = lhs, rdx = rhs, then rax = sum.
+        // (Flag helpers want lhs in rcx, rhs in rdx, result in rax.)
+        c.mov(rcx, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rdx, qword[r13 + GprOffset(src_idx)]);
+        c.mov(rax, rcx);
+        c.add(rax, rdx);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-        c.mov(qword[r13 + Offsets::FlagResult], rax);
 
-        // Tag the op.
-        constexpr u32 FLAG_OP_ADD64 = 1;
-        c.mov(dword[r13 + Offsets::FlagOp], FLAG_OP_ADD64);
+        EmitFlagsFromAdd(c);
         return true;
     }
 
     if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rcx, qword[r13 + GprOffset(dst_idx)]);
         const auto imm = src.imm.value.s;
-        // ADD r64, imm32 with sign-extension. If the immediate
-        // fits in s32 we use the short form; otherwise mov-and-add.
-        if (imm >= INT32_MIN && imm <= INT32_MAX) {
-            c.add(rax, static_cast<int>(imm));
-        } else {
-            c.mov(rcx, imm);
-            c.add(rax, rcx);
-        }
+        // Materialize the immediate into rdx so the flag helper
+        // sees the same rhs the operation used.
+        c.mov(rdx, imm);
+        c.mov(rax, rcx);
+        c.add(rax, rdx);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-        // Flag side-band omitted for the imm form in this slice.
+
+        EmitFlagsFromAdd(c);
         return true;
     }
 
@@ -302,7 +463,7 @@ bool EmitAdd(const ZydisDecodedInstruction& insn,
 }
 
 /// SUB r64, imm32-sx — for stack adjustment in function prologue.
-/// Also SUB r64, r64. Flag side-effects deferred (same plan as ADD).
+/// Also SUB r64, r64. Writes ZF/SF/CF/OF/PF.
 bool EmitSub(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
@@ -317,23 +478,96 @@ bool EmitSub(const ZydisDecodedInstruction& insn,
     if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_idx = ZydisGprToIndex(src.reg.value);
         if (src_idx < 0) return false;
-        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
-        c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
-        c.sub(rax, rcx);
+        c.mov(rcx, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rdx, qword[r13 + GprOffset(src_idx)]);
+        c.mov(rax, rcx);
+        c.sub(rax, rdx);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+
+        EmitFlagsFromSubtract(c);
         return true;
     }
 
     if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rcx, qword[r13 + GprOffset(dst_idx)]);
         const auto imm = src.imm.value.s;
-        if (imm >= INT32_MIN && imm <= INT32_MAX) {
-            c.sub(rax, static_cast<int>(imm));
-        } else {
-            c.mov(rcx, imm);
-            c.sub(rax, rcx);
-        }
+        c.mov(rdx, imm);
+        c.mov(rax, rcx);
+        c.sub(rax, rdx);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+
+        EmitFlagsFromSubtract(c);
+        return true;
+    }
+
+    return false;
+}
+
+/// CMP r64, r64 / CMP r64, imm32-sx.
+/// Like SUB but doesn't write the result back — only writes flags.
+bool EmitCmp(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    const auto& lhs_op = ops[0];
+    const auto& rhs_op = ops[1];
+
+    if (lhs_op.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int lhs_idx = ZydisGprToIndex(lhs_op.reg.value);
+    if (lhs_idx < 0) return false;
+
+    if (rhs_op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int rhs_idx = ZydisGprToIndex(rhs_op.reg.value);
+        if (rhs_idx < 0) return false;
+        c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
+        c.mov(rdx, qword[r13 + GprOffset(rhs_idx)]);
+        c.mov(rax, rcx);
+        c.sub(rax, rdx);
+        EmitFlagsFromSubtract(c);
+        return true;
+    }
+
+    if (rhs_op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
+        c.mov(rdx, rhs_op.imm.value.s);
+        c.mov(rax, rcx);
+        c.sub(rax, rdx);
+        EmitFlagsFromSubtract(c);
+        return true;
+    }
+
+    return false;
+}
+
+/// TEST r64, r64 / TEST r64, imm32-sx.
+/// Like AND but doesn't write the result back — only writes flags.
+/// CF and OF are always 0 (per x86 spec).
+bool EmitTest(const ZydisDecodedInstruction& insn,
+              const ZydisDecodedOperand* ops,
+              Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    const auto& lhs_op = ops[0];
+    const auto& rhs_op = ops[1];
+
+    if (lhs_op.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int lhs_idx = ZydisGprToIndex(lhs_op.reg.value);
+    if (lhs_idx < 0) return false;
+
+    if (rhs_op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int rhs_idx = ZydisGprToIndex(rhs_op.reg.value);
+        if (rhs_idx < 0) return false;
+        c.mov(rax, qword[r13 + GprOffset(lhs_idx)]);
+        c.mov(rdx, qword[r13 + GprOffset(rhs_idx)]);
+        c.and_(rax, rdx);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
+    if (rhs_op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(rax, qword[r13 + GprOffset(lhs_idx)]);
+        c.mov(rdx, rhs_op.imm.value.s);
+        c.and_(rax, rdx);
+        EmitFlagsFromBitwise(c);
         return true;
     }
 
@@ -341,6 +575,7 @@ bool EmitSub(const ZydisDecodedInstruction& insn,
 }
 
 /// XOR r64, r64 — common register-zero idiom (`xor rax, rax`).
+/// Writes ZF/SF/PF (CF, OF = 0 per x86 spec for bitwise ops).
 /// We don't yet implement XOR r64, imm.
 bool EmitXor(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
@@ -359,6 +594,8 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
     c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
     c.xor_(rax, rcx);
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+
+    EmitFlagsFromBitwise(c);
     return true;
 }
 
@@ -444,6 +681,205 @@ bool EmitRet(const ZydisDecodedInstruction& insn,
     return true;
 }
 
+/// Helper: given a Jcc mnemonic, emit code that reads the relevant
+/// flag(s) from state.rflags and produces the *condition* (1 if
+/// the branch should be taken, 0 if not) in the low bit of rax.
+/// All other bits of rax are zeroed.
+///
+/// Returns true on success; false if the mnemonic isn't a Jcc we
+/// recognize.
+///
+/// We could be cleverer here — read state.rflags into a host
+/// register and use `setcc` based on host flags — but that requires
+/// `popfq` from a memory location, which would clobber other flag
+/// state we don't want to touch. The explicit bit-test approach is
+/// slightly more code but doesn't disturb anything.
+bool EmitJccCondition(ZydisMnemonic mnemonic, Xbyak::CodeGenerator& c) {
+    using namespace RflagsBits;
+    // Load rflags into rax (we're going to compute the condition
+    // into rax anyway).
+    c.mov(rax, qword[r13 + Offsets::Rflags]);
+
+    auto test_bit = [&](u64 bit) {
+        // result in rcx = (rflags & bit) ? 1 : 0
+        c.mov(rcx, rax);
+        c.and_(rcx, bit);
+        c.setnz(cl);
+        c.movzx(rcx, cl);
+    };
+    auto test_not_bit = [&](u64 bit) {
+        c.mov(rcx, rax);
+        c.and_(rcx, bit);
+        c.setz(cl);
+        c.movzx(rcx, cl);
+    };
+
+    switch (mnemonic) {
+        // Equal / not equal: ZF
+        case ZYDIS_MNEMONIC_JZ:                          // JE / JZ: ZF=1
+            test_bit(ZF); break;
+        case ZYDIS_MNEMONIC_JNZ:                         // JNE / JNZ: ZF=0
+            test_not_bit(ZF); break;
+
+        // Sign-based: SF
+        case ZYDIS_MNEMONIC_JS:                          // JS: SF=1
+            test_bit(SF); break;
+        case ZYDIS_MNEMONIC_JNS:                         // JNS: SF=0
+            test_not_bit(SF); break;
+
+        // Overflow: OF
+        case ZYDIS_MNEMONIC_JO:                          // JO: OF=1
+            test_bit(OF); break;
+        case ZYDIS_MNEMONIC_JNO:                         // JNO: OF=0
+            test_not_bit(OF); break;
+
+        // Parity: PF
+        case ZYDIS_MNEMONIC_JP:                          // JP / JPE: PF=1
+            test_bit(PF); break;
+        case ZYDIS_MNEMONIC_JNP:                         // JNP / JPO: PF=0
+            test_not_bit(PF); break;
+
+        // Unsigned comparison: CF, ZF
+        case ZYDIS_MNEMONIC_JB:                          // JB / JC / JNAE: CF=1
+            test_bit(CF); break;
+        case ZYDIS_MNEMONIC_JNB:                         // JNB / JNC / JAE: CF=0
+            test_not_bit(CF); break;
+        case ZYDIS_MNEMONIC_JBE: {                       // JBE / JNA: CF=1 OR ZF=1
+            c.mov(rcx, rax);
+            c.and_(rcx, CF | ZF);
+            c.setnz(cl);
+            c.movzx(rcx, cl);
+            break;
+        }
+        case ZYDIS_MNEMONIC_JNBE: {                      // JNBE / JA: CF=0 AND ZF=0
+            c.mov(rcx, rax);
+            c.and_(rcx, CF | ZF);
+            c.setz(cl);
+            c.movzx(rcx, cl);
+            break;
+        }
+
+        // Signed comparison: SF, OF, ZF
+        case ZYDIS_MNEMONIC_JL: {                        // JL / JNGE: SF != OF
+            // rcx = (SF >> 7) XOR (OF >> 11), both in low bit.
+            c.mov(rcx, rax);
+            c.shr(rcx, 7);                               // SF -> bit 0
+            c.mov(rdx, rax);
+            c.shr(rdx, 11);                              // OF -> bit 0
+            c.xor_(rcx, rdx);
+            c.and_(rcx, 1);
+            break;
+        }
+        case ZYDIS_MNEMONIC_JNL: {                       // JNL / JGE: SF == OF
+            c.mov(rcx, rax);
+            c.shr(rcx, 7);
+            c.mov(rdx, rax);
+            c.shr(rdx, 11);
+            c.xor_(rcx, rdx);
+            c.not_(rcx);
+            c.and_(rcx, 1);
+            break;
+        }
+        case ZYDIS_MNEMONIC_JLE: {                       // JLE / JNG: ZF=1 OR SF != OF
+            // First (SF != OF) into r8.
+            c.mov(r8, rax);
+            c.shr(r8, 7);
+            c.mov(rcx, rax);
+            c.shr(rcx, 11);
+            c.xor_(r8, rcx);
+            c.and_(r8, 1);
+            // Then ZF into rcx.
+            c.mov(rcx, rax);
+            c.shr(rcx, 6);
+            c.and_(rcx, 1);
+            // OR them.
+            c.or_(rcx, r8);
+            break;
+        }
+        case ZYDIS_MNEMONIC_JNLE: {                      // JNLE / JG: ZF=0 AND SF == OF
+            c.mov(r8, rax);
+            c.shr(r8, 7);
+            c.mov(rcx, rax);
+            c.shr(rcx, 11);
+            c.xor_(r8, rcx);
+            c.and_(r8, 1);
+            // r8 = (SF != OF). We want NOT(ZF=1 OR (SF!=OF)).
+            c.mov(rcx, rax);
+            c.shr(rcx, 6);
+            c.and_(rcx, 1);
+            c.or_(rcx, r8);
+            // rcx is now (ZF=1 OR SF!=OF). Invert.
+            c.not_(rcx);
+            c.and_(rcx, 1);
+            break;
+        }
+
+        default:
+            return false;
+    }
+    return true;
+}
+
+/// Conditional jump (Jcc) — block terminator.
+/// Reads flags, picks between branch-taken and fall-through target,
+/// writes state.rip, exits to gateway.
+bool EmitJcc(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             u64 next_rip,
+             Xbyak::CodeGenerator& c) {
+    // Zydis emits the absolute target for near jumps in
+    // ops[0].imm.is_relative + .value.s. The decoder normalizes to
+    // an absolute address when ZYDIS_DECODER_FLAG_NORMALIZED is set;
+    // here we calculate manually: target = next_rip + imm (relative)
+    // or just .value.s (absolute).
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        return false;  // indirect Jcc isn't a real x86 form anyway
+    }
+    const u64 target = ops[0].imm.is_relative
+        ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+        : static_cast<u64>(ops[0].imm.value.s);
+
+    // Compute condition (1 or 0) into rcx. Bails if mnemonic isn't
+    // a Jcc we recognize.
+    if (!EmitJccCondition(insn.mnemonic, c)) return false;
+
+    // Select target via conditional move. rdx = target, rax = next_rip;
+    // if rcx != 0, set rax = rdx.
+    c.mov(rax, next_rip);
+    c.mov(rdx, target);
+    c.test(rcx, rcx);
+    c.cmovnz(rax, rdx);
+    c.mov(qword[r13 + Offsets::Rip], rax);
+
+    // Exit to gateway with BlockEnd.
+    constexpr u32 EXIT_BLOCK_END = static_cast<u32>(ExitReason::BlockEnd);
+    c.mov(dword[r13 + offsetof(GuestState, exit_reason)], EXIT_BLOCK_END);
+    c.jmp(r14);
+    return true;
+}
+
+/// JMP rel — unconditional direct branch (block terminator).
+/// JMP r/m64 (indirect) is not handled yet.
+bool EmitJmp(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             u64 next_rip,
+             Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_JMP) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        return false;  // indirect JMP deferred
+    }
+    const u64 target = ops[0].imm.is_relative
+        ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+        : static_cast<u64>(ops[0].imm.value.s);
+
+    c.mov(rax, target);
+    c.mov(qword[r13 + Offsets::Rip], rax);
+    constexpr u32 EXIT_BLOCK_END = static_cast<u32>(ExitReason::BlockEnd);
+    c.mov(dword[r13 + offsetof(GuestState, exit_reason)], EXIT_BLOCK_END);
+    c.jmp(r14);
+    return true;
+}
+
 } // namespace
 
 // ============================================================================
@@ -514,11 +950,37 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_MOV:  handled = EmitMov(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_ADD:  handled = EmitAdd(insn, ops, c); break;
             case ZYDIS_MNEMONIC_SUB:  handled = EmitSub(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_CMP:  handled = EmitCmp(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_TEST: handled = EmitTest(insn, ops, c); break;
             case ZYDIS_MNEMONIC_XOR:  handled = EmitXor(insn, ops, c); break;
             case ZYDIS_MNEMONIC_PUSH: handled = EmitPush(insn, ops, c); break;
             case ZYDIS_MNEMONIC_POP:  handled = EmitPop(insn, ops, c); break;
             case ZYDIS_MNEMONIC_RET:
                 handled = EmitRet(insn, ops, c);
+                if (handled) emitted_terminator = true;
+                break;
+            case ZYDIS_MNEMONIC_JMP:
+                handled = EmitJmp(insn, ops, next_rip, c);
+                if (handled) emitted_terminator = true;
+                break;
+            // All conditional jumps go through EmitJcc.
+            case ZYDIS_MNEMONIC_JZ:
+            case ZYDIS_MNEMONIC_JNZ:
+            case ZYDIS_MNEMONIC_JS:
+            case ZYDIS_MNEMONIC_JNS:
+            case ZYDIS_MNEMONIC_JO:
+            case ZYDIS_MNEMONIC_JNO:
+            case ZYDIS_MNEMONIC_JP:
+            case ZYDIS_MNEMONIC_JNP:
+            case ZYDIS_MNEMONIC_JB:
+            case ZYDIS_MNEMONIC_JNB:
+            case ZYDIS_MNEMONIC_JBE:
+            case ZYDIS_MNEMONIC_JNBE:
+            case ZYDIS_MNEMONIC_JL:
+            case ZYDIS_MNEMONIC_JNL:
+            case ZYDIS_MNEMONIC_JLE:
+            case ZYDIS_MNEMONIC_JNLE:
+                handled = EmitJcc(insn, ops, next_rip, c);
                 if (handled) emitted_terminator = true;
                 break;
             default:
