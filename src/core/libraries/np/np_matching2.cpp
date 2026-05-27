@@ -13,6 +13,10 @@
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/system/userservice.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 namespace Libraries::Np::NpMatching2 {
 
 static bool g_initialized = false;
@@ -262,9 +266,20 @@ int PS4_SYSV_ABI sceNpMatching2CreateJoinRoomA(OrbisNpMatching2ContextId ctxId,
                                                   nullptr,
                                                   0};
             OrbisNpMatching2CreateJoinRoomResponseA resp{&room, {&me, 1, &me, &me}};
+#ifdef SHADPS4_USES_RUNTIME
+            // OrbisNpMatching2RequestCallback signature:
+            //   void(ctxId, reqId, event, error, void* data, void* arg)
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A),
+                0, reinterpret_cast<u64>(&resp),
+                reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A, 0, &resp,
                                optParam->arg);
+#endif
         });
     }
     return ORBIS_OK;
@@ -396,19 +411,43 @@ void ProcessEvents() {
 
         if (npMatching2ContextCallback) {
             while (!g_ctx_events.empty()) {
+#ifdef SHADPS4_USES_RUNTIME
+                // OrbisNpMatching2ContextCallback signature:
+                //   void(NpMatching2ContextEvent* event)
+                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                    reinterpret_cast<u64>(npMatching2ContextCallback),
+                    reinterpret_cast<u64>(&g_ctx_events.front()));
+#else
                 npMatching2ContextCallback(&g_ctx_events.front());
+#endif
                 g_ctx_events.pop_front();
             }
         }
         if (npMatching2LobbyCallback) {
             while (!g_lobby_events.empty()) {
+#ifdef SHADPS4_USES_RUNTIME
+                // OrbisNpMatching2LobbyEventCallback signature:
+                //   void(NpMatching2LobbyEvent* event)
+                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                    reinterpret_cast<u64>(npMatching2LobbyCallback),
+                    reinterpret_cast<u64>(&g_lobby_events.front()));
+#else
                 npMatching2LobbyCallback(&g_lobby_events.front());
+#endif
                 g_lobby_events.pop_front();
             }
         }
         if (npMatching2RoomCallback) {
             while (!g_room_events.empty()) {
+#ifdef SHADPS4_USES_RUNTIME
+                // OrbisNpMatching2RoomEventCallback signature:
+                //   void(NpMatching2RoomEvent* event)
+                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                    reinterpret_cast<u64>(npMatching2RoomCallback),
+                    reinterpret_cast<u64>(&g_room_events.front()));
+#else
                 npMatching2RoomCallback(&g_room_events.front());
+#endif
                 g_room_events.pop_front();
             }
         }
@@ -529,9 +568,18 @@ int PS4_SYSV_ABI sceNpMatching2GetWorldInfoList(OrbisNpMatching2ContextId ctxId,
         g_responses.emplace_back([=]() {
             OrbisNpMatching2World w{nullptr, 1, 10, 0, 10, 0, {}};
             OrbisNpMatching2GetWorldInfoListResponse resp{&w, 1};
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST),
+                0, reinterpret_cast<u64>(&resp),
+                reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST, 0, &resp,
                                optParam->arg);
+#endif
         });
     }
 
@@ -570,8 +618,16 @@ int PS4_SYSV_ABI sceNpMatching2LeaveRoom(OrbisNpMatching2ContextId ctxId,
         std::scoped_lock lk{g_responses_mutex};
         auto reqIdCopy = *requestId;
         g_responses.emplace_back([=]() {
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_ROOM),
+                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_ROOM, 0,
                                nullptr, optParam->arg);
+#endif
         });
     }
 
@@ -634,8 +690,17 @@ int PS4_SYSV_ABI sceNpMatching2SearchRoom(OrbisNpMatching2ContextId ctxId,
         auto requestCopy = *request;
         g_responses.emplace_back([=]() {
             OrbisNpMatching2SearchRoomResponseA resp{{0, 0, 0, {}}, nullptr};
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM_A),
+                0, reinterpret_cast<u64>(&resp),
+                reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM_A, 0,
                                &resp, optParam->arg);
+#endif
         });
     }
 
@@ -671,8 +736,16 @@ int PS4_SYSV_ABI sceNpMatching2SetUserInfo(OrbisNpMatching2ContextId ctxId,
         std::scoped_lock lk{g_responses_mutex};
         auto reqIdCopy = *requestId;
         g_responses.emplace_back([=]() {
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_USER_INFO),
+                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_USER_INFO, 0,
                                nullptr, optParam->arg);
+#endif
         });
     }
 
@@ -700,8 +773,16 @@ int PS4_SYSV_ABI sceNpMatching2SendRoomMessage(OrbisNpMatching2ContextId ctxId, 
         std::scoped_lock lk{g_responses_mutex};
         auto reqIdCopy = *requestId;
         g_responses.emplace_back([=]() {
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_MESSAGE),
+                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_MESSAGE,
                                0, nullptr, optParam->arg);
+#endif
         });
     }
 
@@ -729,9 +810,17 @@ int PS4_SYSV_ABI sceNpMatching2SetRoomDataExternal(OrbisNpMatching2ContextId ctx
         std::scoped_lock lk{g_responses_mutex};
         auto reqIdCopy = *requestId;
         g_responses.emplace_back([=]() {
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_EXTERNAL),
+                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_EXTERNAL, 0, nullptr,
                                optParam->arg);
+#endif
         });
     }
 
@@ -759,9 +848,17 @@ int PS4_SYSV_ABI sceNpMatching2SetRoomDataInternal(OrbisNpMatching2ContextId ctx
         std::scoped_lock lk{g_responses_mutex};
         auto reqIdCopy = *requestId;
         g_responses.emplace_back([=]() {
+#ifdef SHADPS4_USES_RUNTIME
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(optParam->callback),
+                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_INTERNAL),
+                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+#else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_INTERNAL, 0, nullptr,
                                optParam->arg);
+#endif
         });
     }
 
