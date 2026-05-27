@@ -222,6 +222,169 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
 
 } // namespace
 
+#ifdef _WIN32
+
+// =============================================================================
+// Windows unwind info registration for the JIT gateway.
+// =============================================================================
+//
+// Windows x64 requires every executable code range to have an entry in the
+// process's unwind tables (.pdata equivalent) so the OS can walk stack
+// frames during exception handling, debugger break-in, sampling profilers,
+// /GS security checks, and other SEH operations.
+//
+// For statically compiled code, the linker emits these tables automatically.
+// For dynamically generated code (our gateway), we must register the info
+// ourselves via `RtlAddFunctionTable`.
+//
+// Without this, the OS unwinder hits a gateway frame, can't find any
+// unwind info, and crashes the process — which is exactly what happens
+// to "simple" JIT-using tests like MovAddRet on Windows debug builds,
+// where /GS cookie checks and other security mechanisms trigger
+// frequent SEH walks even in the absence of explicit exceptions.
+//
+// We register info for the gateway here. JIT-compiled blocks are
+// jumped to (not called), so they have an unusual relationship with
+// the unwinder; if gateway-only registration turns out insufficient,
+// the next layer is to also describe JIT blocks via
+// RtlInstallFunctionTableCallback (deferred).
+//
+// References:
+//   - x64 exception handling overview:
+//     learn.microsoft.com/cpp/build/exception-handling-x64
+//   - RtlAddFunctionTable:
+//     learn.microsoft.com/windows/win32/api/winnt/nf-winnt-rtladdfunctiontable
+//
+// Structures below mirror those in <winnt.h>. We define our own
+// copies because (a) `UNWIND_INFO` is not a documented public type
+// (only `RUNTIME_FUNCTION` is), and (b) the layout is fixed and easy
+// to express directly.
+
+namespace {
+
+// Operation codes for UNWIND_CODE.UnwindOp.
+constexpr u8 UWOP_PUSH_NONVOL = 0;
+// (other UWOPs not used here)
+
+// Register encodings for UWOP_PUSH_NONVOL.OpInfo (matches AMD64 reg-num).
+constexpr u8 UWREG_RBX = 3;
+constexpr u8 UWREG_RBP = 5;
+constexpr u8 UWREG_RSI = 6;
+constexpr u8 UWREG_RDI = 7;
+constexpr u8 UWREG_R12 = 12;
+constexpr u8 UWREG_R13 = 13;
+constexpr u8 UWREG_R14 = 14;
+constexpr u8 UWREG_R15 = 15;
+
+// One UNWIND_CODE describes a single prologue operation that the OS
+// needs to be able to reverse during a stack walk. Layout matches
+// the `UNWIND_CODE` union in winnt.h.
+struct UnwindCode {
+    u8 code_offset;     // offset of the END of the corresponding insn
+    u8 unwind_op : 4;   // UWOP_*
+    u8 op_info   : 4;   // op-specific (e.g. UWREG_* for UWOP_PUSH_NONVOL)
+};
+static_assert(sizeof(UnwindCode) == 2, "UNWIND_CODE must be exactly 2 bytes");
+
+// UNWIND_INFO header + the inline codes array. Layout matches
+// winnt.h:_UNWIND_INFO. codes[] is sized to the max we use (8 pushes);
+// CountOfCodes tells the OS how many are valid. The array must end
+// on a 4-byte boundary, which 8 codes (16 bytes) satisfies.
+struct UnwindInfoGateway {
+    u8 version          : 3;  // = 1
+    u8 flags            : 5;  // = 0 (no exception handler, no chained)
+    u8 size_of_prolog;
+    u8 count_of_codes;
+    u8 frame_register   : 4;  // = 0 (no frame register)
+    u8 frame_offset     : 4;  // = 0
+    UnwindCode codes[8];      // exactly 8 pushes in gateway prolog
+};
+static_assert(sizeof(UnwindInfoGateway) == 4 + 8 * 2,
+              "UNWIND_INFO layout mismatch — check bit-field packing");
+
+// Offsets within the gateway RWX page. We co-locate unwind metadata
+// with the gateway code in the same page; placing it at offset 2048
+// keeps it comfortably past the ~200-byte gateway code while still
+// leaving room for the RUNTIME_FUNCTION descriptor right after.
+constexpr u64 GATEWAY_UNWIND_INFO_OFFSET = 2048;
+constexpr u64 GATEWAY_RUNTIME_FN_OFFSET  =
+    GATEWAY_UNWIND_INFO_OFFSET + sizeof(UnwindInfoGateway);
+static_assert(GATEWAY_RUNTIME_FN_OFFSET + sizeof(RUNTIME_FUNCTION) < GATEWAY_SIZE,
+              "unwind metadata doesn't fit in the gateway page");
+
+/// Populate unwind metadata for the gateway and register it with the OS.
+///
+/// Called once per Gateway construction, after the gateway code has
+/// been emitted. Returns true if the OS accepted the registration.
+/// On false, JIT execution may still work for tests that don't
+/// trigger SEH walks, but anything that does (debugger break,
+/// exception, /GS failure) will crash.
+bool RegisterGatewayUnwindInfo(u8* gateway_base) {
+    // ----------------------------------------------------------------
+    // Build UNWIND_INFO describing the gateway's MS x64 prologue:
+    //
+    //   offset 0:  push rbp    (1 byte;  rsp after = -8)
+    //   offset 1:  push rbx    (1 byte;  rsp after = -16)
+    //   offset 2:  push rdi    (1 byte;  rsp after = -24)
+    //   offset 3:  push rsi    (1 byte;  rsp after = -32)
+    //   offset 4:  push r12    (2 bytes; rsp after = -40)
+    //   offset 6:  push r13    (2 bytes; rsp after = -48)
+    //   offset 8:  push r14    (2 bytes; rsp after = -56)
+    //   offset 10: push r15    (2 bytes; rsp after = -64)
+    //   offset 12: (prologue ends; following movs/leas don't affect
+    //              unwind state, so we set size_of_prolog = 12)
+    //
+    // Per Microsoft documentation, codes are stored in REVERSE
+    // prologue order: codes[0] describes the LAST prologue op. The
+    // CodeOffset field records where the corresponding instruction
+    // ENDS (its "rsp value after this op was applied").
+    // ----------------------------------------------------------------
+    UnwindInfoGateway* ui = reinterpret_cast<UnwindInfoGateway*>(
+        gateway_base + GATEWAY_UNWIND_INFO_OFFSET);
+    *ui = {};
+    ui->version = 1;
+    ui->flags = 0;
+    ui->size_of_prolog = 12;
+    ui->count_of_codes = 8;
+    ui->frame_register = 0;
+    ui->frame_offset = 0;
+    ui->codes[0] = {12, UWOP_PUSH_NONVOL, UWREG_R15};
+    ui->codes[1] = {10, UWOP_PUSH_NONVOL, UWREG_R14};
+    ui->codes[2] = { 8, UWOP_PUSH_NONVOL, UWREG_R13};
+    ui->codes[3] = { 6, UWOP_PUSH_NONVOL, UWREG_R12};
+    ui->codes[4] = { 4, UWOP_PUSH_NONVOL, UWREG_RSI};
+    ui->codes[5] = { 3, UWOP_PUSH_NONVOL, UWREG_RDI};
+    ui->codes[6] = { 2, UWOP_PUSH_NONVOL, UWREG_RBX};
+    ui->codes[7] = { 1, UWOP_PUSH_NONVOL, UWREG_RBP};
+
+    // ----------------------------------------------------------------
+    // RUNTIME_FUNCTION ties code range -> unwind info. Addresses are
+    // RVAs (relative to BaseAddress passed to RtlAddFunctionTable).
+    //
+    // BeginAddress: 0 (gateway code starts at the page base)
+    // EndAddress:   covers the full code budget so any future
+    //               extensions in the same page are also described.
+    // ----------------------------------------------------------------
+    RUNTIME_FUNCTION* rf = reinterpret_cast<RUNTIME_FUNCTION*>(
+        gateway_base + GATEWAY_RUNTIME_FN_OFFSET);
+    rf->BeginAddress      = 0;
+    rf->EndAddress        = static_cast<DWORD>(GATEWAY_SIZE);
+    rf->UnwindInfoAddress = static_cast<DWORD>(GATEWAY_UNWIND_INFO_OFFSET);
+
+    return ::RtlAddFunctionTable(rf, 1,
+                                 reinterpret_cast<DWORD64>(gateway_base)) != FALSE;
+}
+
+void UnregisterGatewayUnwindInfo(u8* gateway_base) {
+    RUNTIME_FUNCTION* rf = reinterpret_cast<RUNTIME_FUNCTION*>(
+        gateway_base + GATEWAY_RUNTIME_FN_OFFSET);
+    ::RtlDeleteFunctionTable(rf);
+}
+
+} // namespace
+
+#endif // _WIN32
+
 Gateway::Gateway() {
     gateway_code_ = AllocateGatewayRegion();
     ASSERT_MSG(gateway_code_ != nullptr,
@@ -231,11 +394,30 @@ Gateway::Gateway() {
     GenerateGateway(gateway_code_, gateway_size_);
     entry_ = reinterpret_cast<EntryFn>(gateway_code_);
 
+#ifdef _WIN32
+    // Register the gateway's unwind metadata so Windows can walk
+    // stack frames through it. Without this, SEH walks (from /GS
+    // checks, debugger breaks, etc.) crash the process even for
+    // simple JIT operations. See RegisterGatewayUnwindInfo for the
+    // full rationale.
+    if (!RegisterGatewayUnwindInfo(gateway_code_)) {
+        LOG_WARNING(Core,
+                    "Gateway: RtlAddFunctionTable failed; SEH walks "
+                    "through JIT frames will crash. JIT may still "
+                    "work for code paths that don't trigger walks.");
+    }
+#endif
+
     LOG_INFO(Core, "Gateway: generated at {} (size budget {} bytes)",
              static_cast<void*>(gateway_code_), gateway_size_);
 }
 
 Gateway::~Gateway() {
+#ifdef _WIN32
+    if (gateway_code_ != nullptr) {
+        UnregisterGatewayUnwindInfo(gateway_code_);
+    }
+#endif
     FreeGatewayRegion(gateway_code_);
     gateway_code_ = nullptr;
     entry_ = nullptr;
