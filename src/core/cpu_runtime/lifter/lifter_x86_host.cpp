@@ -614,35 +614,90 @@ bool EmitSub(const ZydisDecodedInstruction& insn,
 
 /// CMP r64, r64 / CMP r64, imm32-sx.
 /// Like SUB but doesn't write the result back — only writes flags.
+/// CMP — sets flags by computing lhs - rhs without storing the result.
+///
+/// Supported forms:
+///   cmp r64, r64
+///   cmp r64, imm32 (sign-extended)
+///   cmp r64, [m]                      ← new
+///   cmp [m], r64                      ← new
+///   cmp [m], imm32                    ← new
+///
+/// Memory operands flow through EmitEffectiveAddress which puts the
+/// computed address into rdx. We then load the 8 bytes at [rdx] and
+/// shuffle into rcx/rdx as needed for the subtract step.
 bool EmitCmp(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
+             u64 next_rip,
              Xbyak::CodeGenerator& c) {
     if (insn.operand_width != 64) return false;
     const auto& lhs_op = ops[0];
     const auto& rhs_op = ops[1];
 
-    if (lhs_op.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int lhs_idx = ZydisGprToIndex(lhs_op.reg.value);
-    if (lhs_idx < 0) return false;
+    // ----- lhs is a register -----
+    if (lhs_op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int lhs_idx = ZydisGprToIndex(lhs_op.reg.value);
+        if (lhs_idx < 0) return false;
 
-    if (rhs_op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int rhs_idx = ZydisGprToIndex(rhs_op.reg.value);
-        if (rhs_idx < 0) return false;
-        c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
-        c.mov(rdx, qword[r13 + GprOffset(rhs_idx)]);
-        c.mov(rax, rcx);
-        c.sub(rax, rdx);
-        EmitFlagsFromSubtract(c);
-        return true;
+        if (rhs_op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int rhs_idx = ZydisGprToIndex(rhs_op.reg.value);
+            if (rhs_idx < 0) return false;
+            c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
+            c.mov(rdx, qword[r13 + GprOffset(rhs_idx)]);
+            c.mov(rax, rcx);
+            c.sub(rax, rdx);
+            EmitFlagsFromSubtract(c);
+            return true;
+        }
+
+        if (rhs_op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
+            c.mov(rdx, rhs_op.imm.value.s);
+            c.mov(rax, rcx);
+            c.sub(rax, rdx);
+            EmitFlagsFromSubtract(c);
+            return true;
+        }
+
+        if (rhs_op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            // EmitEffectiveAddress → rdx = addr (clobbers rax).
+            // Then rdx = *rdx (the value). Then load lhs into rcx.
+            if (!EmitEffectiveAddress(rhs_op.mem, next_rip, c)) return false;
+            c.mov(rdx, qword[rdx]);
+            c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
+            c.mov(rax, rcx);
+            c.sub(rax, rdx);
+            EmitFlagsFromSubtract(c);
+            return true;
+        }
+        return false;
     }
 
-    if (rhs_op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        c.mov(rcx, qword[r13 + GprOffset(lhs_idx)]);
-        c.mov(rdx, rhs_op.imm.value.s);
-        c.mov(rax, rcx);
-        c.sub(rax, rdx);
-        EmitFlagsFromSubtract(c);
-        return true;
+    // ----- lhs is memory -----
+    if (lhs_op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute address into rdx, then load the value into rcx (it
+        // becomes the lhs of the subtract).
+        if (!EmitEffectiveAddress(lhs_op.mem, next_rip, c)) return false;
+        c.mov(rcx, qword[rdx]);
+
+        if (rhs_op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int rhs_idx = ZydisGprToIndex(rhs_op.reg.value);
+            if (rhs_idx < 0) return false;
+            c.mov(rdx, qword[r13 + GprOffset(rhs_idx)]);
+            c.mov(rax, rcx);
+            c.sub(rax, rdx);
+            EmitFlagsFromSubtract(c);
+            return true;
+        }
+
+        if (rhs_op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(rdx, rhs_op.imm.value.s);
+            c.mov(rax, rcx);
+            c.sub(rax, rdx);
+            EmitFlagsFromSubtract(c);
+            return true;
+        }
+        return false;
     }
 
     return false;
@@ -967,22 +1022,43 @@ bool EmitJcc(const ZydisDecodedInstruction& insn,
     return true;
 }
 
-/// JMP rel — unconditional direct branch (block terminator).
-/// JMP r/m64 (indirect) is not handled yet.
+/// JMP — direct (rel) and indirect (r/m64) forms. Block terminator.
+///
+/// Direct:  target = next_rip + disp32
+/// Indirect (register): target = guest_reg
+/// Indirect (memory):   target = *(guest_addr)  — the PLT pattern
+///                      `jmp qword [rip+disp32]` is by far the most
+///                      common shape here.
 bool EmitJmp(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              u64 next_rip,
              Xbyak::CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_JMP) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        return false;  // indirect JMP deferred
-    }
-    const u64 target = ops[0].imm.is_relative
-        ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
-        : static_cast<u64>(ops[0].imm.value.s);
 
-    c.mov(rax, target);
-    c.mov(qword[r13 + Offsets::Rip], rax);
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        // Direct relative jump.
+        const u64 target = ops[0].imm.is_relative
+            ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+            : static_cast<u64>(ops[0].imm.value.s);
+        c.mov(rax, target);
+        c.mov(qword[r13 + Offsets::Rip], rax);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        // Indirect through register: target = guest reg value.
+        const int reg_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (reg_idx < 0) return false;
+        c.mov(rax, qword[r13 + GprOffset(reg_idx)]);
+        c.mov(qword[r13 + Offsets::Rip], rax);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Indirect through memory: target = *(effective address).
+        // EmitEffectiveAddress puts the address in rdx; we then load
+        // the 8-byte target from [rdx] into rax.
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(rax, qword[rdx]);
+        c.mov(qword[r13 + Offsets::Rip], rax);
+    } else {
+        return false;
+    }
+
     constexpr u32 EXIT_BLOCK_END = static_cast<u32>(ExitReason::BlockEnd);
     c.mov(dword[r13 + offsetof(GuestState, exit_reason)], EXIT_BLOCK_END);
     c.jmp(r14);
@@ -1153,7 +1229,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_LEA:  handled = EmitLea(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_ADD:  handled = EmitAdd(insn, ops, c); break;
             case ZYDIS_MNEMONIC_SUB:  handled = EmitSub(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_CMP:  handled = EmitCmp(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_CMP:  handled = EmitCmp(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_TEST: handled = EmitTest(insn, ops, c); break;
             case ZYDIS_MNEMONIC_XOR:  handled = EmitXor(insn, ops, c); break;
             case ZYDIS_MNEMONIC_PUSH: handled = EmitPush(insn, ops, c); break;

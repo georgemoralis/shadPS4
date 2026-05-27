@@ -1010,5 +1010,66 @@ TEST_F(CpuRuntimeTest, Mov32_RegMem_LoadsZeroExtended) {
     EXPECT_EQ(r.state.rip, kReturnSentinel);
 }
 
+// CMP r64, [r64+disp] — verify ZF is set when the values are equal.
+//
+//   mov rax, 0x55              48 c7 c0 55 00 00 00      (0-6)
+//   mov [rsp-8], rax           48 89 44 24 f8            (7-11)
+//   mov rcx, 0x55              48 c7 c1 55 00 00 00      (12-18)
+//   cmp rcx, [rsp-8]           48 3b 4c 24 f8            (19-23)
+//   jz +1                      74 01                     (24-25)
+//   ret                        c3                        (26)
+//   mov rax, 0x99              48 c7 c0 99 00 00 00      (27-33)
+//   ret                        c3                        (34)
+//
+// rax should hold 0x99 (post-branch path) if cmp set ZF; otherwise 0x55.
+TEST_F(CpuRuntimeTest, Cmp_RegMem_SetsZfWhenEqual) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x55, 0x00, 0x00, 0x00,        // mov rax, 0x55
+        0x48, 0x89, 0x44, 0x24, 0xf8,                     // mov [rsp-8], rax
+        0x48, 0xc7, 0xc1, 0x55, 0x00, 0x00, 0x00,        // mov rcx, 0x55
+        0x48, 0x3b, 0x4c, 0x24, 0xf8,                     // cmp rcx, [rsp-8]
+        0x74, 0x01,                                       // jz +1
+        0xc3,                                             // ret (not taken)
+        0x48, 0xc7, 0xc0, 0x99, 0x00, 0x00, 0x00,        // mov rax, 0x99
+        0xc3,                                             // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x99u)
+        << "CMP rcx, [rsp-8] should have set ZF, JZ taken, rax = 0x99";
+}
+
+// JMP qword [r64+disp] — indirect jump through memory (PLT thunk).
+//
+// Lay out a function-pointer slot at [rsp-8], pointing to a small
+// program tail that sets rax = 0x77 and returns. The JMP loads
+// from that slot and transfers control.
+//
+//   lea rax, [rip+0x10]           48 8d 05 10 00 00 00       (0-6)  → points to label `tail`
+//   mov [rsp-8], rax              48 89 44 24 f8             (7-11)
+//   jmp qword [rsp-8]             ff 24 24 f8 (we use rsp-relative ModR/M)
+//
+// Simpler encoding: jmp qword [rsp-8] = ff 64 24 f8 (4 bytes)
+//   total prologue = 16 bytes before the jmp = lea(7) + mov(5) + jmp(4)
+//   tail (offset 16): mov rax, 0x77; ret
+//
+//   lea rax, [rip+0x09]           48 8d 05 09 00 00 00      (0-6)  → +next_rip(7)+9 = 16
+//   mov [rsp-8], rax              48 89 44 24 f8            (7-11)
+//   jmp qword [rsp-8]             ff 64 24 f8               (12-15)
+//   mov rax, 0x77                 48 c7 c0 77 00 00 00      (16-22)
+//   ret                           c3                        (23)
+TEST_F(CpuRuntimeTest, JmpIndirect_Memory_FollowsThroughPointer) {
+    const u8 program[] = {
+        0x48, 0x8d, 0x05, 0x09, 0x00, 0x00, 0x00,  // lea rax, [rip+9]
+        0x48, 0x89, 0x44, 0x24, 0xf8,              // mov [rsp-8], rax
+        0xff, 0x64, 0x24, 0xf8,                    // jmp qword [rsp-8]
+        0x48, 0xc7, 0xc0, 0x77, 0x00, 0x00, 0x00,  // mov rax, 0x77
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x77u)
+        << "JMP indirect should have transferred control to the tail block";
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
 } // namespace
 } // namespace Core::Runtime
