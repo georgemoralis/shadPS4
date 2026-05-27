@@ -15,8 +15,8 @@
 #include "core/cpu_runtime/block_cache.h"
 #include "core/cpu_runtime/code_cache.h"
 #include "core/cpu_runtime/gateway/gateway.h"
-#include "core/cpu_runtime/lifter/lifter.h"
 #include "core/cpu_runtime/hle_registry.h"
+#include "core/cpu_runtime/lifter/lifter.h"
 
 namespace Core::Runtime {
 
@@ -54,8 +54,7 @@ static_assert(std::is_same_v<decltype(GuestState::gpr), std::array<u64, 16>>,
 // i=0..7. If the lane count per ymm register ever changes (e.g.,
 // AVX-512 expansion that re-uses this field), the stride would
 // need to change too.
-static_assert(std::is_same_v<decltype(GuestState::ymm),
-                             std::array<u64, 32 * 4>>,
+static_assert(std::is_same_v<decltype(GuestState::ymm), std::array<u64, 32 * 4>>,
               "GuestState::ymm must hold 32 ymm registers of 4 u64 lanes; "
               "the HLE bridge's XMM marshaling assumes this layout");
 
@@ -64,14 +63,14 @@ static_assert(std::is_same_v<decltype(GuestState::ymm),
 // These match the canonical AMD64 register numbering (verified in
 // the lifter) but using named constants makes the dispatcher's
 // intent legible at the call site and centralises the convention.
-constexpr int kSysvArg0 = 7;  // RDI
-constexpr int kSysvArg1 = 6;  // RSI
-constexpr int kSysvArg2 = 2;  // RDX
-constexpr int kSysvArg3 = 1;  // RCX
-constexpr int kSysvArg4 = 8;  // R8
-constexpr int kSysvArg5 = 9;  // R9
-constexpr int kSysvRet  = 0;  // RAX
-constexpr int kGuestRsp = 4;  // RSP (host stack of the guest)
+constexpr int kSysvArg0 = 7; // RDI
+constexpr int kSysvArg1 = 6; // RSI
+constexpr int kSysvArg2 = 2; // RDX
+constexpr int kSysvArg3 = 1; // RCX
+constexpr int kSysvArg4 = 8; // R8
+constexpr int kSysvArg5 = 9; // R9
+constexpr int kSysvRet = 0;  // RAX
+constexpr int kGuestRsp = 4; // RSP (host stack of the guest)
 
 // ---------------- end of compile-time invariants ----------------
 
@@ -177,23 +176,17 @@ struct HostReturn {
 ///     is reading past the end of the guest stack mapping; in
 ///     practice guest stacks are megabytes deep and the 64-byte
 ///     overscan is negligible.
-typedef HostReturn (*HostHleFn)(u64, u64, u64, u64, u64, u64,
-                                double, double, double, double,
-                                double, double, double, double,
-                                u64, u64, u64, u64,
-                                u64, u64, u64, u64, ...)
-                              __attribute__((sysv_abi));
+typedef HostReturn (*HostHleFn)(u64, u64, u64, u64, u64, u64, double, double, double, double,
+                                double, double, double, double, u64, u64, u64, u64, u64, u64, u64,
+                                u64, ...) __attribute__((sysv_abi));
 
-HostReturn CallHostFromGuest(VAddr host_fn,
-                             u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
-                             double f0, double f1, double f2, double f3,
-                             double f4, double f5, double f6, double f7,
-                             u64 s0, u64 s1, u64 s2, u64 s3,
-                             u64 s4, u64 s5, u64 s6, u64 s7) {
+HostReturn CallHostFromGuest(VAddr host_fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
+                             double f0, double f1, double f2, double f3, double f4, double f5,
+                             double f6, double f7, u64 s0, u64 s1, u64 s2, u64 s3, u64 s4, u64 s5,
+                             u64 s6, u64 s7) {
     auto fn = reinterpret_cast<HostHleFn>(host_fn);
-    return fn(a0, a1, a2, a3, a4, a5,
-              f0, f1, f2, f3, f4, f5, f6, f7,
-              s0, s1, s2, s3, s4, s5, s6, s7);
+    return fn(a0, a1, a2, a3, a4, a5, f0, f1, f2, f3, f4, f5, f6, f7, s0, s1, s2, s3, s4, s5, s6,
+              s7);
 }
 
 /// Dispatcher trampoline. Called from the gateway with the current
@@ -217,8 +210,7 @@ void* DispatcherTrampoline(GuestState* state) {
     // CHECKPOINT B: we read state->rip. If we see A but not B,
     // dereferencing state is bad (e.g. wrong arg passing from gateway).
     const u64 first_rip = state->rip;
-    std::fprintf(stderr, "[disp] B: state->rip=0x%llx\n",
-                 (unsigned long long)first_rip);
+    std::fprintf(stderr, "[disp] B: state->rip=0x%llx\n", (unsigned long long)first_rip);
     std::fflush(stderr);
 
     // CHECKPOINT C: we read tl_active_runtime. If we see B but not C,
@@ -266,8 +258,7 @@ void* DispatcherTrampoline(GuestState* state) {
             // registered; spdlog/fmt internal SEH walks would
             // fault. The same workaround is used in CompileBlock.
             const u64 guest_rsp = state->gpr[kGuestRsp];
-            const u64 guest_return_addr =
-                *reinterpret_cast<const u64*>(guest_rsp);
+            const u64 guest_return_addr = *reinterpret_cast<const u64*>(guest_rsp);
 
             // Look up the resolved HLE function name. If the
             // address isn't registered, that's either a JIT bug
@@ -275,8 +266,7 @@ void* DispatcherTrampoline(GuestState* state) {
             // call (callback machinery, runtime helpers, etc.).
             // Either way, emit a loud warning that's easy to grep
             // for in crash logs.
-            const std::string_view name =
-                HleRegistry::Instance().Lookup(host_fn);
+            const std::string_view name = HleRegistry::Instance().Lookup(host_fn);
 
             // Marshal the 8 XMM-arg slots from state.ymm. Each YMM
             // register occupies 4 u64 lanes; the low 64 bits of
@@ -304,8 +294,7 @@ void* DispatcherTrampoline(GuestState* state) {
             // extra reads pull whatever lives beyond the args. The
             // called HLE function ignores them per its declared
             // signature.
-            const u64* guest_stack_args =
-                reinterpret_cast<const u64*>(guest_rsp) + 1;
+            const u64* guest_stack_args = reinterpret_cast<const u64*>(guest_rsp) + 1;
             const u64 s0 = guest_stack_args[0];
             const u64 s1 = guest_stack_args[1];
             const u64 s2 = guest_stack_args[2];
@@ -317,60 +306,47 @@ void* DispatcherTrampoline(GuestState* state) {
 
             if (name.empty()) {
                 std::fprintf(stderr,
-                    "[bridge] WARNING unregistered host=0x%llx ret=0x%llx | "
-                    "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                    "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
-                    (unsigned long long)host_fn,
-                    (unsigned long long)guest_return_addr,
-                    (unsigned long long)state->gpr[7],
-                    (unsigned long long)state->gpr[6],
-                    (unsigned long long)state->gpr[2],
-                    (unsigned long long)state->gpr[1],
-                    (unsigned long long)state->gpr[8],
-                    (unsigned long long)state->gpr[9]);
+                             "[bridge] WARNING unregistered host=0x%llx ret=0x%llx | "
+                             "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                             "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
+                             (unsigned long long)host_fn, (unsigned long long)guest_return_addr,
+                             (unsigned long long)state->gpr[7], (unsigned long long)state->gpr[6],
+                             (unsigned long long)state->gpr[2], (unsigned long long)state->gpr[1],
+                             (unsigned long long)state->gpr[8], (unsigned long long)state->gpr[9]);
             } else {
                 // %.*s lets us print a non-null-terminated
                 // string_view without copying it. The cast to int
                 // is required because precision uses int width.
                 std::fprintf(stderr,
-                    "[bridge] call %.*s host=0x%llx ret=0x%llx | "
-                    "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                    "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
-                    static_cast<int>(name.size()), name.data(),
-                    (unsigned long long)host_fn,
-                    (unsigned long long)guest_return_addr,
-                    (unsigned long long)state->gpr[7],
-                    (unsigned long long)state->gpr[6],
-                    (unsigned long long)state->gpr[2],
-                    (unsigned long long)state->gpr[1],
-                    (unsigned long long)state->gpr[8],
-                    (unsigned long long)state->gpr[9]);
+                             "[bridge] call %.*s host=0x%llx ret=0x%llx | "
+                             "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                             "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
+                             static_cast<int>(name.size()), name.data(),
+                             (unsigned long long)host_fn, (unsigned long long)guest_return_addr,
+                             (unsigned long long)state->gpr[7], (unsigned long long)state->gpr[6],
+                             (unsigned long long)state->gpr[2], (unsigned long long)state->gpr[1],
+                             (unsigned long long)state->gpr[8], (unsigned long long)state->gpr[9]);
             }
             // Log XMM args on a continuation line. Print as hex bit
             // patterns rather than decimals — they're easier to
             // recognize as "this is 1.0" vs "this is garbage" by eye.
             std::fprintf(stderr,
-                "[bridge]   xmm0=0x%llx xmm1=0x%llx xmm2=0x%llx xmm3=0x%llx "
-                "xmm4=0x%llx xmm5=0x%llx xmm6=0x%llx xmm7=0x%llx\n",
-                (unsigned long long)state->ymm[0],
-                (unsigned long long)state->ymm[4],
-                (unsigned long long)state->ymm[8],
-                (unsigned long long)state->ymm[12],
-                (unsigned long long)state->ymm[16],
-                (unsigned long long)state->ymm[20],
-                (unsigned long long)state->ymm[24],
-                (unsigned long long)state->ymm[28]);
+                         "[bridge]   xmm0=0x%llx xmm1=0x%llx xmm2=0x%llx xmm3=0x%llx "
+                         "xmm4=0x%llx xmm5=0x%llx xmm6=0x%llx xmm7=0x%llx\n",
+                         (unsigned long long)state->ymm[0], (unsigned long long)state->ymm[4],
+                         (unsigned long long)state->ymm[8], (unsigned long long)state->ymm[12],
+                         (unsigned long long)state->ymm[16], (unsigned long long)state->ymm[20],
+                         (unsigned long long)state->ymm[24], (unsigned long long)state->ymm[28]);
             // Log stack-spilled args on a third continuation line.
             // Same caveats as XMM line: if the function takes few
             // stack args, the latter slots are whatever the guest
             // happened to leave there. Still useful for diagnosis.
             std::fprintf(stderr,
-                "[bridge]   stk0=0x%llx stk1=0x%llx stk2=0x%llx stk3=0x%llx "
-                "stk4=0x%llx stk5=0x%llx stk6=0x%llx stk7=0x%llx\n",
-                (unsigned long long)s0, (unsigned long long)s1,
-                (unsigned long long)s2, (unsigned long long)s3,
-                (unsigned long long)s4, (unsigned long long)s5,
-                (unsigned long long)s6, (unsigned long long)s7);
+                         "[bridge]   stk0=0x%llx stk1=0x%llx stk2=0x%llx stk3=0x%llx "
+                         "stk4=0x%llx stk5=0x%llx stk6=0x%llx stk7=0x%llx\n",
+                         (unsigned long long)s0, (unsigned long long)s1, (unsigned long long)s2,
+                         (unsigned long long)s3, (unsigned long long)s4, (unsigned long long)s5,
+                         (unsigned long long)s6, (unsigned long long)s7);
             std::fflush(stderr);
 
             // Short-circuit calls to unregistered host addresses.
@@ -398,22 +374,20 @@ void* DispatcherTrampoline(GuestState* state) {
             // we surface it instead of jumping into random host code.
             HostReturn ret{};
             if (name.empty()) {
-                std::fprintf(stderr,
-                    "[bridge] SHORT-CIRCUIT unregistered host=0x%llx -> 0\n",
-                    (unsigned long long)host_fn);
+                std::fprintf(stderr, "[bridge] SHORT-CIRCUIT unregistered host=0x%llx -> 0\n",
+                             (unsigned long long)host_fn);
                 std::fflush(stderr);
                 // ret already zero-initialized: rax=0, xmm0=0.0
             } else {
-                ret = CallHostFromGuest(
-                    host_fn,
-                    state->gpr[kSysvArg0],   // RDI
-                    state->gpr[kSysvArg1],   // RSI
-                    state->gpr[kSysvArg2],   // RDX
-                    state->gpr[kSysvArg3],   // RCX
-                    state->gpr[kSysvArg4],   // R8
-                    state->gpr[kSysvArg5],   // R9
-                    f0, f1, f2, f3, f4, f5, f6, f7,
-                    s0, s1, s2, s3, s4, s5, s6, s7);
+                ret = CallHostFromGuest(host_fn,
+                                        state->gpr[kSysvArg0], // RDI
+                                        state->gpr[kSysvArg1], // RSI
+                                        state->gpr[kSysvArg2], // RDX
+                                        state->gpr[kSysvArg3], // RCX
+                                        state->gpr[kSysvArg4], // R8
+                                        state->gpr[kSysvArg5], // R9
+                                        f0, f1, f2, f3, f4, f5, f6, f7, s0, s1, s2, s3, s4, s5, s6,
+                                        s7);
             }
             // Write both rax and xmm0 back to guest state. The
             // guest knows which one is meaningful based on the
@@ -428,17 +402,13 @@ void* DispatcherTrampoline(GuestState* state) {
             // Print the post-return rax/xmm0. If we never see this
             // line for a given host_fn, that function crashed.
             if (name.empty()) {
-                std::fprintf(stderr,
-                    "[bridge] ret  host=0x%llx -> rax=0x%llx xmm0=0x%llx\n",
-                    (unsigned long long)host_fn,
-                    (unsigned long long)ret.rax,
-                    (unsigned long long)xmm0_bits);
+                std::fprintf(stderr, "[bridge] ret  host=0x%llx -> rax=0x%llx xmm0=0x%llx\n",
+                             (unsigned long long)host_fn, (unsigned long long)ret.rax,
+                             (unsigned long long)xmm0_bits);
             } else {
-                std::fprintf(stderr,
-                    "[bridge] ret  %.*s -> rax=0x%llx xmm0=0x%llx\n",
-                    static_cast<int>(name.size()), name.data(),
-                    (unsigned long long)ret.rax,
-                    (unsigned long long)xmm0_bits);
+                std::fprintf(stderr, "[bridge] ret  %.*s -> rax=0x%llx xmm0=0x%llx\n",
+                             static_cast<int>(name.size()), name.data(),
+                             (unsigned long long)ret.rax, (unsigned long long)xmm0_bits);
             }
             std::fflush(stderr);
 
@@ -467,10 +437,8 @@ void* DispatcherTrampoline(GuestState* state) {
 } // namespace
 
 Runtime::Runtime()
-    : block_cache_(std::make_unique<BlockCache>()),
-      code_cache_(std::make_unique<CodeCache>()),
-      gateway_(std::make_unique<Gateway>()),
-      lifter_(std::make_unique<Lifter>(*code_cache_)) {
+    : block_cache_(std::make_unique<BlockCache>()), code_cache_(std::make_unique<CodeCache>()),
+      gateway_(std::make_unique<Gateway>()), lifter_(std::make_unique<Lifter>(*code_cache_)) {
     LOG_INFO(Core, "CPU runtime initialized (gateway + lifter ready)");
 }
 
@@ -482,8 +450,7 @@ void Runtime::Run(GuestState& state) {
     // lock: nested Run() calls (typical for HLE → guest callback →
     // HLE → guest pattern) restore the outer Run's pointers on exit.
     std::fprintf(stderr, "[run] R0: enter, state.rip=0x%llx state.gpr[4]=0x%llx\n",
-                 (unsigned long long)state.rip,
-                 (unsigned long long)state.gpr[4]);
+                 (unsigned long long)state.rip, (unsigned long long)state.gpr[4]);
     std::fflush(stderr);
     Runtime* const saved_rt = tl_active_runtime;
     GuestState* const saved_state = tl_current_guest_state;
@@ -528,8 +495,8 @@ Runtime& Runtime::Instance() {
 // CallGuest helpers
 // ============================================================================
 
-GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
-                              SetupFn setup, void* user_data) {
+GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top, SetupFn setup,
+                              void* user_data) {
     ASSERT_MSG(guest_fn != 0, "CallGuest: null guest_fn");
     ASSERT_MSG(guest_stack_top != nullptr, "CallGuest: null guest_stack_top");
 
@@ -549,7 +516,7 @@ GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
     rsp -= 8;
     *reinterpret_cast<u64*>(rsp) = kHostReturnAddress;
 
-    state.gpr[4] = rsp;             // RSP
+    state.gpr[4] = rsp; // RSP
     state.rip = guest_fn;
 
     // Let the caller populate argument registers.
@@ -577,22 +544,20 @@ struct SimpleArgs {
 // (GPR indices 7, 6, 2, 1, 8, 9 in canonical AMD64 ordering).
 void SimpleSetup(GuestState& state, void* user_data) {
     const auto* args = static_cast<const SimpleArgs*>(user_data);
-    state.gpr[7] = args->a0;  // RDI
-    state.gpr[6] = args->a1;  // RSI
-    state.gpr[2] = args->a2;  // RDX
-    state.gpr[1] = args->a3;  // RCX
-    state.gpr[8] = args->a4;  // R8
-    state.gpr[9] = args->a5;  // R9
+    state.gpr[7] = args->a0; // RDI
+    state.gpr[6] = args->a1; // RSI
+    state.gpr[2] = args->a2; // RDX
+    state.gpr[1] = args->a3; // RCX
+    state.gpr[8] = args->a4; // R8
+    state.gpr[9] = args->a5; // R9
 }
 } // namespace
 
-u64 Runtime::CallGuestSimple(VAddr guest_fn, void* guest_stack_top,
-                             u64 a0, u64 a1, u64 a2,
-                             u64 a3, u64 a4, u64 a5) {
+u64 Runtime::CallGuestSimple(VAddr guest_fn, void* guest_stack_top, u64 a0, u64 a1, u64 a2, u64 a3,
+                             u64 a4, u64 a5) {
     SimpleArgs args{a0, a1, a2, a3, a4, a5};
-    GuestState state = CallGuest(guest_fn, guest_stack_top,
-                                 &SimpleSetup, &args);
-    return state.gpr[0];  // RAX
+    GuestState state = CallGuest(guest_fn, guest_stack_top, &SimpleSetup, &args);
+    return state.gpr[0]; // RAX
 }
 
 // ============================================================================
@@ -607,11 +572,10 @@ u64 Runtime::CallGuestSimple(VAddr guest_fn, void* guest_stack_top,
 //   RAX=0, RCX=1, RDX=2, RBX=3, RSP=4, RBP=5, RSI=6, RDI=7,
 //   R8=8, R9=9, R10=10, R11=11, R12=12, R13=13, R14=14, R15=15
 
-void Runtime::CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn,
-                                     SetupFn setup, void* user_data) {
+void Runtime::CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn, SetupFn setup,
+                                     void* user_data) {
     ASSERT_MSG(guest_fn != 0, "CallGuestOnCallerStack: null guest_fn");
-    ASSERT_MSG(caller.gpr[4] != 0,
-               "CallGuestOnCallerStack: caller has null RSP (uninitialized?)");
+    ASSERT_MSG(caller.gpr[4] != 0, "CallGuestOnCallerStack: caller has null RSP (uninitialized?)");
 
     // Snapshot callee-saved registers, plus RSP and RIP (which we'll
     // restore to whatever the caller had before the callback).
@@ -659,25 +623,21 @@ void Runtime::CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn,
     caller.rip = saved_rip;
 }
 
-u64 Runtime::CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn,
-                                          u64 a0, u64 a1, u64 a2,
-                                          u64 a3, u64 a4, u64 a5) {
+u64 Runtime::CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn, u64 a0, u64 a1,
+                                          u64 a2, u64 a3, u64 a4, u64 a5) {
     SimpleArgs args{a0, a1, a2, a3, a4, a5};
     CallGuestOnCallerStack(caller, guest_fn, &SimpleSetup, &args);
-    return caller.gpr[0];  // RAX
+    return caller.gpr[0]; // RAX
 }
 
 // ============================================================================
 // Dual-context dispatch (the shared HLE-callback helper)
 // ============================================================================
 
-u64 Runtime::InvokeGuestCallback(VAddr guest_fn,
-                                 u64 a0, u64 a1, u64 a2,
-                                 u64 a3, u64 a4, u64 a5) {
+u64 Runtime::InvokeGuestCallback(VAddr guest_fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
     GuestState* caller_state = CurrentGuestState();
     if (caller_state != nullptr) {
-        return CallGuestSimpleOnCallerStack(*caller_state, guest_fn,
-                                            a0, a1, a2, a3, a4, a5);
+        return CallGuestSimpleOnCallerStack(*caller_state, guest_fn, a0, a1, a2, a3, a4, a5);
     }
 
     // Post-JIT path: HLE worker thread invoking a guest callback.
@@ -690,8 +650,7 @@ u64 Runtime::InvokeGuestCallback(VAddr guest_fn,
         return 0;
     }
     void* guest_stack_top = static_cast<u8*>(guest_stack) + kCallbackStackSize;
-    const u64 result = CallGuestSimple(guest_fn, guest_stack_top,
-                                       a0, a1, a2, a3, a4, a5);
+    const u64 result = CallGuestSimple(guest_fn, guest_stack_top, a0, a1, a2, a3, a4, a5);
     std::free(guest_stack);
     return result;
 }
@@ -725,10 +684,9 @@ bool Runtime::IsGuestPointer(const void* ptr) noexcept {
     }
 #ifdef _WIN32
     HMODULE handle = nullptr;
-    if (GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            reinterpret_cast<LPCWSTR>(ptr), &handle)) {
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(ptr), &handle)) {
         // ptr is inside a loaded host module — it's host code.
         return false;
     }

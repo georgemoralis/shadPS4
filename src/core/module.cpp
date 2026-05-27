@@ -111,18 +111,15 @@ s32 Module::Start(u64 args, const void* argp, void* param) {
     // NOTE: malloc'd stack matches what RunMainEntryRuntime does. The
     // proper fix is to use Memory::MapMemory to allocate in the user
     // region; deferred until the memory-API choice is settled.
-    constexpr u64 kModuleInitStackSize = 1 * 1024 * 1024;  // 1 MB
+    constexpr u64 kModuleInitStackSize = 1 * 1024 * 1024; // 1 MB
     void* guest_stack = std::malloc(kModuleInitStackSize);
     ASSERT_MSG(guest_stack != nullptr,
                "Module::Start: failed to allocate guest stack for module init");
     void* guest_stack_top = static_cast<u8*>(guest_stack) + kModuleInitStackSize;
 
-    const s32 result = static_cast<s32>(
-        Runtime::Runtime::Instance().CallGuestSimple(
-            addr, guest_stack_top,
-            static_cast<u64>(args),
-            reinterpret_cast<u64>(argp),
-            reinterpret_cast<u64>(param)));
+    const s32 result = static_cast<s32>(Runtime::Runtime::Instance().CallGuestSimple(
+        addr, guest_stack_top, static_cast<u64>(args), reinterpret_cast<u64>(argp),
+        reinterpret_cast<u64>(param)));
 
     std::free(guest_stack);
     return result;

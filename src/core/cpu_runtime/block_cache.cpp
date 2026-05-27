@@ -56,8 +56,8 @@ u32 BlockCache::InvalidateRange(u64 start_rip, u64 end_rip) {
         }
     }
     if (removed > 0) {
-        LOG_DEBUG(Core, "BlockCache: invalidated {} block(s) in [{:#x}, {:#x})",
-                  removed, start_rip, end_rip);
+        LOG_DEBUG(Core, "BlockCache: invalidated {} block(s) in [{:#x}, {:#x})", removed, start_rip,
+                  end_rip);
     }
     return removed;
 }

@@ -885,8 +885,7 @@ static void DispatchPendingNpStateCallbacks() {
             //   void(user_id, state, np_id*, userdata)
             // PS4_SYSV_ABI: RDI=user_id, RSI=state, RDX=np_id*, RCX=userdata
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(legacy_callback.func),
-                static_cast<u64>(event.user_id),
+                reinterpret_cast<u64>(legacy_callback.func), static_cast<u64>(event.user_id),
                 static_cast<u64>(event.state),
                 reinterpret_cast<u64>(event.has_np_id ? &event.np_id : nullptr),
                 reinterpret_cast<u64>(legacy_callback.userdata));
@@ -907,10 +906,8 @@ static void DispatchPendingNpStateCallbacks() {
                 // NpStateCallbackA signature:
                 //   void(user_id, state, userdata)
                 Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                    reinterpret_cast<u64>(entry.func),
-                    static_cast<u64>(event.user_id),
-                    static_cast<u64>(event.state),
-                    reinterpret_cast<u64>(entry.userdata));
+                    reinterpret_cast<u64>(entry.func), static_cast<u64>(event.user_id),
+                    static_cast<u64>(event.state), reinterpret_cast<u64>(entry.userdata));
 #else
                 entry.func(event.user_id, event.state, entry.userdata);
 #endif
@@ -922,10 +919,8 @@ static void DispatchPendingNpStateCallbacks() {
             // NpStateCallbackForNpToolkit signature:
             //   void(user_id, state, userdata)
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(NpStateCbForNp.func),
-                static_cast<u64>(event.user_id),
-                static_cast<u64>(event.state),
-                reinterpret_cast<u64>(NpStateCbForNp.userdata));
+                reinterpret_cast<u64>(NpStateCbForNp.func), static_cast<u64>(event.user_id),
+                static_cast<u64>(event.state), reinterpret_cast<u64>(NpStateCbForNp.userdata));
 #else
             NpStateCbForNp.func(event.user_id, event.state, NpStateCbForNp.userdata);
 #endif

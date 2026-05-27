@@ -103,19 +103,16 @@ void _thread_cleanupspecific() {
                 //
                 // The destructor takes one arg: `data` (const void*). PS4_SYSV_ABI
                 // puts it in RDI = gpr[7]. CallGuestSimple handles that.
-                constexpr u64 kKeyDtorStackSize = 256 * 1024;  // 256 KB
+                constexpr u64 kKeyDtorStackSize = 256 * 1024; // 256 KB
                 void* guest_stack = std::malloc(kKeyDtorStackSize);
                 if (guest_stack != nullptr) {
-                    void* guest_stack_top =
-                        static_cast<u8*>(guest_stack) + kKeyDtorStackSize;
+                    void* guest_stack_top = static_cast<u8*>(guest_stack) + kKeyDtorStackSize;
                     Core::Runtime::Runtime::Instance().CallGuestSimple(
-                        reinterpret_cast<u64>(destructor),
-                        guest_stack_top,
+                        reinterpret_cast<u64>(destructor), guest_stack_top,
                         reinterpret_cast<u64>(data));
                     std::free(guest_stack);
                 } else {
-                    LOG_ERROR(Lib_Kernel,
-                              "pthread key destructor: failed to allocate guest stack");
+                    LOG_ERROR(Lib_Kernel, "pthread key destructor: failed to allocate guest stack");
                 }
 #else
                 destructor(data);

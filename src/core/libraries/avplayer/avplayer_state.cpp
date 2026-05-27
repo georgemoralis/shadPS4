@@ -107,11 +107,8 @@ void AvPlayerState::DefaultEventCallback(void* opaque, AvPlayerEvents event_id, 
         //                  s32 source_id (always 0 here), void* event_data)
         // PS4_SYSV_ABI: RDI=ptr, RSI=event_id, RDX=source_id, RCX=event_data
         Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-            reinterpret_cast<u64>(callback),
-            reinterpret_cast<u64>(ptr),
-            static_cast<u64>(event_id),
-            /*source_id=*/0,
-            reinterpret_cast<u64>(event_data));
+            reinterpret_cast<u64>(callback), reinterpret_cast<u64>(ptr), static_cast<u64>(event_id),
+            /*source_id=*/0, reinterpret_cast<u64>(event_data));
 #else
         callback(ptr, event_id, 0, event_data);
 #endif

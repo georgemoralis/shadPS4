@@ -113,15 +113,13 @@ public:
     ///
     /// Returns the GuestState after execution. The caller is responsible
     /// for extracting return values from the appropriate register fields.
-    GuestState CallGuest(VAddr guest_fn, void* guest_stack_top,
-                         SetupFn setup, void* user_data);
+    GuestState CallGuest(VAddr guest_fn, void* guest_stack_top, SetupFn setup, void* user_data);
 
     /// Convenience: call a guest function with up to 6 pointer-sized
     /// arguments. Returns the value of RAX (which holds the return
     /// value for integer/pointer returns under PS4_SYSV_ABI). Caller
     /// provides the guest stack.
-    u64 CallGuestSimple(VAddr guest_fn, void* guest_stack_top,
-                        u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
+    u64 CallGuestSimple(VAddr guest_fn, void* guest_stack_top, u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
                         u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
 
     // ========================================================================
@@ -159,15 +157,13 @@ public:
     /// GuestState; it should set up argument registers (RDI, RSI,
     /// etc.) for the callback. Caller-saved registers (RAX, RCX,
     /// RDX, RDI, RSI, R8-R11) may be clobbered after this call.
-    void CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn,
-                                SetupFn setup, void* user_data);
+    void CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn, SetupFn setup, void* user_data);
 
     /// Convenience: invoke a guest function on the caller's stack
     /// with up to 6 pointer-sized integer arguments. Returns the
     /// callback's return value (caller.gpr[0] after the call).
-    u64 CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn,
-                                     u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
-                                     u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
+    u64 CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn, u64 a0 = 0, u64 a1 = 0,
+                                     u64 a2 = 0, u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
 
     // ========================================================================
     // Dual-context dispatch — the common HLE-callback pattern
@@ -200,9 +196,8 @@ public:
     /// CallGuestSimpleOnCallerStack or CallGuestSimple based on
     /// whether a caller GuestState is active. Returns RAX after the
     /// call (0 if allocation failed in the post-JIT path).
-    u64 InvokeGuestCallback(VAddr guest_fn,
-                            u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
-                            u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
+    u64 InvokeGuestCallback(VAddr guest_fn, u64 a0 = 0, u64 a1 = 0, u64 a2 = 0, u64 a3 = 0,
+                            u64 a4 = 0, u64 a5 = 0);
 
     // ========================================================================
     // Host-vs-guest function-pointer discrimination

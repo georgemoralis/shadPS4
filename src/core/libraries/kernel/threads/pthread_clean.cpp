@@ -46,27 +46,22 @@ void PS4_SYSV_ABI posix_pthread_cleanup_pop(int execute) {
             //   - Post-JIT (called from posix_pthread_exit's cleanup
             //     loop after start_routine returned): no caller state.
             //     Allocate a fresh stack, same pattern as ThreadDtors.
-            Core::Runtime::GuestState* caller_state =
-                Core::Runtime::Runtime::CurrentGuestState();
+            Core::Runtime::GuestState* caller_state = Core::Runtime::Runtime::CurrentGuestState();
             if (caller_state != nullptr) {
                 Core::Runtime::Runtime::Instance().CallGuestSimpleOnCallerStack(
-                    *caller_state,
-                    reinterpret_cast<u64>(old->routine),
+                    *caller_state, reinterpret_cast<u64>(old->routine),
                     reinterpret_cast<u64>(old->routine_arg));
             } else {
                 constexpr u64 kCleanupStackSize = 256 * 1024;
                 void* guest_stack = std::malloc(kCleanupStackSize);
                 if (guest_stack != nullptr) {
-                    void* guest_stack_top =
-                        static_cast<u8*>(guest_stack) + kCleanupStackSize;
+                    void* guest_stack_top = static_cast<u8*>(guest_stack) + kCleanupStackSize;
                     Core::Runtime::Runtime::Instance().CallGuestSimple(
-                        reinterpret_cast<u64>(old->routine),
-                        guest_stack_top,
+                        reinterpret_cast<u64>(old->routine), guest_stack_top,
                         reinterpret_cast<u64>(old->routine_arg));
                     std::free(guest_stack);
                 } else {
-                    LOG_ERROR(Lib_Kernel,
-                              "pthread cleanup: failed to allocate guest stack");
+                    LOG_ERROR(Lib_Kernel, "pthread cleanup: failed to allocate guest stack");
                 }
             }
 #else

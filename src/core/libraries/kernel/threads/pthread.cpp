@@ -91,27 +91,22 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
         // pthread_clean.cpp:posix_pthread_cleanup_pop for the same pattern:
         //   - Mid-JIT (guest pthread_exit): use caller's stack
         //   - Post-JIT (ThreadFunc cleanup): fresh stack
-        Core::Runtime::GuestState* caller_state =
-            Core::Runtime::Runtime::CurrentGuestState();
+        Core::Runtime::GuestState* caller_state = Core::Runtime::Runtime::CurrentGuestState();
         if (caller_state != nullptr) {
             Core::Runtime::Runtime::Instance().CallGuestSimpleOnCallerStack(
-                *caller_state,
-                reinterpret_cast<u64>(old->routine),
+                *caller_state, reinterpret_cast<u64>(old->routine),
                 reinterpret_cast<u64>(old->routine_arg));
         } else {
             constexpr u64 kCleanupStackSize = 256 * 1024;
             void* guest_stack = std::malloc(kCleanupStackSize);
             if (guest_stack != nullptr) {
-                void* guest_stack_top =
-                    static_cast<u8*>(guest_stack) + kCleanupStackSize;
+                void* guest_stack_top = static_cast<u8*>(guest_stack) + kCleanupStackSize;
                 Core::Runtime::Runtime::Instance().CallGuestSimple(
-                    reinterpret_cast<u64>(old->routine),
-                    guest_stack_top,
+                    reinterpret_cast<u64>(old->routine), guest_stack_top,
                     reinterpret_cast<u64>(old->routine_arg));
                 std::free(guest_stack);
             } else {
-                LOG_ERROR(Lib_Kernel,
-                          "pthread_exit cleanup: failed to allocate guest stack");
+                LOG_ERROR(Lib_Kernel, "pthread_exit cleanup: failed to allocate guest stack");
             }
         }
 #else
@@ -137,12 +132,12 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
         // completion) but the dtor sees a fresh stack rather than continuing on
         // the guest's. For ThreadDtors (the global libkernel destructor, called
         // with no args), this is harmless: it doesn't touch caller stack state.
-        constexpr u64 kThreadDtorStackSize = 256 * 1024;  // 256 KB
+        constexpr u64 kThreadDtorStackSize = 256 * 1024; // 256 KB
         void* guest_stack = std::malloc(kThreadDtorStackSize);
         if (guest_stack != nullptr) {
             void* guest_stack_top = static_cast<u8*>(guest_stack) + kThreadDtorStackSize;
-            Core::Runtime::Runtime::Instance().CallGuestSimple(
-                reinterpret_cast<u64>(ThreadDtors), guest_stack_top);
+            Core::Runtime::Runtime::Instance().CallGuestSimple(reinterpret_cast<u64>(ThreadDtors),
+                                                               guest_stack_top);
             std::free(guest_stack);
         } else {
             LOG_ERROR(Lib_Kernel, "ThreadDtors: failed to allocate guest stack");
@@ -297,18 +292,15 @@ static void* RunThread(void* arg) {
     // be fed to the lifter as if they were guest instructions, which
     // produces undefined behavior at best.
     void* ret;
-    if (Core::Runtime::Runtime::IsGuestPointer(
-            reinterpret_cast<void*>(curthread->start_routine))) {
+    if (Core::Runtime::Runtime::IsGuestPointer(reinterpret_cast<void*>(curthread->start_routine))) {
         // Guest path: call via JIT. We don't switch the *host* stack
         // — the JIT operates on the guest stack via GuestState::gpr[4]
         // (RSP). Windows TEB stack-check disable from the asm is not
         // replicated; JIT-emitted code doesn't trigger Windows'
         // stack-checking heuristics.
-        ret = reinterpret_cast<void*>(
-            Core::Runtime::Runtime::Instance().CallGuestSimple(
-                reinterpret_cast<u64>(curthread->start_routine),
-                stack,
-                reinterpret_cast<u64>(curthread->arg)));
+        ret = reinterpret_cast<void*>(Core::Runtime::Runtime::Instance().CallGuestSimple(
+            reinterpret_cast<u64>(curthread->start_routine), stack,
+            reinterpret_cast<u64>(curthread->arg)));
     } else {
         // Host path: call directly. The host C++ thunk knows how to
         // handle the stack itself; we just invoke it on this thread's

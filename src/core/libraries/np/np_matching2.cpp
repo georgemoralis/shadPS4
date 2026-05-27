@@ -270,11 +270,10 @@ int PS4_SYSV_ABI sceNpMatching2CreateJoinRoomA(OrbisNpMatching2ContextId ctxId,
             // OrbisNpMatching2RequestCallback signature:
             //   void(ctxId, reqId, event, error, void* data, void* arg)
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A),
-                0, reinterpret_cast<u64>(&resp),
-                reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A), 0,
+                reinterpret_cast<u64>(&resp), reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A, 0, &resp,
@@ -305,12 +304,9 @@ int PS4_SYSV_ABI sceNpMatching2RegisterContextCallback(OrbisNpMatching2ContextCa
         // Guest callback signature:
         //   void(contextId, event, cause, errorCode, userdata)
         Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-            reinterpret_cast<u64>(callback),
-            static_cast<u64>(arg->contextId),
-            static_cast<u64>(arg->event),
-            static_cast<u64>(arg->cause),
-            static_cast<u64>(arg->errorCode),
-            reinterpret_cast<u64>(userdata));
+            reinterpret_cast<u64>(callback), static_cast<u64>(arg->contextId),
+            static_cast<u64>(arg->event), static_cast<u64>(arg->cause),
+            static_cast<u64>(arg->errorCode), reinterpret_cast<u64>(userdata));
 #else
         callback(arg->contextId, arg->event, arg->cause, arg->errorCode, userdata);
 #endif
@@ -338,12 +334,9 @@ int PS4_SYSV_ABI sceNpMatching2RegisterLobbyEventCallback(
         // Guest callback signature:
         //   void(contextId, lobbyId, event, data, userdata)
         Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-            reinterpret_cast<u64>(callback),
-            static_cast<u64>(arg->contextId),
-            static_cast<u64>(arg->lobbyId),
-            static_cast<u64>(arg->event),
-            reinterpret_cast<u64>(arg->data),
-            reinterpret_cast<u64>(userdata));
+            reinterpret_cast<u64>(callback), static_cast<u64>(arg->contextId),
+            static_cast<u64>(arg->lobbyId), static_cast<u64>(arg->event),
+            reinterpret_cast<u64>(arg->data), reinterpret_cast<u64>(userdata));
 #else
         callback(arg->contextId, arg->lobbyId, arg->event, arg->data, userdata);
 #endif
@@ -373,12 +366,9 @@ int PS4_SYSV_ABI sceNpMatching2RegisterRoomEventCallback(OrbisNpMatching2Context
         // Guest callback signature:
         //   void(contextId, roomId, event, data, userdata)
         Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-            reinterpret_cast<u64>(callback),
-            static_cast<u64>(arg->contextId),
-            static_cast<u64>(arg->roomId),
-            static_cast<u64>(arg->event),
-            reinterpret_cast<u64>(arg->data),
-            reinterpret_cast<u64>(userdata));
+            reinterpret_cast<u64>(callback), static_cast<u64>(arg->contextId),
+            static_cast<u64>(arg->roomId), static_cast<u64>(arg->event),
+            reinterpret_cast<u64>(arg->data), reinterpret_cast<u64>(userdata));
 #else
         callback(arg->contextId, arg->roomId, arg->event, arg->data, userdata);
 #endif
@@ -590,11 +580,10 @@ int PS4_SYSV_ABI sceNpMatching2GetWorldInfoList(OrbisNpMatching2ContextId ctxId,
             OrbisNpMatching2GetWorldInfoListResponse resp{&w, 1};
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST),
-                0, reinterpret_cast<u64>(&resp),
-                reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST), 0,
+                reinterpret_cast<u64>(&resp), reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST, 0, &resp,
@@ -640,10 +629,10 @@ int PS4_SYSV_ABI sceNpMatching2LeaveRoom(OrbisNpMatching2ContextId ctxId,
         g_responses.emplace_back([=]() {
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_ROOM),
-                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_ROOM), 0, /*data=*/0,
+                reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_LEAVE_ROOM, 0,
                                nullptr, optParam->arg);
@@ -712,11 +701,10 @@ int PS4_SYSV_ABI sceNpMatching2SearchRoom(OrbisNpMatching2ContextId ctxId,
             OrbisNpMatching2SearchRoomResponseA resp{{0, 0, 0, {}}, nullptr};
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM_A),
-                0, reinterpret_cast<u64>(&resp),
-                reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM_A), 0,
+                reinterpret_cast<u64>(&resp), reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM_A, 0,
                                &resp, optParam->arg);
@@ -758,10 +746,10 @@ int PS4_SYSV_ABI sceNpMatching2SetUserInfo(OrbisNpMatching2ContextId ctxId,
         g_responses.emplace_back([=]() {
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_USER_INFO),
-                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_USER_INFO), 0, /*data=*/0,
+                reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_USER_INFO, 0,
                                nullptr, optParam->arg);
@@ -795,10 +783,10 @@ int PS4_SYSV_ABI sceNpMatching2SendRoomMessage(OrbisNpMatching2ContextId ctxId, 
         g_responses.emplace_back([=]() {
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_MESSAGE),
-                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_MESSAGE), 0, /*data=*/0,
+                reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy, ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_MESSAGE,
                                0, nullptr, optParam->arg);
@@ -832,10 +820,10 @@ int PS4_SYSV_ABI sceNpMatching2SetRoomDataExternal(OrbisNpMatching2ContextId ctx
         g_responses.emplace_back([=]() {
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_EXTERNAL),
-                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_EXTERNAL), 0,
+                /*data=*/0, reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_EXTERNAL, 0, nullptr,
@@ -870,10 +858,10 @@ int PS4_SYSV_ABI sceNpMatching2SetRoomDataInternal(OrbisNpMatching2ContextId ctx
         g_responses.emplace_back([=]() {
 #ifdef SHADPS4_USES_RUNTIME
             Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                reinterpret_cast<u64>(optParam->callback),
-                static_cast<u64>(ctxId), static_cast<u64>(reqIdCopy),
-                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_INTERNAL),
-                0, /*data=*/0, reinterpret_cast<u64>(optParam->arg));
+                reinterpret_cast<u64>(optParam->callback), static_cast<u64>(ctxId),
+                static_cast<u64>(reqIdCopy),
+                static_cast<u64>(ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_INTERNAL), 0,
+                /*data=*/0, reinterpret_cast<u64>(optParam->arg));
 #else
             optParam->callback(ctxId, reqIdCopy,
                                ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_INTERNAL, 0, nullptr,

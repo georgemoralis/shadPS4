@@ -85,7 +85,9 @@ public:
     void WriteEnd() noexcept;
 
     /// Size and high-water-mark, for diagnostics.
-    [[nodiscard]] u64 Capacity() const noexcept { return capacity_; }
+    [[nodiscard]] u64 Capacity() const noexcept {
+        return capacity_;
+    }
     [[nodiscard]] u64 Used() const noexcept {
         return used_.load(std::memory_order_acquire);
     }
@@ -99,7 +101,9 @@ public:
     /// Base pointer of the code cache. Diagnostic only — clients
     /// should not access this directly except for very specific
     /// purposes (e.g. perf-map files for profilers).
-    [[nodiscard]] const u8* Base() const noexcept { return base_; }
+    [[nodiscard]] const u8* Base() const noexcept {
+        return base_;
+    }
 
 private:
     u8* base_ = nullptr;

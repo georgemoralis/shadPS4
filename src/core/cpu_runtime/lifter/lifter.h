@@ -47,9 +47,15 @@ public:
     /// Diagnostics: number of blocks compiled, number of bytes of
     /// host code emitted, number of unsupported-instruction
     /// terminations.
-    [[nodiscard]] u64 BlocksCompiled() const noexcept { return blocks_compiled_; }
-    [[nodiscard]] u64 BytesEmitted() const noexcept { return bytes_emitted_; }
-    [[nodiscard]] u64 UnsupportedHits() const noexcept { return unsupported_hits_; }
+    [[nodiscard]] u64 BlocksCompiled() const noexcept {
+        return blocks_compiled_;
+    }
+    [[nodiscard]] u64 BytesEmitted() const noexcept {
+        return bytes_emitted_;
+    }
+    [[nodiscard]] u64 UnsupportedHits() const noexcept {
+        return unsupported_hits_;
+    }
 
 private:
     CodeCache& code_cache_;

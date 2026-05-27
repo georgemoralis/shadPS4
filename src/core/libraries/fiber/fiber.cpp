@@ -76,7 +76,7 @@ static void _sceFiberSwitchEntry(OrbisFiberData*, bool) {
 // _sceFiberForceQuit is defined below as a real function (it does C++ work
 // before calling into the asm path), so we only stub its asm dependency.
 
-#else  // !SHADPS4_USES_RUNTIME
+#else // !SHADPS4_USES_RUNTIME
 
 extern "C" s32 PS4_SYSV_ABI _sceFiberSetJmp(OrbisFiberContext* ctx) asm("_sceFiberSetJmp");
 extern "C" s32 PS4_SYSV_ABI _sceFiberLongJmp(OrbisFiberContext* ctx) asm("_sceFiberLongJmp");
@@ -84,7 +84,7 @@ extern "C" void PS4_SYSV_ABI _sceFiberSwitchEntry(OrbisFiberData* data,
                                                   bool set_fpu) asm("_sceFiberSwitchEntry");
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit");
 
-#endif  // SHADPS4_USES_RUNTIME
+#endif // SHADPS4_USES_RUNTIME
 
 #ifdef SHADPS4_USES_RUNTIME
 // _sceFiberForceQuit: keep the C++ body (it does meaningful C++ work) but
@@ -110,7 +110,7 @@ extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) {
     OrbisFiberContext* g_ctx = GetFiberContext();
     g_ctx->return_val = ret;
-    _sceFiberLongJmp(g_ctx);  // stubbed: aborts with diagnostic
+    _sceFiberLongJmp(g_ctx); // stubbed: aborts with diagnostic
 }
 #else
 extern "C" void PS4_SYSV_ABI _sceFiberForceQuit(u64 ret) asm("_sceFiberForceQuit");

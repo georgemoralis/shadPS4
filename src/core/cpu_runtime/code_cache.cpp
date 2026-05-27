@@ -35,8 +35,7 @@ u8* AllocateRwxRegion(u64 size) {
 #ifdef _WIN32
     // Windows: VirtualAlloc with PAGE_EXECUTE_READWRITE. No W^X
     // restriction; the page stays RWX for the cache lifetime.
-    void* p = ::VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE,
-                             PAGE_EXECUTE_READWRITE);
+    void* p = ::VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
     return static_cast<u8*>(p);
 
 #elif defined(__APPLE__) && defined(ARCH_ARM64)
@@ -54,8 +53,8 @@ u8* AllocateRwxRegion(u64 size) {
     // Generic POSIX: PROT_READ | PROT_WRITE | PROT_EXEC. Linux and
     // FreeBSD allow this for userspace. macOS Intel allows this for
     // pages not tagged MAP_JIT.
-    void* p = ::mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC,
-                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    void* p =
+        ::mmap(nullptr, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) {
         return nullptr;
     }
@@ -111,17 +110,16 @@ namespace {
 // flags, zero prologue size, zero codes. Layout matches winnt.h's
 // _UNWIND_INFO with an empty UNWIND_CODE array. 4 bytes total.
 struct UnwindInfoJitBlock {
-    u8 version        : 3;   // = 1
-    u8 flags          : 5;   // = 0 (no exception handler, no chained)
-    u8 size_of_prolog;       // = 0
-    u8 count_of_codes;       // = 0
-    u8 frame_register : 4;   // = 0
-    u8 frame_offset   : 4;   // = 0
+    u8 version : 3;        // = 1
+    u8 flags : 5;          // = 0 (no exception handler, no chained)
+    u8 size_of_prolog;     // = 0
+    u8 count_of_codes;     // = 0
+    u8 frame_register : 4; // = 0
+    u8 frame_offset : 4;   // = 0
     // No UNWIND_CODE entries; size_of_prolog and count_of_codes are
     // both zero so the structure ends here.
 };
-static_assert(sizeof(UnwindInfoJitBlock) == 4,
-              "UNWIND_INFO header must be exactly 4 bytes");
+static_assert(sizeof(UnwindInfoJitBlock) == 4, "UNWIND_INFO header must be exactly 4 bytes");
 
 // Layout inside the code cache mapping:
 //   [0 .. capacity_)            — user-visible JIT code region
@@ -148,8 +146,7 @@ thread_local RUNTIME_FUNCTION tls_runtime_function;
 /// prologue. The OS guarantees ControlPc is within the registered
 /// range; we just fill in a RUNTIME_FUNCTION pointing at our
 /// pre-written UNWIND_INFO and return.
-PRUNTIME_FUNCTION CALLBACK GetRuntimeFunctionForJitBlock(
-        DWORD64 ControlPc, PVOID Context) {
+PRUNTIME_FUNCTION CALLBACK GetRuntimeFunctionForJitBlock(DWORD64 ControlPc, PVOID Context) {
     auto* cc = static_cast<const CodeCache*>(Context);
     const auto cap = static_cast<DWORD>(cc->Capacity());
 
@@ -157,8 +154,8 @@ PRUNTIME_FUNCTION CALLBACK GetRuntimeFunctionForJitBlock(
     // every PC in our region. Silence the "unused" warning.
     (void)ControlPc;
 
-    tls_runtime_function.BeginAddress      = 0;
-    tls_runtime_function.EndAddress        = cap;
+    tls_runtime_function.BeginAddress = 0;
+    tls_runtime_function.EndAddress = cap;
     tls_runtime_function.UnwindInfoAddress = cap;
     return &tls_runtime_function;
 }
@@ -185,17 +182,12 @@ bool InstallJitBlockUnwindCallback(const CodeCache& cc) {
     const DWORD range = static_cast<DWORD>(cap + WIN_UNWIND_RESERVE);
 
     return ::RtlInstallFunctionTableCallback(
-        table_id,
-        reinterpret_cast<DWORD64>(base),
-        range,
-        &GetRuntimeFunctionForJitBlock,
-        const_cast<void*>(static_cast<const void*>(&cc)),
-        nullptr) != FALSE;
+               table_id, reinterpret_cast<DWORD64>(base), range, &GetRuntimeFunctionForJitBlock,
+               const_cast<void*>(static_cast<const void*>(&cc)), nullptr) != FALSE;
 }
 
 void RemoveJitBlockUnwindCallback(const CodeCache& cc) {
-    const DWORD64 table_id =
-        reinterpret_cast<DWORD64>(cc.Base()) | 0x3ULL;
+    const DWORD64 table_id = reinterpret_cast<DWORD64>(cc.Base()) | 0x3ULL;
     ::RtlDeleteFunctionTable(reinterpret_cast<PRUNTIME_FUNCTION>(table_id));
 }
 
@@ -237,14 +229,11 @@ CodeCache::CodeCache(u64 size_bytes) {
     // Contains() naturally exclude it without checks.
     const u64 total_size = capacity_ + PLATFORM_METADATA_RESERVE;
     base_ = AllocateRwxRegion(total_size);
-    ASSERT_MSG(base_ != nullptr,
-               "CodeCache: failed to allocate {} bytes of RWX memory",
+    ASSERT_MSG(base_ != nullptr, "CodeCache: failed to allocate {} bytes of RWX memory",
                total_size);
 
-    LOG_INFO(Core,
-             "CodeCache: allocated {} MB at {} (page size {} KB)",
-             capacity_ / (1024 * 1024), static_cast<void*>(base_),
-             page_size / 1024);
+    LOG_INFO(Core, "CodeCache: allocated {} MB at {} (page size {} KB)", capacity_ / (1024 * 1024),
+             static_cast<void*>(base_), page_size / 1024);
 
 #ifdef _WIN32
     // Register the JIT block unwind callback so the OS unwinder can
@@ -252,11 +241,10 @@ CodeCache::CodeCache(u64 size_bytes) {
     // metadata. See InstallJitBlockUnwindCallback for the full
     // story and limitations.
     if (!InstallJitBlockUnwindCallback(*this)) {
-        LOG_WARNING(Core,
-                    "CodeCache: RtlInstallFunctionTableCallback failed; "
-                    "SEH walks through JIT blocks may crash. The gateway "
-                    "unwind info is still installed, so walks that don't "
-                    "originate inside JIT code should remain OK.");
+        LOG_WARNING(Core, "CodeCache: RtlInstallFunctionTableCallback failed; "
+                          "SEH walks through JIT blocks may crash. The gateway "
+                          "unwind info is still installed, so walks that don't "
+                          "originate inside JIT code should remain OK.");
     }
 #endif
 }
@@ -295,8 +283,7 @@ u8* CodeCache::Allocate(u64 size) {
 void CodeCache::Flush() {
     std::lock_guard lock{emit_mutex_};
     used_.store(0, std::memory_order_release);
-    LOG_INFO(Core, "CodeCache: flushed (capacity {} MB)",
-             capacity_ / (1024 * 1024));
+    LOG_INFO(Core, "CodeCache: flushed (capacity {} MB)", capacity_ / (1024 * 1024));
 }
 
 void CodeCache::WriteBegin() noexcept {

@@ -453,8 +453,7 @@ public:
             if (transfer->callback) {
 #ifdef SHADPS4_USES_RUNTIME
                 Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                    reinterpret_cast<u64>(transfer->callback),
-                    reinterpret_cast<u64>(transfer));
+                    reinterpret_cast<u64>(transfer->callback), reinterpret_cast<u64>(transfer));
 #else
                 transfer->callback(transfer);
 #endif
