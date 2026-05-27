@@ -67,11 +67,22 @@ struct HostReturn {
 ///
 /// Arguments are unpacked from canonical SysV slots:
 ///
-///   Integer args 0..5 →  rdi, rsi, rdx, rcx, r8, r9  (state.gpr[7,6,2,1,8,9])
-///   Float args   0..7 →  xmm0..xmm7  (low u64 of each state.ymm[i*4])
+///   Integer args 0..5 →  rdi, rsi, rdx, rcx, r8, r9
+///                        (state.gpr[7,6,2,1,8,9])
+///   Float args   0..7 →  xmm0..xmm7
+///                        (low u64 of each state.ymm[i*4])
+///   Integer args 6..13 → stack at [rsp+8..+64]
+///                        (read from guest stack at [guest_rsp+8..+64])
 ///
-/// The function pointer is declared variadic. This serves two
-/// purposes:
+/// The 8 stack-spilled slots are declared as additional named u64
+/// args AFTER the 6 register slots are full. Per SysV classification
+/// each is INTEGER, but with the integer register pool already
+/// exhausted by args 0..5, the compiler emits stores to the host
+/// stack at [rsp+0, +8, ..., +56] before the call. The called HLE
+/// function reads them as its 7th..14th positional args via the
+/// same SysV layout.
+///
+/// The function pointer is variadic. This serves two purposes:
 ///
 ///   1. It makes the compiler set AL = number of XMM args used (8)
 ///      when emitting the call instruction. AL is required by the
@@ -88,11 +99,12 @@ struct HostReturn {
 ///
 /// Deferred (still not handled; documented as limitations):
 ///
-///   - More than 6 integer args spill to stack; we don't marshal
-///     stack args yet. Real PS4 HLE functions rarely take >6 ints.
-///   - More than 8 float args spill to stack; similar story.
-///   - Aggregate returns via a hidden RDI pointer (would silently
-///     shift all args by one slot) are not handled. The bridge
+///   - More than 14 integer args (would require reading further
+///     into guest stack and adding more named slots). Rare; defer
+///     until observed.
+///   - More than 8 float args spill to stack; not yet handled.
+///   - Aggregate returns via a hidden RDI pointer would silently
+///     shift all args by one slot — not handled. The bridge
 ///     assumes scalar or empty returns.
 ///   - Float (32-bit) values are passed via the same XMM slots as
 ///     doubles; we pass the low 64 bits of each YMM lane. The host
@@ -101,18 +113,32 @@ struct HostReturn {
 ///     in the low 32 of the corresponding XMM. NaN canonicalization
 ///     by the host compiler may quiet signaling NaNs through the
 ///     double-typed pass-through; benign for non-NaN values.
+///   - Guest stack args are read unconditionally as 8 qwords past
+///     the return address. If the guest's actual stack-arg count
+///     is < 8, the extra reads pull whatever happens to be on the
+///     guest stack beyond the args (caller's spill area, padding).
+///     The called HLE function ignores slots beyond its declared
+///     arg count, so the extra reads are harmless. The only risk
+///     is reading past the end of the guest stack mapping; in
+///     practice guest stacks are megabytes deep and the 64-byte
+///     overscan is negligible.
 typedef HostReturn (*HostHleFn)(u64, u64, u64, u64, u64, u64,
                                 double, double, double, double,
-                                double, double, double, double, ...)
+                                double, double, double, double,
+                                u64, u64, u64, u64,
+                                u64, u64, u64, u64, ...)
                               __attribute__((sysv_abi));
 
 HostReturn CallHostFromGuest(VAddr host_fn,
                              u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
                              double f0, double f1, double f2, double f3,
-                             double f4, double f5, double f6, double f7) {
+                             double f4, double f5, double f6, double f7,
+                             u64 s0, u64 s1, u64 s2, u64 s3,
+                             u64 s4, u64 s5, u64 s6, u64 s7) {
     auto fn = reinterpret_cast<HostHleFn>(host_fn);
     return fn(a0, a1, a2, a3, a4, a5,
-              f0, f1, f2, f3, f4, f5, f6, f7);
+              f0, f1, f2, f3, f4, f5, f6, f7,
+              s0, s1, s2, s3, s4, s5, s6, s7);
 }
 
 /// Dispatcher trampoline. Called from the gateway with the current
@@ -194,6 +220,27 @@ void* DispatcherTrampoline(GuestState* state) {
             const double f6 = load_xmm_low(6);
             const double f7 = load_xmm_low(7);
 
+            // Marshal up to 8 stack-spilled integer args from guest
+            // stack. SysV places them at [rsp+8, +16, +24, ...]
+            // (just past the return address). The compiler will
+            // re-spill them onto the host stack via our named u64
+            // params s0..s7.
+            //
+            // If the guest's actual stack-arg count is < 8, the
+            // extra reads pull whatever lives beyond the args. The
+            // called HLE function ignores them per its declared
+            // signature.
+            const u64* guest_stack_args =
+                reinterpret_cast<const u64*>(guest_rsp) + 1;
+            const u64 s0 = guest_stack_args[0];
+            const u64 s1 = guest_stack_args[1];
+            const u64 s2 = guest_stack_args[2];
+            const u64 s3 = guest_stack_args[3];
+            const u64 s4 = guest_stack_args[4];
+            const u64 s5 = guest_stack_args[5];
+            const u64 s6 = guest_stack_args[6];
+            const u64 s7 = guest_stack_args[7];
+
             if (name.empty()) {
                 std::fprintf(stderr,
                     "[bridge] WARNING unregistered host=0x%llx ret=0x%llx | "
@@ -239,6 +286,17 @@ void* DispatcherTrampoline(GuestState* state) {
                 (unsigned long long)state->ymm[20],
                 (unsigned long long)state->ymm[24],
                 (unsigned long long)state->ymm[28]);
+            // Log stack-spilled args on a third continuation line.
+            // Same caveats as XMM line: if the function takes few
+            // stack args, the latter slots are whatever the guest
+            // happened to leave there. Still useful for diagnosis.
+            std::fprintf(stderr,
+                "[bridge]   stk0=0x%llx stk1=0x%llx stk2=0x%llx stk3=0x%llx "
+                "stk4=0x%llx stk5=0x%llx stk6=0x%llx stk7=0x%llx\n",
+                (unsigned long long)s0, (unsigned long long)s1,
+                (unsigned long long)s2, (unsigned long long)s3,
+                (unsigned long long)s4, (unsigned long long)s5,
+                (unsigned long long)s6, (unsigned long long)s7);
             std::fflush(stderr);
 
             const HostReturn ret = CallHostFromGuest(
@@ -249,7 +307,8 @@ void* DispatcherTrampoline(GuestState* state) {
                 state->gpr[1],   // RCX
                 state->gpr[8],   // R8
                 state->gpr[9],   // R9
-                f0, f1, f2, f3, f4, f5, f6, f7);
+                f0, f1, f2, f3, f4, f5, f6, f7,
+                s0, s1, s2, s3, s4, s5, s6, s7);
             // Write both rax and xmm0 back to guest state. The
             // guest knows which one is meaningful based on the
             // called function's signature; the "other" slot may

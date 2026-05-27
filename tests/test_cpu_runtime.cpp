@@ -1214,6 +1214,24 @@ static PS4_SYSV_ABI u64 HleBridgeTestFn_MixedArgs(u64 a, double b,
            c * 100 + static_cast<u64>(d) * 1000;
 }
 
+// Seven integer args: 6 in registers, 1 spilled to stack at
+// [rsp+8]. Position-weighted multipliers make wrong slot
+// allocation obvious in the failure message.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_SevenArgs(
+    u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g) {
+    return a * 1 + b * 10 + c * 100 + d * 1000 +
+           e * 10000 + f * 100000 + g * 1000000;
+}
+
+// Eight integer args: 6 in registers, 2 spilled to stack at
+// [rsp+8, +16]. Verifies the ORDER of stack args (lowest addr =
+// 7th arg = `g`; next = 8th arg = `h`).
+static PS4_SYSV_ABI u64 HleBridgeTestFn_EightArgs(
+    u64 a, u64 b, u64 c, u64 d, u64 e, u64 f, u64 g, u64 h) {
+    return a * 1 + b * 10 + c * 100 + d * 1000 +
+           e * 10000 + f * 100000 + g * 1000000 + h * 10000000;
+}
+
 // HLE bridge: guest calls a PS4_SYSV_ABI host function with 6
 // distinct int args, captures the return value.
 //
@@ -2347,6 +2365,95 @@ TEST_F(CpuRuntimeTest, HleBridge_MixedIntAndFloatArgs) {
     // Expected: 2*1 + 3*10 + 5*100 + 7*1000 = 2 + 30 + 500 + 7000 = 7532
     EXPECT_EQ(state.gpr[0], 7532ULL)
         << "Mixed args should be: rdi=2(a), xmm0=3(b), rsi=5(c), xmm1=7(d)";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// HLE bridge: 7th integer arg arrives via guest stack at [rsp+8]
+// (just past the return address) and lands as the function's 7th
+// arg.
+//
+// Program sets up rdi=1, rsi=2, rdx=3, rcx=4, r8=5, r9=6, pushes
+// 7, calls host fn, pops stack arg, returns.
+TEST_F(CpuRuntimeTest, HleBridge_StackArg_PassedViaGuestStack) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_SevenArgs);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_SevenArgs");
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00,  // mov rdi, 1     (0..6)
+        0x48, 0xc7, 0xc6, 0x02, 0x00, 0x00, 0x00,  // mov rsi, 2     (7..13)
+        0x48, 0xc7, 0xc2, 0x03, 0x00, 0x00, 0x00,  // mov rdx, 3     (14..20)
+        0x48, 0xc7, 0xc1, 0x04, 0x00, 0x00, 0x00,  // mov rcx, 4     (21..27)
+        0x49, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,  // mov r8, 5      (28..34)
+        0x49, 0xc7, 0xc1, 0x06, 0x00, 0x00, 0x00,  // mov r9, 6      (35..41)
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7     (42..48)
+        0x50,                                       // push rax       (49)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <fn>  (50..59; imm 52..59)
+        0xff, 0xd0,                                 // call rax       (60..61)
+        0x48, 0x83, 0xc4, 0x08,                     // add rsp, 8     (62..65)
+        0xc3,                                       // ret            (66)
+    };
+    std::memcpy(&program[52], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // 1*1 + 2*10 + 3*100 + 4*1000 + 5*10000 + 6*100000 + 7*1000000
+    // = 1 + 20 + 300 + 4000 + 50000 + 600000 + 7000000 = 7654321
+    EXPECT_EQ(state.gpr[0], 7654321ULL)
+        << "7th arg (=7) should reach the host fn via guest stack [rsp+8]";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// HLE bridge: 8th integer arg arrives via guest stack at [rsp+16].
+// Verifies stack arg ORDER: arg 7 pushed last (closest to return
+// addr), arg 8 pushed first.
+TEST_F(CpuRuntimeTest, HleBridge_TwoStackArgs_OrderedCorrectly) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_EightArgs);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_EightArgs");
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00,  // mov rdi, 1     (0..6)
+        0x48, 0xc7, 0xc6, 0x02, 0x00, 0x00, 0x00,  // mov rsi, 2     (7..13)
+        0x48, 0xc7, 0xc2, 0x03, 0x00, 0x00, 0x00,  // mov rdx, 3     (14..20)
+        0x48, 0xc7, 0xc1, 0x04, 0x00, 0x00, 0x00,  // mov rcx, 4     (21..27)
+        0x49, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,  // mov r8, 5      (28..34)
+        0x49, 0xc7, 0xc1, 0x06, 0x00, 0x00, 0x00,  // mov r9, 6      (35..41)
+        0x48, 0xc7, 0xc0, 0x08, 0x00, 0x00, 0x00,  // mov rax, 8     (42..48)
+        0x50,                                       // push rax       (49) ; arg 8
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7     (50..56)
+        0x50,                                       // push rax       (57) ; arg 7 (lowest)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <fn>  (58..67; imm 60..67)
+        0xff, 0xd0,                                 // call rax       (68..69)
+        0x48, 0x83, 0xc4, 0x10,                     // add rsp, 16    (70..73)
+        0xc3,                                       // ret            (74)
+    };
+    std::memcpy(&program[60], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // 1 + 20 + 300 + 4000 + 50000 + 600000 + 7000000 + 80000000 = 87654321
+    EXPECT_EQ(state.gpr[0], 87654321ULL)
+        << "8th arg (=8) should be at [rsp+16], 7th arg (=7) at [rsp+8]; "
+        << "if order swapped, would get 78654321";
     EXPECT_EQ(state.rip, kReturnSentinel);
 }
 
