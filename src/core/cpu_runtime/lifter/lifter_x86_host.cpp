@@ -96,7 +96,11 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
 
     const bool has_base = (mem.base != ZYDIS_REGISTER_NONE);
     const bool has_index = (mem.index != ZYDIS_REGISTER_NONE);
-    const s64 disp = mem.disp.has_displacement ? mem.disp.value : 0;
+    // Note: Zydis 4.1+ exposes mem.disp.has_displacement to distinguish
+    // [base] from [base+0]. shadPS4's bundled Zydis (4.0.x) doesn't.
+    // The distinction doesn't matter for emit: a zero displacement
+    // produces no `add` (see the `if (disp != 0)` guard below).
+    const s64 disp = mem.disp.value;
 
     // RIP-relative: base == RIP, no index. Address = next_rip + disp.
     // We constant-fold this into a single mov.
