@@ -397,7 +397,9 @@ void Linker::Relocate(Module* module) {
             case STB_GLOBAL:
             case STB_WEAK: {
                 rel_name = names_tlb + sym.st_name;
-                if (Resolve(rel_name, rel_sym_type, module, &symrec)) {
+                const bool truly_resolved =
+                    Resolve(rel_name, rel_sym_type, module, &symrec);
+                if (truly_resolved) {
                     // Only set the rela bit if the symbol was actually resolved and not stubbed.
                     module->SetRelaBit(bit_idx);
                 }
@@ -409,7 +411,21 @@ void Linker::Relocate(Module* module) {
                 // attempts to call host code at addresses the linker
                 // never registered (a strong signal of a JIT bug or
                 // a corrupted guest pointer).
-                if (symbol_virtual_addr != 0) {
+                //
+                // IMPORTANT: only register when Resolve() returned
+                // true — i.e. this is a REAL HLE function whose host
+                // implementation exists. When Resolve falls through
+                // to AeroLib::GetStub, it returns false; those stub
+                // host pointers MUST NOT be registered. Stubs all
+                // funnel into CommonStubTemplate<I> whose body
+                // LOG_ERRORs through a thread_local that's broken on
+                // raw-CreateThread threads on Windows debug builds
+                // (reads 0xFFFFFFFFFFFFFFFF and crashes). Leaving
+                // stubs unregistered means the bridge sees an empty
+                // name on lookup and short-circuits the call to a
+                // clean return-zero, mirroring what the stub would
+                // have returned anyway.
+                if (truly_resolved && symbol_virtual_addr != 0) {
                     Core::Runtime::HleRegistry::Instance().Register(
                         symbol_virtual_addr, symrec.name);
                 }

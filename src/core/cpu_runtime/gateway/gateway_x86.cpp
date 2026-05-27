@@ -98,10 +98,21 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     c.push(r13);
     c.push(r14);
     c.push(r15);
-    // Total pushed: 8 * 8 = 64 bytes. rsp was 16-aligned at function
-    // entry (per ABI), after `call` it's misaligned by 8 (return
-    // address), then 8*8 = 64 puts it back to 16-aligned. No extra
-    // sub-from-rsp needed.
+    // Stack alignment after the 8 pushes:
+    //
+    //   At Enter() entry (immediately after CALL), rsp is misaligned
+    //   by 8 from a 16-byte boundary — the CALL pushed an 8-byte
+    //   return address onto a 16-aligned caller rsp.
+    //
+    //   8 pushes = 64 bytes added. 64 mod 16 = 0, so rsp is STILL
+    //   misaligned by 8 here. To call C cleanly later (which expects
+    //   rsp 16-aligned right before the CALL, becoming misaligned by
+    //   8 inside the callee), we need to compensate by 8.
+    //
+    // The SysV branch below documents the analogous reasoning for
+    // 6 pushes = 48 bytes. The conclusion is the same: an extra
+    // 8-byte sub to realign.
+    c.sub(rsp, 8);
 
     c.mov(r13, rcx); // state
     c.mov(r12, rdx); // dispatcher
@@ -193,6 +204,7 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     c.L(exit_stub);
 
 #ifdef _WIN32
+    c.add(rsp, 8); // undo the alignment dummy (matches `sub rsp, 8` in prologue)
     c.pop(r15);
     c.pop(r14);
     c.pop(r13);

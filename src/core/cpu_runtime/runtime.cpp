@@ -208,7 +208,26 @@ HostReturn CallHostFromGuest(VAddr host_fn,
 /// pointing at a guest block (or at the host-return sentinel) does
 /// the function return.
 void* DispatcherTrampoline(GuestState* state) {
+    // CHECKPOINT A: we entered the trampoline. If we never see this
+    // line, the gateway is calling something other than us, or the
+    // call itself faulted before any host C++ ran.
+    std::fprintf(stderr, "[disp] A: enter state=%p\n", (void*)state);
+    std::fflush(stderr);
+
+    // CHECKPOINT B: we read state->rip. If we see A but not B,
+    // dereferencing state is bad (e.g. wrong arg passing from gateway).
+    const u64 first_rip = state->rip;
+    std::fprintf(stderr, "[disp] B: state->rip=0x%llx\n",
+                 (unsigned long long)first_rip);
+    std::fflush(stderr);
+
+    // CHECKPOINT C: we read tl_active_runtime. If we see B but not C,
+    // thread_local read is the failure (CRT TLS init issue on
+    // raw-CreateThread thread).
     Runtime* rt = tl_active_runtime;
+    std::fprintf(stderr, "[disp] C: rt=%p\n", (void*)rt);
+    std::fflush(stderr);
+
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
 
     while (true) {
@@ -354,16 +373,48 @@ void* DispatcherTrampoline(GuestState* state) {
                 (unsigned long long)s6, (unsigned long long)s7);
             std::fflush(stderr);
 
-            const HostReturn ret = CallHostFromGuest(
-                host_fn,
-                state->gpr[kSysvArg0],   // RDI
-                state->gpr[kSysvArg1],   // RSI
-                state->gpr[kSysvArg2],   // RDX
-                state->gpr[kSysvArg3],   // RCX
-                state->gpr[kSysvArg4],   // R8
-                state->gpr[kSysvArg5],   // R9
-                f0, f1, f2, f3, f4, f5, f6, f7,
-                s0, s1, s2, s3, s4, s5, s6, s7);
+            // Short-circuit calls to unregistered host addresses.
+            //
+            // shadPS4's linker (after the gating fix in linker.cpp's
+            // STB_GLOBAL/STB_WEAK arm) only registers a host address
+            // into HleRegistry when Resolve() actually resolved the
+            // symbol to a real HLE function. When Resolve falls
+            // through to AeroLib::GetStub — i.e. the import is
+            // unresolved-NID — the stub address is left out of the
+            // registry, and the lookup above returns an empty name.
+            //
+            // We can't safely call those stubs: CommonStubTemplate<I>
+            // in aerolib/stubs.cpp unconditionally calls LOG_ERROR,
+            // which on raw-CreateThread threads (every shadPS4 game
+            // thread, see core/thread.cpp) reads a broken thread_local
+            // (`g_curthread`, pthread.h:361) on Windows debug builds
+            // and faults reading 0xFFFFFFFFFFFFFFFF. So when we see
+            // an empty name, we log via fprintf and return zero — the
+            // exact same return value the stub would have produced
+            // had it survived the LOG_ERROR.
+            //
+            // This is also a defense against a JIT bug accidentally
+            // computing a non-import host address as a call target:
+            // we surface it instead of jumping into random host code.
+            HostReturn ret{};
+            if (name.empty()) {
+                std::fprintf(stderr,
+                    "[bridge] SHORT-CIRCUIT unregistered host=0x%llx -> 0\n",
+                    (unsigned long long)host_fn);
+                std::fflush(stderr);
+                // ret already zero-initialized: rax=0, xmm0=0.0
+            } else {
+                ret = CallHostFromGuest(
+                    host_fn,
+                    state->gpr[kSysvArg0],   // RDI
+                    state->gpr[kSysvArg1],   // RSI
+                    state->gpr[kSysvArg2],   // RDX
+                    state->gpr[kSysvArg3],   // RCX
+                    state->gpr[kSysvArg4],   // R8
+                    state->gpr[kSysvArg5],   // R9
+                    f0, f1, f2, f3, f4, f5, f6, f7,
+                    s0, s1, s2, s3, s4, s5, s6, s7);
+            }
             // Write both rax and xmm0 back to guest state. The
             // guest knows which one is meaningful based on the
             // called function's signature; the "other" slot may
@@ -430,11 +481,21 @@ void Runtime::Run(GuestState& state) {
     // this thread. Setting these is per-Run nesting, not a global
     // lock: nested Run() calls (typical for HLE → guest callback →
     // HLE → guest pattern) restore the outer Run's pointers on exit.
+    std::fprintf(stderr, "[run] R0: enter, state.rip=0x%llx state.gpr[4]=0x%llx\n",
+                 (unsigned long long)state.rip,
+                 (unsigned long long)state.gpr[4]);
+    std::fflush(stderr);
     Runtime* const saved_rt = tl_active_runtime;
     GuestState* const saved_state = tl_current_guest_state;
+    std::fprintf(stderr, "[run] R1: tls read ok, saved_rt=%p\n", (void*)saved_rt);
+    std::fflush(stderr);
     tl_active_runtime = this;
     tl_current_guest_state = &state;
+    std::fprintf(stderr, "[run] R2: tls write ok\n");
+    std::fflush(stderr);
     gateway_->Enter(state, &DispatcherTrampoline);
+    std::fprintf(stderr, "[run] R3: gateway returned\n");
+    std::fflush(stderr);
     tl_current_guest_state = saved_state;
     tl_active_runtime = saved_rt;
 }
