@@ -34,9 +34,16 @@
 namespace Core::Runtime {
 namespace {
 
-// Sentinel popped from the guest stack by RET. The tests check that
-// state.rip equals this value to confirm the return path executed.
-constexpr u64 kReturnSentinel = 0xDEADBEEFCAFEBABEULL;
+// Sentinel popped from the guest stack by RET. We use the runtime's
+// public kHostReturnAddress so the dispatcher recognizes it and
+// exits cleanly when the guest RETs through the call chain.
+//
+// (Before the gateway looped, tests could use any sentinel because
+// Run() exited after one block regardless of where RET set RIP.
+// Now that the dispatcher loops, the sentinel MUST be a value the
+// dispatcher recognizes as "exit" — otherwise the dispatcher tries
+// to compile a block at that fake address and segfaults.)
+constexpr u64 kReturnSentinel = kHostReturnAddress;
 
 /// Allocate a pair of pages (code + stack) as RWX memory for the
 /// guest. Uses the host OS directly rather than the upstream
@@ -165,22 +172,22 @@ TEST_F(CpuRuntimeTest, MultipleRegistersAndOpcodes_ProduceCorrectValues) {
 // emits an exit sequence that sets exit_reason and stores the
 // un-lifted RIP so callers can diagnose where execution stopped.
 TEST_F(CpuRuntimeTest, UnsupportedOpcode_ExitsCleanly) {
-    // CALL is still unsupported in the current lifter slice (needs
-    // block-chaining design). Use it to verify the unsupported-exit
-    // path still works. If/when CALL becomes supported, replace
-    // with another not-yet-supported instruction.
+    // INC is still unsupported in the current lifter slice. Use it
+    // to verify the unsupported-exit path still works. If/when INC
+    // becomes supported, replace with another not-yet-supported
+    // instruction.
     const u8 program[] = {
         0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
-        0xe8, 0x00, 0x00, 0x00, 0x00,              // call rel32=0 (unsupported)
+        0x48, 0xff, 0xc3,                           // inc rbx       (unsupported)
         0xc3,                                       // ret  (unreached)
     };
     const auto r = RunProgram(program, sizeof(program), mem);
 
-    // RIP should point to the CALL instruction (at offset 7).
+    // RIP should point to the INC instruction (at offset 7).
     EXPECT_EQ(r.state.rip, r.program_base + 7);
     EXPECT_EQ(r.state.exit_reason,
               static_cast<u32>(ExitReason::UnsupportedInstruction));
-    // MOV before CALL should have executed.
+    // MOV before INC should have executed.
     EXPECT_EQ(r.state.gpr[0], 1u);
 }
 
@@ -725,20 +732,20 @@ TEST_F(CpuRuntimeTest, TestZeroReg_SetsZeroFlag) {
     EXPECT_FALSE(result.state.rflags & kOF);
 }
 
-// JZ taken: CMP that produces ZF=1, then JZ jumps over a fault.
+// JZ taken: CMP that produces ZF=1, then JZ jumps to a target
+// outside the program's lifted bytes. The dispatcher follows
+// the branch, tries to compile at the target (which is zeros),
+// and exits with UnsupportedInstruction. state.rip ends up
+// at the target — confirming the branch was taken.
 //
 //   xor rax, rax     48 31 c0
-//   jz  +0x10        74 10            ; if ZF, jump to byte 18
-//   <unreachable padding>
-//   ret              c3
-//
-// After CMP rax,rax (sets ZF), JZ should be taken. state.rip should
-// be set to (next_rip + 0x10) = start + 5 + 0x10 = start + 21.
+//   jz  +0x10        74 10            ; if ZF, jump to byte 21
+//   <padding bytes that won't be reached when taken>
 TEST_F(CpuRuntimeTest, Jz_TakenWhenZf) {
     const u8 program[] = {
         0x48, 0x31, 0xc0,          // xor rax, rax       (offset 0-2)
         0x74, 0x10,                // jz +0x10           (offset 3-4)
-        // Bytes 5..20 are unreachable when branch taken.
+        // Bytes 5..20 are unreached when branch is taken.
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
 
@@ -753,25 +760,28 @@ TEST_F(CpuRuntimeTest, Jz_TakenWhenZf) {
     Runtime rt;
     rt.Run(state);
 
-    // After JZ: state.rip should be the branch target.
-    // jz +0x10 at offset 3 has next_rip = offset 5, target = 5 + 16 = 21.
+    // After JZ taken: state.rip should be the branch target = 21.
+    // (Now that the dispatcher loops, control then enters the
+    // block at offset 21, which is zero-padding; the lifter
+    // exits with UnsupportedInstruction at offset 21.)
     EXPECT_EQ(state.rip, program_base + 21);
-    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction));
 }
 
-// JZ not taken: with ZF=0, JZ falls through. state.rip should be the
-// fall-through (next instruction after the jz).
+// JZ not taken: with ZF=0, JZ falls through. The dispatcher then
+// enters the fall-through block (also zero-padding past the JZ)
+// and exits with UnsupportedInstruction at the fall-through point.
 //
 //   mov rax, 1       48 c7 c0 01 00 00 00
 //   test rax, rax    48 85 c0                ; ZF=0 since rax != 0
 //   jz  +0x10        74 10
-//   <fall-through point>
+//   <fall-through point at offset 12>
 TEST_F(CpuRuntimeTest, Jz_FallsThroughWhenNoZf) {
     const u8 program[] = {
         0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1   (offsets 0-6)
         0x48, 0x85, 0xc0,                           // test rax,rax (offsets 7-9)
         0x74, 0x10,                                 // jz  +0x10    (offsets 10-11)
-        // fall-through at offset 12.
+        // Fall-through at offset 12: zero-padding.
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
 
@@ -786,9 +796,12 @@ TEST_F(CpuRuntimeTest, Jz_FallsThroughWhenNoZf) {
     Runtime rt;
     rt.Run(state);
 
-    // Fall-through target is offset 12 (the byte after the jz).
+    // Fall-through target is offset 12. The dispatcher tries to
+    // continue there and exits with UnsupportedInstruction
+    // (zero-padding starts with bytes that aren't 64-bit
+    // instructions in this lifter's repertoire).
     EXPECT_EQ(state.rip, program_base + 12);
-    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction));
 }
 
 // JNZ: opposite of JZ. With ZF=0, JNZ should be taken.

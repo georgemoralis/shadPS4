@@ -125,31 +125,42 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
 #endif
 
     // ============================================================
-    // Pre-compute the exit stub address into r14. JIT code wanting
-    // to exit will `jmp r14`.
+    // Pre-compute exit-path addresses:
+    //   r14 = dispatch_loop_top (normal block-end re-enters dispatcher)
+    //   r15 = exit_stub         (fatal exit returns to C)
     //
-    // We use lea+rip-relative to capture the address of the
-    // forward label `exit_stub`.
+    // Block terminators (JMP/Jcc/RET/CALL) `jmp r14` to continue
+    // dispatching. The dispatcher decides whether to exit (sentinel
+    // host-return, compile failure) by returning nullptr, in which
+    // case the gateway falls through from the dispatcher call to
+    // the exit stub.
+    //
+    // Lifter-emitted "fatal exit" paths (unsupported instruction,
+    // decode failure) `jmp r15` directly, bypassing the dispatcher.
+    // This preserves diagnostic state (state.rip holds the offending
+    // address) and avoids the dispatcher trying to compile the same
+    // bad address again.
     // ============================================================
     Xbyak::Label exit_stub;
-    c.lea(r14, ptr[rip + exit_stub]);
+    Xbyak::Label dispatch_loop_top;
+    c.lea(r14, ptr[rip + dispatch_loop_top]);
+    c.lea(r15, ptr[rip + exit_stub]);
 
     // ============================================================
     // DISPATCH LOOP
     // ============================================================
     //
     // Call dispatcher(state) -> rax = host code pointer.
-    // jmp rax (into JIT code).
+    //   - If non-null: jmp rax (into JIT code). When the JIT block
+    //     exits via a block terminator, it does `jmp r14`, which
+    //     lands at dispatch_loop_top and we go around again.
+    //   - If null: exit to C via the exit stub.
     //
-    // JIT code's block-exit either:
-    //   a) jmp to dispatch_loop_top (next block lookup), or
-    //   b) jmp r14 (exit to C).
-    //
-    // For this validation slice, every block exits via (b) — the
-    // dispatcher loop runs once. Block chaining via (a) is added
-    // in PR 3.
+    // This loop runs entirely in machine code without returning to
+    // C until the dispatcher decides to exit. Block chaining (where
+    // blocks jump directly to each other, bypassing the dispatcher)
+    // is a future optimization layered on top.
 
-    Xbyak::Label dispatch_loop_top;
     c.L(dispatch_loop_top);
 
     // Call dispatcher(state). r13 is state. We need state in rdi
@@ -165,8 +176,9 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
 #endif
 
     // Returned host code pointer in rax. If it's null, exit
-    // (dispatcher returned null = "we don't have this block and
-    // can't compile it"). Otherwise jmp into JIT.
+    // (dispatcher returned null = "we should stop"). Otherwise
+    // jmp into JIT; the JIT will eventually `jmp r14` back to
+    // dispatch_loop_top.
     c.test(rax, rax);
     c.jz(exit_stub);
     c.jmp(rax);

@@ -301,7 +301,19 @@ int PS4_SYSV_ABI sceNpMatching2RegisterContextCallback(OrbisNpMatching2ContextCa
     }
 
     npMatching2ContextCallback = [callback, userdata](auto arg) {
+#ifdef SHADPS4_USES_RUNTIME
+        // Guest callback signature:
+        //   void(contextId, event, cause, errorCode, userdata)
+        Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+            reinterpret_cast<u64>(callback),
+            static_cast<u64>(arg->contextId),
+            static_cast<u64>(arg->event),
+            static_cast<u64>(arg->cause),
+            static_cast<u64>(arg->errorCode),
+            reinterpret_cast<u64>(userdata));
+#else
         callback(arg->contextId, arg->event, arg->cause, arg->errorCode, userdata);
+#endif
     };
 
     return ORBIS_OK;
@@ -322,7 +334,19 @@ int PS4_SYSV_ABI sceNpMatching2RegisterLobbyEventCallback(
     }
 
     npMatching2LobbyCallback = [callback, userdata](auto arg) {
+#ifdef SHADPS4_USES_RUNTIME
+        // Guest callback signature:
+        //   void(contextId, lobbyId, event, data, userdata)
+        Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+            reinterpret_cast<u64>(callback),
+            static_cast<u64>(arg->contextId),
+            static_cast<u64>(arg->lobbyId),
+            static_cast<u64>(arg->event),
+            reinterpret_cast<u64>(arg->data),
+            reinterpret_cast<u64>(userdata));
+#else
         callback(arg->contextId, arg->lobbyId, arg->event, arg->data, userdata);
+#endif
     };
 
     return ORBIS_OK;
@@ -345,7 +369,19 @@ int PS4_SYSV_ABI sceNpMatching2RegisterRoomEventCallback(OrbisNpMatching2Context
     }
 
     npMatching2RoomCallback = [callback, userdata](auto arg) {
+#ifdef SHADPS4_USES_RUNTIME
+        // Guest callback signature:
+        //   void(contextId, roomId, event, data, userdata)
+        Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+            reinterpret_cast<u64>(callback),
+            static_cast<u64>(arg->contextId),
+            static_cast<u64>(arg->roomId),
+            static_cast<u64>(arg->event),
+            reinterpret_cast<u64>(arg->data),
+            reinterpret_cast<u64>(userdata));
+#else
         callback(arg->contextId, arg->roomId, arg->event, arg->data, userdata);
+#endif
     };
 
     return ORBIS_OK;
@@ -409,45 +445,29 @@ void ProcessEvents() {
     {
         std::scoped_lock lk{g_events_mutex};
 
+        // Note: npMatching2ContextCallback / LobbyCallback / RoomCallback
+        // are std::function<>'s holding C++ lambdas, NOT guest function
+        // pointers. The lambdas wrap the actual guest callback (captured
+        // by `callback` in the registration sites above). The guest
+        // invocation happens *inside* the lambda body, where it's
+        // properly gated by SHADPS4_USES_RUNTIME. So these outer calls
+        // run natively in both build modes — they're plain C++ function
+        // calls into the lambda.
         if (npMatching2ContextCallback) {
             while (!g_ctx_events.empty()) {
-#ifdef SHADPS4_USES_RUNTIME
-                // OrbisNpMatching2ContextCallback signature:
-                //   void(NpMatching2ContextEvent* event)
-                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                    reinterpret_cast<u64>(npMatching2ContextCallback),
-                    reinterpret_cast<u64>(&g_ctx_events.front()));
-#else
                 npMatching2ContextCallback(&g_ctx_events.front());
-#endif
                 g_ctx_events.pop_front();
             }
         }
         if (npMatching2LobbyCallback) {
             while (!g_lobby_events.empty()) {
-#ifdef SHADPS4_USES_RUNTIME
-                // OrbisNpMatching2LobbyEventCallback signature:
-                //   void(NpMatching2LobbyEvent* event)
-                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                    reinterpret_cast<u64>(npMatching2LobbyCallback),
-                    reinterpret_cast<u64>(&g_lobby_events.front()));
-#else
                 npMatching2LobbyCallback(&g_lobby_events.front());
-#endif
                 g_lobby_events.pop_front();
             }
         }
         if (npMatching2RoomCallback) {
             while (!g_room_events.empty()) {
-#ifdef SHADPS4_USES_RUNTIME
-                // OrbisNpMatching2RoomEventCallback signature:
-                //   void(NpMatching2RoomEvent* event)
-                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
-                    reinterpret_cast<u64>(npMatching2RoomCallback),
-                    reinterpret_cast<u64>(&g_room_events.front()));
-#else
                 npMatching2RoomCallback(&g_room_events.front());
-#endif
                 g_room_events.pop_front();
             }
         }

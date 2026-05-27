@@ -149,4 +149,20 @@ static_assert(offsetof(GuestState, gs_base) == Offsets::GsBase);
 static_assert(sizeof(GuestState) % 16 == 0,
               "GuestState size must be 16-byte aligned for gateway save area");
 
+/// Magic guest address used as the sentinel return address pushed
+/// onto the guest stack by CallGuest. When guest code RETs through
+/// the full call chain, RSP eventually points at this value, RET
+/// pops it into state.rip, and the dispatcher recognizes it as the
+/// signal to return control to the host.
+///
+/// The value is chosen to be non-canonical (high half nonzero) and
+/// far from any real guest mapping, so accidental jumps to nearby
+/// addresses don't accidentally exit. The dispatcher's check is by
+/// exact equality.
+///
+/// Tests and CallGuest both use this constant. Changing it
+/// requires updating the dispatcher's recognition logic in
+/// runtime.cpp.
+constexpr u64 kHostReturnAddress = 0xCB'CB'CB'CB'00'00'00'00ULL;
+
 } // namespace Core::Runtime

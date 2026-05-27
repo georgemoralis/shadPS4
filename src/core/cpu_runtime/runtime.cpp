@@ -34,10 +34,18 @@ thread_local GuestState* tl_current_guest_state = nullptr;
 
 /// Dispatcher trampoline. Called from the gateway with the current
 /// state; returns the host code pointer for state.rip, compiling on
-/// demand if needed.
+/// demand if needed. Returning nullptr causes the gateway to exit
+/// the dispatch loop and return to C.
 void* DispatcherTrampoline(GuestState* state) {
     Runtime* rt = tl_active_runtime;
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
+
+    // Sentinel check: if guest code RET'd through the call chain back
+    // to the host-return address, exit cleanly.
+    if (state->rip == kHostReturnAddress) {
+        state->exit_reason = static_cast<u32>(ExitReason::BlockEnd);
+        return nullptr;
+    }
 
     BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
     if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
@@ -125,14 +133,12 @@ GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
     rsp &= ~static_cast<u64>(0xF);
     rsp -= 8;
 
-    // Push a sentinel return address that will exit the runtime cleanly
-    // when the guest function executes its terminal RET. We use a
-    // recognizable invalid address; the lifter's RET handler will set
-    // state.rip to this value and exit_reason to BlockEnd, at which
-    // point we return.
-    constexpr u64 kReturnSentinel = 0xCB'CB'CB'CB'00'00'00'00ULL;
+    // Push the host-return sentinel address onto the guest stack.
+    // When guest code RETs through the full call chain, RSP points
+    // here, RET pops it into state.rip, and the dispatcher
+    // recognizes it as the signal to return control.
     rsp -= 8;
-    *reinterpret_cast<u64*>(rsp) = kReturnSentinel;
+    *reinterpret_cast<u64*>(rsp) = kHostReturnAddress;
 
     state.gpr[4] = rsp;             // RSP
     state.rip = guest_fn;

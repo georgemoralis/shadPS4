@@ -880,6 +880,52 @@ bool EmitJmp(const ZydisDecodedInstruction& insn,
     return true;
 }
 
+/// CALL rel — direct near call (block terminator).
+///
+/// Semantics:
+///   1. Push next_rip (the return address) onto the guest stack.
+///   2. Set state.rip = target.
+///   3. Exit to gateway. The dispatcher then enters the callee
+///      block; when the callee RETs, it pops next_rip into
+///      state.rip and the dispatcher re-enters the block after our
+///      call site.
+///
+/// This call/return matching only works because the gateway now
+/// loops (PR: this one). In the previous one-block-per-Run model,
+/// CALL couldn't return.
+///
+/// CALL r/m64 (indirect) is not handled yet — it'd be the same
+/// shape but with the target loaded from a register or memory.
+bool EmitCall(const ZydisDecodedInstruction& insn,
+              const ZydisDecodedOperand* ops,
+              u64 next_rip,
+              Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_CALL) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        return false;  // indirect CALL deferred
+    }
+    const u64 target = ops[0].imm.is_relative
+        ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+        : static_cast<u64>(ops[0].imm.value.s);
+
+    // Push next_rip onto guest stack: guest_rsp -= 8; *guest_rsp = next_rip.
+    c.mov(rdx, qword[r13 + GprOffset(kGuestRspIdx)]);
+    c.sub(rdx, 8);
+    c.mov(rax, next_rip);
+    c.mov(qword[rdx], rax);
+    c.mov(qword[r13 + GprOffset(kGuestRspIdx)], rdx);
+
+    // Set state.rip = target.
+    c.mov(rax, target);
+    c.mov(qword[r13 + Offsets::Rip], rax);
+
+    // Exit to gateway.
+    constexpr u32 EXIT_BLOCK_END = static_cast<u32>(ExitReason::BlockEnd);
+    c.mov(dword[r13 + offsetof(GuestState, exit_reason)], EXIT_BLOCK_END);
+    c.jmp(r14);
+    return true;
+}
+
 } // namespace
 
 // ============================================================================
@@ -932,11 +978,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             LOG_WARNING(Core, "Lifter: decode failed at {:#x}", rip);
             ++unsupported_hits_;
             // Emit a clean exit so the host program doesn't die.
+            // Use r15 (fatal exit) rather than r14 (dispatcher loop)
+            // because retrying the same bad address would just loop.
             c.mov(rax, rip);
             c.mov(qword[r13 + Offsets::Rip], rax);
             c.mov(dword[r13 + offsetof(GuestState, exit_reason)],
                   static_cast<u32>(ExitReason::UnsupportedInstruction));
-            c.jmp(r14);
+            c.jmp(r15);
             emitted_terminator = true;
             break;
         }
@@ -961,6 +1009,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 break;
             case ZYDIS_MNEMONIC_JMP:
                 handled = EmitJmp(insn, ops, next_rip, c);
+                if (handled) emitted_terminator = true;
+                break;
+            case ZYDIS_MNEMONIC_CALL:
+                handled = EmitCall(insn, ops, next_rip, c);
                 if (handled) emitted_terminator = true;
                 break;
             // All conditional jumps go through EmitJcc.
@@ -994,12 +1046,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                         rip, static_cast<u32>(insn.mnemonic));
             ++unsupported_hits_;
             // Update state.rip to the un-lifted instruction so a
-            // post-mortem caller knows where it stopped, then exit.
+            // post-mortem caller knows where it stopped, then exit
+            // via r15 (fatal exit). Using r14 here would loop the
+            // dispatcher on the same bad address.
             c.mov(rax, rip);
             c.mov(qword[r13 + Offsets::Rip], rax);
             c.mov(dword[r13 + offsetof(GuestState, exit_reason)],
                   static_cast<u32>(ExitReason::UnsupportedInstruction));
-            c.jmp(r14);
+            c.jmp(r15);
             emitted_terminator = true;
             break;
         }
