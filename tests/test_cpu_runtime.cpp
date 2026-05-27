@@ -29,6 +29,7 @@
 
 #include "core/cpu_runtime/block_cache.h"
 #include "core/cpu_runtime/guest_state.h"
+#include "core/cpu_runtime/hle_registry.h"
 #include "core/cpu_runtime/runtime.h"
 
 // The test shim's common/types.h is a stripped-down stand-in for
@@ -1181,6 +1182,14 @@ static PS4_SYSV_ABI u64 HleBridgeTestFn_SumArgs(u64 a, u64 b, u64 c,
     return a * 1 + b * 10 + c * 100 + d * 1000 + e * 10000 + f * 100000;
 }
 
+// A second host function we *intentionally* leave unregistered, to
+// exercise the bridge's "WARNING unregistered host call" path. It
+// returns a sentinel so we can confirm execution actually reached
+// the function despite the lack of registration.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_Unregistered(u64 a, u64, u64, u64, u64, u64) {
+    return a + 0xDEAD0000ULL;
+}
+
 // HLE bridge: guest calls a PS4_SYSV_ABI host function with 6
 // distinct int args, captures the return value.
 //
@@ -1196,6 +1205,12 @@ static PS4_SYSV_ABI u64 HleBridgeTestFn_SumArgs(u64 a, u64 b, u64 c,
 //   ret                   c3                       (54)
 TEST_F(CpuRuntimeTest, HleBridge_GuestCallsHostFunction_MarshalsArgsAndReturn) {
     const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_SumArgs);
+
+    // Register the test function so the bridge prints "[bridge] call
+    // <name>" instead of the warning path. This both confirms the
+    // bridge looks up names correctly and avoids polluting the test
+    // log with a spurious WARNING.
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_SumArgs");
 
     u8 program[] = {
         0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00,  // mov rdi, 1
@@ -2185,6 +2200,82 @@ TEST_F(CpuRuntimeTest, Test16_SetsZeroFlagOnDisjointBits) {
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)    << "no overlapping bits → ZF set";
+}
+
+// =============================================================================
+// HleRegistry tests.
+//
+// Tests focus on the data structure's contract, not the bridge
+// integration (which is already covered by HleBridge_* tests above).
+// =============================================================================
+
+// Basic register/lookup round-trip.
+TEST(HleRegistryTest, RegisterAndLookup) {
+    HleRegistry::Instance().ClearForTesting();
+    HleRegistry::Instance().Register(0xDEADBEEFULL, "sceKernelFoo");
+    EXPECT_EQ(HleRegistry::Instance().Lookup(0xDEADBEEFULL), "sceKernelFoo");
+    EXPECT_TRUE(HleRegistry::Instance().Contains(0xDEADBEEFULL));
+}
+
+// Unknown addresses return empty.
+TEST(HleRegistryTest, UnknownAddressReturnsEmpty) {
+    HleRegistry::Instance().ClearForTesting();
+    EXPECT_TRUE(HleRegistry::Instance().Lookup(0xCAFEBABEULL).empty());
+    EXPECT_FALSE(HleRegistry::Instance().Contains(0xCAFEBABEULL));
+}
+
+// Re-registration is idempotent (first write wins). This matters
+// because the linker may resolve the same import in multiple
+// modules; we want the first registration to stick rather than
+// silently overwriting.
+TEST(HleRegistryTest, ReRegistrationKeepsFirstName) {
+    HleRegistry::Instance().ClearForTesting();
+    HleRegistry::Instance().Register(0x1234ULL, "first_name");
+    HleRegistry::Instance().Register(0x1234ULL, "second_name");
+    EXPECT_EQ(HleRegistry::Instance().Lookup(0x1234ULL), "first_name");
+}
+
+// Size grows as new entries are added; unchanged on re-registration.
+TEST(HleRegistryTest, SizeReflectsUniqueEntries) {
+    HleRegistry::Instance().ClearForTesting();
+    EXPECT_EQ(HleRegistry::Instance().Size(), 0u);
+    HleRegistry::Instance().Register(0xA, "a");
+    HleRegistry::Instance().Register(0xB, "b");
+    HleRegistry::Instance().Register(0xA, "a-again");   // duplicate addr
+    EXPECT_EQ(HleRegistry::Instance().Size(), 2u);
+}
+
+// HLE bridge: confirm unregistered host calls still execute (we
+// warn, but don't refuse). This is the "warn + continue" policy:
+// killing execution on an unregistered call would prevent us from
+// gathering data on edge cases (e.g. callbacks, runtime helpers).
+//
+// Setup: ensure HleBridgeTestFn_Unregistered is NOT in the registry,
+// then call it from guest code. Expect the result to come back
+// despite the warning being logged.
+TEST_F(CpuRuntimeTest, HleBridge_UnregisteredHostCall_StillExecutes) {
+    // Defensive: clear the registry of any prior registration for
+    // this function. Tests run in unpredictable order; an earlier
+    // test might have registered it.
+    HleRegistry::Instance().ClearForTesting();
+
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_Unregistered);
+    ASSERT_TRUE(HleRegistry::Instance().Lookup(host_fn_addr).empty())
+        << "test setup invariant: target must be unregistered";
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x42, 0x00, 0x00, 0x00,  // mov rdi, 0x42       (0..6)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <addr>     (7..16; imm at 9..16)
+        0xff, 0xd0,                                 // call rax            (17..18)
+        0xc3,                                       // ret                 (19)
+    };
+    // imm starts after the 2-byte `48 b8` prefix at offset 9.
+    std::memcpy(&program[9], &host_fn_addr, sizeof(host_fn_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x42ULL + 0xDEAD0000ULL)
+        << "Unregistered call should still run and return its computed value";
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
 }
 
 } // namespace

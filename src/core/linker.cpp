@@ -12,6 +12,7 @@
 #include "common/thread.h"
 #include "core/aerolib/aerolib.h"
 #include "core/aerolib/stubs.h"
+#include "core/cpu_runtime/hle_registry.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/kernel.h"
@@ -401,6 +402,17 @@ void Linker::Relocate(Module* module) {
                     module->SetRelaBit(bit_idx);
                 }
                 symbol_virtual_addr = symrec.virtual_address;
+                // Publish the (host address -> name) mapping to the
+                // CPU runtime's HLE registry. The bridge inside the
+                // dispatcher uses this to identify which HLE
+                // function is being called and to detect any
+                // attempts to call host code at addresses the linker
+                // never registered (a strong signal of a JIT bug or
+                // a corrupted guest pointer).
+                if (symbol_virtual_addr != 0) {
+                    Core::Runtime::HleRegistry::Instance().Register(
+                        symbol_virtual_addr, symrec.name);
+                }
                 break;
             }
             default:

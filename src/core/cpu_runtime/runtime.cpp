@@ -12,6 +12,7 @@
 #include "core/cpu_runtime/code_cache.h"
 #include "core/cpu_runtime/gateway/gateway.h"
 #include "core/cpu_runtime/lifter/lifter.h"
+#include "core/cpu_runtime/hle_registry.h"
 
 namespace Core::Runtime {
 
@@ -135,18 +136,46 @@ void* DispatcherTrampoline(GuestState* state) {
             const u64 guest_rsp = state->gpr[4];
             const u64 guest_return_addr =
                 *reinterpret_cast<const u64*>(guest_rsp);
-            std::fprintf(stderr,
-                "[bridge] call host=0x%llx ret=0x%llx | "
-                "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
-                (unsigned long long)host_fn,
-                (unsigned long long)guest_return_addr,
-                (unsigned long long)state->gpr[7],
-                (unsigned long long)state->gpr[6],
-                (unsigned long long)state->gpr[2],
-                (unsigned long long)state->gpr[1],
-                (unsigned long long)state->gpr[8],
-                (unsigned long long)state->gpr[9]);
+
+            // Look up the resolved HLE function name. If the
+            // address isn't registered, that's either a JIT bug
+            // (we computed a wrong target) or a non-import host
+            // call (callback machinery, runtime helpers, etc.).
+            // Either way, emit a loud warning that's easy to grep
+            // for in crash logs.
+            const std::string_view name =
+                HleRegistry::Instance().Lookup(host_fn);
+            if (name.empty()) {
+                std::fprintf(stderr,
+                    "[bridge] WARNING unregistered host=0x%llx ret=0x%llx | "
+                    "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                    "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
+                    (unsigned long long)host_fn,
+                    (unsigned long long)guest_return_addr,
+                    (unsigned long long)state->gpr[7],
+                    (unsigned long long)state->gpr[6],
+                    (unsigned long long)state->gpr[2],
+                    (unsigned long long)state->gpr[1],
+                    (unsigned long long)state->gpr[8],
+                    (unsigned long long)state->gpr[9]);
+            } else {
+                // %.*s lets us print a non-null-terminated
+                // string_view without copying it. The cast to int
+                // is required because precision uses int width.
+                std::fprintf(stderr,
+                    "[bridge] call %.*s host=0x%llx ret=0x%llx | "
+                    "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                    "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
+                    static_cast<int>(name.size()), name.data(),
+                    (unsigned long long)host_fn,
+                    (unsigned long long)guest_return_addr,
+                    (unsigned long long)state->gpr[7],
+                    (unsigned long long)state->gpr[6],
+                    (unsigned long long)state->gpr[2],
+                    (unsigned long long)state->gpr[1],
+                    (unsigned long long)state->gpr[8],
+                    (unsigned long long)state->gpr[9]);
+            }
             std::fflush(stderr);
 
             const u64 ret = CallHostFromGuest(
@@ -159,10 +188,19 @@ void* DispatcherTrampoline(GuestState* state) {
                 state->gpr[9]);  // R9
             state->gpr[0] = ret; // RAX
 
-            std::fprintf(stderr,
-                "[bridge] ret  host=0x%llx -> rax=0x%llx\n",
-                (unsigned long long)host_fn,
-                (unsigned long long)ret);
+            // Print the post-return rax. If we never see this
+            // line for a given host_fn, that function crashed.
+            if (name.empty()) {
+                std::fprintf(stderr,
+                    "[bridge] ret  host=0x%llx -> rax=0x%llx\n",
+                    (unsigned long long)host_fn,
+                    (unsigned long long)ret);
+            } else {
+                std::fprintf(stderr,
+                    "[bridge] ret  %.*s -> rax=0x%llx\n",
+                    static_cast<int>(name.size()), name.data(),
+                    (unsigned long long)ret);
+            }
             std::fflush(stderr);
 
             // Pop guest return address.

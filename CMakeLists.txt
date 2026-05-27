@@ -989,6 +989,8 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
              src/core/cpu_runtime/code_cache.cpp
              src/core/cpu_runtime/code_cache.h
              src/core/cpu_runtime/guest_state.h
+             src/core/cpu_runtime/hle_registry.cpp
+             src/core/cpu_runtime/hle_registry.h
              src/core/cpu_runtime/runtime.cpp
              src/core/cpu_runtime/runtime.h
              src/core/cpu_runtime/gateway/gateway.h
