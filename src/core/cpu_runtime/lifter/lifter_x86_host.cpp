@@ -1582,6 +1582,206 @@ bool EmitCmc(Xbyak::CodeGenerator& c) {
 }
 
 // =============================================================================
+// LEAVE — function epilogue shorthand.
+//
+// Semantics: `mov rsp, rbp; pop rbp`. Tears down a standard
+// function frame. One byte (0xC9), no operands, no flags affected.
+// Extremely common at the tail of non-leaf C functions.
+// =============================================================================
+
+bool EmitLeave(Xbyak::CodeGenerator& c) {
+    // Read current rbp — this will be the new rsp value (and the
+    // address from which we pop the saved rbp).
+    c.mov(rax, qword[r13 + GprOffset(5)]);  // rax = old rbp
+
+    // Load *rax (the saved rbp value) into rcx — this is the new rbp.
+    c.mov(rcx, qword[rax]);
+
+    // Write new rbp.
+    c.mov(qword[r13 + GprOffset(5)], rcx);
+
+    // Compute new rsp = old rbp + 8 (the pop advanced past saved rbp).
+    c.add(rax, 8);
+    c.mov(qword[r13 + GprOffset(4)], rax);
+    return true;
+}
+
+// =============================================================================
+// ADC / SBB — add and subtract with carry input.
+//
+// ADC dst, src  →  dst = dst + src + CF
+// SBB dst, src  →  dst = dst - src - CF
+//
+// These are how multi-precision arithmetic gets done:
+//
+//   add  rax, rcx      ; lo + lo, sets CF
+//   adc  rbx, rdx      ; hi + hi + CF
+//
+// We round-trip flags through host rflags so the host CPU reads
+// the existing guest CF as its ADC/SBB input AND writes the new
+// CF correctly. Same flag-handling pattern as shifts/rotates/IMUL.
+//
+// Supported forms (matching ADD/SUB scope): r64,r64 and r64,imm32.
+// Memory-source forms would follow but require careful operand
+// ordering — deferred until a real binary hits them.
+// =============================================================================
+
+enum class AdcSbbKind { Adc, Sbb };
+
+bool EmitAdcSbb64(const ZydisDecodedInstruction& insn,
+                  const ZydisDecodedOperand* ops,
+                  Xbyak::CodeGenerator& c,
+                  AdcSbbKind kind) {
+    if (insn.operand_width != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (dst_idx < 0) return false;
+
+    // Load src into rcx.
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+        if (src_idx < 0) return false;
+        c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        // Sign-extended from imm32 / imm8 — Zydis exposes the
+        // sign-extended s64 in imm.value.s.
+        c.mov(rcx, ops[1].imm.value.s);
+    } else {
+        return false;
+    }
+
+    // Load dst into rax.
+    c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+
+    // Round-trip flags so host CF is the same as guest CF.
+    c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.push(r8);
+    c.popfq();
+
+    switch (kind) {
+        case AdcSbbKind::Adc: c.adc(rax, rcx); break;
+        case AdcSbbKind::Sbb: c.sbb(rax, rcx); break;
+    }
+
+    c.pushfq();
+    c.pop(r8);
+    c.mov(qword[r13 + Offsets::Rflags], r8);
+
+    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    return true;
+}
+
+// =============================================================================
+// Narrow-width (8-bit and 16-bit) ADD / SUB / CMP.
+//
+// Existing 64- and 32-bit handlers compute flags via the
+// EmitFlagsFromAdd/Subtract helpers, which work in 64-bit terms.
+// For narrow widths the flag-set rules differ:
+//
+//   - CF: carry out of bit 7 (8-bit) or bit 15 (16-bit), not bit 63.
+//   - SF: bit 7 / bit 15 of the result, not bit 63.
+//   - OF: signed-overflow detected at the narrow boundary.
+//
+// Recomputing all of these manually would mean three new flag
+// helpers per width. Cleaner: use the host CPU's own narrow-width
+// arithmetic instruction and round-trip flags. The host implements
+// the exact same flag rules the guest expects.
+//
+// CMP is structurally a SUB that throws away the result but keeps
+// the flags — handled by passing a "discard result" flag through
+// the same emit function.
+// =============================================================================
+
+enum class NarrowArithKind { Add, Sub, Cmp };
+
+bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
+                      const ZydisDecodedOperand* ops,
+                      Xbyak::CodeGenerator& c,
+                      NarrowArithKind kind) {
+    if (insn.operand_width != 8) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (dst_idx < 0) return false;
+
+    // Load dst byte into al.
+    c.mov(al, byte[r13 + GprOffset(dst_idx)]);
+
+    // Load src byte into cl.
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+        if (src_idx < 0) return false;
+        c.mov(cl, byte[r13 + GprOffset(src_idx)]);
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
+    } else {
+        return false;
+    }
+
+    // Round-trip flags (so host computes narrow-width flags).
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.push(rdx);
+    c.popfq();
+
+    switch (kind) {
+        case NarrowArithKind::Add: c.add(al, cl); break;
+        case NarrowArithKind::Sub: c.sub(al, cl); break;
+        case NarrowArithKind::Cmp: c.cmp(al, cl); break;  // sets flags, no write
+    }
+
+    c.pushfq();
+    c.pop(rdx);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+    // CMP discards the result — only ADD/SUB write back. Narrow
+    // store preserves upper 56 bits per x86-64 semantics.
+    if (kind != NarrowArithKind::Cmp) {
+        c.mov(byte[r13 + GprOffset(dst_idx)], al);
+    }
+    return true;
+}
+
+bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
+                       const ZydisDecodedOperand* ops,
+                       Xbyak::CodeGenerator& c,
+                       NarrowArithKind kind) {
+    if (insn.operand_width != 16) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (dst_idx < 0) return false;
+
+    c.mov(ax, word[r13 + GprOffset(dst_idx)]);
+
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+        if (src_idx < 0) return false;
+        c.mov(cx, word[r13 + GprOffset(src_idx)]);
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(cx, static_cast<u16>(ops[1].imm.value.u & 0xFFFF));
+    } else {
+        return false;
+    }
+
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.push(rdx);
+    c.popfq();
+
+    switch (kind) {
+        case NarrowArithKind::Add: c.add(ax, cx); break;
+        case NarrowArithKind::Sub: c.sub(ax, cx); break;
+        case NarrowArithKind::Cmp: c.cmp(ax, cx); break;
+    }
+
+    c.pushfq();
+    c.pop(rdx);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+    if (kind != NarrowArithKind::Cmp) {
+        c.mov(word[r13 + GprOffset(dst_idx)], ax);
+    }
+    return true;
+}
+
+// =============================================================================
 // MOV — 8-bit and 16-bit forms.
 //
 // Mirror of the 64-bit MOV but with narrowed loads/stores. Key
@@ -2211,9 +2411,43 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 break;
             case ZYDIS_MNEMONIC_LEA:    handled = EmitLea(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_MOVSXD: handled = EmitMovsxd(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_ADD:  handled = EmitAdd(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_SUB:  handled = EmitSub(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_CMP:  handled = EmitCmp(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_ADD:
+                // 64- and 32-bit go through the existing path (eager
+                // flag computation); 8- and 16-bit use the round-trip
+                // technique via EmitNarrowArith.
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Add);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Add);
+                } else {
+                    handled = EmitAdd(insn, ops, c);
+                }
+                break;
+            case ZYDIS_MNEMONIC_SUB:
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Sub);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Sub);
+                } else {
+                    handled = EmitSub(insn, ops, c);
+                }
+                break;
+            case ZYDIS_MNEMONIC_CMP:
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Cmp);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Cmp);
+                } else {
+                    handled = EmitCmp(insn, ops, next_rip, c);
+                }
+                break;
+
+            // Add/sub with carry input — multi-precision arithmetic.
+            case ZYDIS_MNEMONIC_ADC: handled = EmitAdcSbb64(insn, ops, c, AdcSbbKind::Adc); break;
+            case ZYDIS_MNEMONIC_SBB: handled = EmitAdcSbb64(insn, ops, c, AdcSbbKind::Sbb); break;
+
+            // Function epilogue shorthand: mov rsp, rbp; pop rbp.
+            case ZYDIS_MNEMONIC_LEAVE: handled = EmitLeave(c); break;
             case ZYDIS_MNEMONIC_TEST: handled = EmitTest(insn, ops, c); break;
             case ZYDIS_MNEMONIC_XOR:  handled = EmitXor(insn, ops, c); break;
             case ZYDIS_MNEMONIC_AND:  handled = EmitAnd(insn, ops, c); break;

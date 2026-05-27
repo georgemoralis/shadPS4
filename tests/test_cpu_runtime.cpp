@@ -1964,5 +1964,185 @@ TEST_F(CpuRuntimeTest, Cmc_TogglesCarryFromZeroToOne) {
     EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);
 }
 
+// =============================================================================
+// Tier-4 opcode batch: LEAVE, ADC/SBB, 8/16-bit ADD/SUB/CMP.
+// =============================================================================
+
+// LEAVE — function epilogue. Tests against a realistic frame
+// setup that compilers actually emit:
+//
+//   push rax     ; (stand-in for `push rbp` — we want a known
+//                ;  sentinel as the "saved rbp" so we can verify
+//                ;  that LEAVE restores it correctly)
+//   mov rbp, rsp ; frame pointer = stack pointer
+//   <body>
+//   leave        ; mov rsp, rbp; pop rbp  (pops what we pushed)
+//   ret          ; pops the host-return sentinel
+//
+// After this sequence: rbp should equal the value we originally
+// pushed, and RIP should be the host-return sentinel (proving
+// RSP was restored to the right level for RET to find the
+// sentinel on top).
+TEST_F(CpuRuntimeTest, Leave_TearsDownFrame) {
+    const u8 program[] = {
+        // mov rax, 0xAABBCCDDEEFF0011 — the "saved rbp" sentinel
+        0x48, 0xb8, 0x11, 0x00, 0xff, 0xee, 0xdd, 0xcc, 0xbb, 0xaa,
+        0x50,                    // push rax (save sentinel as saved rbp)
+        0x48, 0x89, 0xe5,        // mov rbp, rsp (set up frame pointer)
+        // ... no body needed ...
+        0xc9,                    // leave (mov rsp, rbp; pop rbp)
+        0xc3,                    // ret  (pops host sentinel)
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[5], 0xAABBCCDDEEFF0011ULL)
+        << "rbp should be restored to the value originally pushed";
+    EXPECT_EQ(r.state.rip, kReturnSentinel)
+        << "RET should find the sentinel — LEAVE restored RSP correctly";
+}
+
+// ADC chain — the canonical 128-bit add pattern.
+//
+//   { lo = 0xFFFFFFFFFFFFFFFF, hi = 0x0000000000000001 }
+// + { lo = 0x0000000000000001, hi = 0x0000000000000002 }
+// = { lo = 0x0000000000000000, hi = 0x0000000000000004 }   (with CF=1 chained)
+//
+// Layout: rax = low_a, rbx = high_a, rcx = low_b, rdx = high_b.
+// After `add rax, rcx` then `adc rbx, rdx`, expect rax=0, rbx=4.
+TEST_F(CpuRuntimeTest, Adc_128BitAddChain_CarriesCorrectly) {
+    const u8 program[] = {
+        // mov rax, 0xFFFFFFFFFFFFFFFF
+        0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        // mov rbx, 1
+        0x48, 0xc7, 0xc3, 0x01, 0x00, 0x00, 0x00,
+        // mov rcx, 1
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00,
+        // mov rdx, 2
+        0x48, 0xc7, 0xc2, 0x02, 0x00, 0x00, 0x00,
+        // add rax, rcx        (sets CF=1)
+        0x48, 0x01, 0xc8,
+        // adc rbx, rdx        (reads CF, adds it)
+        0x48, 0x11, 0xd3,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u)                   << "low half wraps to 0";
+    EXPECT_EQ(r.state.gpr[3], 4u)                   << "high half: 1 + 2 + CF(1) = 4";
+}
+
+// SBB chain — the inverse, multi-precision subtraction.
+//
+//   { lo = 0x0000000000000000, hi = 0x0000000000000004 }
+// - { lo = 0x0000000000000001, hi = 0x0000000000000002 }
+// = { lo = 0xFFFFFFFFFFFFFFFF, hi = 0x0000000000000001 }   (CF=1 borrowed)
+TEST_F(CpuRuntimeTest, Sbb_128BitSubChain_BorrowsCorrectly) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,   // mov rax, 0
+        0x48, 0xc7, 0xc3, 0x04, 0x00, 0x00, 0x00,   // mov rbx, 4
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00,   // mov rcx, 1
+        0x48, 0xc7, 0xc2, 0x02, 0x00, 0x00, 0x00,   // mov rdx, 2
+        0x48, 0x29, 0xc8,                            // sub rax, rcx  (sets CF=1)
+        0x48, 0x19, 0xd3,                            // sbb rbx, rdx  (reads CF)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFFFFULL) << "low half borrows to all-Fs";
+    EXPECT_EQ(r.state.gpr[3], 1u)                   << "high half: 4 - 2 - CF(1) = 1";
+}
+
+// ADC reads CF=0 case — verify chain starts clean from a 0-flag state.
+TEST_F(CpuRuntimeTest, Adc_WithCarryClear_BehavesLikeAdd) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,   // mov rax, 5
+        0x48, 0xc7, 0xc3, 0x03, 0x00, 0x00, 0x00,   // mov rbx, 3
+        0xf8,                                        // clc → CF=0
+        0x48, 0x11, 0xd8,                            // adc rax, rbx  (5 + 3 + 0 = 8)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 8u);
+}
+
+// 8-bit ADD — flags set per byte semantics. Adding 0xFF + 0x01 in
+// 8-bit overflows: result = 0x00, CF = 1, ZF = 1.
+TEST_F(CpuRuntimeTest, Add8_OverflowsByteAndSetsCarry) {
+    const u8 program[] = {
+        // mov al, 0xFF      (B0 FF — 2-byte immediate-to-low-byte form)
+        0xb0, 0xff,
+        // mov bl, 0x01
+        0xb3, 0x01,
+        // add al, bl        (00 d8)
+        0x00, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFu, 0u)           << "0xFF + 0x01 wraps to 0";
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL)      << "CF set by byte-overflow";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)    << "ZF set (result is 0)";
+}
+
+// 8-bit ADD — preserves upper 56 bits of dst's slot. Set rax to a
+// sentinel, then do an 8-bit add to al, and check the upper bits
+// of rax are intact.
+TEST_F(CpuRuntimeTest, Add8_PreservesUpperBits) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFE0010
+        0x48, 0xb8, 0x10, 0x00, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        // add al, 5
+        0x04, 0x05,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFE0015ULL);
+}
+
+// 8-bit CMP — sets flags but doesn't write back. CMP al, bl with
+// al=5, bl=5 should set ZF.
+TEST_F(CpuRuntimeTest, Cmp8_EqualValues_SetsZeroFlag) {
+    const u8 program[] = {
+        // mov al, 5; mov bl, 5
+        0xb0, 0x05,
+        0xb3, 0x05,
+        // cmp al, bl     (38 d8)
+        0x38, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFu, 5u)           << "CMP must not write al";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)    << "ZF set (al == bl)";
+}
+
+// 16-bit SUB — width-correct flag semantics. 0x8000 (highest s16
+// negative) - 1 = 0x7FFF, with OF set because we crossed the
+// signed boundary.
+TEST_F(CpuRuntimeTest, Sub16_SignedOverflow_SetsOverflowFlag) {
+    const u8 program[] = {
+        // mov ax, 0x8000     66 b8 00 80
+        0x66, 0xb8, 0x00, 0x80,
+        // mov bx, 1          66 bb 01 00
+        0x66, 0xbb, 0x01, 0x00,
+        // sub ax, bx         66 29 d8
+        0x66, 0x29, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFFFu, 0x7FFFu);
+    // OF is bit 11 of rflags.
+    EXPECT_EQ(r.state.rflags & 0x800ULL, 0x800ULL)
+        << "Crossing the s16 sign boundary sets OF";
+}
+
+// 16-bit ADD — preserves upper 48 bits.
+TEST_F(CpuRuntimeTest, Add16_PreservesUpper48Bits) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFE0100
+        0x48, 0xb8, 0x00, 0x01, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        // add ax, 5          66 83 c0 05
+        0x66, 0x83, 0xc0, 0x05,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFE0105ULL);
+}
+
 } // namespace
 } // namespace Core::Runtime
