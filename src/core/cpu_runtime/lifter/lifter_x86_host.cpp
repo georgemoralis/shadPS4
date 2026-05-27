@@ -1018,41 +1018,99 @@ bool EmitOr(const ZydisDecodedInstruction& insn,
 // NOT, NEG — unary ops.
 // =============================================================================
 
-/// NOT r64 — bitwise complement. Per x86 spec, NOT does not affect
-/// any flags.
+/// NOT r/m — bitwise complement. Per x86 spec, NOT does NOT affect
+/// any flags at any width. So we skip the round-trip-flags pattern
+/// the binary narrow-arith ops use.
 bool EmitNot(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0) return false;
 
-    c.mov(rax, qword[r13 + GprOffset(idx)]);
-    c.not_(rax);
-    c.mov(qword[r13 + GprOffset(idx)], rax);
-    return true;
+    switch (insn.operand_width) {
+        case 64:
+            c.mov(rax, qword[r13 + GprOffset(idx)]);
+            c.not_(rax);
+            c.mov(qword[r13 + GprOffset(idx)], rax);
+            return true;
+        case 32:
+            // 32-bit writes zero-extend. mov-eax then writeback covers
+            // both halves of the 64-bit slot atomically.
+            c.mov(eax, dword[r13 + GprOffset(idx)]);
+            c.not_(eax);
+            c.mov(qword[r13 + GprOffset(idx)], rax);
+            return true;
+        case 16:
+            // 16-bit writes preserve upper 48 bits — use word memory operand.
+            c.mov(ax, word[r13 + GprOffset(idx)]);
+            c.not_(ax);
+            c.mov(word[r13 + GprOffset(idx)], ax);
+            return true;
+        case 8:
+            // 8-bit writes preserve upper 56 bits.
+            c.mov(al, byte[r13 + GprOffset(idx)]);
+            c.not_(al);
+            c.mov(byte[r13 + GprOffset(idx)], al);
+            return true;
+        default:
+            return false;
+    }
 }
 
-/// NEG r64 — two's complement negate; equivalent to `0 - src`.
+/// NEG r/m — two's complement negate; equivalent to `0 - src`.
 /// Flags follow SUB semantics: CF = (src != 0), ZF/SF/OF/PF computed
-/// normally against the result.
+/// from the result with width-specific semantics.
+///
+/// For 64-bit we use the lazy-flag helper (EmitFlagsFromSubtract).
+/// For 8/16-bit we round-trip flags through the host CPU so it
+/// computes correct narrow-width flag values — same pattern the
+/// narrow-arith ops (ADD/SUB/...) use.
 bool EmitNeg(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0) return false;
 
-    // Set up flag helper inputs: lhs=0 in rcx, rhs=src in rdx,
-    // result in rax.
-    c.xor_(rcx, rcx);
-    c.mov(rdx, qword[r13 + GprOffset(idx)]);
-    c.mov(rax, rcx);
-    c.sub(rax, rdx);
-    c.mov(qword[r13 + GprOffset(idx)], rax);
-    EmitFlagsFromSubtract(c);
+    if (insn.operand_width == 64) {
+        // Set up flag helper inputs: lhs=0 in rcx, rhs=src in rdx,
+        // result in rax.
+        c.xor_(rcx, rcx);
+        c.mov(rdx, qword[r13 + GprOffset(idx)]);
+        c.mov(rax, rcx);
+        c.sub(rax, rdx);
+        c.mov(qword[r13 + GprOffset(idx)], rax);
+        EmitFlagsFromSubtract(c);
+        return true;
+    }
+
+    // Narrow widths (8/16): round-trip flags through host so host
+    // CPU computes narrow-width flag bits (CF, ZF, SF, PF) correctly.
+    // 32-bit takes a slightly different path because writes zero-
+    // extend; not yet implemented (compilers rarely emit `neg r32d`
+    // independent of a `neg r64`).
+    if (insn.operand_width != 8 && insn.operand_width != 16) {
+        return false;
+    }
+
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.push(rdx);
+    c.popfq();
+
+    if (insn.operand_width == 8) {
+        c.mov(al, byte[r13 + GprOffset(idx)]);
+        c.neg(al);
+        c.mov(byte[r13 + GprOffset(idx)], al);
+    } else { // 16
+        c.mov(ax, word[r13 + GprOffset(idx)]);
+        c.neg(ax);
+        c.mov(word[r13 + GprOffset(idx)], ax);
+    }
+
+    c.pushfq();
+    c.pop(rdx);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
     return true;
 }
 
@@ -1772,7 +1830,14 @@ bool EmitAdcSbb64(const ZydisDecodedInstruction& insn,
 // the same emit function.
 // =============================================================================
 
-enum class NarrowArithKind { Add, Sub, Cmp, Test };
+// Operation kind for `EmitNarrowArith8`/`EmitNarrowArith16`.
+//
+// The name "arith" is historical — these operations share the same
+// round-trip-through-host-flags pattern (so the host CPU computes
+// narrow-width flags correctly), but they include both arithmetic
+// (ADD/SUB) and bitwise (AND/OR/XOR) operations. CMP and TEST are
+// the "discard result" variants of SUB and AND respectively.
+enum class NarrowArithKind { Add, Sub, Cmp, Test, And, Or, Xor };
 
 bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
                       const ZydisDecodedOperand* ops,
@@ -1807,14 +1872,17 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
         case NarrowArithKind::Sub: c.sub(al, cl); break;
         case NarrowArithKind::Cmp: c.cmp(al, cl); break;  // sets flags, no write
         case NarrowArithKind::Test: c.test(al, cl); break; // (al & cl), flags only
+        case NarrowArithKind::And: c.and_(al, cl); break;
+        case NarrowArithKind::Or:  c.or_(al, cl); break;
+        case NarrowArithKind::Xor: c.xor_(al, cl); break;
     }
 
     c.pushfq();
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    // CMP and TEST discard the result — only ADD/SUB write back. Narrow
-    // store preserves upper 56 bits per x86-64 semantics.
+    // CMP and TEST discard the result — only the others write back.
+    // Narrow store preserves upper 56 bits per x86-64 semantics.
     if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
         c.mov(byte[r13 + GprOffset(dst_idx)], al);
     }
@@ -1851,6 +1919,9 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
         case NarrowArithKind::Sub: c.sub(ax, cx); break;
         case NarrowArithKind::Cmp: c.cmp(ax, cx); break;
         case NarrowArithKind::Test: c.test(ax, cx); break;
+        case NarrowArithKind::And: c.and_(ax, cx); break;
+        case NarrowArithKind::Or:  c.or_(ax, cx); break;
+        case NarrowArithKind::Xor: c.xor_(ax, cx); break;
     }
 
     c.pushfq();
@@ -2548,9 +2619,33 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitTest(insn, ops, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_XOR:  handled = EmitXor(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_AND:  handled = EmitAnd(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_OR:   handled = EmitOr(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_XOR:
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Xor);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Xor);
+                } else {
+                    handled = EmitXor(insn, ops, c);
+                }
+                break;
+            case ZYDIS_MNEMONIC_AND:
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::And);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::And);
+                } else {
+                    handled = EmitAnd(insn, ops, c);
+                }
+                break;
+            case ZYDIS_MNEMONIC_OR:
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Or);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Or);
+                } else {
+                    handled = EmitOr(insn, ops, c);
+                }
+                break;
             case ZYDIS_MNEMONIC_NOT:  handled = EmitNot(insn, ops, c); break;
             case ZYDIS_MNEMONIC_NEG:  handled = EmitNeg(insn, ops, c); break;
             case ZYDIS_MNEMONIC_INC:  handled = EmitInc(insn, ops, c); break;

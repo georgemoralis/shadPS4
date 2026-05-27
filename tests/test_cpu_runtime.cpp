@@ -2245,6 +2245,181 @@ TEST_F(CpuRuntimeTest, Test16_SetsZeroFlagOnDisjointBits) {
 }
 
 // =============================================================================
+// Tier-5: 8/16-bit AND, OR, XOR, NOT, NEG.
+//
+// Verifies the narrow-width bitwise ops use the round-trip-flags
+// pattern correctly and that narrow stores preserve the upper bits
+// of the underlying 64-bit GPR slot.
+// =============================================================================
+
+// 8-bit AND. Pre-loads rax with a value whose upper 56 bits are
+// non-zero; the AND should affect only the low byte and leave the
+// upper bits intact.
+TEST_F(CpuRuntimeTest, And8_PreservesUpperBitsAndComputesIntersection) {
+    const u8 program[] = {
+        // mov rax, 0x11223344'556677F0
+        0x48, 0xb8, 0xf0, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        // mov bl, 0x0F
+        0xb3, 0x0f,
+        // and al, bl                  (20 d8)
+        0x20, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Low byte: 0xF0 & 0x0F = 0x00. Upper 56 bits unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0x1122334455667700ULL)
+        << "AL written, upper 56 bits of RAX must be preserved";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)
+        << "zero result → ZF set";
+}
+
+// 8-bit OR. Similar to AND but combining bits.
+TEST_F(CpuRuntimeTest, Or8_PreservesUpperBitsAndComputesUnion) {
+    const u8 program[] = {
+        // mov rax, 0xAAAAAAAA'AAAAAAF0
+        0x48, 0xb8, 0xf0, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        // mov bl, 0x0F
+        0xb3, 0x0f,
+        // or al, bl                   (08 d8)
+        0x08, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xAAAAAAAAAAAAAAFFULL)
+        << "Low byte = 0xF0 | 0x0F = 0xFF; upper 56 unchanged";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x00ULL)
+        << "non-zero result → ZF clear";
+}
+
+// 8-bit XOR. Useful idiom: `xor al, al` to zero the low byte
+// without touching upper bits (rare but compilers sometimes emit it).
+TEST_F(CpuRuntimeTest, Xor8_PreservesUpperBitsAndZerosLowByte) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEF'CAFEBABE
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        // xor al, al                  (30 c0)
+        0x30, 0xc0,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEBA00ULL)
+        << "AL cleared, upper 56 bits of RAX preserved";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)
+        << "ZF set when result is zero";
+}
+
+// 8-bit AND with immediate. The reg,imm form is encoded differently
+// from reg,reg; both should land in the narrow-arith path.
+TEST_F(CpuRuntimeTest, And8_RegImm_PreservesUpperBits) {
+    const u8 program[] = {
+        // mov rax, 0x12345678'9ABCDEFF
+        0x48, 0xb8, 0xff, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+        // and al, 0x0F                (24 0F)
+        0x24, 0x0f,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x123456789ABCDE0FULL)
+        << "AL = 0xFF & 0x0F = 0x0F; upper 56 bits preserved";
+}
+
+// 16-bit AND. Same pattern with word writes.
+TEST_F(CpuRuntimeTest, And16_PreservesUpper48BitsAndComputesIntersection) {
+    const u8 program[] = {
+        // mov rax, 0xCAFEBABE'12345678
+        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xbe, 0xba, 0xfe, 0xca,
+        // mov bx, 0xFF00
+        0x66, 0xbb, 0x00, 0xff,
+        // and ax, bx                  (66 21 d8)
+        0x66, 0x21, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Low word: 0x5678 & 0xFF00 = 0x5600. Upper 48 unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0xCAFEBABE12345600ULL)
+        << "AX written via word store, upper 48 bits of RAX preserved";
+}
+
+// 16-bit XOR.
+TEST_F(CpuRuntimeTest, Xor16_PreservesUpper48BitsAndXorsLowWord) {
+    const u8 program[] = {
+        // mov rax, 0x11223344'55667788
+        0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
+        // mov bx, 0xFFFF
+        0x66, 0xbb, 0xff, 0xff,
+        // xor ax, bx                  (66 31 d8)
+        0x66, 0x31, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Low word: 0x7788 XOR 0xFFFF = 0x8877. Upper 48 unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0x1122334455668877ULL);
+}
+
+// 8-bit NOT.
+TEST_F(CpuRuntimeTest, Not8_PreservesUpperBits) {
+    const u8 program[] = {
+        // mov rax, 0xFEDCBA98'765432FF
+        0x48, 0xb8, 0xff, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe,
+        // not al                      (f6 d0)
+        0xf6, 0xd0,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AL = ~0xFF = 0x00. Upper 56 unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0xFEDCBA9876543200ULL);
+}
+
+// 16-bit NOT.
+TEST_F(CpuRuntimeTest, Not16_PreservesUpper48Bits) {
+    const u8 program[] = {
+        // mov rax, 0xFEDCBA98'00000000
+        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x98, 0xba, 0xdc, 0xfe,
+        // not ax                      (66 f7 d0)
+        0x66, 0xf7, 0xd0,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AX = ~0x0000 = 0xFFFF. Upper 48 unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0xFEDCBA980000FFFFULL);
+}
+
+// 8-bit NEG. Result is two's complement; flags follow SUB semantics.
+TEST_F(CpuRuntimeTest, Neg8_NegatesByteAndPreservesUpper) {
+    const u8 program[] = {
+        // mov rax, 0x12345678'9ABCDE05
+        0x48, 0xb8, 0x05, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+        // neg al                      (f6 d8)
+        0xf6, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AL = -5 = 0xFB. Upper 56 unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0x123456789ABCDEFBULL);
+    // For non-zero input, CF is set (NEG of non-zero borrows from
+    // imaginary higher bit).
+    EXPECT_EQ(r.state.rflags & 0x01ULL, 0x01ULL)
+        << "NEG of non-zero must set CF";
+}
+
+// 8-bit NEG of zero — CF should be CLEAR (special case).
+TEST_F(CpuRuntimeTest, Neg8_OfZero_ClearsCarry) {
+    const u8 program[] = {
+        // mov rax, 0x12345678'9ABCDE00
+        0x48, 0xb8, 0x00, 0xde, 0xbc, 0x9a, 0x78, 0x56, 0x34, 0x12,
+        // neg al
+        0xf6, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x123456789ABCDE00ULL);
+    EXPECT_EQ(r.state.rflags & 0x01ULL, 0x00ULL)
+        << "NEG of zero must clear CF (no borrow)";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)
+        << "result is zero → ZF set";
+}
+
+// =============================================================================
 // HLE bridge: XMM marshaling (float/double args + double return).
 // =============================================================================
 
