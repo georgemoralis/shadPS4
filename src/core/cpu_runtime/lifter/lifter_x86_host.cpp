@@ -1085,12 +1085,11 @@ bool EmitNeg(const ZydisDecodedInstruction& insn,
         return true;
     }
 
-    // Narrow widths (8/16): round-trip flags through host so host
-    // CPU computes narrow-width flag bits (CF, ZF, SF, PF) correctly.
-    // 32-bit takes a slightly different path because writes zero-
-    // extend; not yet implemented (compilers rarely emit `neg r32d`
-    // independent of a `neg r64`).
-    if (insn.operand_width != 8 && insn.operand_width != 16) {
+    // Narrow widths (8/16/32): round-trip flags through host so the
+    // host CPU computes width-correct flag bits (CF, ZF, SF, PF).
+    if (insn.operand_width != 8 &&
+        insn.operand_width != 16 &&
+        insn.operand_width != 32) {
         return false;
     }
 
@@ -1102,10 +1101,18 @@ bool EmitNeg(const ZydisDecodedInstruction& insn,
         c.mov(al, byte[r13 + GprOffset(idx)]);
         c.neg(al);
         c.mov(byte[r13 + GprOffset(idx)], al);
-    } else { // 16
+    } else if (insn.operand_width == 16) {
         c.mov(ax, word[r13 + GprOffset(idx)]);
         c.neg(ax);
         c.mov(word[r13 + GprOffset(idx)], ax);
+    } else { // 32
+        // 32-bit writes zero-extend the upper 32 bits of the
+        // underlying 64-bit slot. We load into eax (which clears
+        // upper 32 of rax automatically), negate, then qword-store
+        // so the zero extension reaches memory.
+        c.mov(eax, dword[r13 + GprOffset(idx)]);
+        c.neg(eax);
+        c.mov(qword[r13 + GprOffset(idx)], rax);
     }
 
     c.pushfq();
@@ -1841,6 +1848,7 @@ enum class NarrowArithKind { Add, Sub, Cmp, Test, And, Or, Xor };
 
 bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
                       const ZydisDecodedOperand* ops,
+                      u64 next_rip,
                       Xbyak::CodeGenerator& c,
                       NarrowArithKind kind) {
     if (insn.operand_width != 8) return false;
@@ -1851,13 +1859,25 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
     // Load dst byte into al.
     c.mov(al, byte[r13 + GprOffset(dst_idx)]);
 
-    // Load src byte into cl.
+    // Load src byte into cl. Three source forms:
+    //   - reg: read from the guest GPR slot.
+    //   - imm: literal byte.
+    //   - mem: compute guest effective address into rdx, deref to cl.
+    //
+    // For mem source, EmitEffectiveAddress trashes rdx (and uses
+    // rax/rcx as transients); we use rdx and cl AFTER, which is
+    // safe — al is already loaded and cl is what we're populating.
+    // The subsequent flag round-trip reuses rdx, also safe because
+    // we no longer need the address by then.
     if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_idx = ZydisGprToIndex(ops[1].reg.value);
         if (src_idx < 0) return false;
         c.mov(cl, byte[r13 + GprOffset(src_idx)]);
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
         c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.mov(cl, byte[rdx]);
     } else {
         return false;
     }
@@ -1891,6 +1911,7 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
 
 bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
                        const ZydisDecodedOperand* ops,
+                       u64 next_rip,
                        Xbyak::CodeGenerator& c,
                        NarrowArithKind kind) {
     if (insn.operand_width != 16) return false;
@@ -1906,6 +1927,9 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
         c.mov(cx, word[r13 + GprOffset(src_idx)]);
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
         c.mov(cx, static_cast<u16>(ops[1].imm.value.u & 0xFFFF));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.mov(cx, word[rdx]);
     } else {
         return false;
     }
@@ -2578,27 +2602,27 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 // flag computation); 8- and 16-bit use the round-trip
                 // technique via EmitNarrowArith.
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Add);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Add);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Add);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Add);
                 } else {
                     handled = EmitAdd(insn, ops, c);
                 }
                 break;
             case ZYDIS_MNEMONIC_SUB:
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Sub);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Sub);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Sub);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Sub);
                 } else {
                     handled = EmitSub(insn, ops, c);
                 }
                 break;
             case ZYDIS_MNEMONIC_CMP:
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Cmp);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Cmp);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Cmp);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Cmp);
                 } else {
                     handled = EmitCmp(insn, ops, next_rip, c);
                 }
@@ -2612,36 +2636,36 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_LEAVE: handled = EmitLeave(c); break;
             case ZYDIS_MNEMONIC_TEST:
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Test);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Test);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Test);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Test);
                 } else {
                     handled = EmitTest(insn, ops, c);
                 }
                 break;
             case ZYDIS_MNEMONIC_XOR:
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Xor);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Xor);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Xor);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Xor);
                 } else {
                     handled = EmitXor(insn, ops, c);
                 }
                 break;
             case ZYDIS_MNEMONIC_AND:
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::And);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::And);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::And);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::And);
                 } else {
                     handled = EmitAnd(insn, ops, c);
                 }
                 break;
             case ZYDIS_MNEMONIC_OR:
                 if (insn.operand_width == 8) {
-                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Or);
+                    handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Or);
                 } else if (insn.operand_width == 16) {
-                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Or);
+                    handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Or);
                 } else {
                     handled = EmitOr(insn, ops, c);
                 }

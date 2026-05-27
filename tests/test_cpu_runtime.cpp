@@ -2419,6 +2419,104 @@ TEST_F(CpuRuntimeTest, Neg8_OfZero_ClearsCarry) {
         << "result is zero → ZF set";
 }
 
+// 32-bit NEG. Writes zero-extend the upper 32 bits; flags are
+// computed for the 32-bit value (SF on bit 31, not bit 63).
+TEST_F(CpuRuntimeTest, Neg32_ZeroExtendsAndComputesFlags) {
+    const u8 program[] = {
+        // mov rax, 0x12345678'00000005 (upper bits must be cleared)
+        0x48, 0xb8, 0x05, 0x00, 0x00, 0x00, 0x78, 0x56, 0x34, 0x12,
+        // neg eax                       (f7 d8)
+        0xf7, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // EAX = -5 (mod 2^32) = 0xFFFFFFFB; upper 32 zero-extended.
+    EXPECT_EQ(r.state.gpr[0], 0x00000000FFFFFFFBULL)
+        << "32-bit write zero-extends upper 32 bits";
+    EXPECT_EQ(r.state.rflags & 0x01ULL, 0x01ULL) << "non-zero input → CF set";
+    EXPECT_EQ(r.state.rflags & 0x80ULL, 0x80ULL) << "bit 31 set → SF set";
+}
+
+TEST_F(CpuRuntimeTest, Neg32_OfZero_ClearsCarryAndZeroExtends) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEF'00000000 (upper bits will be lost)
+        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde,
+        // neg eax
+        0xf7, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // EAX = -0 = 0; zero-extended kills the upper 32 bits too.
+    EXPECT_EQ(r.state.gpr[0], 0x0000000000000000ULL)
+        << "NEG eax of zero: upper 32 of RAX zero-extended away";
+    EXPECT_EQ(r.state.rflags & 0x01ULL, 0x00ULL) << "input zero → CF clear";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL) << "result zero → ZF set";
+}
+
+// 8-bit AND with memory source. Tests that the narrow-arith path
+// correctly handles the [base+disp] addressing mode.
+//
+// Setup: stack holds a byte 0xF0. Guest does:
+//   mov al, 0xFF
+//   and al, byte ptr [rsp+0]
+// Expected: AL = 0xFF & 0xF0 = 0xF0.
+TEST_F(CpuRuntimeTest, And8_RegMem_LoadsViaEffectiveAddress) {
+    u8 program[] = {
+        // Push a value onto guest stack so [rsp] holds known bytes.
+        // mov rax, 0x00000000'000000F0
+        0x48, 0xb8, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x50,                              // push rax
+        // mov rax, 0x000000FF (low byte is target)
+        0x48, 0xb8, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // and al, byte ptr [rsp]         (22 04 24)
+        0x22, 0x04, 0x24,
+        0x48, 0x83, 0xc4, 0x08,            // add rsp, 8 (cleanup)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 0xF0ULL)
+        << "AL should be 0xFF AND 0xF0 = 0xF0 (loaded from [rsp])";
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x00ULL) << "non-zero result → ZF clear";
+}
+
+// 8-bit OR with memory source.
+TEST_F(CpuRuntimeTest, Or8_RegMem_LoadsViaEffectiveAddress) {
+    u8 program[] = {
+        // mov rax, 0x05  (push as byte source)
+        0x48, 0xb8, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x50,                              // push rax
+        // mov rax, 0x80  (target with bit 7 set)
+        0x48, 0xb8, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // or al, byte ptr [rsp]          (0a 04 24)
+        0x0a, 0x04, 0x24,
+        0x48, 0x83, 0xc4, 0x08,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 0x85ULL)
+        << "AL = 0x80 | 0x05 = 0x85";
+}
+
+// 16-bit AND with memory source. Verifies word loads via the
+// effective-address helper.
+TEST_F(CpuRuntimeTest, And16_RegMem_LoadsViaEffectiveAddress) {
+    u8 program[] = {
+        // Push 0x0F0F (low word) — the high bytes are irrelevant since
+        // we'll read only word ptr [rsp].
+        0x48, 0xb8, 0x0f, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x50,
+        // mov rax, 0xFFFF (target word)
+        0x48, 0xb8, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // and ax, word ptr [rsp]         (66 23 04 24)
+        0x66, 0x23, 0x04, 0x24,
+        0x48, 0x83, 0xc4, 0x08,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFFFULL, 0x0F0FULL)
+        << "AX = 0xFFFF AND 0x0F0F = 0x0F0F";
+}
+
 // =============================================================================
 // HLE bridge: XMM marshaling (float/double args + double return).
 // =============================================================================
