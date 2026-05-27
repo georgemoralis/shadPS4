@@ -61,10 +61,35 @@ constexpr u64 kReturnSentinel = kHostReturnAddress;
 /// guest. Uses the host OS directly rather than the upstream
 /// AddressSpace because the tests are about the JIT itself, not
 /// about the memory subsystem.
+///
+/// Layout (low → high):
+///   base_                           ─ code + working stack
+///   base_ + TOTAL_SIZE - HEADROOM   ─ StackTop()
+///   base_ + TOTAL_SIZE              ─ end of allocation
+///
+/// `HEADROOM` is a band of committed bytes ABOVE the reported stack
+/// top. It exists for the HLE bridge: when guest code performs a
+/// CALL into a host function, the dispatcher's bridge speculatively
+/// reads 8 u64 stack-arg slots at `[guest_rsp+8 .. guest_rsp+64]`
+/// — see the bridge documentation in src/core/cpu_runtime/runtime.cpp.
+/// Real game stacks are megabytes deep and the overscan is invisible
+/// there, but our tests' tightly-bounded 2-page allocation has no
+/// such cushion. Without HEADROOM, every HleBridge_* test would fault
+/// on Windows where VirtualAlloc is strict (Linux's mmap arena
+/// sometimes leaves neighboring pages mapped, masking the bug, but
+/// the read is still UB). The headroom is zero-initialized by the OS
+/// allocator on both platforms, so tests inspecting the overscan see
+/// deterministic 0s rather than uninitialized garbage.
 class GuestMemory {
 public:
     static constexpr u64 PAGE_SIZE = 4096;
     static constexpr u64 TOTAL_SIZE = PAGE_SIZE * 2;
+    /// Bytes reserved above StackTop() for the HLE bridge's speculative
+    /// 8-u64-slot read past the guest return-address slot. 64 bytes
+    /// is the strict minimum (8 * sizeof(u64)); 128 leaves slack for
+    /// future bridge expansion (more stack args) without revisiting
+    /// every test's stack arithmetic.
+    static constexpr u64 BRIDGE_HEADROOM = 128;
 
     GuestMemory() {
 #ifdef _WIN32
@@ -91,7 +116,13 @@ public:
     GuestMemory& operator=(const GuestMemory&) = delete;
 
     [[nodiscard]] u8* CodePtr() const { return base_; }
-    [[nodiscard]] u8* StackTop() const { return base_ + TOTAL_SIZE; }
+    /// Reports the boundary BELOW the bridge-overscan headroom — i.e.,
+    /// the highest guest-stack address that "stack" callers should
+    /// treat as theirs. The bytes from here to `base_ + TOTAL_SIZE`
+    /// belong to the bridge and must not carry test state.
+    [[nodiscard]] u8* StackTop() const {
+        return base_ + TOTAL_SIZE - BRIDGE_HEADROOM;
+    }
     [[nodiscard]] bool IsValid() const { return base_ != nullptr; }
 
 private:
