@@ -1692,7 +1692,7 @@ bool EmitAdcSbb64(const ZydisDecodedInstruction& insn,
 // the same emit function.
 // =============================================================================
 
-enum class NarrowArithKind { Add, Sub, Cmp };
+enum class NarrowArithKind { Add, Sub, Cmp, Test };
 
 bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
                       const ZydisDecodedOperand* ops,
@@ -1726,15 +1726,16 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
         case NarrowArithKind::Add: c.add(al, cl); break;
         case NarrowArithKind::Sub: c.sub(al, cl); break;
         case NarrowArithKind::Cmp: c.cmp(al, cl); break;  // sets flags, no write
+        case NarrowArithKind::Test: c.test(al, cl); break; // (al & cl), flags only
     }
 
     c.pushfq();
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    // CMP discards the result — only ADD/SUB write back. Narrow
+    // CMP and TEST discard the result — only ADD/SUB write back. Narrow
     // store preserves upper 56 bits per x86-64 semantics.
-    if (kind != NarrowArithKind::Cmp) {
+    if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
         c.mov(byte[r13 + GprOffset(dst_idx)], al);
     }
     return true;
@@ -1769,13 +1770,14 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
         case NarrowArithKind::Add: c.add(ax, cx); break;
         case NarrowArithKind::Sub: c.sub(ax, cx); break;
         case NarrowArithKind::Cmp: c.cmp(ax, cx); break;
+        case NarrowArithKind::Test: c.test(ax, cx); break;
     }
 
     c.pushfq();
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    if (kind != NarrowArithKind::Cmp) {
+    if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
         c.mov(word[r13 + GprOffset(dst_idx)], ax);
     }
     return true;
@@ -2302,8 +2304,17 @@ Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
 }
 
 Lifter::~Lifter() {
-    LOG_INFO(Core, "Lifter: {} blocks compiled, {} bytes emitted, {} unsupported",
-             blocks_compiled_, bytes_emitted_, unsupported_hits_);
+    // Use fprintf rather than LOG_INFO here: by the time the lifter
+    // destructor runs at program shutdown, shadPS4's logging
+    // subsystem has often been torn down, and LOG_INFO degrades to
+    // emitting the format string verbatim with the `{}` placeholders
+    // un-substituted. fprintf works at any teardown phase.
+    std::fprintf(stderr,
+                 "[lifter] %llu blocks compiled, %llu bytes emitted, %llu unsupported\n",
+                 (unsigned long long)blocks_compiled_,
+                 (unsigned long long)bytes_emitted_,
+                 (unsigned long long)unsupported_hits_);
+    std::fflush(stderr);
 }
 
 void* Lifter::CompileBlock(u64 guest_rip) {
@@ -2448,7 +2459,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
 
             // Function epilogue shorthand: mov rsp, rbp; pop rbp.
             case ZYDIS_MNEMONIC_LEAVE: handled = EmitLeave(c); break;
-            case ZYDIS_MNEMONIC_TEST: handled = EmitTest(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_TEST:
+                if (insn.operand_width == 8) {
+                    handled = EmitNarrowArith8(insn, ops, c, NarrowArithKind::Test);
+                } else if (insn.operand_width == 16) {
+                    handled = EmitNarrowArith16(insn, ops, c, NarrowArithKind::Test);
+                } else {
+                    handled = EmitTest(insn, ops, c);
+                }
+                break;
             case ZYDIS_MNEMONIC_XOR:  handled = EmitXor(insn, ops, c); break;
             case ZYDIS_MNEMONIC_AND:  handled = EmitAnd(insn, ops, c); break;
             case ZYDIS_MNEMONIC_OR:   handled = EmitOr(insn, ops, c); break;

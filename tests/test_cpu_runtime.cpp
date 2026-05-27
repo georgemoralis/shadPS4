@@ -2144,5 +2144,48 @@ TEST_F(CpuRuntimeTest, Add16_PreservesUpper48Bits) {
     EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFE0105ULL);
 }
 
+// 8-bit TEST — bit-wise AND, sets flags only, doesn't write.
+//
+// Real PS4 binary triggered this with `test r/m8, r/m8`. Set up
+// al = 0x10, bl = 0x01: test would AND them = 0, ZF=1.
+TEST_F(CpuRuntimeTest, Test8_NoOverlap_SetsZeroFlag) {
+    const u8 program[] = {
+        0xb0, 0x10,                                  // mov al, 0x10
+        0xb3, 0x01,                                  // mov bl, 0x01
+        0x84, 0xd8,                                  // test al, bl  (operand_width=8)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)    << "0x10 & 0x01 = 0 → ZF set";
+    EXPECT_EQ(r.state.gpr[0] & 0xFFu, 0x10u)         << "TEST must not write al";
+}
+
+// 8-bit TEST — overlapping bits clears ZF.
+TEST_F(CpuRuntimeTest, Test8_Overlap_ClearsZeroFlag) {
+    const u8 program[] = {
+        0xb0, 0x11,                                  // mov al, 0x11 (low bit + bit 4)
+        0xb3, 0x01,                                  // mov bl, 0x01 (low bit)
+        0x84, 0xd8,                                  // test al, bl  → result 0x01, ZF=0
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0u)         << "0x11 & 0x01 = 0x01 → ZF clear";
+}
+
+// 16-bit TEST.
+TEST_F(CpuRuntimeTest, Test16_SetsZeroFlagOnDisjointBits) {
+    const u8 program[] = {
+        // mov ax, 0x00F0
+        0x66, 0xb8, 0xf0, 0x00,
+        // mov bx, 0x0F00
+        0x66, 0xbb, 0x00, 0x0f,
+        // test ax, bx        (66 85 d8)
+        0x66, 0x85, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)    << "no overlapping bits → ZF set";
+}
+
 } // namespace
 } // namespace Core::Runtime

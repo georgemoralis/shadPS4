@@ -3,6 +3,7 @@
 
 #include "core/cpu_runtime/runtime.h"
 
+#include <cstdio>
 #include <cstdlib>
 
 #include "common/assert.h"
@@ -119,6 +120,35 @@ void* DispatcherTrampoline(GuestState* state) {
         //      sentinel (we exit).
         if (!rt->IsGuestPointer(reinterpret_cast<const void*>(state->rip))) {
             const VAddr host_fn = state->rip;
+
+            // Read the guest return address now (before the call)
+            // so we can log it. If the host fn crashes, this log
+            // line will be the last thing emitted — telling us
+            // *which* host fn crashed and *which* guest block
+            // called it.
+            //
+            // We use fprintf+fflush rather than LOG_* because the
+            // dispatcher is reached from a JIT-emitted gateway
+            // frame that doesn't have Windows unwind info
+            // registered; spdlog/fmt internal SEH walks would
+            // fault. The same workaround is used in CompileBlock.
+            const u64 guest_rsp = state->gpr[4];
+            const u64 guest_return_addr =
+                *reinterpret_cast<const u64*>(guest_rsp);
+            std::fprintf(stderr,
+                "[bridge] call host=0x%llx ret=0x%llx | "
+                "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
+                "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
+                (unsigned long long)host_fn,
+                (unsigned long long)guest_return_addr,
+                (unsigned long long)state->gpr[7],
+                (unsigned long long)state->gpr[6],
+                (unsigned long long)state->gpr[2],
+                (unsigned long long)state->gpr[1],
+                (unsigned long long)state->gpr[8],
+                (unsigned long long)state->gpr[9]);
+            std::fflush(stderr);
+
             const u64 ret = CallHostFromGuest(
                 host_fn,
                 state->gpr[7],   // RDI
@@ -129,10 +159,15 @@ void* DispatcherTrampoline(GuestState* state) {
                 state->gpr[9]);  // R9
             state->gpr[0] = ret; // RAX
 
+            std::fprintf(stderr,
+                "[bridge] ret  host=0x%llx -> rax=0x%llx\n",
+                (unsigned long long)host_fn,
+                (unsigned long long)ret);
+            std::fflush(stderr);
+
             // Pop guest return address.
-            const u64 rsp = state->gpr[4];
-            state->rip = *reinterpret_cast<const u64*>(rsp);
-            state->gpr[4] = rsp + 8;
+            state->rip = guest_return_addr;
+            state->gpr[4] = guest_rsp + 8;
             continue;
         }
 
