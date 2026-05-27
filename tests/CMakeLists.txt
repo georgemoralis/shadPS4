@@ -298,6 +298,7 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         # Under test
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/block_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/code_cache.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/hle_registry.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/runtime.cpp
 
         # Required by logger
