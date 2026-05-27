@@ -674,13 +674,40 @@ void EmitFlagsFromBitwise(Xbyak::CodeGenerator& c) {
     EmitWritePF(c);
 }
 
-/// ADD r64, r64 / ADD r64, imm32-sx.
+/// ADD r64, r64 / ADD r64, imm32-sx / ADD qword[mem], r64.
 /// Writes ZF/SF/CF/OF/PF to state.rflags (eager flag computation).
+/// `next_rip` is needed by the mem-dst form's address calculation
+/// (RIP-relative case); reg-dst forms ignore it.
 bool EmitAdd(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
+             u64 next_rip,
              Xbyak::CodeGenerator& c) {
     const auto& dst = ops[0];
     const auto& src = ops[1];
+
+    // 64-bit ADD with memory destination: `add qword[mem], r64`.
+    // Mirrors EmitOr's mem-dst pattern. We stash the computed address
+    // into r10 before reusing rdx as the rhs operand for the flag
+    // helper. EmitFlagsFromAdd clobbers r8/r9 only, so r10 survives
+    // until after the writeback (and beyond — we don't actually need
+    // r10 after the store).
+    if (insn.operand_width == 64 &&
+        dst.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(src.reg.value);
+        if (src_idx < 0) return false;
+        if (!EmitEffectiveAddress(dst.mem, next_rip, c)) return false;
+        // rdx = address; preserve it in r10 so the flag helper can
+        // use rdx for the rhs.
+        c.mov(r10, rdx);
+        c.mov(rcx, qword[r10]);                       // rcx = lhs (orig [mem])
+        c.mov(rdx, qword[r13 + GprOffset(src_idx)]);  // rdx = rhs
+        c.mov(rax, rcx);
+        c.add(rax, rdx);
+        c.mov(qword[r10], rax);                       // store result
+        EmitFlagsFromAdd(c);
+        return true;
+    }
 
     if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst_idx = ZydisGprToIndex(dst.reg.value);
@@ -1008,6 +1035,26 @@ bool EmitAnd(const ZydisDecodedInstruction& insn,
         return true;
     }
 
+    // 64-bit register destination with immediate source: `and r64, imm`.
+    // Zydis presents the (sign-extended) value as s64; the architecture
+    // only allows imm8 and imm32-sx forms, so the value always fits
+    // in a signed 32-bit window — but we materialize the full s64 into
+    // rdx anyway to match EmitAdd's 64-bit imm pattern and avoid xbyak
+    // encoding-size foot-guns.
+    if (insn.operand_width == 64 &&
+        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0) return false;
+        const auto imm = ops[1].imm.value.s;
+        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rdx, imm);
+        c.and_(rax, rdx);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
     if (insn.operand_width == 64) {
         return EmitBitwise64RegReg(ops[0], ops[1], c,
             [&](Xbyak::Reg64 a, Xbyak::Reg64 b) { c.and_(a, b); });
@@ -1240,25 +1287,53 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
     return true;
 }
 
-/// DEC r64 — subtract 1, preserve CF.
+/// DEC r/m — subtract 1, preserve CF. 64- and 32-bit register forms.
 bool EmitDec(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64) return false;
+    if (insn.operand_width != 64 && insn.operand_width != 32) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0) return false;
 
+    // Snapshot CF (bit 0 of rflags) into r10 so we can restore it
+    // after the SUB clobbers it. DEC must preserve CF.
     c.mov(r10, qword[r13 + Offsets::Rflags]);
     c.and_(r10, 0x1);
 
-    c.mov(rcx, qword[r13 + GprOffset(idx)]);
-    c.mov(rdx, 1);
-    c.mov(rax, rcx);
-    c.sub(rax, rdx);
-    c.mov(qword[r13 + GprOffset(idx)], rax);
-    EmitFlagsFromSubtract(c);
+    if (insn.operand_width == 64) {
+        c.mov(rcx, qword[r13 + GprOffset(idx)]);
+        c.mov(rdx, 1);
+        c.mov(rax, rcx);
+        c.sub(rax, rdx);
+        c.mov(qword[r13 + GprOffset(idx)], rax);
+        EmitFlagsFromSubtract(c);
+    } else {
+        // 32-bit: same round-trip-through-host-flags pattern used by
+        // the 32-bit INC path. The host's 32-bit SUB computes
+        // CF/OF/SF/ZF/PF/AF at 32-bit width; we capture all of them
+        // by snapshotting rflags before and after the host op. The
+        // 32-bit write into eax zero-extends rax, and we store the
+        // full qword so the guest slot inherits the zero-extension.
+        c.mov(eax, dword[r13 + GprOffset(idx)]);
+        c.mov(ecx, 1);
 
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        c.sub(eax, ecx);
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        c.mov(qword[r13 + GprOffset(idx)], rax);
+    }
+
+    // Restore CF: clear bit 0 of rflags, OR in the saved CF. Going
+    // through r11 sidesteps xbyak's sign-extension of imm32 in the
+    // mem-form AND (see the same trick in EmitInc).
     c.mov(r11, qword[r13 + Offsets::Rflags]);
     c.btr(r11, 0);
     c.or_(r11, r10);
@@ -3077,7 +3152,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 } else if (insn.operand_width == 16) {
                     handled = EmitNarrowArith16(insn, ops, next_rip, c, NarrowArithKind::Add);
                 } else {
-                    handled = EmitAdd(insn, ops, c);
+                    handled = EmitAdd(insn, ops, next_rip, c);
                 }
                 break;
             case ZYDIS_MNEMONIC_SUB:
