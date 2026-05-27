@@ -984,10 +984,30 @@ bool EmitBitwise32RegReg(const ZydisDecodedOperand& dst,
     return true;
 }
 
-/// AND — bitwise and. Supported: r64,r64 and r32,r32.
+/// AND — bitwise and. Supported: r64,r64; r32,r32; r32,imm.
 bool EmitAnd(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
+    // 32-bit register destination with immediate source: very common
+    // masking idiom (`and eax, 0xFF`, `and ecx, 0x3F`, etc.). Mirrors
+    // the 32-bit reg-reg path's flag-handling: EmitFlagsFromBitwise
+    // produces the same lazy flag computation, so behavior matches
+    // the existing 32-bit AND.
+    if (insn.operand_width == 32 &&
+        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0) return false;
+        // Zydis sign-extends imm8 forms into a u64 for us; truncate to
+        // u32 — the bit pattern is preserved for the masking case.
+        const u32 imm = static_cast<u32>(ops[1].imm.value.u & 0xFFFFFFFFu);
+        c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+        c.and_(eax, imm);                          // 32-bit op zero-extends rax
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
     if (insn.operand_width == 64) {
         return EmitBitwise64RegReg(ops[0], ops[1], c,
             [&](Xbyak::Reg64 a, Xbyak::Reg64 b) { c.and_(a, b); });
@@ -1247,8 +1267,50 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
 }
 
 // =============================================================================
-// MOVZX r{16,32,64}, r/m{8,16} — zero-extend a smaller value.
+// BT — bit test. Reads bit `src mod opsize` from `dst`, sets CF to
+// that bit, leaves other flags undefined per Intel SDM.
 // =============================================================================
+
+/// BT r/m, r — register-register form, 64-bit width.
+/// Only the dst,src reg-reg form is implemented for now; the imm
+/// form (`bt r64, imm8`) and the mem-dst form can be added when seen.
+///
+/// Implementation notes:
+/// - We never let the host's `bt` set guest CF directly because BT
+///   leaves OF/SF/ZF/AF/PF "undefined" — Intel allows arbitrary
+///   values. To stay deterministic we compute CF explicitly and
+///   leave the other guest flags unchanged.
+/// - The bit index is masked to (opsize - 1) by host BT already
+///   when src is a register operand, but Zydis-decoded BT may
+///   present a 64-bit register holding a value > 63. The host
+///   instruction also masks by opsize-1 in that case, so we mirror
+///   the architectural semantics for free.
+bool EmitBt(const ZydisDecodedInstruction& insn,
+            const ZydisDecodedOperand* ops,
+            Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+    if (dst_idx < 0 || src_idx < 0) return false;
+
+    // Load value and bit index.
+    c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+    c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
+    // Host BT with reg-src already masks by opsize-1 (i.e. cl & 63
+    // for 64-bit). No explicit `and rcx, 63` needed.
+    c.bt(rax, rcx);                                 // host CF := bit N of rax
+
+    // Capture host CF into r11, then merge into guest rflags.
+    c.setc(r11b);
+    c.movzx(r11, r11b);
+    c.mov(r10, qword[r13 + Offsets::Rflags]);
+    c.btr(r10, 0);                                  // clear guest CF
+    c.or_(r10, r11);                                // OR in new CF
+    c.mov(qword[r13 + Offsets::Rflags], r10);
+    return true;
+}
 
 /// MOVZX — read 8 or 16 bits from src (register or memory),
 /// zero-extend to the destination's width, write to dst.
@@ -1909,6 +1971,52 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
                       Xbyak::CodeGenerator& c,
                       NarrowArithKind kind) {
     if (insn.operand_width != 8) return false;
+
+    // ----- Memory destination/lhs — Cmp/Test only -----
+    //
+    // Common in compiled code as "test byte ptr [reg+disp], imm8"
+    // (boolean field check) and "cmp byte ptr [mem], imm8". Cmp/Test
+    // discard the result so there's no writeback, and rdx is free to
+    // repurpose for the flag round-trip after we no longer need the
+    // address.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
+            return false;
+        }
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        // rdx = effective address. Load 8-bit lhs into al.
+        c.mov(al, byte[rdx]);
+
+        // Load rhs into cl. Mem-mem doesn't exist for cmp/test.
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+            if (src_idx < 0) return false;
+            c.mov(cl, byte[r13 + GprOffset(src_idx)]);
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
+        } else {
+            return false;
+        }
+
+        // Flag round-trip through host CPU (so it computes correct
+        // 8-bit-width flags). rdx is free now — address is no longer
+        // needed for a writeback.
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        switch (kind) {
+            case NarrowArithKind::Cmp:  c.cmp(al, cl); break;
+            case NarrowArithKind::Test: c.test(al, cl); break;
+            default: return false;  // unreachable: filtered above
+        }
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        return true;
+    }
+
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
     if (dst_idx < 0) return false;
@@ -3041,6 +3149,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_NEG:  handled = EmitNeg(insn, ops, c); break;
             case ZYDIS_MNEMONIC_INC:  handled = EmitInc(insn, ops, c); break;
             case ZYDIS_MNEMONIC_DEC:  handled = EmitDec(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_BT:   handled = EmitBt(insn, ops, c); break;
             case ZYDIS_MNEMONIC_MOVZX: handled = EmitMovzx(insn, ops, next_rip, c); break;
 
             // Shifts. All three use the same emit with a kind tag.
