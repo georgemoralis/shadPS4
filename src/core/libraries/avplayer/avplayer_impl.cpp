@@ -7,50 +7,16 @@
 #include "core/tls.h"
 
 #ifdef SHADPS4_USES_RUNTIME
-#include <cstdlib>
 #include "core/cpu_runtime/runtime.h"
 #endif
 
 namespace Libraries::AvPlayer {
 
 #ifdef SHADPS4_USES_RUNTIME
-namespace {
-
-// Helper: invoke a guest callback. Dual-context pattern, same as
-// pthread-cleanup (see pthread_clean.cpp:posix_pthread_cleanup_pop):
-//   - If we're mid-JIT (e.g. AvPlayer wrapper called from an HLE shim
-//     that's running guest code through the JIT), reuse the caller's
-//     GuestState so the callback runs on the guest's stack.
-//   - If we're post-JIT (e.g. AvPlayer worker thread that started on
-//     a host start_routine), allocate a fresh stack via malloc.
-//
-// Returns the callback's RAX value (typically the return value).
-//
-// The wrappers in this file all dispatch to one of these helpers.
-u64 InvokeGuestCallback(u64 guest_fn, u64 a0 = 0, u64 a1 = 0,
-                        u64 a2 = 0, u64 a3 = 0) {
-    Core::Runtime::GuestState* caller_state =
-        Core::Runtime::Runtime::CurrentGuestState();
-    if (caller_state != nullptr) {
-        return Core::Runtime::Runtime::Instance().CallGuestSimpleOnCallerStack(
-            *caller_state, guest_fn, a0, a1, a2, a3);
-    }
-    // Post-JIT path: AvPlayer worker thread invoking a guest callback.
-    // Allocate a per-call stack; 256 KB matches the size used by other
-    // post-JIT callback sites (pthread cleanup, ThreadDtors).
-    constexpr u64 kCallbackStackSize = 256 * 1024;
-    void* guest_stack = std::malloc(kCallbackStackSize);
-    if (guest_stack == nullptr) {
-        return 0;  // Best-effort; AvPlayer code generally doesn't check.
-    }
-    void* guest_stack_top = static_cast<u8*>(guest_stack) + kCallbackStackSize;
-    const u64 result = Core::Runtime::Runtime::Instance().CallGuestSimple(
-        guest_fn, guest_stack_top, a0, a1, a2, a3);
-    std::free(guest_stack);
-    return result;
-}
-
-}  // namespace
+// The wrappers below dispatch guest-callback invocation through
+// Runtime::InvokeGuestCallback (which handles the dual-context
+// dispatch: mid-JIT uses caller's stack, post-JIT allocates fresh).
+// See core/cpu_runtime/runtime.h for the helper's contract.
 #endif  // SHADPS4_USES_RUNTIME
 
 void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
@@ -58,7 +24,7 @@ void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
     const auto allocate = self->m_init_data_original.memory_replacement.allocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    return reinterpret_cast<void*>(InvokeGuestCallback(
+    return reinterpret_cast<void*>(Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(allocate),
         reinterpret_cast<u64>(ptr),
         static_cast<u64>(alignment),
@@ -73,7 +39,7 @@ void PS4_SYSV_ABI AvPlayer::Deallocate(void* handle, void* memory) {
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    InvokeGuestCallback(
+    Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(deallocate),
         reinterpret_cast<u64>(ptr),
         reinterpret_cast<u64>(memory));
@@ -87,7 +53,7 @@ void* PS4_SYSV_ABI AvPlayer::AllocateTexture(void* handle, u32 alignment, u32 si
     const auto allocate = self->m_init_data_original.memory_replacement.allocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    return reinterpret_cast<void*>(InvokeGuestCallback(
+    return reinterpret_cast<void*>(Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(allocate),
         reinterpret_cast<u64>(ptr),
         static_cast<u64>(alignment),
@@ -102,7 +68,7 @@ void PS4_SYSV_ABI AvPlayer::DeallocateTexture(void* handle, void* memory) {
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    InvokeGuestCallback(
+    Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(deallocate),
         reinterpret_cast<u64>(ptr),
         reinterpret_cast<u64>(memory));
@@ -118,7 +84,7 @@ int PS4_SYSV_ABI AvPlayer::OpenFile(void* handle, const char* filename) {
     const auto open = self->m_init_data_original.file_replacement.open;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    return static_cast<int>(InvokeGuestCallback(
+    return static_cast<int>(Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(open),
         reinterpret_cast<u64>(ptr),
         reinterpret_cast<u64>(filename)));
@@ -134,7 +100,7 @@ int PS4_SYSV_ABI AvPlayer::CloseFile(void* handle) {
     const auto close = self->m_init_data_original.file_replacement.close;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    return static_cast<int>(InvokeGuestCallback(
+    return static_cast<int>(Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(close),
         reinterpret_cast<u64>(ptr)));
 #else
@@ -149,7 +115,7 @@ int PS4_SYSV_ABI AvPlayer::ReadOffsetFile(void* handle, u8* buffer, u64 position
     const auto read_offset = self->m_init_data_original.file_replacement.read_offset;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    return static_cast<int>(InvokeGuestCallback(
+    return static_cast<int>(Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(read_offset),
         reinterpret_cast<u64>(ptr),
         reinterpret_cast<u64>(buffer),
@@ -167,7 +133,7 @@ u64 PS4_SYSV_ABI AvPlayer::SizeFile(void* handle) {
     const auto size = self->m_init_data_original.file_replacement.size;
     const auto ptr = self->m_init_data_original.file_replacement.object_ptr;
 #ifdef SHADPS4_USES_RUNTIME
-    return InvokeGuestCallback(
+    return Core::Runtime::Runtime::Instance().InvokeGuestCallback(
         reinterpret_cast<u64>(size),
         reinterpret_cast<u64>(ptr));
 #else

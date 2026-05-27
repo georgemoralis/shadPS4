@@ -397,5 +397,43 @@ TEST_F(CpuRuntimeTest, IsGuestPointer_DistinguishesAddressRanges) {
         << "Addresses not in any loaded host module are assumed guest";
 }
 
+// InvokeGuestCallback dispatches to CallGuestSimple in the post-JIT
+// (no caller) path. The mid-JIT path is exercised implicitly through
+// the dual-context call sites; here we verify the post-JIT branch
+// works in isolation.
+//
+// Guest function: takes RDI as input, returns RDI+0x10 in RAX.
+//   mov rax, rdi    48 89 f8
+//   add rax, 0x10   48 83 c0 10
+//   ret             c3
+TEST_F(CpuRuntimeTest, InvokeGuestCallback_PostJitPathUsesFreshStack) {
+    const u8 program[] = {
+        0x48, 0x89, 0xf8,                          // mov rax, rdi
+        0x48, 0x83, 0xc0, 0x10,                    // add rax, 0x10
+        0xc3,                                       // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    // Note: we use the singleton runtime here, not a local Runtime,
+    // because InvokeGuestCallback is a method that internally calls
+    // CurrentGuestState() — which is a TLS read, not bound to any
+    // specific instance. This means previous tests in this suite
+    // may have populated the singleton's block cache, but since
+    // we're targeting a fresh program at a fresh address, that's
+    // fine.
+    Runtime& rt = Runtime::Instance();
+
+    // No caller GuestState is active — we're not inside Run() — so
+    // CurrentGuestState() returns nullptr and InvokeGuestCallback
+    // takes the malloc path.
+    EXPECT_EQ(Runtime::CurrentGuestState(), nullptr);
+
+    u64 result = rt.InvokeGuestCallback(
+        reinterpret_cast<VAddr>(mem.CodePtr()),
+        /*a0=*/0x40);
+
+    EXPECT_EQ(result, 0x50u);
+}
+
 } // namespace
 } // namespace Core::Runtime

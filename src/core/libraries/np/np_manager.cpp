@@ -16,6 +16,10 @@
 #include "core/libraries/np/np_manager.h"
 #include "core/tls.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 namespace Libraries::Np::NpManager {
 
 static bool g_shadnet_enabled = false;
@@ -876,9 +880,21 @@ static void DispatchPendingNpStateCallbacks() {
 
     for (auto& event : pending_events) {
         if (legacy_callback.func != nullptr) {
+#ifdef SHADPS4_USES_RUNTIME
+            // LegacyNpStateCallback signature:
+            //   void(user_id, state, np_id*, userdata)
+            // PS4_SYSV_ABI: RDI=user_id, RSI=state, RDX=np_id*, RCX=userdata
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(legacy_callback.func),
+                static_cast<u64>(event.user_id),
+                static_cast<u64>(event.state),
+                reinterpret_cast<u64>(event.has_np_id ? &event.np_id : nullptr),
+                reinterpret_cast<u64>(legacy_callback.userdata));
+#else
             legacy_callback.func(event.user_id, event.state,
                                  event.has_np_id ? &event.np_id : nullptr,
                                  legacy_callback.userdata);
+#endif
         }
 
         for (const auto& entry : callbacks) {
@@ -887,12 +903,32 @@ static void DispatchPendingNpStateCallbacks() {
             }
 
             if (entry.func != nullptr) {
+#ifdef SHADPS4_USES_RUNTIME
+                // NpStateCallbackA signature:
+                //   void(user_id, state, userdata)
+                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                    reinterpret_cast<u64>(entry.func),
+                    static_cast<u64>(event.user_id),
+                    static_cast<u64>(event.state),
+                    reinterpret_cast<u64>(entry.userdata));
+#else
                 entry.func(event.user_id, event.state, entry.userdata);
+#endif
             }
         }
 
         if (NpStateCbForNp.func != nullptr) {
+#ifdef SHADPS4_USES_RUNTIME
+            // NpStateCallbackForNpToolkit signature:
+            //   void(user_id, state, userdata)
+            Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                reinterpret_cast<u64>(NpStateCbForNp.func),
+                static_cast<u64>(event.user_id),
+                static_cast<u64>(event.state),
+                reinterpret_cast<u64>(NpStateCbForNp.userdata));
+#else
             NpStateCbForNp.func(event.user_id, event.state, NpStateCbForNp.userdata);
+#endif
         }
     }
 }

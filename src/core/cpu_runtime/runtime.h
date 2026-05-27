@@ -170,6 +170,41 @@ public:
                                      u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
 
     // ========================================================================
+    // Dual-context dispatch — the common HLE-callback pattern
+    //
+    // Most HLE callback sites have the same shape:
+    //   - If CurrentGuestState() returns non-null (mid-JIT, the HLE
+    //     wrapper was called from JIT code), use the caller's stack.
+    //   - Otherwise (post-JIT, the HLE wrapper was called from a host
+    //     thread like libusb's worker or AvPlayer's controller),
+    //     allocate a fresh stack via malloc.
+    //
+    // Writing this dispatch by hand at each call site (as PR 1.5d-1
+    // and PR 1.5d-2 do) produces ~15 lines of `#ifdef`-gated
+    // boilerplate per site. With ~14 more sites to convert, that's
+    // 200+ lines of identical-shape code. This helper collapses it
+    // to a single call per site.
+    //
+    // The helper allocates a 256 KB stack for the post-JIT case
+    // (matches the size used by other post-JIT sites in this PR).
+    // The allocation can fail (returns 0 in that case with an error
+    // logged); AvPlayer-style callers that can't recover should
+    // check for that, but most callers ignore the return value
+    // because the callbacks are void.
+    //
+    // Returns the callback's RAX. For void callbacks, the value is
+    // meaningless and can be discarded.
+    // ========================================================================
+
+    /// Dual-context guest-callback invocation. Picks
+    /// CallGuestSimpleOnCallerStack or CallGuestSimple based on
+    /// whether a caller GuestState is active. Returns RAX after the
+    /// call (0 if allocation failed in the post-JIT path).
+    u64 InvokeGuestCallback(VAddr guest_fn,
+                            u64 a0 = 0, u64 a1 = 0, u64 a2 = 0,
+                            u64 a3 = 0, u64 a4 = 0, u64 a5 = 0);
+
+    // ========================================================================
     // Host-vs-guest function-pointer discrimination
     //
     // Several integration boundaries receive a function pointer of

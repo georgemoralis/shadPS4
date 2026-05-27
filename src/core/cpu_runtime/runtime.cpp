@@ -3,6 +3,8 @@
 
 #include "core/cpu_runtime/runtime.h"
 
+#include <cstdlib>
+
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "core/cpu_runtime/block_cache.h"
@@ -248,6 +250,35 @@ u64 Runtime::CallGuestSimpleOnCallerStack(GuestState& caller, VAddr guest_fn,
     SimpleArgs args{a0, a1, a2, a3, a4, a5};
     CallGuestOnCallerStack(caller, guest_fn, &SimpleSetup, &args);
     return caller.gpr[0];  // RAX
+}
+
+// ============================================================================
+// Dual-context dispatch (the shared HLE-callback helper)
+// ============================================================================
+
+u64 Runtime::InvokeGuestCallback(VAddr guest_fn,
+                                 u64 a0, u64 a1, u64 a2,
+                                 u64 a3, u64 a4, u64 a5) {
+    GuestState* caller_state = CurrentGuestState();
+    if (caller_state != nullptr) {
+        return CallGuestSimpleOnCallerStack(*caller_state, guest_fn,
+                                            a0, a1, a2, a3, a4, a5);
+    }
+
+    // Post-JIT path: HLE worker thread invoking a guest callback.
+    // 256 KB matches the size used by pthread cleanup, ThreadDtors,
+    // and the AvPlayer wrappers.
+    constexpr u64 kCallbackStackSize = 256 * 1024;
+    void* guest_stack = std::malloc(kCallbackStackSize);
+    if (guest_stack == nullptr) {
+        LOG_ERROR(Core, "InvokeGuestCallback: failed to allocate guest stack");
+        return 0;
+    }
+    void* guest_stack_top = static_cast<u8*>(guest_stack) + kCallbackStackSize;
+    const u64 result = CallGuestSimple(guest_fn, guest_stack_top,
+                                       a0, a1, a2, a3, a4, a5);
+    std::free(guest_stack);
+    return result;
 }
 
 // ============================================================================

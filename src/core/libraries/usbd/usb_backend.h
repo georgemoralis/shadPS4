@@ -10,6 +10,10 @@
 #include "common/assert.h"
 #include "common/types.h"
 
+#ifdef SHADPS4_USES_RUNTIME
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 namespace Libraries::Usbd {
 
 #if defined(_WIN32)
@@ -447,7 +451,13 @@ public:
             transfer->status = HandleAsyncTransfer(transfer);
             transfer->actual_length = transfer->length;
             if (transfer->callback) {
+#ifdef SHADPS4_USES_RUNTIME
+                Core::Runtime::Runtime::Instance().InvokeGuestCallback(
+                    reinterpret_cast<u64>(transfer->callback),
+                    reinterpret_cast<u64>(transfer));
+#else
                 transfer->callback(transfer);
+#endif
             }
             if (flags & LIBUSB_TRANSFER_FREE_TRANSFER) {
                 libusb_free_transfer(transfer);
