@@ -3,10 +3,12 @@
 
 #include "core/cpu_runtime/runtime.h"
 
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -19,6 +21,59 @@
 namespace Core::Runtime {
 
 namespace {
+
+// ============================================================================
+// Compile-time invariants
+// ============================================================================
+//
+// The dispatcher's HLE bridge unmarshals integer arg slots directly
+// from `state->gpr[]` and stores the SysV return value into
+// `state->gpr[0]`. The XMM-arg path indexes `state->ymm[]` in
+// strides of 4 (one YMM = 4 u64 lanes). Both depend on a specific
+// GuestState layout that's a convention but isn't enforced by the
+// header. These asserts pin down the relationship:
+
+// The dispatcher reads SysV arg slots as gpr[7,6,2,1,8,9] = (rdi,
+// rsi, rdx, rcx, r8, r9) and writes the return to gpr[0] = rax.
+// These match the canonical AMD64 register-number ordering Zydis
+// uses (verified separately in the lifter), so reordering the slot
+// numbering would break a long chain of assumptions across the
+// whole runtime.
+//
+// We don't have a header constant for "RAX index" — gpr is a flat
+// array. So we assert against GuestState::gpr's static type. If
+// someone replaces it with a non-array (e.g., separate named
+// fields), this breaks the build at this assert and forces the
+// dispatcher to be updated alongside.
+static_assert(std::is_same_v<decltype(GuestState::gpr), std::array<u64, 16>>,
+              "GuestState::gpr must be std::array<u64,16> in canonical "
+              "AMD64 order; the dispatcher's HLE bridge depends on this");
+
+// YMM/XMM file: 32 ymm registers × 4 u64 lanes each. The HLE
+// bridge reads state.ymm[i*4] as the low 64 bits of xmm[i] for
+// i=0..7. If the lane count per ymm register ever changes (e.g.,
+// AVX-512 expansion that re-uses this field), the stride would
+// need to change too.
+static_assert(std::is_same_v<decltype(GuestState::ymm),
+                             std::array<u64, 32 * 4>>,
+              "GuestState::ymm must hold 32 ymm registers of 4 u64 lanes; "
+              "the HLE bridge's XMM marshaling assumes this layout");
+
+// ---------------- Named SysV arg-slot indices ----------------
+//
+// These match the canonical AMD64 register numbering (verified in
+// the lifter) but using named constants makes the dispatcher's
+// intent legible at the call site and centralises the convention.
+constexpr int kSysvArg0 = 7;  // RDI
+constexpr int kSysvArg1 = 6;  // RSI
+constexpr int kSysvArg2 = 2;  // RDX
+constexpr int kSysvArg3 = 1;  // RCX
+constexpr int kSysvArg4 = 8;  // R8
+constexpr int kSysvArg5 = 9;  // R9
+constexpr int kSysvRet  = 0;  // RAX
+constexpr int kGuestRsp = 4;  // RSP (host stack of the guest)
+
+// ---------------- end of compile-time invariants ----------------
 
 // Thread-local pointer to the Runtime instance that owns the currently
 // executing gateway. Used by the dispatcher trampoline to find the
@@ -191,7 +246,7 @@ void* DispatcherTrampoline(GuestState* state) {
             // frame that doesn't have Windows unwind info
             // registered; spdlog/fmt internal SEH walks would
             // fault. The same workaround is used in CompileBlock.
-            const u64 guest_rsp = state->gpr[4];
+            const u64 guest_rsp = state->gpr[kGuestRsp];
             const u64 guest_return_addr =
                 *reinterpret_cast<const u64*>(guest_rsp);
 
@@ -301,12 +356,12 @@ void* DispatcherTrampoline(GuestState* state) {
 
             const HostReturn ret = CallHostFromGuest(
                 host_fn,
-                state->gpr[7],   // RDI
-                state->gpr[6],   // RSI
-                state->gpr[2],   // RDX
-                state->gpr[1],   // RCX
-                state->gpr[8],   // R8
-                state->gpr[9],   // R9
+                state->gpr[kSysvArg0],   // RDI
+                state->gpr[kSysvArg1],   // RSI
+                state->gpr[kSysvArg2],   // RDX
+                state->gpr[kSysvArg3],   // RCX
+                state->gpr[kSysvArg4],   // R8
+                state->gpr[kSysvArg5],   // R9
                 f0, f1, f2, f3, f4, f5, f6, f7,
                 s0, s1, s2, s3, s4, s5, s6, s7);
             // Write both rax and xmm0 back to guest state. The
@@ -315,7 +370,7 @@ void* DispatcherTrampoline(GuestState* state) {
             // have been clobbered by the call but x86-64 calling
             // convention says rax/xmm0 are caller-saved, so the
             // guest doesn't rely on the pre-call values surviving.
-            state->gpr[0] = ret.rax;
+            state->gpr[kSysvRet] = ret.rax;
             const u64 xmm0_bits = std::bit_cast<u64>(ret.xmm0);
             std::memcpy(&state->ymm[0], &xmm0_bits, sizeof(u64));
 
@@ -338,7 +393,7 @@ void* DispatcherTrampoline(GuestState* state) {
 
             // Pop guest return address.
             state->rip = guest_return_addr;
-            state->gpr[4] = guest_rsp + 8;
+            state->gpr[kGuestRsp] = guest_rsp + 8;
             continue;
         }
 

@@ -30,6 +30,82 @@ constexpr u64 BLOCK_HOST_SIZE_CAP = 4096;
 /// dispatcher latency (no break-in checks until exit).
 constexpr u64 BLOCK_GUEST_SIZE_CAP = 1024;
 
+// ============================================================================
+// Compile-time invariants
+// ============================================================================
+//
+// The lifter makes several assumptions about external constants — the
+// Zydis register enum, the GuestState layout, the ExitReason values.
+// These are stable today and depended on throughout the file. Locking
+// them in via static_assert means a future Zydis bump or guest-state
+// refactor breaks the build at the assertion, rather than producing
+// silently-wrong machine code at runtime.
+
+// ---------------- Zydis register enum ordering ----------------
+//
+// `ZydisGprToIndex` (below) is the single point of register-name
+// translation. It assumes Zydis lays out each width's GPRs in
+// contiguous canonical AMD64 order:
+//
+//   64-bit:    RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8..R15
+//   32-bit:    EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI, R8D..R15D
+//   16-bit:    AX,  CX,  DX,  BX,  SP,  BP,  SI,  DI,  R8W..R15W
+//    8-bit-low:           AL,  CL,  DL,  BL
+//    8-bit-low-ext:       SPL, BPL, SIL, DIL
+//    8-bit-rex:           R8B..R15B
+//
+// If Zydis ever renumbers these (would also break every other
+// consumer of the library), the asserts below catch it at compile
+// time instead of letting the lifter emit wrong slot indices.
+
+static_assert(ZYDIS_REGISTER_RCX - ZYDIS_REGISTER_RAX == 1,
+              "Zydis 64-bit GPR enum order changed");
+static_assert(ZYDIS_REGISTER_R15 - ZYDIS_REGISTER_RAX == 15,
+              "Zydis 64-bit GPRs no longer contiguous over 16 entries");
+static_assert(ZYDIS_REGISTER_ECX - ZYDIS_REGISTER_EAX == 1,
+              "Zydis 32-bit GPR enum order changed");
+static_assert(ZYDIS_REGISTER_R15D - ZYDIS_REGISTER_EAX == 15,
+              "Zydis 32-bit GPRs no longer contiguous");
+static_assert(ZYDIS_REGISTER_CX - ZYDIS_REGISTER_AX == 1,
+              "Zydis 16-bit GPR enum order changed");
+static_assert(ZYDIS_REGISTER_R15W - ZYDIS_REGISTER_AX == 15,
+              "Zydis 16-bit GPRs no longer contiguous");
+static_assert(ZYDIS_REGISTER_BL - ZYDIS_REGISTER_AL == 3,
+              "Zydis 8-bit-low GPR enum (AL..BL) ordering changed");
+static_assert(ZYDIS_REGISTER_DIL - ZYDIS_REGISTER_SPL == 3,
+              "Zydis 8-bit extended-low GPR enum (SPL..DIL) ordering changed");
+static_assert(ZYDIS_REGISTER_R15B - ZYDIS_REGISTER_R8B == 7,
+              "Zydis 8-bit REX-prefixed GPR enum (R8B..R15B) ordering changed");
+
+// Specific position invariants the lifter depends on. RSP must be at
+// position 4 in the canonical AMD64 ordering (Zydis encodes it this
+// way; we use kGuestRspIdx = 4 to mirror it in guest state).
+static_assert((ZYDIS_REGISTER_RAX - ZYDIS_REGISTER_RAX) == 0,
+              "RAX must map to slot 0");
+static_assert((ZYDIS_REGISTER_RSP - ZYDIS_REGISTER_RAX) == 4,
+              "RSP must map to slot 4 (canonical AMD64 ordering)");
+static_assert((ZYDIS_REGISTER_RDI - ZYDIS_REGISTER_RAX) == 7,
+              "RDI must map to slot 7 (SysV arg 1; HLE bridge depends on this)");
+static_assert((ZYDIS_REGISTER_R15 - ZYDIS_REGISTER_RAX) == 15,
+              "R15 must map to slot 15");
+
+// ---------------- ExitReason values used by JIT-emitted code ----------------
+//
+// The lifter emits `mov dword[r13 + offsetof(exit_reason)], <imm>`
+// at several exit paths. The constants come from casting ExitReason
+// enumerators; the dispatcher and the test harness compare against
+// the same enumerators. If ExitReason gets renumbered, JIT-emitted
+// stores would write values the dispatcher no longer recognises.
+// Lock the wire-format values down here so both sides have to be
+// updated together.
+
+static_assert(static_cast<u32>(ExitReason::BlockEnd) == 0,
+              "ExitReason::BlockEnd must remain 0 (lifter normal-exit constant)");
+static_assert(static_cast<u32>(ExitReason::UnsupportedInstruction) == 2,
+              "ExitReason::UnsupportedInstruction must remain 2 (lifter unsupported-path)");
+
+// ---------------- end of compile-time invariants ----------------
+
 /// Map a Zydis GPR enum to a guest-state GPR index 0..15.
 /// Returns -1 for non-GPR or unsupported registers.
 ///
@@ -85,6 +161,10 @@ constexpr u32 GprOffset(int idx) {
 /// Guest RSP index (canonical AMD64 order: RAX=0, RCX=1, RDX=2,
 /// RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8..R15=8..15).
 constexpr int kGuestRspIdx = 4;
+
+static_assert(kGuestRspIdx == (ZYDIS_REGISTER_RSP - ZYDIS_REGISTER_RAX),
+              "kGuestRspIdx must match the canonical AMD64 RSP slot index "
+              "(also assumed by the dispatcher, gateway, and HLE bridge)");
 
 using namespace Xbyak::util;
 
