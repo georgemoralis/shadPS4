@@ -32,37 +32,124 @@ thread_local Runtime* tl_active_runtime = nullptr;
 // nullptr when no JIT execution is active on this thread.
 thread_local GuestState* tl_current_guest_state = nullptr;
 
+/// HLE bridge — calls a host function as if it were the next-block
+/// continuation of guest execution.
+///
+/// We use a `PS4_SYSV_ABI` function pointer so the *call instruction*
+/// emitted at the call site below uses System V x86-64 calling
+/// convention (args in RDI/RSI/RDX/RCX/R8/R9, return in RAX). This
+/// matches the convention shadPS4's HLE functions are declared with.
+///
+///   - On Linux x86-64, SysV is the host C ABI by default — the
+///     attribute is a no-op but harmless.
+///   - On Windows x86-64, the host C ABI is MS x64 (args in
+///     RCX/RDX/R8/R9 + shadow space). Without `PS4_SYSV_ABI` the
+///     compiler would generate an MS-x64 call here, and arguments
+///     would land in the wrong registers from the HLE function's
+///     point of view. With the attribute, clang generates a SysV
+///     call and arguments flow correctly.
+///
+/// Arguments are unpacked from canonical SysV arg-passing slots in
+/// `state.gpr[]`:
+///
+///   1st arg  →  gpr[7]  (RDI)
+///   2nd arg  →  gpr[6]  (RSI)
+///   3rd arg  →  gpr[2]  (RDX)
+///   4th arg  →  gpr[1]  (RCX)
+///   5th arg  →  gpr[8]  (R8)
+///   6th arg  →  gpr[9]  (R9)
+///
+/// The return value (RAX in the SysV ABI) is written to `gpr[0]`.
+///
+/// Deferred (not yet handled; documented as limitations):
+///
+///   - Float/double args (XMM0..7 in the SSE arg-passing class).
+///   - More than 6 integer args (would spill to the stack and we
+///     don't marshal stack args yet).
+///   - Variadic functions (RAX = SSE arg count is required).
+///   - Aggregate returns via a hidden RDI pointer (would shift all
+///     subsequent args by one slot — silent misalignment).
+///
+/// In practice shadPS4's HLE shims are integer-arg/integer-return
+/// functions, so the minimal bridge above covers them. We'll widen
+/// the bridge when a real HLE function trips one of the gaps.
+typedef u64 (*HostHleFn)(u64, u64, u64, u64, u64, u64) __attribute__((sysv_abi));
+
+u64 CallHostFromGuest(VAddr host_fn,
+                      u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+    auto fn = reinterpret_cast<HostHleFn>(host_fn);
+    return fn(a0, a1, a2, a3, a4, a5);
+}
+
 /// Dispatcher trampoline. Called from the gateway with the current
-/// state; returns the host code pointer for state.rip, compiling on
-/// demand if needed. Returning nullptr causes the gateway to exit
-/// the dispatch loop and return to C.
+/// state; returns the host code pointer for `state.rip`, compiling
+/// on demand if needed. Returning nullptr causes the gateway to
+/// exit the dispatch loop and return to C.
+///
+/// Iterates over consecutive host-function calls without going back
+/// to the gateway: each time the popped return address is itself a
+/// host pointer (e.g. one HLE shim returning into another), the
+/// loop body handles it inline. Only when `state.rip` ends up
+/// pointing at a guest block (or at the host-return sentinel) does
+/// the function return.
 void* DispatcherTrampoline(GuestState* state) {
     Runtime* rt = tl_active_runtime;
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
 
-    // Sentinel check: if guest code RET'd through the call chain back
-    // to the host-return address, exit cleanly.
-    if (state->rip == kHostReturnAddress) {
-        state->exit_reason = static_cast<u32>(ExitReason::BlockEnd);
-        return nullptr;
-    }
+    while (true) {
+        // Sentinel check: if guest code RET'd through the call chain
+        // back to the host-return address, exit cleanly.
+        if (state->rip == kHostReturnAddress) {
+            state->exit_reason = static_cast<u32>(ExitReason::BlockEnd);
+            return nullptr;
+        }
 
-    BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
-    if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
+        // HLE bridge: if state.rip points at host code (anywhere in
+        // a loaded host module — shadps4.exe itself, any system DLL,
+        // etc.), call it via the SysV-ABI bridge instead of trying
+        // to JIT-compile bytes from host memory.
+        //
+        // After the call:
+        //   1. Write the return value into guest RAX.
+        //   2. Pop the return address from the guest stack into
+        //      state.rip. (Guest code's pre-call setup pushed it.)
+        //   3. Loop. The new state.rip might be a guest block (we
+        //      fall through to JIT it), another host function
+        //      (another bridge iteration), or the host-return
+        //      sentinel (we exit).
+        if (!rt->IsGuestPointer(reinterpret_cast<const void*>(state->rip))) {
+            const VAddr host_fn = state->rip;
+            const u64 ret = CallHostFromGuest(
+                host_fn,
+                state->gpr[7],   // RDI
+                state->gpr[6],   // RSI
+                state->gpr[2],   // RDX
+                state->gpr[1],   // RCX
+                state->gpr[8],   // R8
+                state->gpr[9]);  // R9
+            state->gpr[0] = ret; // RAX
+
+            // Pop guest return address.
+            const u64 rsp = state->gpr[4];
+            state->rip = *reinterpret_cast<const u64*>(rsp);
+            state->gpr[4] = rsp + 8;
+            continue;
+        }
+
+        // Guest path: cache lookup, compile on miss.
+        BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
+        if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
+            return host_ptr;
+        }
+        void* host_ptr = rt->CompileBlockForDispatcher(state->rip);
+        if (host_ptr == nullptr) {
+            // Compile failed. Returning nullptr causes the gateway
+            // to exit with whatever exit_reason the lifter set.
+            return nullptr;
+        }
+        bc.Insert(state->rip, host_ptr);
         return host_ptr;
     }
-
-    // Cache miss — compile the block.
-    // Friend access: Runtime exposes its lifter via a private hook.
-    void* host_ptr = rt->CompileBlockForDispatcher(state->rip);
-    if (host_ptr == nullptr) {
-        // Compile failed. Returning nullptr causes the gateway to
-        // exit to C with whatever exit_reason the lifter set in
-        // its fallback.
-        return nullptr;
-    }
-    bc.Insert(state->rip, host_ptr);
-    return host_ptr;
 }
 
 } // namespace

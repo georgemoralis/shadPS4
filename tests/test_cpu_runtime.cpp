@@ -31,6 +31,16 @@
 #include "core/cpu_runtime/guest_state.h"
 #include "core/cpu_runtime/runtime.h"
 
+// The test shim's common/types.h is a stripped-down stand-in for
+// upstream's. shadPS4 proper defines PS4_SYSV_ABI in common/types.h;
+// the shim doesn't carry it. Define it locally so the HLE-bridge
+// host helper can be marked with the same convention an HLE function
+// in shadPS4 would use. On Linux x86-64 the attribute is a no-op
+// (SysV IS the default), but it matches upstream's source shape.
+#ifndef PS4_SYSV_ABI
+#define PS4_SYSV_ABI __attribute__((sysv_abi))
+#endif
+
 namespace Core::Runtime {
 namespace {
 
@@ -172,22 +182,25 @@ TEST_F(CpuRuntimeTest, MultipleRegistersAndOpcodes_ProduceCorrectValues) {
 // emits an exit sequence that sets exit_reason and stores the
 // un-lifted RIP so callers can diagnose where execution stopped.
 TEST_F(CpuRuntimeTest, UnsupportedOpcode_ExitsCleanly) {
-    // INC is still unsupported in the current lifter slice. Use it
-    // to verify the unsupported-exit path still works. If/when INC
+    // BSR is still unsupported in the current lifter slice. Use it
+    // to verify the unsupported-exit path still works. If/when BSR
     // becomes supported, replace with another not-yet-supported
-    // instruction.
+    // instruction (BSF / POPCNT / SHLD / DIV / IDIV are all good
+    // candidates).
+    //
+    // Encoding: 48 0f bd d8 = BSR rbx, rax (4 bytes).
     const u8 program[] = {
         0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
-        0x48, 0xff, 0xc3,                           // inc rbx       (unsupported)
+        0x48, 0x0f, 0xbd, 0xd8,                     // bsr rbx, rax   (unsupported)
         0xc3,                                       // ret  (unreached)
     };
     const auto r = RunProgram(program, sizeof(program), mem);
 
-    // RIP should point to the INC instruction (at offset 7).
+    // RIP should point to the BSR instruction (at offset 7).
     EXPECT_EQ(r.state.rip, r.program_base + 7);
     EXPECT_EQ(r.state.exit_reason,
               static_cast<u32>(ExitReason::UnsupportedInstruction));
-    // MOV before INC should have executed.
+    // MOV before BSR should have executed.
     EXPECT_EQ(r.state.gpr[0], 1u);
 }
 
@@ -1069,6 +1082,886 @@ TEST_F(CpuRuntimeTest, JmpIndirect_Memory_FollowsThroughPointer) {
     EXPECT_EQ(r.state.gpr[0], 0x77u)
         << "JMP indirect should have transferred control to the tail block";
     EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
+// XOR r32, r32 — 32-bit XOR; zero-register idiom + zero-extension.
+//
+// Set rax = 0xFFFFFFFFFFFFFFFF, then xor eax, eax. After the xor
+// rax must be 0 (low 32 are zero from the xor, upper 32 zeroed by
+// the 32-bit op rule).
+//
+//   mov rax, -1            48 b8 ff ff ff ff ff ff ff ff      (0-9)
+//   xor eax, eax           31 c0                              (10-11)
+//   ret                    c3                                  (12)
+TEST_F(CpuRuntimeTest, Xor32_RegReg_ZerosRegister) {
+    const u8 program[] = {
+        0x48, 0xb8, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,  // mov rax, -1
+        0x31, 0xc0,                                                   // xor eax, eax
+        0xc3,                                                         // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);
+    // Verify ZF is set in flags.
+    EXPECT_NE(r.state.rflags & 0x40, 0u) << "XOR result 0 should set ZF";
+}
+
+// MOVSXD r64, r32 — sign-extend a 32-bit value to 64 bits.
+//
+//   mov rbx, 0xFFFFFFFF      48 c7 c3 ff ff ff ff       (sign-ext to 0xFFFFFFFFFFFFFFFF)
+//   wait — that's mov rbx, imm32-sign-extended.  Want low 32 = -1, upper 32 don't matter.
+//   Actually mov rbx, 0xFFFFFFFFFFFFFFFF via mov rbx,imm32sx gives -1 already.
+//   Let me use ebx instead: mov ebx, 0xFFFFFFFF → ebx = -1 (and rbx upper bits zeroed by 32-bit MOV).
+//
+//   mov ebx, 0xFFFFFFFF      bb ff ff ff ff             (0-4) → ebx = -1, rbx = 0x00000000FFFFFFFF
+//   movsxd rax, ebx          48 63 c3                   (5-7) → rax = sext(ebx as int32) = -1
+//   ret                      c3                          (8)
+//
+// Expected: rax = 0xFFFFFFFFFFFFFFFF (i.e., -1 as a 64-bit signed).
+TEST_F(CpuRuntimeTest, Movsxd_RegReg_SignExtends) {
+    const u8 program[] = {
+        0xbb, 0xff, 0xff, 0xff, 0xff,  // mov ebx, 0xFFFFFFFF
+        0x48, 0x63, 0xc3,              // movsxd rax, ebx
+        0xc3,                          // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFFFFull)
+        << "MOVSXD should sign-extend, not zero-extend";
+}
+
+// CALL r64 (indirect through register).
+//
+// Load a function pointer into rcx via LEA, then call rcx. The
+// callee sets rax = 0x88 and RETs; control returns to the caller's
+// RET which pops the host sentinel.
+//
+// Layout (decisive offsets):
+//   lea rcx, [rip+3]       48 8d 0d 03 00 00 00     (0..6)   next_rip=7, +3 = 10
+//   call rcx               ff d1                    (7..8)
+//   ret  (caller)          c3                       (9)
+//   mov rax, 0x88          48 c7 c0 88 00 00 00     (10..16) ← callee entry
+//   ret  (callee)          c3                       (17)
+TEST_F(CpuRuntimeTest, CallIndirect_Register_RoundTrips) {
+    const u8 program[] = {
+        0x48, 0x8d, 0x0d, 0x03, 0x00, 0x00, 0x00,  // lea rcx, [rip+3]  → offset 10
+        0xff, 0xd1,                                 // call rcx
+        0xc3,                                       // ret (caller's, → sentinel)
+        0x48, 0xc7, 0xc0, 0x88, 0x00, 0x00, 0x00,  // callee: mov rax, 0x88
+        0xc3,                                       // callee: ret  → caller's ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x88u);
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
+// =============================================================================
+// HLE bridge tests
+// =============================================================================
+//
+// These exercise the dispatcher's host-pointer detection: when
+// guest code calls into an address that lives inside the host
+// binary (any loaded module, per `Runtime::IsGuestPointer`), the
+// dispatcher should bypass the JIT lifter, call the host function
+// via the SysV-ABI bridge, write the return value to guest RAX,
+// pop the guest return address, and continue.
+//
+// The bridge is the key abstraction that lets the same JIT
+// architecture work on a future ARM64 host backend, where lifting
+// AArch64 host code as if it were x86 would be nonsense. By
+// routing host calls through an explicit ABI-correct C++ bridge,
+// the lifter only ever sees real guest x86 code.
+
+// Host function used as the call target. Declared PS4_SYSV_ABI to
+// match shadPS4's HLE convention. Sums its six arguments and adds
+// a constant so the return value is sensitive to argument order.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_SumArgs(u64 a, u64 b, u64 c,
+                                                u64 d, u64 e, u64 f) {
+    // The constants below let us verify each arg landed in the right
+    // SysV slot. If we got the marshal order wrong, the sum would
+    // still match but checking specific values rules that out.
+    return a * 1 + b * 10 + c * 100 + d * 1000 + e * 10000 + f * 100000;
+}
+
+// HLE bridge: guest calls a PS4_SYSV_ABI host function with 6
+// distinct int args, captures the return value.
+//
+// Program (RDI=1, RSI=2, RDX=3, RCX=4, R8=5, R9=6 → call host_fn):
+//   mov rdi, 1            48 c7 c7 01 00 00 00     (0..6)
+//   mov rsi, 2            48 c7 c6 02 00 00 00     (7..13)
+//   mov rdx, 3            48 c7 c2 03 00 00 00     (14..20)
+//   mov rcx, 4            48 c7 c1 04 00 00 00     (21..27)
+//   mov r8,  5            49 c7 c0 05 00 00 00     (28..34)
+//   mov r9,  6            49 c7 c1 06 00 00 00     (35..41)
+//   mov rax, <host_fn>    48 b8 [8-byte addr]      (42..51)
+//   call rax              ff d0                    (52..53)
+//   ret                   c3                       (54)
+TEST_F(CpuRuntimeTest, HleBridge_GuestCallsHostFunction_MarshalsArgsAndReturn) {
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_SumArgs);
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x01, 0x00, 0x00, 0x00,  // mov rdi, 1
+        0x48, 0xc7, 0xc6, 0x02, 0x00, 0x00, 0x00,  // mov rsi, 2
+        0x48, 0xc7, 0xc2, 0x03, 0x00, 0x00, 0x00,  // mov rdx, 3
+        0x48, 0xc7, 0xc1, 0x04, 0x00, 0x00, 0x00,  // mov rcx, 4
+        0x49, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,  // mov r8,  5
+        0x49, 0xc7, 0xc1, 0x06, 0x00, 0x00, 0x00,  // mov r9,  6
+        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, <imm64>
+        0xff, 0xd0,                                 // call rax
+        0xc3,                                       // ret
+    };
+    // Patch the 8 bytes after the `48 b8` (offset 42, then prefix 48 b8 = 2)
+    // → addr bytes at offsets 44..51.
+    std::memcpy(&program[44], &host_fn_addr, sizeof(host_fn_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    const u64 expected = 1 + 20 + 300 + 4000 + 50000 + 600000;
+    EXPECT_EQ(r.state.gpr[0], expected)
+        << "Args should be marshaled in SysV order; RAX should hold the host return";
+    EXPECT_EQ(r.state.rip, kReturnSentinel)
+        << "After host call returns, post-call block's RET should pop sentinel";
+}
+
+// HLE bridge: confirm IsGuestPointer correctly classifies the
+// host helper. If this fails, the bridge wouldn't fire and the
+// JIT would try to lift host code (which is the bug ARM64 would
+// hit). The test is here so a regression in host/guest discrimination
+// shows up loudly.
+TEST_F(CpuRuntimeTest, HleBridge_IsGuestPointer_ClassifiesHostFunction) {
+    Runtime rt;
+    const void* host_fn = reinterpret_cast<const void*>(&HleBridgeTestFn_SumArgs);
+    EXPECT_FALSE(rt.IsGuestPointer(host_fn))
+        << "A function in the test binary must be classified as host code";
+    EXPECT_TRUE(rt.IsGuestPointer(mem.CodePtr()))
+        << "An mmap'd guest code page must be classified as guest";
+}
+
+// =============================================================================
+// Tier-1 opcode batch: NOP, AND, OR, NOT, NEG, INC, DEC, MOVZX, CMOV.
+//
+// Each test is focused: it isolates one mnemonic's behavior with
+// minimal supporting code, so a regression points at the right
+// emit function.
+// =============================================================================
+
+// NOP — verify the block compiles and surrounding instructions
+// run normally. Tests 1-byte (0x90), 2-byte (0x66 0x90), and the
+// 5-byte multi-byte form (0x0F 0x1F /0).
+TEST_F(CpuRuntimeTest, Nop_AcceptsAllForms) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7
+        0x90,                                       // nop (1-byte)
+        0x66, 0x90,                                 // nop (2-byte, 66 prefix)
+        0x0f, 0x1f, 0x40, 0x00,                     // nop dword[rax+0] (4-byte)
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 7u) << "MOV before NOPs should still be in rax";
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
+// AND r64, r64 — bitwise AND.
+TEST_F(CpuRuntimeTest, And64_RegReg_ComputesIntersection) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00,  // mov rax, 0x0F
+        0x48, 0xc7, 0xc3, 0x33, 0x00, 0x00, 0x00,  // mov rbx, 0x33
+        0x48, 0x21, 0xd8,                           // and rax, rbx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x03u);  // 0x0F & 0x33 = 0x03
+    EXPECT_EQ(r.state.gpr[3], 0x33u);  // rbx unchanged
+}
+
+// OR r64, r64 — bitwise OR.
+TEST_F(CpuRuntimeTest, Or64_RegReg_ComputesUnion) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00,  // mov rax, 0x0F
+        0x48, 0xc7, 0xc3, 0x30, 0x00, 0x00, 0x00,  // mov rbx, 0x30
+        0x48, 0x09, 0xd8,                           // or rax, rbx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x3Fu);  // 0x0F | 0x30 = 0x3F
+}
+
+// NOT r64 — bitwise complement; flags unchanged.
+TEST_F(CpuRuntimeTest, Not_RegisterFlipsBits) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0xff, 0x00, 0x00, 0x00,  // mov rax, 0x00FF
+        0x48, 0xf7, 0xd0,                           // not rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFF00ULL);  // ~0xFF (in 64-bit)
+}
+
+// NEG r64 — two's complement. Verifies the value AND that CF is
+// set to 1 (because source was nonzero per x86 NEG semantics).
+TEST_F(CpuRuntimeTest, Neg_NonZero_SetsCarryAndNegatesValue) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,  // mov rax, 5
+        0x48, 0xf7, 0xd8,                           // neg rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-5LL));  // two's complement
+    // CF (bit 0 of rflags) should be set because source was nonzero.
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);
+}
+
+// NEG of zero leaves zero AND clears CF.
+TEST_F(CpuRuntimeTest, Neg_Zero_ClearsCarry) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
+        0x48, 0xf7, 0xd8,                           // neg rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0u);  // CF clear
+}
+
+// INC r64 — adds 1 and preserves CF. We deliberately use the
+// guest's CF (set via STC via OR rather than STC instruction —
+// since we don't have STC yet — by computing a CMP that sets CF)
+// to verify INC doesn't clobber it.
+//
+// Simpler approach: use a SUB that produces CF=0, then INC, and
+// verify CF is still 0 afterward. Then run a separate program
+// with a SUB that produces CF=1 and verify it's preserved across INC.
+TEST_F(CpuRuntimeTest, Inc_PreservesCarryFlag_ClearCase) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,  // mov rax, 5
+        0x48, 0xc7, 0xc3, 0x03, 0x00, 0x00, 0x00,  // mov rbx, 3
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → rax=2, CF=0
+        0x48, 0xff, 0xc0,                           // inc rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 3u);                  // 2 + 1 = 3
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0u);         // CF still 0
+}
+
+TEST_F(CpuRuntimeTest, Inc_PreservesCarryFlag_SetCase) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → rax=-2 (huge), CF=1
+        0x48, 0xff, 0xc0,                           // inc rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // -2 + 1 = -1.
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-1LL));
+    // CF was set by SUB-with-borrow and must survive INC.
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);
+}
+
+// DEC r64 — subtracts 1 and preserves CF.
+TEST_F(CpuRuntimeTest, Dec_PreservesCarryFlag_SetCase) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → CF=1
+        0x48, 0xff, 0xc8,                           // dec rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // -2 - 1 = -3.
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-3LL));
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);     // CF preserved
+}
+
+// DEC sets ZF when result is zero.
+TEST_F(CpuRuntimeTest, Dec_FromOne_SetsZeroFlag) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
+        0x48, 0xff, 0xc8,                           // dec rax
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL);   // ZF bit 6
+}
+
+// MOVZX r64, r/m8 — zero-extend byte from register.
+TEST_F(CpuRuntimeTest, Movzx_Reg8To64_ZeroExtends) {
+    const u8 program[] = {
+        // Set rax to 0xFFFFFFFFFFFFFFFF, then load BL = 0x7F (so AL
+        // becomes 0x7F but upper bits of rax are all 1s). MOVZX
+        // should produce 0x000000000000007F in rdx.
+        0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff,  // mov rax, -1 (sign-extends to all-Fs)
+        0x48, 0xc7, 0xc3, 0x7f, 0x00, 0x00, 0x00,  // mov rbx, 0x7F
+        0x48, 0x0f, 0xb6, 0xd3,                     // movzx rdx, bl
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[2], 0x7Fu);  // rdx = zero-extended bl
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFFFFULL);  // rax unchanged
+}
+
+// MOVZX r64, r/m16 — zero-extend word from register.
+TEST_F(CpuRuntimeTest, Movzx_Reg16To64_ZeroExtends) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc3, 0x34, 0x12, 0x00, 0x00,  // mov rbx, 0x1234
+        0x48, 0x0f, 0xb7, 0xc3,                     // movzx rax, bx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x1234u);
+}
+
+// MOVZX r64, [mem] — zero-extend byte from memory. Stash a byte
+// onto the guest stack via PUSH, MOVZX from [rsp], then rebalance
+// the stack with ADD RSP,8 before RET so RET pops the sentinel and
+// not the value we just pushed.
+TEST_F(CpuRuntimeTest, Movzx_Mem8To64_ZeroExtends) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc3, 0xa5, 0x00, 0x00, 0x00,  // mov rbx, 0xA5
+        0x53,                                       // push rbx
+        0x48, 0x0f, 0xb6, 0x04, 0x24,               // movzx rax, byte [rsp]
+        0x48, 0x83, 0xc4, 0x08,                     // add rsp, 8 (rebalance)
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xA5u);
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
+// MOVZX r16, r/m8 — destination is 16-bit. The x86-64 ABI rule
+// for 16-bit register writes is that the upper 48 bits of the
+// underlying 64-bit register are *preserved* (unlike 32-bit
+// writes, which zero-extend). A previous version of EmitMovzx
+// stored the full qword after the movzx; this regression test
+// would have failed under that version because the upper 48
+// bits of rax would have been zeroed instead of kept.
+//
+// Setup: load rax with a sentinel that puts a distinctive
+// non-zero pattern in the upper 48 bits. Then load bl with
+// 0xCD. Then `movzx ax, bl` — only the low 16 of rax should
+// change.
+//
+// Encoding of `movzx ax, bl`: 66 0f b6 c3 (operand-size override
+// 66 selects 16-bit dst; 0f b6 is movzx-from-r/m8; c3 is the
+// ModR/M for ax<-bl).
+TEST_F(CpuRuntimeTest, Movzx_Reg16To8_PreservesUpper48Bits) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFE0000
+        0x48, 0xb8,
+        0x00, 0x00, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        0x48, 0xc7, 0xc3, 0xcd, 0x00, 0x00, 0x00,   // mov rbx, 0xCD
+        0x66, 0x0f, 0xb6, 0xc3,                      // movzx ax, bl
+        0xc3,                                        // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Expected: upper 48 bits preserved, low 16 = 0x00CD.
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFE00CDULL)
+        << "MOVZX with 16-bit dst must preserve upper 48 bits";
+}
+
+// MOVZX r32, r/m8 — destination is 32-bit. x86-64 32-bit writes
+// implicitly zero-extend to 64, so upper 32 bits should be zero
+// regardless of what was there before.
+//
+// Encoding of `movzx eax, bl`: 0f b6 c3 (no REX, no 66 prefix).
+TEST_F(CpuRuntimeTest, Movzx_Reg32To8_ZeroExtendsUpper32) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFE0000
+        0x48, 0xb8,
+        0x00, 0x00, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        0x48, 0xc7, 0xc3, 0x42, 0x00, 0x00, 0x00,   // mov rbx, 0x42
+        0x0f, 0xb6, 0xc3,                            // movzx eax, bl
+        0xc3,                                        // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Expected: full 64 bits = 0x42 (upper 32 zeroed by x86-64
+    // write rule; low 32 = zero-extended byte = 0x42).
+    EXPECT_EQ(r.state.gpr[0], 0x42u)
+        << "MOVZX with 32-bit dst must zero-extend to 64 bits";
+}
+
+// CMOV taken: condition true, dst should be replaced with src.
+//
+// Set rax=10, rbx=20, then CMP rax with 0 (rax > 0 ⇒ NE), then
+// CMOVNZ rax, rbx. Expect rax = 20 (the move was taken).
+TEST_F(CpuRuntimeTest, CmovNz_ConditionTrue_TakesMove) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00,  // mov rax, 10
+        0x48, 0xc7, 0xc3, 0x14, 0x00, 0x00, 0x00,  // mov rbx, 20
+        0x48, 0x83, 0xf8, 0x00,                     // cmp rax, 0       (sets ZF=0)
+        0x48, 0x0f, 0x45, 0xc3,                     // cmovnz rax, rbx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 20u);
+}
+
+// CMOV not taken: condition false, dst should be unchanged.
+//
+// Set rax=0, rbx=20, then CMP rax with 0 (ZF=1), then CMOVNZ
+// rax, rbx. Expect rax = 0 (move was NOT taken).
+TEST_F(CpuRuntimeTest, CmovNz_ConditionFalse_LeavesDstAlone) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,  // mov rax, 0
+        0x48, 0xc7, 0xc3, 0x14, 0x00, 0x00, 0x00,  // mov rbx, 20
+        0x48, 0x83, 0xf8, 0x00,                     // cmp rax, 0       (sets ZF=1)
+        0x48, 0x0f, 0x45, 0xc3,                     // cmovnz rax, rbx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);
+}
+
+// CMOV with signed-less condition (the branchless-min idiom).
+// rax = 5, rbx = 3. cmp rax, rbx ⇒ rax > rbx ⇒ SF==OF, JL would
+// NOT take. CMOVL is "less than" (SF != OF), so move NOT taken.
+// Expect rax stays 5.
+TEST_F(CpuRuntimeTest, CmovL_NotTakenWhenSourceIsGreater) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x05, 0x00, 0x00, 0x00,  // mov rax, 5
+        0x48, 0xc7, 0xc3, 0x03, 0x00, 0x00, 0x00,  // mov rbx, 3
+        0x48, 0x39, 0xd8,                           // cmp rax, rbx
+        0x48, 0x0f, 0x4c, 0xc3,                     // cmovl rax, rbx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 5u);  // unchanged: rax not < rbx
+}
+
+// =============================================================================
+// Tier-2 opcode batch: SHL/SHR/SAR (imm8 and CL forms),
+// 8-bit MOV variants, 16-bit MOV variants.
+// =============================================================================
+
+// SHL rax, 4 — left shift by immediate. Multiplies by 16.
+TEST_F(CpuRuntimeTest, Shl_Imm8_LeftShifts) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc1, 0xe0, 0x04,                     // shl rax, 4
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 3u << 4);  // = 48
+}
+
+// SHR rax, 1 — logical right shift by immediate.
+TEST_F(CpuRuntimeTest, Shr_Imm8_RightShifts) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x80, 0x00, 0x00, 0x00,  // mov rax, 128
+        0x48, 0xd1, 0xe8,                           // shr rax, 1 (1-bit form)
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 64u);
+}
+
+// SAR (arithmetic right shift) — preserves sign bit when input is
+// negative. Load rax with -16, SAR by 2, expect -4.
+TEST_F(CpuRuntimeTest, Sar_Imm8_SignExtendsNegative) {
+    const u8 program[] = {
+        // mov rax, -16 (sign-extended 32-bit imm in the
+        // standard "mov rax, imm32" encoding)
+        0x48, 0xc7, 0xc0, 0xf0, 0xff, 0xff, 0xff,  // mov rax, -16
+        0x48, 0xc1, 0xf8, 0x02,                     // sar rax, 2
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-4LL));
+}
+
+// SHL via CL — dynamic shift count.
+TEST_F(CpuRuntimeTest, Shl_Cl_LeftShiftsByDynamicCount) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
+        0x48, 0xc7, 0xc1, 0x05, 0x00, 0x00, 0x00,  // mov rcx, 5
+        0x48, 0xd3, 0xe0,                           // shl rax, cl
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 1u << 5);  // = 32
+}
+
+// Shift by zero must preserve all flags. We deliberately set up a
+// known flag state via SUB, then SHL by 0, then verify CF is still
+// set from the SUB.
+//
+// This is the most important shift-semantics test — it would fail
+// with a naive implementation that always overwrites rflags.
+TEST_F(CpuRuntimeTest, ShlByZero_PreservesFlags) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → CF=1
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x00,  // mov rcx, 0    (shift count)
+        0x48, 0xd3, 0xe0,                           // shl rax, cl   (no-op)
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // rax should be unchanged (-2 in two's complement).
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-2LL));
+    // CF must still be set from the SUB.
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);
+}
+
+// SHL sets CF to the last bit shifted out. Shifting 0x80 (high bit
+// of byte, in bit 7) left by 1 should leave CF=0 because the bit
+// that fell off was bit 7 of a 64-bit value — and bit 7 doesn't
+// fall off a 64-bit shift. Let's use a value with a bit in
+// position 63 instead.
+TEST_F(CpuRuntimeTest, Shl_CarriesOutHighBit) {
+    const u8 program[] = {
+        // mov rax, 0x8000000000000000 — high bit set
+        0x48, 0xb8,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80,
+        0x48, 0xd1, 0xe0,                            // shl rax, 1
+        0xc3,                                        // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);                  // bit shifted out, nothing left
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);     // CF = 1 (the bit fell off)
+}
+
+// 8-bit MOV r,r — preserves upper bits of dst slot (like MOVZX r16).
+TEST_F(CpuRuntimeTest, Mov8_RegReg_PreservesUpperBits) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFE0000
+        0x48, 0xb8,
+        0x00, 0x00, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        0x48, 0xc7, 0xc3, 0x42, 0x00, 0x00, 0x00,    // mov rbx, 0x42
+        0x88, 0xd8,                                   // mov al, bl
+        0xc3,                                         // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Low byte replaced with 0x42; upper 56 preserved.
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFE0042ULL);
+}
+
+// 8-bit MOV r,imm.
+TEST_F(CpuRuntimeTest, Mov8_RegImm_WritesLowByte) {
+    const u8 program[] = {
+        0x48, 0xb8,                                   // mov rax, 0xFFFFFFFFFFFFFFFF
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xb0, 0x7f,                                   // mov al, 0x7F
+        0xc3,                                         // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFF7FULL);
+}
+
+// 8-bit MOV r,[mem] and m,r round-trip.
+//
+// Setup: write a byte via `mov byte[rbx], al`, then read it back
+// via `mov cl, byte[rbx]`. The pointer is into the guest data area
+// (we'll position rbx there). This exercises both memory forms.
+TEST_F(CpuRuntimeTest, Mov8_MemRegRoundTrip) {
+    const u64 addr = reinterpret_cast<u64>(mem.CodePtr() + GuestMemory::PAGE_SIZE);
+
+    u8 program[] = {
+        // mov rax, 0xA7
+        0x48, 0xc7, 0xc0, 0xa7, 0x00, 0x00, 0x00,
+        // mov rbx, <addr>
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        // mov byte[rbx], al
+        0x88, 0x03,
+        // mov cl, byte[rbx]
+        0x8a, 0x0b,
+        // ret
+        0xc3,
+    };
+    std::memcpy(&program[9], &addr, sizeof(addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // cl should hold the byte we wrote.
+    EXPECT_EQ(r.state.gpr[1] & 0xFFu, 0xA7u);
+}
+
+// 16-bit MOV r,r — preserves upper 48 bits.
+TEST_F(CpuRuntimeTest, Mov16_RegReg_PreservesUpper48Bits) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFE0000
+        0x48, 0xb8,
+        0x00, 0x00, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        // mov rbx, 0x1234
+        0x48, 0xc7, 0xc3, 0x34, 0x12, 0x00, 0x00,
+        // mov ax, bx          (66 prefix + 89 d8)
+        0x66, 0x89, 0xd8,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFE1234ULL);
+}
+
+// 16-bit MOV r,imm.
+TEST_F(CpuRuntimeTest, Mov16_RegImm_WritesLowWord) {
+    const u8 program[] = {
+        0x48, 0xb8,                                   // mov rax, all-Fs
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        // mov ax, 0xCAFE      (66 b8 fe ca)
+        0x66, 0xb8, 0xfe, 0xca,
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFCAFEULL);
+}
+
+// 16-bit MOV memory round-trip.
+TEST_F(CpuRuntimeTest, Mov16_MemRegRoundTrip) {
+    const u64 addr = reinterpret_cast<u64>(mem.CodePtr() + GuestMemory::PAGE_SIZE);
+
+    u8 program[] = {
+        // mov rax, 0xC0DE
+        0x48, 0xc7, 0xc0, 0xde, 0xc0, 0x00, 0x00,
+        // mov rbx, <addr>
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        // mov word[rbx], ax       66 89 03
+        0x66, 0x89, 0x03,
+        // mov cx, word[rbx]       66 8b 0b
+        0x66, 0x8b, 0x0b,
+        0xc3,
+    };
+    std::memcpy(&program[9], &addr, sizeof(addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1] & 0xFFFFu, 0xC0DEu);
+}
+
+// =============================================================================
+// Tier-3 opcode batch: IMUL (all three forms), ROL/ROR, CDQE/CDQ/
+// CWDE/CQO, STC/CLC/CMC.
+// =============================================================================
+
+// IMUL r64, r64 (2-op form) — most common C-style multiply.
+TEST_F(CpuRuntimeTest, Imul_2Op_Reg_MultipliesIntoDst) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7
+        0x48, 0xc7, 0xc3, 0x06, 0x00, 0x00, 0x00,  // mov rbx, 6
+        0x48, 0x0f, 0xaf, 0xc3,                     // imul rax, rbx
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 42u);
+    EXPECT_EQ(r.state.gpr[3], 6u);  // rbx unchanged
+}
+
+// IMUL r64, r64, imm32 (3-op form) — compiler emits this for
+// `x * constant` where constant fits in imm32.
+TEST_F(CpuRuntimeTest, Imul_3Op_ImmediateConstant) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        // imul rax, rbx, 100   →   48 69 c3 64 00 00 00
+        0x48, 0x69, 0xc3, 0x64, 0x00, 0x00, 0x00,
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 500u);
+    EXPECT_EQ(r.state.gpr[3], 5u);  // rbx unchanged
+}
+
+// IMUL r64, r64, imm8 (3-op form, short immediate).
+TEST_F(CpuRuntimeTest, Imul_3Op_ImmediateImm8) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc3, 0x09, 0x00, 0x00, 0x00,  // mov rbx, 9
+        // imul rax, rbx, 11   →   48 6b c3 0b
+        0x48, 0x6b, 0xc3, 0x0b,
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 99u);
+}
+
+// IMUL r/m64 (1-op form) — full 128-bit signed multiply.
+// 2 * 3 = 6. Low half in RAX = 6, high half in RDX = 0.
+TEST_F(CpuRuntimeTest, Imul_1Op_FullPrecisionMul) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00,  // mov rax, 2
+        0x48, 0xc7, 0xc3, 0x03, 0x00, 0x00, 0x00,  // mov rbx, 3
+        0x48, 0xf7, 0xeb,                           // imul rbx   (rdx:rax = rax * rbx)
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 6u);  // RAX = low half
+    EXPECT_EQ(r.state.gpr[2], 0u);  // RDX = high half
+}
+
+// IMUL 1-op with a result that exceeds 64 bits — verifies the
+// high half lands in RDX.
+//
+// Set RAX = 0x100000000, RBX = 0x100000000. Product = 0x10000000000000000
+// which is exactly 2^64, so RAX = 0 and RDX = 1.
+TEST_F(CpuRuntimeTest, Imul_1Op_OverflowsIntoHighHalf) {
+    const u8 program[] = {
+        // mov rax, 0x100000000
+        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        // mov rbx, 0x100000000
+        0x48, 0xbb, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0xf7, 0xeb,                           // imul rbx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);  // RAX = low half = 0
+    EXPECT_EQ(r.state.gpr[2], 1u);  // RDX = high half = 1
+}
+
+// IMUL with negative result — signed semantics.
+TEST_F(CpuRuntimeTest, Imul_2Op_NegativeProduct) {
+    const u8 program[] = {
+        // mov rax, -3 (sign-extended imm32)
+        0x48, 0xc7, 0xc0, 0xfd, 0xff, 0xff, 0xff,
+        0x48, 0xc7, 0xc3, 0x07, 0x00, 0x00, 0x00,  // mov rbx, 7
+        0x48, 0x0f, 0xaf, 0xc3,                     // imul rax, rbx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-21LL));
+}
+
+// ROL r64, imm — rotate left by 4. 0xF000000000000001 << 4 (rotated)
+// should produce 0x000000000000001F (the high nibble wraps to low).
+TEST_F(CpuRuntimeTest, Rol_Imm_RotatesLeftWithWrap) {
+    const u8 program[] = {
+        // mov rax, 0xF000000000000001
+        0x48, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0,
+        0x48, 0xc1, 0xc0, 0x04,                     // rol rax, 4
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x000000000000001FULL);
+}
+
+// ROR r64, imm — rotate right by 4. 0x000000000000001F rotated right
+// by 4 produces 0xF000000000000001 (low nibble wraps to high).
+TEST_F(CpuRuntimeTest, Ror_Imm_RotatesRightWithWrap) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x1f, 0x00, 0x00, 0x00,  // mov rax, 0x1F
+        0x48, 0xc1, 0xc8, 0x04,                     // ror rax, 4
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xF000000000000001ULL);
+}
+
+// ROL by zero must preserve flags (same rule as shifts). Set CF
+// via SUB, then rotate by 0, verify CF intact.
+TEST_F(CpuRuntimeTest, RolByZero_PreservesFlags) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → CF=1
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x00,  // mov rcx, 0
+        0x48, 0xd3, 0xc0,                           // rol rax, cl   (no-op)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(-2LL));
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);  // CF still set
+}
+
+// CDQE — sign-extend EAX into RAX.
+TEST_F(CpuRuntimeTest, Cdqe_SignExtendsNegativeEax) {
+    const u8 program[] = {
+        // mov eax, -1   →   b8 ff ff ff ff (5 bytes — 32-bit imm)
+        0xb8, 0xff, 0xff, 0xff, 0xff,
+        0x48, 0x98,                                 // cdqe
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// CDQE with non-negative EAX — upper 32 should be zero.
+TEST_F(CpuRuntimeTest, Cdqe_ZeroExtendsPositiveEax) {
+    const u8 program[] = {
+        // mov eax, 0x7FFFFFFF (largest positive s32)
+        0xb8, 0xff, 0xff, 0xff, 0x7f,
+        0x48, 0x98,                                 // cdqe
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x000000007FFFFFFFULL);
+}
+
+// CDQ — sign-extend EAX into EDX. Negative case.
+TEST_F(CpuRuntimeTest, Cdq_NegativeEax_FillsEdxWithOnes) {
+    const u8 program[] = {
+        0xb8, 0xff, 0xff, 0xff, 0xff,               // mov eax, -1
+        0x99,                                       // cdq
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // After CDQ on negative EAX: EDX = 0xFFFFFFFF, upper 32 of RDX = 0.
+    EXPECT_EQ(r.state.gpr[2], 0x00000000FFFFFFFFULL);
+}
+
+// CDQ with positive EAX — EDX cleared, upper 32 of RDX cleared too.
+TEST_F(CpuRuntimeTest, Cdq_PositiveEax_ClearsEdx) {
+    const u8 program[] = {
+        // mov rdx, 0xDEADBEEFCAFEBABE — make sure CDQ actually clears it
+        0x48, 0xba, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        0xb8, 0x42, 0x00, 0x00, 0x00,               // mov eax, 0x42
+        0x99,                                       // cdq
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[2], 0u);  // RDX fully cleared
+}
+
+// CQO — sign-extend RAX into RDX.
+TEST_F(CpuRuntimeTest, Cqo_NegativeRax_FillsRdxWithOnes) {
+    const u8 program[] = {
+        // mov rax, -1 (sign-extended imm32)
+        0x48, 0xc7, 0xc0, 0xff, 0xff, 0xff, 0xff,
+        0x48, 0x99,                                 // cqo
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[2], 0xFFFFFFFFFFFFFFFFULL);
+}
+
+// STC — set carry flag.
+TEST_F(CpuRuntimeTest, Stc_SetsCarryFlag) {
+    const u8 program[] = {
+        0xf9,                                       // stc
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);
+}
+
+// CLC — clear carry flag. First set CF via SUB, then CLC, verify cleared.
+TEST_F(CpuRuntimeTest, Clc_ClearsCarryFlag) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → CF=1
+        0xf8,                                       // clc
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0u);
+}
+
+// CMC — complement carry flag. SUB sets CF=1, CMC flips to 0.
+TEST_F(CpuRuntimeTest, Cmc_TogglesCarryFromOneToZero) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00,  // mov rax, 3
+        0x48, 0xc7, 0xc3, 0x05, 0x00, 0x00, 0x00,  // mov rbx, 5
+        0x48, 0x29, 0xd8,                           // sub rax, rbx → CF=1
+        0xf5,                                       // cmc
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0u);
+}
+
+// CMC — from 0 to 1.
+TEST_F(CpuRuntimeTest, Cmc_TogglesCarryFromZeroToOne) {
+    const u8 program[] = {
+        0xf8,                                       // clc → CF=0
+        0xf5,                                       // cmc → CF=1
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0x1ULL, 0x1ULL);
 }
 
 } // namespace
