@@ -4,6 +4,7 @@
 #include "core/cpu_runtime/lifter/lifter.h"
 
 #include <cstddef>
+#include <cstdio>
 #include <Zydis/Zydis.h>
 #include <xbyak/xbyak.h>
 
@@ -241,6 +242,110 @@ bool EmitMov(const ZydisDecodedInstruction& insn,
     }
 
     return false;
+}
+
+/// MOV with 32-bit operand width.
+///
+/// x86-64 quirk worth being explicit about: writing to a 32-bit
+/// register zero-extends into the full 64-bit register. So
+/// `mov eax, ebx` actually clears the upper 32 bits of rax. We get
+/// this for free by:
+///   1. Loading the 32-bit source value into a host 32-bit reg
+///      (e.g. `mov eax, dword[...]`), which zero-extends rax.
+///   2. Storing rax as a full 64-bit qword into the dst's GPR slot.
+///
+/// Memory operands are 4 bytes for 32-bit MOVs (not 8). The dst's
+/// upper 32 bits get zeroed only when the dst is a register; for
+/// memory dst, only 4 bytes are written.
+bool EmitMov32(const ZydisDecodedInstruction& insn,
+               const ZydisDecodedOperand* ops,
+               u64 next_rip,
+               Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 32) return false;
+    const auto& dst = ops[0];
+    const auto& src = ops[1];
+
+    // ----- Memory destination -----
+    if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute effective address into rdx.
+        if (!EmitEffectiveAddress(dst.mem, next_rip, c)) return false;
+
+        if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src_idx = ZydisGprToIndex(src.reg.value);
+            if (src_idx < 0) return false;
+            // Load low 32 bits of src; store 4 bytes at [rdx].
+            c.mov(eax, dword[r13 + GprOffset(src_idx)]);
+            c.mov(dword[rdx], eax);
+            return true;
+        }
+        if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(dword[rdx], static_cast<s32>(src.imm.value.s));
+            return true;
+        }
+        return false;
+    }
+
+    // ----- Register destination -----
+    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(dst.reg.value);
+    if (dst_idx < 0) return false;
+
+    if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(src.reg.value);
+        if (src_idx < 0) return false;
+        // 32-bit load into eax zero-extends rax. Storing rax as
+        // qword gives the dst's upper 32 bits the required zero.
+        c.mov(eax, dword[r13 + GprOffset(src_idx)]);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        return true;
+    }
+
+    if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        // `mov eax, imm32`. The 32-bit move zero-extends rax.
+        c.mov(eax, static_cast<s32>(src.imm.value.s));
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        return true;
+    }
+
+    if (src.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(src.mem, next_rip, c)) return false;
+        // 32-bit load zero-extends rax. Store full 64.
+        c.mov(eax, dword[rdx]);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        return true;
+    }
+
+    return false;
+}
+
+/// LEA r64, [mem] — compute effective address into a register.
+///
+/// No memory access. The effective-address computation already lives
+/// in EmitEffectiveAddress (it puts the address into rdx); for LEA
+/// we just store rdx to the destination GPR slot.
+///
+/// Common patterns:
+///   lea rax, [rip+disp32]   — pointer to globals (REX.W + 8d /0)
+///   lea rbp, [rsp+disp8]    — frame pointer via offset
+///   lea rcx, [rax + rbx*8]  — array indexing into a register
+/// All flow through EmitEffectiveAddress; we don't care which.
+///
+/// 32-bit LEA (`lea r32, [m]`) is not yet handled; its semantics
+/// require truncating the 32-bit result and zero-extending to 64.
+bool EmitLea(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             u64 next_rip,
+             Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;  // 32-bit LEA deferred
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (dst_idx < 0) return false;
+
+    if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+    c.mov(qword[r13 + GprOffset(dst_idx)], rdx);
+    return true;
 }
 
 // ============================================================================
@@ -946,6 +1051,31 @@ Lifter::~Lifter() {
 }
 
 void* Lifter::CompileBlock(u64 guest_rip) {
+    // Diagnostic: trace the compile path via fprintf(stderr).
+    //
+    // We deliberately do NOT use LOG_INFO here, even though it would
+    // be the natural fit. The reason: this function is called from
+    // inside the gateway-dispatched code path (Runtime::Run -> gateway
+    // -> dispatcher trampoline -> here). The gateway is JIT-emitted
+    // x86 code with no registered Windows unwind info (.pdata /
+    // .xdata). Any spdlog/fmt operation that triggers SEH stack
+    // walking — RTC1 checks, RAII destructor cleanup paths, debug
+    // checks — fails when the walker reaches the JIT gateway frame
+    // and reads garbage from a missing function table entry.
+    //
+    // Empirically: LOG_INFO from constructors (before JIT execution)
+    // works; LOG_INFO from inside CompileBlock crashes with
+    // "access violation reading 0xFFFFFFFFFFFFFFFF". The fprintf path
+    // doesn't walk the stack and is safe.
+    //
+    // The proper long-term fix is registering unwind info for the
+    // gateway via RtlAddFunctionTable on Windows. That's a separate
+    // piece of work. Until then, JIT-dispatched-context code uses
+    // fprintf for diagnostics.
+    std::fprintf(stderr, "[lifter] CompileBlock: guest_rip = 0x%llx\n",
+                 static_cast<unsigned long long>(guest_rip));
+    std::fflush(stderr);
+
     // Reserve a chunk of code cache for this block. We don't know
     // the final size yet; conservatively reserve the size cap and
     // commit only what we use. (For a real impl we'd use xbyak's
@@ -953,7 +1083,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     // overhead is tiny.)
     u8* code_buf = code_cache_.Allocate(BLOCK_HOST_SIZE_CAP);
     if (code_buf == nullptr) {
-        LOG_ERROR(Core, "Lifter: code cache full at RIP {:#x}", guest_rip);
+        std::fprintf(stderr, "[lifter] code cache full at RIP 0x%llx\n",
+                     static_cast<unsigned long long>(guest_rip));
         return nullptr;
     }
 
@@ -975,11 +1106,23 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // safe-decode path that catches faults.
         ZydisDecodedInstruction insn;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+        std::fprintf(stderr, "[lifter] about to decode at 0x%llx\n",
+                     static_cast<unsigned long long>(rip));
+        std::fflush(stderr);
         const auto status = ZydisDecoderDecodeFull(
             &decoder, reinterpret_cast<const void*>(rip), 15,
             &insn, ops);
+        std::fprintf(stderr, "[lifter] decoded at 0x%llx ok=%d mnemonic=%s\n",
+                     static_cast<unsigned long long>(rip),
+                     ZYAN_SUCCESS(status) ? 1 : 0,
+                     ZYAN_SUCCESS(status)
+                         ? ZydisMnemonicGetString(insn.mnemonic)
+                         : "(decode-failed)");
+        std::fflush(stderr);
         if (!ZYAN_SUCCESS(status)) {
-            LOG_WARNING(Core, "Lifter: decode failed at {:#x}", rip);
+            std::fprintf(stderr, "[lifter] decode FAILED at 0x%llx\n",
+                         static_cast<unsigned long long>(rip));
+            std::fflush(stderr);
             ++unsupported_hits_;
             // Emit a clean exit so the host program doesn't die.
             // Use r15 (fatal exit) rather than r14 (dispatcher loop)
@@ -999,7 +1142,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // Dispatch on mnemonic.
         bool handled = false;
         switch (insn.mnemonic) {
-            case ZYDIS_MNEMONIC_MOV:  handled = EmitMov(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_MOV:
+                if (insn.operand_width == 64) {
+                    handled = EmitMov(insn, ops, next_rip, c);
+                } else if (insn.operand_width == 32) {
+                    handled = EmitMov32(insn, ops, next_rip, c);
+                }
+                // 8/16-bit MOV not yet handled.
+                break;
+            case ZYDIS_MNEMONIC_LEA:  handled = EmitLea(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_ADD:  handled = EmitAdd(insn, ops, c); break;
             case ZYDIS_MNEMONIC_SUB:  handled = EmitSub(insn, ops, c); break;
             case ZYDIS_MNEMONIC_CMP:  handled = EmitCmp(insn, ops, c); break;
@@ -1045,9 +1196,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         }
 
         if (!handled) {
-            LOG_WARNING(Core,
-                        "Lifter: unsupported insn at {:#x} (mnemonic={})",
-                        rip, static_cast<u32>(insn.mnemonic));
+            std::fprintf(stderr,
+                         "[lifter] unsupported insn at 0x%llx (mnemonic=%s, width=%u, length=%u)\n",
+                         static_cast<unsigned long long>(rip),
+                         ZydisMnemonicGetString(insn.mnemonic),
+                         static_cast<unsigned>(insn.operand_width),
+                         static_cast<unsigned>(insn.length));
+            std::fflush(stderr);
             ++unsupported_hits_;
             // Update state.rip to the un-lifted instruction so a
             // post-mortem caller knows where it stopped, then exit
@@ -1082,10 +1237,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     bytes_emitted_ += emitted;
     ++blocks_compiled_;
 
-    LOG_DEBUG(Core,
-              "Lifter: compiled block {:#x} -> {} ({} guest bytes -> {} host bytes)",
-              guest_rip, static_cast<void*>(code_buf),
-              rip - guest_rip, emitted);
+    std::fprintf(stderr,
+                 "[lifter] compiled block 0x%llx -> %p (%llu guest bytes -> %llu host bytes)\n",
+                 static_cast<unsigned long long>(guest_rip),
+                 static_cast<void*>(code_buf),
+                 static_cast<unsigned long long>(rip - guest_rip),
+                 static_cast<unsigned long long>(emitted));
+    std::fflush(stderr);
 
     return code_buf;
 }

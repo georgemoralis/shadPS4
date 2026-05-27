@@ -886,5 +886,129 @@ TEST_F(CpuRuntimeTest, Jl_TakenWhenSignedLess) {
     EXPECT_EQ(state.rip, program_base + 35);
 }
 
+// CALL + RET round-trip — the multi-block executor test.
+//
+// Demonstrates: CALL pushes the return address, transfers control to
+// the callee through the dispatcher, callee runs and RETs, dispatcher
+// re-enters at the post-call instruction, caller continues to its
+// own RET which pops the host-return sentinel.
+//
+// This is the proof that the looping dispatcher and CALL together
+// actually execute multi-block code end-to-end.
+//
+// Caller (offsets 0..15):
+//   mov rdi, 0x42       48 c7 c7 42 00 00 00     ; arg
+//   call callee         e8 04 00 00 00           ; rel32 = +4 → offset 16
+//   mov rcx, rax        48 89 c1                 ; capture return value
+//   ret                 c3                        ; return to host sentinel
+//
+// Callee (offsets 16..23):
+//   mov rax, rdi        48 89 f8                 ; return = arg
+//   add rax, 1          48 83 c0 01              ; +1
+//   ret                 c3                        ; return to caller
+//
+// Expected: rax = 0x43, rcx = 0x43, rip = host-return sentinel.
+TEST_F(CpuRuntimeTest, Call_RoundTripsThroughCalleeBack) {
+    const u8 program[] = {
+        // Caller
+        0x48, 0xc7, 0xc7, 0x42, 0x00, 0x00, 0x00,  // mov rdi, 0x42       (0-6)
+        0xe8, 0x04, 0x00, 0x00, 0x00,              // call +4 → offset 16 (7-11)
+        0x48, 0x89, 0xc1,                           // mov rcx, rax        (12-14)
+        0xc3,                                       // ret                 (15)
+        // Callee
+        0x48, 0x89, 0xf8,                           // mov rax, rdi        (16-18)
+        0x48, 0x83, 0xc0, 0x01,                     // add rax, 1          (19-22)
+        0xc3,                                       // ret                 (23)
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[0], 0x43u) << "RAX should be 0x42 + 1 from callee";
+    EXPECT_EQ(r.state.gpr[1], 0x43u) << "RCX should hold the captured return value";
+    EXPECT_EQ(r.state.rip, kReturnSentinel)
+        << "Caller's RET should pop the host-return sentinel";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// LEA r64, [base+disp] — compute an effective address into a register.
+// Verifies that LEA writes the *computed address*, not the value at
+// that address (i.e. no memory dereference).
+//
+//   mov rcx, 0x1000     48 c7 c1 00 10 00 00      (offsets 0-6)
+//   lea rax, [rcx+5]    48 8d 41 05                (offsets 7-10)
+//   ret                 c3                          (offset 11)
+//
+// Expected: rax = 0x1000 + 5 = 0x1005.
+TEST_F(CpuRuntimeTest, Lea_BaseDisp8_ComputesAddress) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc1, 0x00, 0x10, 0x00, 0x00,  // mov rcx, 0x1000
+        0x48, 0x8d, 0x41, 0x05,                     // lea rax, [rcx+5]
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x1005u);
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
+// LEA r64, [base + index*scale + disp] — full SIB addressing.
+//
+//   mov rcx, 0x1000      48 c7 c1 00 10 00 00         (0-6)
+//   mov rdx, 3           48 c7 c2 03 00 00 00         (7-13)
+//   lea rax, [rcx+rdx*8+0x10]  48 8d 44 d1 10         (14-18)
+//   ret                  c3                            (19)
+//
+// Expected: rax = 0x1000 + (3 * 8) + 0x10
+//             = 0x1000 + 0x18 + 0x10
+//             = 0x1028
+TEST_F(CpuRuntimeTest, Lea_BaseIndexScaleDisp_ComputesAddress) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc1, 0x00, 0x10, 0x00, 0x00,  // mov rcx, 0x1000
+        0x48, 0xc7, 0xc2, 0x03, 0x00, 0x00, 0x00,  // mov rdx, 3
+        0x48, 0x8d, 0x44, 0xd1, 0x10,              // lea rax, [rcx+rdx*8+0x10]
+        0xc3,                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x1028u);
+}
+
+// MOV r32, r32 — zero-extends to 64 bits.
+//
+// Set rax = 0xFFFFFFFF'DEADBEEF, then `mov eax, ebx` where ebx = 0x12345678.
+// After the mov, rax should be 0x00000000'12345678 (upper half zeroed).
+//
+//   mov rax, 0xFFFFFFFFDEADBEEF      48 b8 ef be ad de ff ff ff ff    (0-9)
+//   mov rbx, 0x12345678              48 c7 c3 78 56 34 12             (10-16)
+//   mov eax, ebx                     89 d8                            (17-18)
+//   ret                              c3                                (19)
+TEST_F(CpuRuntimeTest, Mov32_RegReg_ZeroExtendsUpper) {
+    const u8 program[] = {
+        0x48, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0xff, 0xff, 0xff, 0xff, // mov rax, 0xFFFFFFFFDEADBEEF
+        0x48, 0xc7, 0xc3, 0x78, 0x56, 0x34, 0x12,                   // mov rbx, 0x12345678
+        0x89, 0xd8,                                                  // mov eax, ebx
+        0xc3,                                                        // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x12345678u)
+        << "After mov eax, ebx the upper 32 bits of rax must be zero";
+}
+
+// MOV r32, [r64+disp8] — 32-bit load from memory, zero-extends.
+//
+// Use [rsp-8] for the temporary so we don't clobber the return
+// sentinel at [rsp]. The guest stack has space below rsp.
+//
+//   mov dword [rsp-8], 0x11223344    c7 44 24 f8 44 33 22 11    (0-7)
+//   mov eax, dword [rsp-8]           8b 44 24 f8                (8-11)
+//   ret                              c3                          (12)
+TEST_F(CpuRuntimeTest, Mov32_RegMem_LoadsZeroExtended) {
+    const u8 program[] = {
+        0xc7, 0x44, 0x24, 0xf8, 0x44, 0x33, 0x22, 0x11,  // mov dword [rsp-8], 0x11223344
+        0x8b, 0x44, 0x24, 0xf8,                           // mov eax, [rsp-8]
+        0xc3,                                              // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x11223344u);
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
 } // namespace
 } // namespace Core::Runtime
