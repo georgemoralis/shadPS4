@@ -50,6 +50,105 @@ constexpr u32 GprOffset(int idx) {
     return Offsets::Gpr + static_cast<u32>(idx) * 8;
 }
 
+/// Guest RSP index (canonical AMD64 order: RAX=0, RCX=1, RDX=2,
+/// RBX=3, RSP=4, RBP=5, RSI=6, RDI=7, R8..R15=8..15).
+constexpr int kGuestRspIdx = 4;
+
+using namespace Xbyak::util;
+
+/// Compute the effective address of a guest memory operand into a
+/// host scratch register (always rdx). Uses rax/rcx as transient
+/// scratch during the computation. After this returns, rdx holds
+/// the guest virtual address described by the operand.
+///
+/// Supports:
+///   - [base]
+///   - [base + disp]
+///   - [base + index*scale]
+///   - [base + index*scale + disp]
+///   - [disp32]                          (no base, no index)
+///   - [base = RIP + disp]               (RIP-relative)
+///
+/// Where `base` is a 64-bit guest GPR, `index` is a 64-bit guest
+/// GPR with scale 1/2/4/8, `disp` is a signed displacement, and
+/// `RIP` is the address of the *next* instruction (so RIP-relative
+/// disp resolves to next_rip + disp).
+///
+/// `next_rip` is the address immediately after the current
+/// instruction (used for RIP-relative addressing). The caller
+/// passes guest_rip + insn.length.
+///
+/// Returns true on success; false if the addressing mode isn't
+/// supported (e.g. segment override, non-GPR base).
+bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
+                          u64 next_rip,
+                          Xbyak::CodeGenerator& c) {
+    // Segment overrides other than the standard DS/SS aren't
+    // supported. shadPS4 guest code rarely uses FS/GS, and when it
+    // does it's for TLS via specific helper sequences we'd lift
+    // specially. CS/ES are flat in long mode.
+    if (mem.segment != ZYDIS_REGISTER_DS &&
+        mem.segment != ZYDIS_REGISTER_SS &&
+        mem.segment != ZYDIS_REGISTER_CS &&
+        mem.segment != ZYDIS_REGISTER_ES) {
+        return false;
+    }
+
+    const bool has_base = (mem.base != ZYDIS_REGISTER_NONE);
+    const bool has_index = (mem.index != ZYDIS_REGISTER_NONE);
+    const s64 disp = mem.disp.has_displacement ? mem.disp.value : 0;
+
+    // RIP-relative: base == RIP, no index. Address = next_rip + disp.
+    // We constant-fold this into a single mov.
+    if (has_base && mem.base == ZYDIS_REGISTER_RIP) {
+        if (has_index) return false;  // RIP-relative with index is not a thing
+        c.mov(rdx, static_cast<u64>(static_cast<s64>(next_rip) + disp));
+        return true;
+    }
+
+    // Plain [disp32] absolute (no base, no index).
+    if (!has_base && !has_index) {
+        c.mov(rdx, static_cast<u64>(disp));
+        return true;
+    }
+
+    // General case: rdx = base + index*scale + disp.
+    // Start rdx at the base value (or 0 if no base).
+    if (has_base) {
+        const int base_idx = ZydisGprToIndex(mem.base);
+        if (base_idx < 0) return false;
+        c.mov(rdx, qword[r13 + GprOffset(base_idx)]);
+    } else {
+        c.xor_(rdx, rdx);
+    }
+
+    if (has_index) {
+        const int index_idx = ZydisGprToIndex(mem.index);
+        if (index_idx < 0) return false;
+        // Load index into rax, scale it, add to rdx.
+        c.mov(rax, qword[r13 + GprOffset(index_idx)]);
+        switch (mem.scale) {
+            case 1:  break;  // no shift
+            case 2:  c.shl(rax, 1); break;
+            case 4:  c.shl(rax, 2); break;
+            case 8:  c.shl(rax, 3); break;
+            default: return false;  // invalid SIB scale
+        }
+        c.add(rdx, rax);
+    }
+
+    if (disp != 0) {
+        if (disp >= INT32_MIN && disp <= INT32_MAX) {
+            c.add(rdx, static_cast<int>(disp));
+        } else {
+            c.mov(rax, static_cast<u64>(disp));
+            c.add(rdx, rax);
+        }
+    }
+
+    return true;
+}
+
 // ============================================================================
 // Per-opcode emit functions
 // ============================================================================
@@ -60,29 +159,59 @@ constexpr u32 GprOffset(int idx) {
 //     in which case the dispatcher falls through to EmitUnsupported.
 //
 // Conventions inside emit code:
-//   - rax/rcx are scratch. JIT code is free to clobber them between
-//     instruction boundaries. (More sophisticated allocation comes
-//     later.)
+//   - rax/rcx/rdx are scratch. JIT code is free to clobber them
+//     between instruction boundaries.
 //   - r13 is the GuestState pointer (set by the gateway, never
 //     modified by JIT).
 //   - r12, r14, r15 are reserved (dispatcher, exit stub, future use).
+//
+// `next_rip` is the guest RIP of the next instruction after this
+// one. Used by RIP-relative addressing.
 
-using namespace Xbyak::util;
-
-/// MOV r64, imm64 / MOV r64, r64 / MOV r64, imm32 (sign-extended).
+/// MOV: handles
+///   - r64, r64         (reg-to-reg)
+///   - r64, imm64       (full 10-byte form)
+///   - r64, imm32-sx    (sign-extended)
+///   - r64, [mem]       (load from memory)
+///   - [mem], r64       (store to memory)
+///   - [mem], imm32-sx  (store immediate to memory)
 bool EmitMov(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
+             u64 next_rip,
              Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) {
+        return false;  // 32/16/8-bit MOVs not in initial slice
+    }
     const auto& dst = ops[0];
     const auto& src = ops[1];
 
-    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) {
-        return false; // memory destinations not in initial subset
-    }
-    const int dst_idx = ZydisGprToIndex(dst.reg.value);
-    if (dst_idx < 0) {
+    // ----- Memory destination -----
+    if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute effective address into rdx.
+        if (!EmitEffectiveAddress(dst.mem, next_rip, c)) return false;
+
+        if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src_idx = ZydisGprToIndex(src.reg.value);
+            if (src_idx < 0) return false;
+            // Load src value into rax; store at [rdx].
+            c.mov(rax, qword[r13 + GprOffset(src_idx)]);
+            c.mov(qword[rdx], rax);
+            return true;
+        }
+        if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            // imm32 sign-extended to 64 bits. Load via rax (mov
+            // qword[mem], imm32 doesn't exist as a single insn).
+            c.mov(rax, src.imm.value.s);
+            c.mov(qword[rdx], rax);
+            return true;
+        }
         return false;
     }
+
+    // ----- Register destination -----
+    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(dst.reg.value);
+    if (dst_idx < 0) return false;
 
     if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_idx = ZydisGprToIndex(src.reg.value);
@@ -93,14 +222,16 @@ bool EmitMov(const ZydisDecodedInstruction& insn,
     }
 
     if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        // Zydis gives the immediate value (already sign-extended to
-        // 64 bits if applicable). The instruction width tells us
-        // the semantics; for our initial subset we only handle the
-        // 64-bit-destination case.
-        if (insn.operand_width != 64) {
-            return false;
-        }
+        // Both forms: REX.W + B8+r io (imm64), and REX.W + C7 /0 id
+        // (imm32 sign-extended). Zydis gives us the resolved value.
         c.mov(rax, src.imm.value.s);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        return true;
+    }
+
+    if (src.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(src.mem, next_rip, c)) return false;
+        c.mov(rax, qword[rdx]);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
         return true;
     }
@@ -168,6 +299,107 @@ bool EmitAdd(const ZydisDecodedInstruction& insn,
     }
 
     return false;
+}
+
+/// SUB r64, imm32-sx — for stack adjustment in function prologue.
+/// Also SUB r64, r64. Flag side-effects deferred (same plan as ADD).
+bool EmitSub(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    const auto& dst = ops[0];
+    const auto& src = ops[1];
+
+    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(dst.reg.value);
+    if (dst_idx < 0) return false;
+
+    if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(src.reg.value);
+        if (src_idx < 0) return false;
+        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
+        c.sub(rax, rcx);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        return true;
+    }
+
+    if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        const auto imm = src.imm.value.s;
+        if (imm >= INT32_MIN && imm <= INT32_MAX) {
+            c.sub(rax, static_cast<int>(imm));
+        } else {
+            c.mov(rcx, imm);
+            c.sub(rax, rcx);
+        }
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        return true;
+    }
+
+    return false;
+}
+
+/// XOR r64, r64 — common register-zero idiom (`xor rax, rax`).
+/// We don't yet implement XOR r64, imm.
+bool EmitXor(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    const auto& dst = ops[0];
+    const auto& src = ops[1];
+
+    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (src.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(dst.reg.value);
+    const int src_idx = ZydisGprToIndex(src.reg.value);
+    if (dst_idx < 0 || src_idx < 0) return false;
+
+    c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+    c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
+    c.xor_(rax, rcx);
+    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    return true;
+}
+
+/// PUSH r64 — pushes a register onto the guest stack.
+/// Semantics: guest_rsp -= 8; *guest_rsp = reg.
+bool EmitPush(const ZydisDecodedInstruction& insn,
+              const ZydisDecodedOperand* ops,
+              Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    const auto& src = ops[0];
+    if (src.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int src_idx = ZydisGprToIndex(src.reg.value);
+    if (src_idx < 0) return false;
+
+    // rax = src value, rdx = guest_rsp, decrement, store.
+    c.mov(rax, qword[r13 + GprOffset(src_idx)]);
+    c.mov(rdx, qword[r13 + GprOffset(kGuestRspIdx)]);
+    c.sub(rdx, 8);
+    c.mov(qword[rdx], rax);                              // write to guest stack
+    c.mov(qword[r13 + GprOffset(kGuestRspIdx)], rdx);    // update RSP
+    return true;
+}
+
+/// POP r64 — pops top of guest stack into a register.
+/// Semantics: reg = *guest_rsp; guest_rsp += 8.
+bool EmitPop(const ZydisDecodedInstruction& insn,
+             const ZydisDecodedOperand* ops,
+             Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64) return false;
+    const auto& dst = ops[0];
+    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisGprToIndex(dst.reg.value);
+    if (dst_idx < 0) return false;
+
+    // rdx = guest_rsp, rax = *rdx, increment rsp, store.
+    c.mov(rdx, qword[r13 + GprOffset(kGuestRspIdx)]);
+    c.mov(rax, qword[rdx]);
+    c.add(rdx, 8);
+    c.mov(qword[r13 + GprOffset(kGuestRspIdx)], rdx);
+    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    return true;
 }
 
 /// RET — single-byte (0xC3) form. Pops the return address from the
@@ -273,11 +505,18 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         }
 
+        // Compute next_rip for RIP-relative addressing.
+        const u64 next_rip = rip + insn.length;
+
         // Dispatch on mnemonic.
         bool handled = false;
         switch (insn.mnemonic) {
-            case ZYDIS_MNEMONIC_MOV: handled = EmitMov(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_ADD: handled = EmitAdd(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_MOV:  handled = EmitMov(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_ADD:  handled = EmitAdd(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_SUB:  handled = EmitSub(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_XOR:  handled = EmitXor(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_PUSH: handled = EmitPush(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_POP:  handled = EmitPop(insn, ops, c); break;
             case ZYDIS_MNEMONIC_RET:
                 handled = EmitRet(insn, ops, c);
                 if (handled) emitted_terminator = true;

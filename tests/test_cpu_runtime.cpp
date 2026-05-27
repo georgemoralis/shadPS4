@@ -165,18 +165,24 @@ TEST_F(CpuRuntimeTest, MultipleRegistersAndOpcodes_ProduceCorrectValues) {
 // emits an exit sequence that sets exit_reason and stores the
 // un-lifted RIP so callers can diagnose where execution stopped.
 TEST_F(CpuRuntimeTest, UnsupportedOpcode_ExitsCleanly) {
+    // CMP is still unsupported in the current lifter slice (flag
+    // computation deferred). Use it to verify the unsupported-exit
+    // path still works. If/when CMP becomes supported, replace with
+    // another not-yet-supported instruction (CALL is a good
+    // long-term choice — it has block-terminator semantics that
+    // require dispatcher cooperation).
     const u8 program[] = {
         0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
-        0x48, 0x31, 0xc0,                           // xor rax, rax  (unsupported)
+        0x48, 0x39, 0xc3,                           // cmp rbx, rax  (unsupported)
         0xc3,                                       // ret  (unreached)
     };
     const auto r = RunProgram(program, sizeof(program), mem);
 
-    // RIP should point to the XOR instruction (at offset 7).
+    // RIP should point to the CMP instruction (at offset 7).
     EXPECT_EQ(r.state.rip, r.program_base + 7);
     EXPECT_EQ(r.state.exit_reason,
               static_cast<u32>(ExitReason::UnsupportedInstruction));
-    // MOV before XOR should have executed.
+    // MOV before CMP should have executed.
     EXPECT_EQ(r.state.gpr[0], 1u);
 }
 
@@ -433,6 +439,203 @@ TEST_F(CpuRuntimeTest, InvokeGuestCallback_PostJitPathUsesFreshStack) {
         /*a0=*/0x40);
 
     EXPECT_EQ(result, 0x50u);
+}
+
+// ============================================================================
+// New opcode tests (PUSH/POP, SUB-imm, XOR, MOV memory, MOV imm)
+// ============================================================================
+
+// PUSH r64 and POP r64. Test by pushing rdi (set up to 0x1234),
+// then popping into rax, then ret. After RET, RAX should be 0x1234.
+//
+//   push rdi    57
+//   pop  rax    58
+//   ret         c3
+TEST_F(CpuRuntimeTest, PushPop_RoundTripsValue) {
+    const u8 program[] = {0x57, 0x58, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 16;  // leave room for push + sentinel
+    *reinterpret_cast<u64*>(guest_rsp + 8) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp + 8);  // RSP at sentinel
+    state.gpr[7] = 0x1234'5678'9abc'def0ULL;              // RDI
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 0x1234'5678'9abc'def0ULL);
+    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// SUB r64, imm8 — subtract 0x20 from rax. Then ret.
+//
+//   mov rax, 0x100   48 c7 c0 00 01 00 00
+//   sub rax, 0x20    48 83 e8 20
+//   ret              c3
+TEST_F(CpuRuntimeTest, SubImm_DecrementsCorrectly) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x01, 0x00, 0x00,  // mov rax, 0x100
+        0x48, 0x83, 0xe8, 0x20,                    // sub rax, 0x20
+        0xc3,                                       // ret
+    };
+    auto result = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(result.state.gpr[0], 0x100ULL - 0x20ULL);
+}
+
+// XOR rax, rax — register-zero idiom. After running, RAX should be 0
+// regardless of what it started as.
+//
+//   xor rax, rax    48 31 c0
+//   ret             c3
+TEST_F(CpuRuntimeTest, XorReg_ZeroesRegister) {
+    const u8 program[] = {0x48, 0x31, 0xc0, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.gpr[0] = 0xdead'beef'cafe'babeULL;  // RAX starts non-zero
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 0u);
+}
+
+// MOV r64, [mem] — load from memory. We put 0xfeedface at a known
+// address, then mov rax from there via rdi-as-base.
+//
+//   mov rax, [rdi]    48 8b 07
+//   ret               c3
+TEST_F(CpuRuntimeTest, MovLoadFromMemory_ViaBaseReg) {
+    const u8 program[] = {0x48, 0x8b, 0x07, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    // Use a chunk of guest memory below the stack as a data slot.
+    u8* data_slot = mem.StackTop() - 32;
+    *reinterpret_cast<u64*>(data_slot) = 0xfeed'face'1234'5678ULL;
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.gpr[7] = reinterpret_cast<u64>(data_slot);  // RDI -> data slot
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 0xfeed'face'1234'5678ULL);
+}
+
+// MOV [mem], r64 — store to memory. Pre-zero a data slot, store
+// 0xdeadbeef there via RDI as base, verify by reading after run.
+//
+//   mov [rdi], rax    48 89 07
+//   ret               c3
+TEST_F(CpuRuntimeTest, MovStoreToMemory_ViaBaseReg) {
+    const u8 program[] = {0x48, 0x89, 0x07, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* data_slot = mem.StackTop() - 32;
+    *reinterpret_cast<u64*>(data_slot) = 0;
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.gpr[0] = 0xdead'beef'1234'5678ULL;            // RAX = value
+    state.gpr[7] = reinterpret_cast<u64>(data_slot);    // RDI -> data slot
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(*reinterpret_cast<u64*>(data_slot), 0xdead'beef'1234'5678ULL);
+}
+
+// MOV r64, [base + disp] — load with displacement. Stack-frame-style
+// addressing: read from [rbp-8].
+//
+//   mov rax, [rbp-8]    48 8b 45 f8
+//   ret                 c3
+TEST_F(CpuRuntimeTest, MovLoadFromMemory_WithDisplacement) {
+    const u8 program[] = {0x48, 0x8b, 0x45, 0xf8, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* data_slot = mem.StackTop() - 40;
+    *reinterpret_cast<u64*>(data_slot) = 0xa1b2'c3d4'e5f6'0708ULL;
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.gpr[5] = reinterpret_cast<u64>(data_slot) + 8;  // RBP -> slot + 8
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 0xa1b2'c3d4'e5f6'0708ULL);
+}
+
+// Full function prologue + epilogue. Verifies that PUSH/POP plus
+// MOV reg-reg plus SUB-imm plus ADD-imm all work together end-to-end.
+//
+//   push rbp           55
+//   mov  rbp, rsp      48 89 e5
+//   sub  rsp, 0x20     48 83 ec 20
+//   mov  rax, rdi      48 89 f8        ; pretend "do something with arg"
+//   add  rsp, 0x20     48 83 c4 20
+//   pop  rbp           5d
+//   ret                c3
+//
+// We pass 0x42 in RDI, expect 0x42 in RAX, and verify RBP and RSP
+// come out the way they started.
+TEST_F(CpuRuntimeTest, FullPrologueEpilogue_ProducesCorrectState) {
+    const u8 program[] = {
+        0x55,                                        // push rbp
+        0x48, 0x89, 0xe5,                            // mov rbp, rsp
+        0x48, 0x83, 0xec, 0x20,                      // sub rsp, 0x20
+        0x48, 0x89, 0xf8,                            // mov rax, rdi
+        0x48, 0x83, 0xc4, 0x20,                      // add rsp, 0x20
+        0x5d,                                        // pop rbp
+        0xc3,                                        // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 16;
+    *reinterpret_cast<u64*>(guest_rsp + 8) = kReturnSentinel;
+
+    const u64 rsp_initial = reinterpret_cast<u64>(guest_rsp + 8);
+    const u64 rbp_initial = 0x1111'2222'3333'4444ULL;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = rsp_initial;
+    state.gpr[5] = rbp_initial;
+    state.gpr[7] = 0x42;  // RDI
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 0x42u)       << "RAX should hold the arg";
+    EXPECT_EQ(state.gpr[5], rbp_initial) << "RBP should be restored";
+    // After the RET, RSP has popped the sentinel return address —
+    // standard x86 calling convention. Entry was at rsp_initial
+    // (pointing at the sentinel slot); after RET it's 8 bytes higher.
+    EXPECT_EQ(state.gpr[4], rsp_initial + 8)
+        << "RSP after RET should be entry+8 (return address popped)";
+    EXPECT_EQ(state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
 }
 
 } // namespace
