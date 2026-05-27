@@ -3,8 +3,10 @@
 
 #include "core/cpu_runtime/runtime.h"
 
+#include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #include "common/assert.h"
 #include "common/logging/log.h"
@@ -37,50 +39,80 @@ thread_local GuestState* tl_current_guest_state = nullptr;
 /// HLE bridge — calls a host function as if it were the next-block
 /// continuation of guest execution.
 ///
-/// We use a `PS4_SYSV_ABI` function pointer so the *call instruction*
-/// emitted at the call site below uses System V x86-64 calling
-/// convention (args in RDI/RSI/RDX/RCX/R8/R9, return in RAX). This
-/// matches the convention shadPS4's HLE functions are declared with.
+/// HLE bridge return value: captures *both* rax and xmm0 from
+/// the called host function.
 ///
-///   - On Linux x86-64, SysV is the host C ABI by default — the
-///     attribute is a no-op but harmless.
-///   - On Windows x86-64, the host C ABI is MS x64 (args in
-///     RCX/RDX/R8/R9 + shadow space). Without `PS4_SYSV_ABI` the
-///     compiler would generate an MS-x64 call here, and arguments
-///     would land in the wrong registers from the HLE function's
-///     point of view. With the attribute, clang generates a SysV
-///     call and arguments flow correctly.
+/// We don't know at runtime whether the called function returns an
+/// int (rax-used), a double (xmm0-used), a void (neither used), or
+/// something else. By declaring the bridge to return a struct
+/// containing one INTEGER-class field (u64) and one SSE-class
+/// field (double), the SysV ABI classifies the struct as
+/// (INTEGER, SSE) — returned in rax + xmm0 respectively. The
+/// compiler emits a call site that reads *both* rax and xmm0 from
+/// the callee, regardless of which the callee actually populated.
 ///
-/// Arguments are unpacked from canonical SysV arg-passing slots in
-/// `state.gpr[]`:
-///
-///   1st arg  →  gpr[7]  (RDI)
-///   2nd arg  →  gpr[6]  (RSI)
-///   3rd arg  →  gpr[2]  (RDX)
-///   4th arg  →  gpr[1]  (RCX)
-///   5th arg  →  gpr[8]  (R8)
-///   6th arg  →  gpr[9]  (R9)
-///
-/// The return value (RAX in the SysV ABI) is written to `gpr[0]`.
-///
-/// Deferred (not yet handled; documented as limitations):
-///
-///   - Float/double args (XMM0..7 in the SSE arg-passing class).
-///   - More than 6 integer args (would spill to the stack and we
-///     don't marshal stack args yet).
-///   - Variadic functions (RAX = SSE arg count is required).
-///   - Aggregate returns via a hidden RDI pointer (would shift all
-///     subsequent args by one slot — silent misalignment).
-///
-/// In practice shadPS4's HLE shims are integer-arg/integer-return
-/// functions, so the minimal bridge above covers them. We'll widen
-/// the bridge when a real HLE function trips one of the gaps.
-typedef u64 (*HostHleFn)(u64, u64, u64, u64, u64, u64) __attribute__((sysv_abi));
+/// We then write both back into guest state. For int-returning
+/// callees: guest.rax = real return value, guest.xmm0 = garbage.
+/// For double-returning callees: guest.rax = garbage, guest.xmm0
+/// = real return. The guest knows the function's signature and
+/// reads only the correct slot; the "garbage" slot is one that
+/// SysV says is caller-saved anyway, so the guest doesn't rely on
+/// the pre-call value being preserved across the call.
+struct HostReturn {
+    u64 rax;
+    double xmm0;
+};
 
-u64 CallHostFromGuest(VAddr host_fn,
-                      u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5) {
+/// HLE bridge — calls a host function with full SysV-ABI marshaling.
+///
+/// Arguments are unpacked from canonical SysV slots:
+///
+///   Integer args 0..5 →  rdi, rsi, rdx, rcx, r8, r9  (state.gpr[7,6,2,1,8,9])
+///   Float args   0..7 →  xmm0..xmm7  (low u64 of each state.ymm[i*4])
+///
+/// The function pointer is declared variadic. This serves two
+/// purposes:
+///
+///   1. It makes the compiler set AL = number of XMM args used (8)
+///      when emitting the call instruction. AL is required by the
+///      SysV ABI for variadic targets (printf, sprintf, ...) so
+///      they can locate their float args via va_arg.
+///   2. For non-variadic targets the AL value is ignored, so we
+///      get full coverage of both cases from one trampoline.
+///
+/// The `__attribute__((sysv_abi))` annotation forces SysV calling
+/// convention on the call instruction. On Linux x86-64 this is the
+/// default; on Windows x86-64 the default is MS x64 (args in
+/// RCX/RDX/R8/R9 + shadow space) — without this attribute, args
+/// would land in the wrong registers from the HLE target's POV.
+///
+/// Deferred (still not handled; documented as limitations):
+///
+///   - More than 6 integer args spill to stack; we don't marshal
+///     stack args yet. Real PS4 HLE functions rarely take >6 ints.
+///   - More than 8 float args spill to stack; similar story.
+///   - Aggregate returns via a hidden RDI pointer (would silently
+///     shift all args by one slot) are not handled. The bridge
+///     assumes scalar or empty returns.
+///   - Float (32-bit) values are passed via the same XMM slots as
+///     doubles; we pass the low 64 bits of each YMM lane. The host
+///     function reads only the low 32 if it expects a float, which
+///     is correct as long as the guest set up the float bit pattern
+///     in the low 32 of the corresponding XMM. NaN canonicalization
+///     by the host compiler may quiet signaling NaNs through the
+///     double-typed pass-through; benign for non-NaN values.
+typedef HostReturn (*HostHleFn)(u64, u64, u64, u64, u64, u64,
+                                double, double, double, double,
+                                double, double, double, double, ...)
+                              __attribute__((sysv_abi));
+
+HostReturn CallHostFromGuest(VAddr host_fn,
+                             u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
+                             double f0, double f1, double f2, double f3,
+                             double f4, double f5, double f6, double f7) {
     auto fn = reinterpret_cast<HostHleFn>(host_fn);
-    return fn(a0, a1, a2, a3, a4, a5);
+    return fn(a0, a1, a2, a3, a4, a5,
+              f0, f1, f2, f3, f4, f5, f6, f7);
 }
 
 /// Dispatcher trampoline. Called from the gateway with the current
@@ -145,6 +177,23 @@ void* DispatcherTrampoline(GuestState* state) {
             // for in crash logs.
             const std::string_view name =
                 HleRegistry::Instance().Lookup(host_fn);
+
+            // Marshal the 8 XMM-arg slots from state.ymm. Each YMM
+            // register occupies 4 u64 lanes; the low 64 bits of
+            // xmm[i] are state.ymm[i*4]. The compiler will load
+            // these into xmm0..xmm7 per SysV when emitting the call.
+            const auto load_xmm_low = [&](unsigned i) -> double {
+                return std::bit_cast<double>(state->ymm[i * 4]);
+            };
+            const double f0 = load_xmm_low(0);
+            const double f1 = load_xmm_low(1);
+            const double f2 = load_xmm_low(2);
+            const double f3 = load_xmm_low(3);
+            const double f4 = load_xmm_low(4);
+            const double f5 = load_xmm_low(5);
+            const double f6 = load_xmm_low(6);
+            const double f7 = load_xmm_low(7);
+
             if (name.empty()) {
                 std::fprintf(stderr,
                     "[bridge] WARNING unregistered host=0x%llx ret=0x%llx | "
@@ -176,30 +225,55 @@ void* DispatcherTrampoline(GuestState* state) {
                     (unsigned long long)state->gpr[8],
                     (unsigned long long)state->gpr[9]);
             }
+            // Log XMM args on a continuation line. Print as hex bit
+            // patterns rather than decimals — they're easier to
+            // recognize as "this is 1.0" vs "this is garbage" by eye.
+            std::fprintf(stderr,
+                "[bridge]   xmm0=0x%llx xmm1=0x%llx xmm2=0x%llx xmm3=0x%llx "
+                "xmm4=0x%llx xmm5=0x%llx xmm6=0x%llx xmm7=0x%llx\n",
+                (unsigned long long)state->ymm[0],
+                (unsigned long long)state->ymm[4],
+                (unsigned long long)state->ymm[8],
+                (unsigned long long)state->ymm[12],
+                (unsigned long long)state->ymm[16],
+                (unsigned long long)state->ymm[20],
+                (unsigned long long)state->ymm[24],
+                (unsigned long long)state->ymm[28]);
             std::fflush(stderr);
 
-            const u64 ret = CallHostFromGuest(
+            const HostReturn ret = CallHostFromGuest(
                 host_fn,
                 state->gpr[7],   // RDI
                 state->gpr[6],   // RSI
                 state->gpr[2],   // RDX
                 state->gpr[1],   // RCX
                 state->gpr[8],   // R8
-                state->gpr[9]);  // R9
-            state->gpr[0] = ret; // RAX
+                state->gpr[9],   // R9
+                f0, f1, f2, f3, f4, f5, f6, f7);
+            // Write both rax and xmm0 back to guest state. The
+            // guest knows which one is meaningful based on the
+            // called function's signature; the "other" slot may
+            // have been clobbered by the call but x86-64 calling
+            // convention says rax/xmm0 are caller-saved, so the
+            // guest doesn't rely on the pre-call values surviving.
+            state->gpr[0] = ret.rax;
+            const u64 xmm0_bits = std::bit_cast<u64>(ret.xmm0);
+            std::memcpy(&state->ymm[0], &xmm0_bits, sizeof(u64));
 
-            // Print the post-return rax. If we never see this
+            // Print the post-return rax/xmm0. If we never see this
             // line for a given host_fn, that function crashed.
             if (name.empty()) {
                 std::fprintf(stderr,
-                    "[bridge] ret  host=0x%llx -> rax=0x%llx\n",
+                    "[bridge] ret  host=0x%llx -> rax=0x%llx xmm0=0x%llx\n",
                     (unsigned long long)host_fn,
-                    (unsigned long long)ret);
+                    (unsigned long long)ret.rax,
+                    (unsigned long long)xmm0_bits);
             } else {
                 std::fprintf(stderr,
-                    "[bridge] ret  %.*s -> rax=0x%llx\n",
+                    "[bridge] ret  %.*s -> rax=0x%llx xmm0=0x%llx\n",
                     static_cast<int>(name.size()), name.data(),
-                    (unsigned long long)ret);
+                    (unsigned long long)ret.rax,
+                    (unsigned long long)xmm0_bits);
             }
             std::fflush(stderr);
 

@@ -15,6 +15,7 @@
 // end. They produce no output unless something fails, so they're
 // suitable for CI.
 
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -1190,6 +1191,29 @@ static PS4_SYSV_ABI u64 HleBridgeTestFn_Unregistered(u64 a, u64, u64, u64, u64, 
     return a + 0xDEAD0000ULL;
 }
 
+// Takes a double; converts to int and doubles it. Used to verify
+// the bridge marshals state.ymm[0] (low 64) into xmm0 for the call.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_DoubleToU64(double x) {
+    return static_cast<u64>(x * 2.0);
+}
+
+// Returns a double computed from its int arg. Used to verify the
+// bridge captures xmm0 (the double's return slot) back into
+// state.ymm[0] via the (rax, xmm0) struct-return trick.
+static PS4_SYSV_ABI double HleBridgeTestFn_ReturnsDouble(u64 i) {
+    return static_cast<double>(i) * 1.5;
+}
+
+// Mixed int/float args. SysV allocates integer args and SSE args
+// from independent pools, so a=rdi, b=xmm0, c=rsi, d=xmm1. The
+// return computes a position-sensitive sum so wrong slots show up
+// as obviously wrong values.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_MixedArgs(u64 a, double b,
+                                                  u64 c, double d) {
+    return a * 1 + static_cast<u64>(b) * 10 +
+           c * 100 + static_cast<u64>(d) * 1000;
+}
+
 // HLE bridge: guest calls a PS4_SYSV_ABI host function with 6
 // distinct int args, captures the return value.
 //
@@ -2203,7 +2227,130 @@ TEST_F(CpuRuntimeTest, Test16_SetsZeroFlagOnDisjointBits) {
 }
 
 // =============================================================================
-// HleRegistry tests.
+// HLE bridge: XMM marshaling (float/double args + double return).
+// =============================================================================
+
+// Float arg in xmm0 is passed through to the host function.
+//
+// Pre-populates state.ymm[0] (low 64 bits = xmm0 low) with the
+// bit pattern of 3.14 before running. The bridge should marshal
+// this into xmm0 when calling the host fn, which receives 3.14
+// as its double arg and returns 6 (3.14 * 2 truncated to u64).
+TEST_F(CpuRuntimeTest, HleBridge_FloatArg_PassesViaXmm0) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_DoubleToU64);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_DoubleToU64");
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,  // mov rax, <addr>     (0..9; imm 2..9)
+        0xff, 0xd0,                    // call rax            (10..11)
+        0xc3,                          // ret                 (12)
+    };
+    std::memcpy(&program[2], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm0 = low 64 of ymm[0]; set to bit pattern of 3.14.
+    state.ymm[0] = std::bit_cast<u64>(3.14);
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], static_cast<u64>(3.14 * 2.0))
+        << "Host fn received xmm0=3.14, should return 6";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// Double return value lands in state.ymm[0].
+//
+// Host fn declared to return double; SysV places the return in
+// xmm0. Our bridge's HostReturn struct trick captures both rax
+// and xmm0 (since (INTEGER, SSE) classified struct is returned
+// in those two registers). We verify the xmm0 bit pattern is
+// preserved into state.ymm[0].
+TEST_F(CpuRuntimeTest, HleBridge_DoubleReturn_CapturedInXmm0) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_ReturnsDouble);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_ReturnsDouble");
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x04, 0x00, 0x00, 0x00,  // mov rdi, 4         (0..6)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <addr>    (7..16; imm 9..16)
+        0xff, 0xd0,                                 // call rax           (17..18)
+        0xc3,                                       // ret                (19)
+    };
+    std::memcpy(&program[9], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    const u64 expected_bits = std::bit_cast<u64>(4.0 * 1.5); // 6.0
+    EXPECT_EQ(state.ymm[0], expected_bits)
+        << "state.ymm[0] should hold the bit pattern of 6.0 after a "
+        << "double-returning HLE call";
+    // We deliberately do NOT check state.gpr[0] (rax) here: for a
+    // double-returning function, rax is caller-saved and the
+    // callee may have left arbitrary values there. The bridge
+    // writes both rax and xmm0 regardless; the guest, knowing
+    // the function returns double, reads only xmm0.
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// Mixed int and float args land in their independent register
+// pools per SysV. fn(u64 a, double b, u64 c, double d) →
+// a=rdi, b=xmm0, c=rsi, d=xmm1.
+//
+// The host function's return uses position-weighted multipliers
+// so a wrong slot (e.g. b ending up in xmm1 instead of xmm0)
+// produces an obviously different number, not a coincidentally
+// correct one.
+TEST_F(CpuRuntimeTest, HleBridge_MixedIntAndFloatArgs) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_MixedArgs);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_MixedArgs");
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x02, 0x00, 0x00, 0x00,  // mov rdi, 2 (a)     (0..6)
+        0x48, 0xc7, 0xc6, 0x05, 0x00, 0x00, 0x00,  // mov rsi, 5 (c)     (7..13)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <addr>    (14..23; imm 16..23)
+        0xff, 0xd0,                                 // call rax           (24..25)
+        0xc3,                                       // ret                (26)
+    };
+    std::memcpy(&program[16], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.ymm[0] = std::bit_cast<u64>(3.0);  // xmm0 = b = 3.0
+    state.ymm[4] = std::bit_cast<u64>(7.0);  // xmm1 = d = 7.0
+
+    Runtime rt;
+    rt.Run(state);
+
+    // Expected: 2*1 + 3*10 + 5*100 + 7*1000 = 2 + 30 + 500 + 7000 = 7532
+    EXPECT_EQ(state.gpr[0], 7532ULL)
+        << "Mixed args should be: rdi=2(a), xmm0=3(b), rsi=5(c), xmm1=7(d)";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+
 //
 // Tests focus on the data structure's contract, not the bridge
 // integration (which is already covered by HleBridge_* tests above).
