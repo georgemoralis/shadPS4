@@ -4539,5 +4539,388 @@ TEST_F(CpuRuntimeTest, Bextr32_MemSrc_ExtractsByteFromMid) {
     EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "32-bit result must zero-extend";
 }
 
+// ============================================================================
+// INC byte[mem] — 8-bit increment with memory destination. The existing
+// emitter handled 32/64-bit reg-dst only. INC architecturally preserves CF,
+// which we get for free because host INC preserves CF and the rflags
+// round-trip captures the rest from the host.
+// ============================================================================
+
+// Increment a memory byte; verify the value advances by 1 and CF is
+// unchanged. Pre-set CF=1 via STC; INC must NOT clear it.
+TEST_F(CpuRuntimeTest, Inc8_MemDst_AdvancesByteAndPreservesCf) {
+    u8* scratch = mem.CodePtr() + 0x100;
+    *scratch = 0x41; // 'A'
+
+    const u8 program[] = {
+        0xf9, // stc  → CF=1
+        // mov rax, <scratch addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // inc byte[rax]   (FE /0 [rax] = 2 bytes; with disp8 = 3)
+        0xfe,
+        0x00,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 3, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(*scratch, 0x42) << "byte incremented in-place";
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF preserved through INC";
+}
+
+// 0x7F → 0x80 wraps signed int8 from positive to negative: OF must be set,
+// SF must be set, ZF must be clear.
+TEST_F(CpuRuntimeTest, Inc8_MemDst_SignedOverflow_SetsOfSf) {
+    u8* scratch = mem.CodePtr() + 0x100;
+    *scratch = 0x7F;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <addr>
+        0xfe, 0x00,                         // inc byte[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(*scratch, 0x80);
+    EXPECT_TRUE(r.state.rflags & (1ULL << 11)) << "OF set on signed wrap +→−";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 7)) << "SF set (result MSB = 1)";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear (result ≠ 0)";
+}
+
+// ============================================================================
+// VPSHUFD dst, src, imm8 — dword shuffle. For each output dword i,
+// dst[i] = src[(imm >> (2*i)) & 3].
+// ============================================================================
+
+// Broadcast: imm = 0x00 → all four output dwords = src[0].
+TEST_F(CpuRuntimeTest, Vpshufd_BroadcastsLowestDword) {
+    const u8 program[] = {
+        0xc5, 0xf9, 0x70, 0xc1, 0x00, // vpshufd xmm0, xmm1, 0x00
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // xmm1 (ymm lane 1) = {0xCAFEBABE, 0xDEADBEEF, 0x11111111, 0x22222222}
+    u32 src[4] = {0xCAFEBABEu, 0xDEADBEEFu, 0x11111111u, 0x22222222u};
+    std::memcpy(&st.ymm[4], src, 16);
+    // Pre-pollute the destination.
+    st.ymm[0] = 0xDEADULL;
+    st.ymm[1] = 0xDEADULL;
+    st.ymm[2] = 0xDEADULL;
+    st.ymm[3] = 0xDEADULL;
+
+    Runtime rt;
+    rt.Run(st);
+
+    u32 out[4];
+    std::memcpy(out, &st.ymm[0], 16);
+    EXPECT_EQ(out[0], 0xCAFEBABEu) << "imm=0 broadcasts src[0] to all 4 lanes";
+    EXPECT_EQ(out[1], 0xCAFEBABEu);
+    EXPECT_EQ(out[2], 0xCAFEBABEu);
+    EXPECT_EQ(out[3], 0xCAFEBABEu);
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeroes upper YMM lane";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Shuffle pattern 0xE4 = 11_10_01_00 → identity (each output i = src[i]).
+// Pattern 0x1B = 00_01_10_11 → reverse: out[0]=src[3], out[1]=src[2],
+// out[2]=src[1], out[3]=src[0].
+TEST_F(CpuRuntimeTest, Vpshufd_ReversesDwords) {
+    const u8 program[] = {
+        0xc5, 0xf9, 0x70, 0xc1, 0x1b, // vpshufd xmm0, xmm1, 0x1b
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    u32 src[4] = {1, 2, 3, 4};
+    std::memcpy(&st.ymm[4], src, 16);
+
+    Runtime rt;
+    rt.Run(st);
+
+    u32 out[4];
+    std::memcpy(out, &st.ymm[0], 16);
+    EXPECT_EQ(out[0], 4u);
+    EXPECT_EQ(out[1], 3u);
+    EXPECT_EQ(out[2], 2u);
+    EXPECT_EQ(out[3], 1u);
+}
+
+// ============================================================================
+// LZCNT — count leading zeros. Sets CF=1 when src is zero (signaling
+// "no bits set, count = operand size"); ZF=1 when result is zero.
+// ============================================================================
+
+// LZCNT of 0xFF (low byte): 32-bit operand → 24 leading zeros.
+TEST_F(CpuRuntimeTest, Lzcnt32_CountsHighZeroBits) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc1, 0xff, 0x00, 0x00, 0x00, // mov rcx, 0xFF
+        0xf3, 0x0f, 0xbd, 0xc1,                   // lzcnt eax, ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 24ULL) << "lzcnt(0xFF) for 32-bit = 24";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "CF clear when src ≠ 0";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear (result ≠ 0)";
+}
+
+// LZCNT of 0: result = operand size (32), CF = 1 (signals "no bits set").
+TEST_F(CpuRuntimeTest, Lzcnt32_ZeroSrc_ReturnsOperandSizeAndSetsCf) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc9,       // xor rcx, rcx
+        0xf3, 0x0f, 0xbd, 0xc1, // lzcnt eax, ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 32ULL) << "lzcnt(0) for 32-bit = 32";
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set when src == 0";
+}
+
+// LZCNT of 0x80000000 (only MSB set): result = 0, ZF = 1.
+TEST_F(CpuRuntimeTest, Lzcnt32_MsbSet_ResultIsZero_SetsZf) {
+    const u8 program[] = {
+        // mov rcx, 0x80000000
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x80, 0xf3, 0x0f, 0xbd, 0xc1, // lzcnt eax, ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0ULL) << "lzcnt(0x8000_0000) = 0";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set (result == 0)";
+}
+
+// ============================================================================
+// SBB 8-bit reg-reg — subtract with borrow. dst = dst - src - CF. Previously
+// 64-bit only; 8-bit observed at libc 0x8000012b9. Uses byte-offset addressing
+// so the surrounding bytes of the dst slot are preserved.
+// ============================================================================
+
+// 10 - 3 - 0(CF) = 7. CF clear → straightforward subtraction.
+TEST_F(CpuRuntimeTest, Sbb8_BorrowClear_StraightSubtraction) {
+    const u8 program[] = {
+        // Force CF=0 via a CMP that produces CF=0 (any A-A).
+        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00, // mov rax, 0x0A
+        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 0x03
+        0xf8,                                     // clc → CF=0
+        0x18, 0xc8,                               // sbb al, cl
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 7ULL) << "10 - 3 - 0 = 7";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "no borrow out";
+}
+
+// 10 - 3 - 1(CF) = 6. Verifies the CF input is actually consumed.
+TEST_F(CpuRuntimeTest, Sbb8_BorrowSet_SubtractsExtraOne) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00, // mov rax, 0x0A
+        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 0x03
+        0xf9,                                     // stc → CF=1
+        0x18, 0xc8,                               // sbb al, cl
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 6ULL) << "10 - 3 - 1 = 6";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "no borrow out";
+}
+
+// 0 - 1 - 0 wraps to 0xFF (-1 in two's complement 8-bit). CF=1 (borrow out).
+TEST_F(CpuRuntimeTest, Sbb8_Underflow_SetsCf) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc0,                         // xor rax, rax  (al=0)
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1
+        0xf8,                                     // clc → CF=0
+        0x18, 0xc8,                               // sbb al, cl
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 0xFFULL) << "0 - 1 wraps to 0xFF";
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set on borrow out of bit 7";
+}
+
+// ============================================================================
+// CMOVNS 16-bit with memory source. The 16-bit form has a unique merge
+// semantic: when condition is TRUE, only the low 16 of dst are overwritten
+// — bits 63:16 of the dst slot are PRESERVED (no zero-extension like the
+// 32-bit form). When FALSE, the dst is entirely unchanged.
+// ============================================================================
+
+// Condition TRUE (SF=0): mem-low-16 replaces dst's low 16; upper 48 bits
+// of the dst GPR slot survive verbatim.
+TEST_F(CpuRuntimeTest, Cmovns16_MemSrc_TrueMergesLow16PreservingUpper48) {
+    u16* scratch = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
+    *scratch = 0xABCD;
+
+    const u8 program[] = {
+        // mov rdi, <scratch addr>
+        0x48,
+        0xbf,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // mov rax, 0xDEADBEEFCAFEBABE — pre-pollute dst's upper 48
+        0x48,
+        0xb8,
+        0xbe,
+        0xba,
+        0xfe,
+        0xca,
+        0xef,
+        0xbe,
+        0xad,
+        0xde,
+        // Force SF=0 via xor rcx,rcx (which clears SF). Then cmovns ax, word[rdi].
+        0x48,
+        0x31,
+        0xc9, // xor rcx, rcx (SF=0 now)
+        0x66,
+        0x0f,
+        0x49,
+        0x07, // cmovns ax, word[rdi]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEABCDULL)
+        << "low 16 replaced by 0xABCD, upper 48 preserved";
+}
+
+// Condition FALSE (SF=1): dst is unchanged entirely.
+TEST_F(CpuRuntimeTest, Cmovns16_MemSrc_FalseLeavesDstUnchanged) {
+    u16* scratch = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
+    *scratch = 0x1234;
+
+    const u8 program[] = {
+        // mov rdi, <scratch addr>
+        0x48,
+        0xbf,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // mov rax, 0xDEADBEEFCAFEBABE — should remain entirely unchanged
+        0x48,
+        0xb8,
+        0xbe,
+        0xba,
+        0xfe,
+        0xca,
+        0xef,
+        0xbe,
+        0xad,
+        0xde,
+        // Force SF=1 by computing a negative result (cmp 0, 1 → SF=1, CF=1).
+        0x48,
+        0xc7,
+        0xc1,
+        0x00,
+        0x00,
+        0x00,
+        0x00, // mov rcx, 0
+        0x48,
+        0x83,
+        0xf9,
+        0x01, // cmp rcx, 1   → SF=1
+        // cmovns ax, word[rdi]  — condition FALSE → no change
+        0x66,
+        0x0f,
+        0x49,
+        0x07,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEBABEULL)
+        << "FALSE condition must leave entire 64-bit slot unchanged";
+}
+
+// ============================================================================
+// SBB 32-bit reg-imm — sign-extended imm8 / imm32 sub-with-borrow.
+// Observed at libc 0x80001021d inside a multi-precision subtract chain.
+// ============================================================================
+
+// `sbb ecx, 0x10` with rcx = 0x100 and CF = 0 → result = 0xF0; CF clear.
+// Verifies the 32-bit write zero-extends rcx (no upper-half leak).
+TEST_F(CpuRuntimeTest, Sbb32_RegImm_BorrowClear_AndZeroExtends) {
+    const u8 program[] = {
+        // mov rcx, 0xDEADBEEF_00000100  — pre-pollute upper 32
+        0x48, 0xb9, 0x00, 0x01, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde,
+        0xf8,             // clc → CF=0
+        0x83, 0xd9, 0x10, // sbb ecx, 0x10
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1], 0xF0ULL) << "0x100 - 0x10 - 0 = 0xF0; upper 32 zero-extended";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "no borrow out";
+}
+
+// `sbb ecx, 0x10` with rcx = 0x100 and CF = 1 → result = 0xEF.
+TEST_F(CpuRuntimeTest, Sbb32_RegImm_BorrowSet_SubtractsExtraOne) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc1, 0x00, 0x01, 0x00, 0x00, // mov rcx, 0x100
+        0xf9,                                     // stc → CF=1
+        0x83, 0xd9, 0x10,                         // sbb ecx, 0x10
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1], 0xEFULL) << "0x100 - 0x10 - 1 = 0xEF; CF input consumed";
+}
+
+// Underflow: 0 - 1 - 0 wraps to 0xFFFFFFFF with CF=1.
+TEST_F(CpuRuntimeTest, Sbb32_RegImm_Underflow_SetsCf) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc9, // xor rcx, rcx
+        0xf8,             // clc
+        0x83, 0xd9, 0x01, // sbb ecx, 1
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1], 0xFFFFFFFFULL) << "0 - 1 wraps to 0xFFFFFFFF (low 32)";
+    EXPECT_EQ(r.state.gpr[1] >> 32, 0u) << "32-bit op must zero-extend bits 63:32";
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set on borrow out";
+}
+
 } // namespace
 } // namespace Core::Runtime
