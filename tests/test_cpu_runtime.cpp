@@ -3398,5 +3398,137 @@ TEST_F(CpuRuntimeTest, And8_HighByteCh_WritesOnlyByte1OfRcx) {
         << "and ch, 0x0F must modify only byte 1; CL and bytes 2..7 preserved";
 }
 
+// ============================================================================
+// DIV — unsigned 64-bit divide with the dividend in RDX:RAX. EmitDiv
+// must load BOTH halves of the dividend (not just RAX) and store
+// BOTH halves of the result (quotient in RAX, remainder in RDX).
+// ============================================================================
+
+// Simple reg-divisor: 100 / 7 = 14 rem 2.
+TEST_F(CpuRuntimeTest, Div64_RegDivisor_ComputesQuotientAndRemainder) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // mov rdx, 0       (hi half)
+        0x48, 0xc7, 0xc0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100     (lo half)
+        0x48, 0xc7, 0xc1, 0x07, 0x00, 0x00, 0x00, // mov rcx, 7       (divisor)
+        0x48, 0xf7, 0xf1,                         // div rcx
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 14ULL) << "quotient: 100 / 7 = 14";
+    EXPECT_EQ(r.state.gpr[2], 2ULL) << "remainder: 100 % 7 = 2";
+}
+
+// 128-bit dividend with non-zero RDX. dividend = 2^64 (RDX=1, RAX=0),
+// divisor = 2^32. quotient = 2^32, remainder = 0. If EmitDiv mistakenly
+// zero'd RDX before the host op (or loaded it from the wrong slot),
+// this test would either fault or compute the wrong quotient.
+TEST_F(CpuRuntimeTest, Div64_RegDivisor_UsesFullRdxRaxDividend) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00, // mov rdx, 1       (hi = 1)
+        0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0       (lo = 0)
+        // mov rcx, 0x100000000 — needs full imm64 (won't fit in imm32)
+        0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xf1, // div rcx
+        0xc3,                                                                         // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // (1 << 64) / (1 << 32) = (1 << 32)
+    EXPECT_EQ(r.state.gpr[0], 0x100000000ULL) << "quotient = 2^32";
+    EXPECT_EQ(r.state.gpr[2], 0ULL) << "remainder = 0";
+}
+
+// Memory divisor — the exact shape the game hit at 0x8079fd328.
+// Validates that EmitEffectiveAddress, the divisor load, and the
+// loads of guest RAX/RDX are sequenced correctly (in particular,
+// that the address in rdx is captured into the divisor BEFORE we
+// overwrite rdx with the dividend's high half).
+TEST_F(CpuRuntimeTest, Div64_MemDivisor_LoadsViaEffectiveAddress) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc2, 0x00, 0x00, 0x00, 0x00, // mov rdx, 0
+        0x48, 0xc7, 0xc0, 0xe8, 0x03, 0x00, 0x00, // mov rax, 1000
+        0x48, 0xc7, 0xc1, 0x0d, 0x00, 0x00, 0x00, // mov rcx, 13
+        0x48, 0x89, 0x4c, 0x24, 0xf8,             // mov [rsp-8], rcx (store divisor)
+        0x48, 0xf7, 0x74, 0x24, 0xf8,             // div qword [rsp-8]
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // 1000 / 13 = 76 remainder 12 (76*13=988, 1000-988=12)
+    EXPECT_EQ(r.state.gpr[0], 76ULL) << "quotient: 1000 / 13 = 76";
+    EXPECT_EQ(r.state.gpr[2], 12ULL) << "remainder: 1000 % 13 = 12";
+}
+
+// ============================================================================
+// 32-bit BEXTR and CMOV — narrow forms of existing emitters. The BEXTR
+// change is trivial (host VEX.W=0 form). The CMOV change has a subtle
+// asymmetry worth a regression test: on x86-64, the rule "32-bit reg
+// writes zero-extend bits 63:32" only fires when the destination is
+// actually written. CMOVcc with a FALSE condition writes nothing, so
+// bits 63:32 of the parent slot must remain undisturbed. This differs
+// from every other 32-bit emitter we have.
+// ============================================================================
+
+// BEXTR eax, ecx, edx — 32-bit form. VEX byte 3 = 0x68 (W=0 direct,
+// vs ANDN/BEXTR-64 where W is the other polarity).
+TEST_F(CpuRuntimeTest, Bextr32_RegRegReg_ExtractsBitsAndZeroExtends) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEF12345678 — pre-pollute upper of dst
+        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde,
+        // mov rcx, 0x00000000_FFFF0000 — source value
+        0x48, 0xb9, 0x00, 0x00, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
+        // mov rdx, 0x0810 — control: start=16 (bits 7:0), len=8 (bits 15:8)
+        0x48, 0xc7, 0xc2, 0x10, 0x08, 0x00, 0x00,
+        // bextr eax, ecx, edx
+        0xc4, 0xe2, 0x68, 0xf7, 0xc1,
+        0xc3, // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Extracting 8 bits starting at bit 16 from 0xFFFF0000 yields 0xFF.
+    // Upper 32 of rax must be zero-extended away (the host eax-write rule).
+    EXPECT_EQ(r.state.gpr[0], 0xFFULL)
+        << "BEXTR 32-bit: extract 8 bits at offset 16 from 0xFFFF0000 = 0xFF; "
+           "upper 32 of rax must be zeroed";
+}
+
+// CMOVZ eax, ecx with the condition TRUE: dst gets src zero-extended,
+// upper 32 of dst slot is wiped. Sets up rflags so ZF=1, then runs
+// the cmov; expects rax = src low 32, upper zeroed.
+TEST_F(CpuRuntimeTest, Cmov32_ConditionTrue_ZeroExtendsSrc) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFEBABE — junk dst
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        // mov rcx, 0xFFFFFFFF12345678 — src with junk upper, low = 0x12345678
+        0x48, 0xb9, 0x78, 0x56, 0x34, 0x12, 0xff, 0xff, 0xff, 0xff,
+        // xor edx, edx → ZF=1, edx=0
+        0x31, 0xd2,
+        // cmovz eax, ecx — cond TRUE (ZF=1) → eax = ecx low 32, upper zeroed
+        0x0f, 0x44, 0xc1,
+        0xc3, // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x12345678ULL)
+        << "CMOVZ 32-bit cond TRUE must zero-extend src; rax = 0x12345678";
+}
+
+// CMOVZ eax, ecx with the condition FALSE: dst is UNCHANGED — including
+// bits 63:32 of the slot. This is the regression catcher. If the lifter
+// blindly applied the "32-bit op zero-extends" rule, the upper junk
+// (0xDEADBEEF) would be wiped here, breaking guest semantics.
+TEST_F(CpuRuntimeTest, Cmov32_ConditionFalse_LeavesUpper32Untouched) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFEBABE — junk dst (upper 32 = 0xDEADBEEF)
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        // mov rcx, 0x00000000_12345678
+        0x48, 0xb9, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
+        // mov rdx, 1; test rdx, rdx → ZF=0
+        0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x48, 0x85, 0xd2,
+        // cmovz eax, ecx — cond FALSE (ZF=0) → no write to rax at all
+        0x0f, 0x44, 0xc1,
+        0xc3, // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEBABEULL)
+        << "CMOVZ 32-bit cond FALSE must leave the WHOLE qword unchanged, "
+           "including bits 63:32 — different from ordinary 32-bit ops";
+}
+
 } // namespace
 } // namespace Core::Runtime

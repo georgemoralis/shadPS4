@@ -1816,7 +1816,7 @@ ZydisMnemonic CmovToJcc(ZydisMnemonic m) {
 /// 64-bit only for now; 32-bit CMOV would follow the same shape.
 bool EmitCmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
               Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64)
+    if (insn.operand_width != 64 && insn.operand_width != 32)
         return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
         return false;
@@ -1829,7 +1829,9 @@ bool EmitCmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
         return false;
 
     // Load src into r8 first — we'll need rax/rcx/rdx for the
-    // condition computation.
+    // condition computation. For 32-bit, we load the full qword from
+    // the slot and rely on the eax-write further down to perform the
+    // zero-extension when the condition is true.
     if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_idx = ZydisGprToIndex(ops[1].reg.value);
         if (src_idx < 0)
@@ -1843,17 +1845,29 @@ bool EmitCmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
         return false;
     }
 
-    // Load current dst value into r9 (the candidate "no-change" result).
+    // Load current dst slot into r9 (the candidate "no-change" result).
+    // For 32-bit CMOVcc with the condition FALSE, the destination is
+    // unchanged ENTIRELY — including bits 63:32. This is a quirk of
+    // CMOVcc relative to ordinary 32-bit ops, which always zero-extend.
+    // So r9 must be the full qword, not the low 32.
     c.mov(r9, qword[r13 + GprOffset(dst_idx)]);
 
     // Compute condition into rcx (0 or 1).
     if (!EmitJccCondition(jcc_equiv, c))
         return false;
 
-    // host_test sets ZF on the indicator; cmovnz picks r8 (src) when
-    // the condition was true (rcx != 0), otherwise keeps r9 (old dst).
+    // For 32-bit, build the cond-TRUE result by zero-extending the low
+    // 32 of the src into rax via a same-name reg-reg mov (mov eax, r8d).
+    // This is the standard idiom to clear bits 63:32 of a host GPR.
+    // Then cmov picks rax (zero-extended src) when the cond was true,
+    // r9 (unchanged dst slot) otherwise. For 64-bit, we use r8 as-is.
     c.test(rcx, rcx);
-    c.cmovnz(r9, r8);
+    if (insn.operand_width == 32) {
+        c.mov(eax, r8d); // rax = src & 0xFFFFFFFF, upper 32 = 0
+        c.cmovnz(r9, rax);
+    } else {
+        c.cmovnz(r9, r8);
+    }
     c.mov(qword[r13 + GprOffset(dst_idx)], r9);
     return true;
 }
@@ -2216,6 +2230,64 @@ bool EmitImul1Op(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     // Write both halves of the result.
     c.mov(qword[r13 + GprOffset(0)], rax); // low → RAX
     c.mov(qword[r13 + GprOffset(2)], rdx); // high → RDX
+    return true;
+}
+
+// =============================================================================
+// DIV — unsigned divide. Single explicit divisor (r/m); the dividend
+// is implicit RDX:RAX. Quotient → RAX, remainder → RDX.
+//
+// First observed in libSceLibc at 0x8079fd328 with a memory divisor.
+// The shape mirrors EmitImul1Op (one explicit operand + implicit
+// RAX/RDX) with two differences:
+//
+//   - DIV's dividend is RDX:RAX (both halves), so we load BOTH guest
+//     slots before the host op. IMUL's dividend was just RAX.
+//   - All flags are documented as "undefined" after DIV (Intel SDM
+//     Vol. 2A). We deliberately skip the rflags round-trip so the
+//     guest sees its pre-DIV flag state preserved — this matches the
+//     letter of the spec (undefined ≡ any value, including unchanged)
+//     and avoids the cost of two push/pop pairs around the host op.
+//
+// Divide-by-zero and quotient-overflow #DE faults propagate as host
+// SIGFPE; until we wire up a signal handler that maps these to a
+// guest exception, programs that actually divide-by-zero will crash
+// the runtime. Real PS4 binaries don't intentionally do this.
+// =============================================================================
+
+bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
+             Xbyak::CodeGenerator& c) {
+    if (insn.operand_width != 64)
+        return false;
+
+    // Load divisor into rcx. For memory operands, EmitEffectiveAddress
+    // writes rdx (the address) and clobbers rax — so we must
+    // dereference the address into rcx *before* loading guest RAX/RDX.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (src_idx < 0)
+            return false;
+        c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+            return false;
+        c.mov(rcx, qword[rdx]);
+    } else {
+        return false;
+    }
+
+    // Load guest RDX:RAX into host rdx:rax. Order matters: rdx is
+    // loaded LAST so it overwrites the address (memory-divisor path)
+    // or the unrelated rdx (register-divisor path) only after we've
+    // captured everything we need.
+    c.mov(rax, qword[r13 + GprOffset(0)]); // RAX = low half of dividend
+    c.mov(rdx, qword[r13 + GprOffset(2)]); // RDX = high half of dividend
+
+    c.div(rcx); // implicit rdx:rax; rax = quotient, rdx = remainder
+
+    // Write both result registers back.
+    c.mov(qword[r13 + GprOffset(0)], rax);
+    c.mov(qword[r13 + GprOffset(2)], rdx);
     return true;
 }
 
@@ -4123,7 +4195,7 @@ bool EmitBextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
                Xbyak::CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_BEXTR)
         return false;
-    if (insn.operand_width != 64)
+    if (insn.operand_width != 64 && insn.operand_width != 32)
         return false;
     if (insn.operand_count_visible != 3)
         return false;
@@ -4147,9 +4219,15 @@ bool EmitBextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     c.push(r8);
     c.popfq();
 
-    // Host BEXTR: dst = bitfield(src, control).
-    // xbyak's bextr is (dst, src, control).
-    c.bextr(rax, r9, r10);
+    // Host BEXTR: dst = bitfield(src, control). xbyak's bextr is
+    // (dst, src, control). For the 32-bit form, writing to eax
+    // zero-extends bits 63:32 of rax automatically, so the qword
+    // storeback below sees a clean high half.
+    if (insn.operand_width == 32) {
+        c.bextr(eax, r9d, r10d);
+    } else {
+        c.bextr(rax, r9, r10);
+    }
 
     c.pushfq();
     c.pop(r8);
@@ -4431,6 +4509,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // Multiplication. EmitImul dispatches by operand_count_visible.
         case ZYDIS_MNEMONIC_IMUL:
             handled = EmitImul(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_DIV:
+            handled = EmitDiv(insn, ops, next_rip, c);
             break;
 
         // Sign-extension family. No operands; operate on RAX/RDX.
