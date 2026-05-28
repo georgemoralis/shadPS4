@@ -685,6 +685,17 @@ bool EmitMovsx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 // and the only consumer is the `JP/JPE/JPO` family for parity,
 // which uses PF not AF.
 //
+// NOTE: this AF omission is NOT an Intel/AMD undefined-flag case.
+// AF is *fully defined and identical on both vendors* for ADD/SUB/
+// ADC/SBB/CMP/NEG/INC/DEC (AF = carry/borrow out of bit 3). Skipping
+// it is a deliberate correctness shortcut on the bet that no PS4
+// title reads AF (it has no purpose outside the legacy BCD adjust
+// instructions AAA/AAS/DAA/DAS, none of which exist in 64-bit mode).
+// If a title ever depends on AF, the fix is: AF = ((lhs ^ rhs ^
+// result) >> 4) & 1, valid for both add and subtract, on both
+// vendors. The ARM64 backend may likewise skip AF for the same
+// reason — this is not a vendor-divergence concern.
+//
 // Input register convention for these helpers:
 //   rcx = lhs (original destination value before the op)
 //   rdx = rhs (source value)
@@ -1747,9 +1758,21 @@ bool EmitDec(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
 ///
 /// Implementation notes:
 /// - We never let the host's `bt` set guest CF directly because BT
-///   leaves OF/SF/ZF/AF/PF "undefined" — Intel allows arbitrary
-///   values. To stay deterministic we compute CF explicitly and
-///   leave the other guest flags unchanged.
+///   leaves OF/SF/ZF/AF/PF "undefined" — both Intel and AMD allow
+///   arbitrary values. To stay deterministic we compute CF explicitly
+///   and leave the other guest flags unchanged.
+///
+///   ── INTEL vs AMD DIVERGENCE (BT/BTS/BTR/BTC undefined flags) ──
+///   Both vendors document SF/ZF/AF/PF as undefined after the BT
+///   family (only CF is defined = the selected bit). Their silicon
+///   differs in what's actually left: AMD tends to preserve the
+///   prior values; Intel may zero or scramble SF/OF. Our "leave the
+///   other guest flags unchanged" policy happens to match AMD's
+///   observed preserve-prior behavior, which is the correct target
+///   for a Jaguar/AuthenticAMD guest — so this is accurate by
+///   construction, not just convenient. The ARM64 backend should
+///   keep the same policy: set only CF, preserve the rest.
+/// ────────────────────────────────────────────────────────────────
 /// - The bit index is masked to (opsize - 1) by host BT already
 ///   when src is a register operand, but Zydis-decoded BT may
 ///   present a 64-bit register holding a value > 63. The host
@@ -2048,6 +2071,38 @@ bool EmitCmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
 // host CPU automatically, matching guest behavior. We don't need
 // to mask explicitly.
 //
+// ── INTEL vs AMD DIVERGENCE (OF and CF on shifts) ──────────────────
+// The PS4 is an AMD Jaguar, and our CPUID spoofs AuthenticAMD, so the
+// *architecturally correct* reference here is the AMD APM, not the
+// Intel SDM. The two diverge on the UNDEFINED cases of shifts:
+//
+//   * OF (overflow flag): BOTH vendors define OF only for count==1
+//     (SHL/SAL: OF = MSB(result) XOR CF; SAR: OF = 0; SHR: OF =
+//     MSB(original)). For count>1 BOTH document OF as "undefined" —
+//     BUT the actual left-behind value differs between Intel and AMD
+//     silicon. AMD Jaguar leaves OF computed as if count==1 (i.e.
+//     MSB(result) XOR CF semantics persist); several Intel parts zero
+//     it or leave the prior value. Software that reads OF after a
+//     multi-bit shift is buggy, but a few real titles do.
+//
+//   * CF for count >= operand-size (e.g. SHL r32 by 32+): documented
+//     "undefined" by both. AMD masks the count FIRST (to 5 or 6 bits)
+//     so e.g. "SHL r32, 32" becomes "SHL r32, 0" => CF unchanged.
+//     This falls out naturally from the host round-trip on an x86
+//     host because the host masks identically.
+//
+// Because we execute the shift on the HOST CPU and copy its rflags
+// verbatim, on an x86 host we inherit *that host's* choice for the
+// undefined bits — which is only guaranteed to match AMD Jaguar when
+// the host is itself AMD. This is an accepted imprecision on the x86
+// host backend (undefined-flag divergence is invisible to correct
+// software). The ARM64 backend, which must compute these flags
+// explicitly rather than via a round-trip, MUST follow the AMD APM
+// rule above: define OF for count==1 per the table, and for count>1
+// reproduce the count==1 OF formula (Jaguar behavior) rather than
+// Intel's zeroing.
+// ───────────────────────────────────────────────────────────────────
+//
 // Limitations: only 64-bit operand width and only register
 // destinations. 32-bit shifts and memory destinations follow the
 // same pattern and can be added on demand.
@@ -2345,6 +2400,29 @@ bool EmitRotate64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 //
 // All three use the host IMUL opcode and round-trip flags so
 // CF/OF come out correct.
+//
+// ── INTEL vs AMD DIVERGENCE (SF/ZF/AF/PF after IMUL) ───────────────
+// CF and OF are defined identically on both vendors (set when the
+// product doesn't fit). The other four — SF, ZF, AF, PF — are
+// documented "undefined" by both Intel and AMD, but their actual
+// silicon behavior differs, and the AMD APM is our reference (PS4 =
+// Jaguar, CPUID = AuthenticAMD):
+//
+//   * AMD Jaguar computes SF/ZF/PF from the LOW half of the result
+//     as if it were a normal data write (SF = MSB of low 64, ZF =
+//     (low 64 == 0), PF = parity of low byte), and leaves AF
+//     cleared. Intel's recent parts also began defining SF this way
+//     (post-2014 SDM), but older Intel leaves these genuinely
+//     garbage. AMD's "compute from low half" has been stable.
+//
+// Because we round-trip the HOST rflags, on an x86 host we again
+// inherit the host CPU's behavior for these undefined bits — only
+// guaranteed AMD-correct on an AMD host. Accepted imprecision here
+// (correct software never reads these after IMUL). The ARM64 backend
+// MUST, when it computes flags explicitly, follow the AMD rule:
+// SF/ZF/PF from the low 64 bits, AF cleared. Do NOT leave them at
+// whatever the AArch64 NZCV happened to be.
+// ───────────────────────────────────────────────────────────────────
 // =============================================================================
 
 /// 1-op IMUL: rdx:rax = rax * src.
@@ -2399,11 +2477,16 @@ bool EmitImul1Op(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
 //
 //   - DIV's dividend is RDX:RAX (both halves), so we load BOTH guest
 //     slots before the host op. IMUL's dividend was just RAX.
-//   - All flags are documented as "undefined" after DIV (Intel SDM
-//     Vol. 2A). We deliberately skip the rflags round-trip so the
-//     guest sees its pre-DIV flag state preserved — this matches the
-//     letter of the spec (undefined ≡ any value, including unchanged)
-//     and avoids the cost of two push/pop pairs around the host op.
+//   - All flags are documented as "undefined" after DIV (both Intel
+//     SDM Vol. 2A and AMD APM Vol. 3 agree here — CF/OF/SF/ZF/AF/PF
+//     are all undefined for DIV and IDIV). We deliberately skip the
+//     rflags round-trip so the guest sees its pre-DIV flag state
+//     preserved — this matches the letter of the spec (undefined ≡
+//     any value, including unchanged) and avoids the cost of two
+//     push/pop pairs around the host op. Preserve-prior also happens
+//     to match AMD Jaguar's observed behavior, so it's the right
+//     target for our AuthenticAMD guest. The ARM64 backend should
+//     likewise leave flags untouched across DIV/IDIV.
 //
 // Divide-by-zero and quotient-overflow #DE faults propagate as host
 // SIGFPE; until we wire up a signal handler that maps these to a
@@ -6810,6 +6893,26 @@ bool EmitPopcnt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 ///   ZF set iff result is zero (i.e. iff MSB of src was set)
 ///   OF/SF/PF/AF are architecturally undefined.
 ///
+/// LZCNT's defined ZF/CF behavior is IDENTICAL on Intel and AMD — the
+/// only documented difference is vs BSR (a different instruction),
+/// not between vendors. So no vendor-divergence handling is needed
+/// here beyond the round-trip.
+///
+/// ── FORWARD NOTE: BSF / BSR / TZCNT (not yet implemented) ──────────
+/// When these get emitters, mind the divergences:
+///   * BSF/BSR with src==0: dst is "undefined" on BOTH vendors (ZF=1
+///     signals the zero-source case). BUT the left-behind dst value
+///     differs: AMD leaves the DESTINATION UNCHANGED (documented
+///     behavior in the APM — "if src==0, dst is not modified"), while
+///     Intel documents it as truly undefined and some parts scribble.
+///     For an AuthenticAMD guest, emit "preserve dst on zero source".
+///     A few real binaries actually rely on the AMD preserve behavior.
+///   * TZCNT/LZCNT vs BSF/BSR on zero source: TZCNT/LZCNT give a
+///     DEFINED result (operand size) and set CF; BSF/BSR give
+///     undefined dst and set ZF. Don't conflate them — TZCNT is NOT
+///     "BSF that always works".
+/// ───────────────────────────────────────────────────────────────────
+///
 /// Note: LZCNT is encoded with `F3` prefix on top of the BSR opcode
 /// (`0F BD`). On non-ABM CPUs the prefix is ignored and the
 /// instruction silently decodes as BSR — a different operation with
@@ -7014,6 +7117,24 @@ bool EmitCpuid(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
     c.jmp(l_done, LT::T_NEAR);
 
     // Leaf 0 — max standard leaf + vendor string.
+    //
+    // ── INTEL vs AMD DIVERGENCE (cache-topology leaves) ───────────
+    // We report max standard leaf = 7. A guest probing the cache
+    // hierarchy therefore gets ZERO for leaf 4 (the default-response
+    // path). This is CORRECT for an AuthenticAMD guest: leaf 4
+    // (Deterministic Cache Parameters) is an INTEL leaf — AMD does
+    // not implement it. AMD exposes cache topology through the
+    // extended leaves 0x80000005 (L1), 0x80000006 (L2/L3), and
+    // 0x8000001d (with TOPOEXT). A well-behaved AMD-aware guest never
+    // queries leaf 4; one that does should see it absent.
+    //
+    // DO NOT "fix" missing cache info by adding an Intel-style leaf 4
+    // here — that would make the spoof internally inconsistent
+    // (AuthenticAMD vendor string + Intel-only leaf). If a title
+    // actually needs cache geometry, add the AMD extended leaves
+    // 0x80000005/6 instead. Reporting max-leaf 7 with zeroed leaf 4
+    // is the accurate Jaguar behavior and is intentional.
+    // ───────────────────────────────────────────────────────────────
     c.L(l_0);
     c.mov(r8d, 7);
     c.mov(r9d, kVendorEbx);
