@@ -3598,12 +3598,12 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf1_ReportsJaguarSignatureAndFeatures) {
     EXPECT_TRUE(ecx & (1u << 0)) << "SSE3 advertised";
     EXPECT_TRUE(ecx & (1u << 19)) << "SSE4.1 advertised";
     EXPECT_TRUE(ecx & (1u << 20)) << "SSE4.2 advertised";
+    EXPECT_TRUE(ecx & (1u << 23)) << "POPCNT advertised";
     EXPECT_TRUE(ecx & (1u << 28)) << "AVX advertised";
 
     // Features we deliberately do NOT advertise (Jaguar lacks them
     // and/or the JIT lacks emitters):
     EXPECT_FALSE(ecx & (1u << 12)) << "FMA must not be advertised";
-    EXPECT_FALSE(ecx & (1u << 23)) << "POPCNT must not be advertised";
     EXPECT_FALSE(ecx & (1u << 30)) << "RDRAND must not be advertised";
 
     // EDX baseline.
@@ -4024,6 +4024,519 @@ TEST_F(CpuRuntimeTest, Vpcmpistri_NoMatch_ReturnsElementCount) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[1] & 0xFFFFFFFFULL, 16ULL) << "No match → ECX = element count (16 bytes)";
+}
+
+// ============================================================================
+// DIV 32-bit — EDX:EAX / r32 → EAX = quotient, EDX = remainder. The
+// existing emitter handled 64-bit only; the 32-bit variant landed
+// inside Sonic Mania's ELF entry at 0x800001046.
+// ============================================================================
+
+// 64-bit dividend 0x1_0000_0001 / 2 = 0x80000000 remainder 1.
+// Sets up high half via RDX = 1, low half via RAX = 1.
+TEST_F(CpuRuntimeTest, Div32_DividendStraddlesEdxEax) {
+    const u8 program[] = {
+        // mov rax, 1     (low half = 1)
+        0x48,
+        0xc7,
+        0xc0,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        // mov rdx, 1     (high half = 1 → dividend = 0x1_0000_0001)
+        0x48,
+        0xc7,
+        0xc2,
+        0x01,
+        0x00,
+        0x00,
+        0x00,
+        // mov rcx, 2     (divisor)
+        0x48,
+        0xc7,
+        0xc1,
+        0x02,
+        0x00,
+        0x00,
+        0x00,
+        0xf7,
+        0xf1, // div ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x80000000ULL) << "Quotient = 0x1_0000_0001 / 2 = 0x8000_0000";
+    EXPECT_EQ(r.state.gpr[2], 1ULL) << "Remainder = 1";
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "RAX upper 32 must zero-extend";
+    EXPECT_EQ(r.state.gpr[2] >> 32, 0u) << "RDX upper 32 must zero-extend";
+}
+
+// Confirm the upper 32 of guest RAX/RDX is IGNORED by 32-bit DIV.
+// Pre-pollutes those upper halves; if the emitter erroneously loaded
+// the full 64-bit slots into host rdx:rax we'd see a wildly different
+// quotient. With xor edx,edx the dividend is just guest EAX low 32.
+TEST_F(CpuRuntimeTest, Div32_IgnoresUpper32OfDividend) {
+    const u8 program[] = {
+        // mov rax, 0xCAFEBABE0000000A  — upper junk, low = 10
+        0x48,
+        0xb8,
+        0x0a,
+        0x00,
+        0x00,
+        0x00,
+        0xbe,
+        0xba,
+        0xfe,
+        0xca,
+        // mov rdx, 0xDEADBEEF00000000  — upper junk, low = 0
+        0x48,
+        0xba,
+        0x00,
+        0x00,
+        0x00,
+        0x00,
+        0xef,
+        0xbe,
+        0xad,
+        0xde,
+        // mov rcx, 3
+        0x48,
+        0xc7,
+        0xc1,
+        0x03,
+        0x00,
+        0x00,
+        0x00,
+        0xf7,
+        0xf1, // div ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 3ULL) << "10 / 3 = 3 (32-bit DIV should ignore upper-32 junk)";
+    EXPECT_EQ(r.state.gpr[2], 1ULL) << "10 % 3 = 1";
+}
+
+// ============================================================================
+// XADD 32-bit mem-dst, reg-src — atomic exchange-and-add. Sets all
+// arithmetic flags from the addition.
+// ============================================================================
+
+// Atomic increment idiom: scratch byte initialized to 5, ecx = 3.
+// After xadd: memory = 5 + 3 = 8, ecx = 5 (the old memory value).
+TEST_F(CpuRuntimeTest, Xadd32_ExchangesAndAdds) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *scratch = 5;
+
+    const u8 program[] = {
+        // mov rax, <scratch addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // mov rcx, 3
+        0x48,
+        0xc7,
+        0xc1,
+        0x03,
+        0x00,
+        0x00,
+        0x00,
+        0x0f,
+        0xc1,
+        0x08, // xadd dword[rax], ecx
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(*scratch, 8u) << "[mem] = old_mem + reg = 5 + 3";
+    EXPECT_EQ(r.state.gpr[1], 5ULL) << "reg gets the OLD mem value (5)";
+    EXPECT_EQ(r.state.gpr[1] >> 32, 0u) << "RCX upper 32 zero-extended";
+}
+
+// Zero-result variant: 0xFFFF_FFFE + 2 overflows to 0 (with CF=1).
+// Verifies flags are captured from the addition.
+TEST_F(CpuRuntimeTest, Xadd32_WrapToZero_SetsCfAndZf) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *scratch = 0xFFFFFFFEu;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0, 0, 0, // mov rax, <addr>
+        0x48, 0xc7, 0xc1, 0x02, 0x00, 0x00, 0x00,          // mov rcx, 2
+        0x0f, 0xc1, 0x08,                                  // xadd dword[rax], ecx
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(*scratch, 0u) << "0xFFFF_FFFE + 2 wraps to 0";
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set on 32-bit add wrap";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set on zero result";
+}
+
+// ============================================================================
+// VPHADDD — horizontal add of 32-bit packed integers. dst[0..1] from src1,
+// dst[2..3] from src2 (in each 128-bit lane).
+// ============================================================================
+
+// `vphaddd xmm0, xmm0, xmm1` with xmm0 = {1,2,3,4} and xmm1 = {10,20,30,40}.
+// Expected: xmm0 = {1+2, 3+4, 10+20, 30+40} = {3, 7, 30, 70}.
+TEST_F(CpuRuntimeTest, Vphaddd_Xmm_PairwiseAddsAcrossOperands) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x79, 0x02, 0xc1, // vphaddd xmm0, xmm0, xmm1
+        0xc3,
+    };
+    GuestMemory& m = mem;
+    std::memcpy(m.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = m.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(m.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // xmm0 = {1, 2, 3, 4} (four 32-bit dwords, low → high)
+    u32 src1[4] = {1, 2, 3, 4};
+    std::memcpy(&st.ymm[0], src1, 16);
+    // xmm1 = {10, 20, 30, 40}
+    u32 src2[4] = {10, 20, 30, 40};
+    std::memcpy(&st.ymm[4], src2, 16);
+
+    Runtime rt;
+    rt.Run(st);
+
+    u32 out[4];
+    std::memcpy(out, &st.ymm[0], 16);
+    EXPECT_EQ(out[0], 1u + 2u) << "dst[0] = src1[0] + src1[1]";
+    EXPECT_EQ(out[1], 3u + 4u) << "dst[1] = src1[2] + src1[3]";
+    EXPECT_EQ(out[2], 10u + 20u) << "dst[2] = src2[0] + src2[1]";
+    EXPECT_EQ(out[3], 30u + 40u) << "dst[3] = src2[2] + src2[3]";
+
+    // 128-bit VEX form must zero bits 255:128 of the destination YMM.
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeroes ymm[lane=2]";
+    EXPECT_EQ(st.ymm[3], 0ULL) << "VEX-128 zeroes ymm[lane=3]";
+}
+
+// ============================================================================
+// VMOVAPS — aligned packed-FP vector move. Treated identically to VMOVUPS
+// since alignment requirements don't matter for the GPR-relayed transfers
+// our emitter performs.
+// ============================================================================
+
+// `vmovaps [mem], xmm0` storing xmm0's 16 bytes to memory.
+TEST_F(CpuRuntimeTest, Vmovaps_StoresXmmToMemory) {
+    // Memory destination = scratch region inside the code page.
+    alignas(16) u8* scratch = reinterpret_cast<u8*>(
+        (reinterpret_cast<uintptr_t>(mem.CodePtr() + 0x100) + 15) & ~uintptr_t{15});
+
+    const u8 program[] = {
+        // mov rax, <scratch addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // vmovaps [rax], xmm0   (3-byte VEX form: c5 f8 29 00)
+        0xc5,
+        0xf8,
+        0x29,
+        0x00,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm0 = some pattern
+    st.ymm[0] = 0x0123456789ABCDEFULL;
+    st.ymm[1] = 0xFEDCBA9876543210ULL;
+    // Clobber the destination region first so a no-op emitter would
+    // leave detectable junk.
+    std::memset(scratch, 0xCC, 16);
+
+    Runtime rt;
+    rt.Run(st);
+
+    u64 lo, hi;
+    std::memcpy(&lo, scratch + 0, 8);
+    std::memcpy(&hi, scratch + 8, 8);
+    EXPECT_EQ(lo, 0x0123456789ABCDEFULL) << "low 64 of xmm0 written to [mem]";
+    EXPECT_EQ(hi, 0xFEDCBA9876543210ULL) << "high 64 of xmm0 written to [mem+8]";
+}
+
+// ============================================================================
+// VMOVQ — 64-bit moves between XMM ↔ XMM and XMM ↔ GPR.
+// ============================================================================
+
+// xmm ← r64: copies full 64-bit GPR into xmm low 64, zeroes the rest.
+// `vmovq xmm0, rax` encodes as `c4 e1 f9 6e c0` (5 bytes).
+TEST_F(CpuRuntimeTest, Vmovq_XmmFromGpr_ZeroesUpper) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFCAFEBABE
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe,
+        0xad, 0xde, 0xc4, 0xe1, 0xf9, 0x6e, 0xc0, // vmovq xmm0, rax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Pre-pollute the destination YMM with junk so a missing upper-
+    // zeroing would be visible.
+    st.ymm[0] = 0xDDDDDDDDDDDDDDDDULL;
+    st.ymm[1] = 0xDDDDDDDDDDDDDDDDULL;
+    st.ymm[2] = 0xDDDDDDDDDDDDDDDDULL;
+    st.ymm[3] = 0xDDDDDDDDDDDDDDDDULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xDEADBEEFCAFEBABEULL) << "xmm0 low 64 = rax";
+    EXPECT_EQ(st.ymm[1], 0ULL) << "xmm0 high 64 must be zero";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "ymm0 lane 2 must be zero (VEX upper-zero)";
+    EXPECT_EQ(st.ymm[3], 0ULL) << "ymm0 lane 3 must be zero";
+}
+
+// r64 ← xmm: full 64-bit overwrite of the GPR with xmm low 64.
+// `vmovq rax, xmm0` encodes as `c4 e1 f9 7e c0` (5 bytes).
+TEST_F(CpuRuntimeTest, Vmovq_GprFromXmm_FullWidth) {
+    const u8 program[] = {
+        0xc4, 0xe1, 0xf9, 0x7e, 0xc0, // vmovq rax, xmm0
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xCAFEBABECAFEBABEULL; // rax pre-pollution
+    st.ymm[0] = 0x0123456789ABCDEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0123456789ABCDEFULL) << "rax = xmm0 low 64";
+}
+
+// ============================================================================
+// SETcc with memory destination — observed at libc 0x800001067.
+// ============================================================================
+
+// `setnbe byte[mem]` where the condition is "not below or equal"
+// (CF=0 AND ZF=0). Pre-set guest rflags with CF=0,ZF=0 so the
+// condition is TRUE; expect byte = 1 written to memory.
+TEST_F(CpuRuntimeTest, Setnbe_MemDst_ConditionTrue_StoresOne) {
+    u8* scratch = mem.CodePtr() + 0x100;
+    *scratch = 0xAA; // pre-pollute
+
+    const u8 program[] = {
+        // mov rax, <scratch addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // setnbe byte[rax]   (3-byte: 0F 97 /0 = 00 mod, /0 ext, [rax])
+        0x0f,
+        0x97,
+        0x00,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0; // CF=0, ZF=0 → setnbe condition TRUE
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*scratch, 1) << "setnbe with CF=0&&ZF=0 stores 1 to [mem]";
+}
+
+// Condition FALSE: with CF=1, "not below or equal" is FALSE → byte = 0.
+TEST_F(CpuRuntimeTest, Setnbe_MemDst_ConditionFalse_StoresZero) {
+    u8* scratch = mem.CodePtr() + 0x100;
+    *scratch = 0xAA;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0, 0, 0, 0, 0, 0, 0, // mov rax, <addr>
+        0x0f, 0x97, 0x00,                      // setnbe byte[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 1; // CF=1 → setnbe condition FALSE
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*scratch, 0) << "setnbe with CF=1 stores 0";
+}
+
+// ============================================================================
+// POPCNT — population count. ZF set iff src is zero; other arithmetic
+// flags cleared. CPUID leaf 1 ECX bit 23 now advertises it.
+// ============================================================================
+
+// POPCNT of 0xFF (8 bits set) → 8, ZF=0.
+TEST_F(CpuRuntimeTest, Popcnt64_CountsBitsAndClearsZf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc1, 0xff, 0x00, 0x00, 0x00, // mov rcx, 0xFF
+        0xf3, 0x48, 0x0f, 0xb8, 0xc1,             // popcnt rax, rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 8ULL) << "popcount(0xFF) = 8";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear when src ≠ 0";
+}
+
+// POPCNT of 0 → 0, ZF=1.
+TEST_F(CpuRuntimeTest, Popcnt64_Zero_SetsZf) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc9,             // xor rcx, rcx
+        0xf3, 0x48, 0x0f, 0xb8, 0xc1, // popcnt rax, rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0ULL) << "popcount(0) = 0";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set when src == 0";
+}
+
+// ============================================================================
+// VPUNPCKLQDQ — unpack and interleave low 64-bit halves.
+//   dst[0] = src1 low 64
+//   dst[1] = src2 low 64
+// The high 64 of each source within the 128-bit lane is discarded.
+// ============================================================================
+
+// `vpunpcklqdq xmm0, xmm1, xmm2` with xmm1's low 64 = A, xmm2's low 64 = B.
+// Expected: xmm0 = {A, B} (B in the high 64 of xmm0).
+TEST_F(CpuRuntimeTest, Vpunpcklqdq_InterleavesLowQuadwords) {
+    const u8 program[] = {
+        0xc5, 0xf1, 0x6c, 0xc2, // vpunpcklqdq xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // xmm1 (ymm lane 1) low 64 = A, high 64 = junk
+    st.ymm[4] = 0xAAAAAAAAAAAAAAAAULL;
+    st.ymm[5] = 0x1111111111111111ULL; // discarded
+    // xmm2 (ymm lane 2) low 64 = B, high 64 = junk
+    st.ymm[8] = 0xBBBBBBBBBBBBBBBBULL;
+    st.ymm[9] = 0x2222222222222222ULL; // discarded
+    // Pre-pollute xmm0 destination
+    st.ymm[0] = 0xDEADDEADDEADDEADULL;
+    st.ymm[1] = 0xDEADDEADDEADDEADULL;
+    st.ymm[2] = 0xDEADDEADDEADDEADULL;
+    st.ymm[3] = 0xDEADDEADDEADDEADULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xAAAAAAAAAAAAAAAAULL) << "dst[0] = src1 low 64";
+    EXPECT_EQ(st.ymm[1], 0xBBBBBBBBBBBBBBBBULL) << "dst[1] = src2 low 64";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeroes ymm lane 2";
+    EXPECT_EQ(st.ymm[3], 0ULL) << "VEX-128 zeroes ymm lane 3";
+}
+
+// ============================================================================
+// BEXTR mem-src form — bitfield extract from memory.
+//   bextr eax, [mem], ecx — data source is memory, control is GPR.
+// Existing emitter handled reg-reg-reg only; mem-src was observed at
+// libc 0x80000ad1d inside a structure-field bit-decode path.
+// ============================================================================
+
+// Extract bits [8..15] (i.e. start=8, len=8) from a memory dword.
+// Control = (8 | (8 << 8)) = 0x808. Memory = 0x12345678 →
+// result = (0x12345678 >> 8) & 0xFF = 0x56.
+TEST_F(CpuRuntimeTest, Bextr32_MemSrc_ExtractsByteFromMid) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *scratch = 0x12345678u;
+
+    const u8 program[] = {
+        // mov rdi, <scratch addr>
+        0x48,
+        0xbf,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // mov rcx, 0x0808
+        0x48,
+        0xc7,
+        0xc1,
+        0x08,
+        0x08,
+        0x00,
+        0x00,
+        // bextr eax, dword[rdi], ecx
+        0xc4,
+        0xe2,
+        0x70,
+        0xf7,
+        0x07,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x56ULL) << "BEXTR(0x12345678, start=8, len=8) = 0x56";
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "32-bit result must zero-extend";
 }
 
 } // namespace
