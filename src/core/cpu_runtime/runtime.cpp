@@ -201,26 +201,76 @@ HostReturn CallHostFromGuest(VAddr host_fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 
 /// pointing at a guest block (or at the host-return sentinel) does
 /// the function return.
 void* DispatcherTrampoline(GuestState* state) {
-    // CHECKPOINT A: we entered the trampoline. If we never see this
-    // line, the gateway is calling something other than us, or the
-    // call itself faulted before any host C++ ran.
-    std::fprintf(stderr, "[disp] A: enter state=%p\n", (void*)state);
-    std::fflush(stderr);
+    // Hot path: the dispatcher trampoline is called once per JIT block
+    // exit, which in tight loops (memset/memcpy/scan) is once per loop
+    // iteration. Calling fprintf+fflush on every entry is fine for
+    // initial bring-up but masks forward progress in real workloads —
+    // a 3.4 MB memset that takes 217k iterations becomes 30+ seconds
+    // of printf and looks identical to a stuck dispatcher.
+    //
+    // Gate the per-entry diagnostics behind a "RIP changed since last
+    // entry" check. New RIPs (control transfers, fresh blocks) still
+    // get the full A/B/C dump; repeat entries to the same RIP (back-
+    // edge loops) stay silent. This keeps the diagnostics useful for
+    // catching where execution actually goes wrong without slowing
+    // tight loops to a crawl.
+    static thread_local u64 prev_logged_rip = 0;
+    const u64 cur_rip = state->rip;
+    const bool rip_changed = (cur_rip != prev_logged_rip);
+    if (rip_changed) {
+        prev_logged_rip = cur_rip;
+        std::fprintf(stderr, "[disp] A: enter state=%p\n", (void*)state);
+        std::fprintf(stderr, "[disp] B: state->rip=0x%llx\n", (unsigned long long)cur_rip);
+    }
 
-    // CHECKPOINT B: we read state->rip. If we see A but not B,
-    // dereferencing state is bad (e.g. wrong arg passing from gateway).
-    const u64 first_rip = state->rip;
-    std::fprintf(stderr, "[disp] B: state->rip=0x%llx\n", (unsigned long long)first_rip);
-    std::fflush(stderr);
-
-    // CHECKPOINT C: we read tl_active_runtime. If we see B but not C,
-    // thread_local read is the failure (CRT TLS init issue on
-    // raw-CreateThread thread).
     Runtime* rt = tl_active_runtime;
-    std::fprintf(stderr, "[disp] C: rt=%p\n", (void*)rt);
-    std::fflush(stderr);
+    if (rip_changed) {
+        std::fprintf(stderr, "[disp] C: rt=%p\n", (void*)rt);
+        std::fflush(stderr);
+    }
 
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
+
+    // Stuck-RIP watchdog. With diagnostics silenced on repeat entries
+    // a real memset can run at hundreds of thousands of iterations
+    // per second, so the threshold needs to accommodate genuinely
+    // long loops. A 16 MB region cleared 16 bytes at a time is ~1 M
+    // iterations — well within normal operation. Set the threshold
+    // at 10 M to catch only true infinite loops (no forward progress
+    // at all) rather than slow ones.
+    //
+    // The watchdog still fires on the same-RIP re-entry pattern; what
+    // we lost was the printf-bound slowdown that was making every
+    // real workload look like an infinite loop.
+    {
+        static thread_local u64 last_rip = 0;
+        static thread_local u64 same_rip_hits = 0;
+        if (cur_rip == last_rip) {
+            ++same_rip_hits;
+        } else {
+            last_rip = cur_rip;
+            same_rip_hits = 1;
+        }
+        constexpr u64 kStuckThreshold = 10'000'000;
+        if (same_rip_hits == kStuckThreshold) {
+            std::fprintf(stderr,
+                         "[disp] STUCK at 0x%llx after %llu re-entries; "
+                         "dumping guest GPRs and exiting fatally:\n",
+                         (unsigned long long)cur_rip, (unsigned long long)same_rip_hits);
+            static const char* const kGprNames[16] = {
+                "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+                "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
+            };
+            for (int i = 0; i < 16; ++i) {
+                std::fprintf(stderr, "  %s = 0x%llx\n", kGprNames[i],
+                             (unsigned long long)state->gpr[i]);
+            }
+            std::fprintf(stderr, "  rflags = 0x%llx\n", (unsigned long long)state->rflags);
+            std::fflush(stderr);
+            state->exit_reason = static_cast<u32>(ExitReason::UnsupportedInstruction);
+            return nullptr;
+        }
+    }
 
     while (true) {
         // Sentinel check: if guest code RET'd through the call chain

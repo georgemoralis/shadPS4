@@ -3158,5 +3158,245 @@ TEST_F(CpuRuntimeTest, HleBridge_UnregisteredHostCall_StillExecutes) {
     EXPECT_EQ(r.state.rip, kReturnSentinel);
 }
 
+// ============================================================================
+// 8-bit shifts (SHL/SHR/SAR with imm8 or CL). The narrow-width form
+// shares the same round-trip-flags-through-host pattern as the 32/64
+// versions, but must preserve bits 63:8 of the parent GPR slot (unlike
+// 32-bit shifts, which zero-extend bits 63:32 via the x86-64 register
+// write rule). The merge step in EmitShift8 — load al, host shift,
+// then mask-and-or back into byte 0 of the slot — is exactly what
+// these tests exercise.
+// ============================================================================
+
+// SHL al, 2 — verify the host shift result lands in byte 0 of the
+// rax slot and the upper 56 bits of the slot are preserved. Encoding
+// shape `C0 /4 ib` (no REX needed for AL).
+TEST_F(CpuRuntimeTest, Shl8_Imm_PreservesUpperBitsOfParentSlot) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEF00000005 — junk in upper, al = 0x05
+        0x48, 0xb8, 0x05, 0x00, 0x00, 0x00, 0xef,
+        0xbe, 0xad, 0xde, 0xc0, 0xe0, 0x02, // shl al, 2 → al = 0x14
+        0xc3,                               // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEF00000014ULL)
+        << "SHL al, 2 must shift only byte 0; bits 63:8 must be preserved";
+}
+
+// SHR bl, 4 — exercises an "extended low-byte" register (BL = byte 0
+// of slot 3 / RBX) to verify the byte-offset accessor handles non-
+// AL destinations correctly. This is the encoding the game hit at
+// 0x807a73217 (mnemonic=shr, width=8, length=3, ops=reg,imm).
+TEST_F(CpuRuntimeTest, Shr8_Imm_OnRbxLowByte) {
+    const u8 program[] = {
+        // mov rbx, 0xFFFFFFFF000000A0 — bl = 0xA0
+        0x48, 0xbb, 0xa0, 0x00, 0x00, 0x00, 0xff,
+        0xff, 0xff, 0xff, 0xc0, 0xeb, 0x04, // shr bl, 4 → bl = 0x0A
+        0xc3,                               // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[3], 0xFFFFFFFF0000000AULL)
+        << "SHR bl, 4 must shift only the low byte and preserve bits 63:8";
+}
+
+// SAR al, 2 with a negative byte value — arithmetic shift fills with
+// the sign bit. Starts from al = 0xF0 (signed -16), expects al = 0xFC
+// (signed -4). Upper bits of the rax slot are zero going in (clean
+// mov rax, imm64 → 0x..00F0) and must remain zero on the way out
+// (the merge mask preserves them without touching the sign-fill).
+TEST_F(CpuRuntimeTest, Sar8_Imm_SignExtendsLowByteOnly) {
+    const u8 program[] = {
+        // mov rax, 0xF0  (full mov-imm64 form so the upper 56 are zero)
+        0x48, 0xb8, 0xf0, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0xc0, 0xf8, 0x02, // sar al, 2 → al = 0xFC
+        0xc3,                               // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x00000000000000FCULL)
+        << "SAR al, 2 should sign-extend within the byte but NOT into bits 63:8";
+}
+
+// SHL al, cl — dynamic shift count via CL. The 8-bit emitter reuses
+// the same CL-source path as the wider shifts, this just confirms
+// the byte-width path doesn't accidentally read more than CL.
+TEST_F(CpuRuntimeTest, Shl8_Cl_DynamicCountOnLowByte) {
+    const u8 program[] = {
+        // mov rax, 0x01 ; al = 1
+        0x48, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // mov rcx, 0x03 ; shift count = 3
+        0x48, 0xb9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd2, 0xe0, // shl al, cl
+        0xc3,                                                                   // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 0x08ULL) << "1 << 3 = 8";
+}
+
+// ============================================================================
+// 64-bit reg-mem arithmetic and bitwise (ADD/SUB/AND/OR/XOR r64, [m]).
+// All five share the same skeleton: EmitEffectiveAddress puts the
+// address in rdx, then the loaded qword overwrites rdx (becoming the
+// rhs for the flag helper), rcx/rax hold the lhs, the host op runs,
+// and the result is stored back. These tests verify the mem-src path
+// for each opcode by writing a known value to the stack and loading
+// it via [rsp-8] addressing.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Add64_RegMem_LoadsAndAdds) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x01, 0x00, 0x00, // mov rax, 0x100
+        0x48, 0x89, 0x44, 0x24, 0xf8,             // mov [rsp-8], rax
+        0x48, 0xc7, 0xc0, 0x50, 0x00, 0x00, 0x00, // mov rax, 0x50
+        0x48, 0x03, 0x44, 0x24, 0xf8,             // add rax, [rsp-8]
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x150ULL) << "0x50 + 0x100 (loaded from memory)";
+}
+
+TEST_F(CpuRuntimeTest, Sub64_RegMem_LoadsAndSubs) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x80, 0x00, 0x00, 0x00, // mov rax, 0x80
+        0x48, 0x89, 0x44, 0x24, 0xf8,             // mov [rsp-8], rax
+        0x48, 0xc7, 0xc0, 0x00, 0x01, 0x00, 0x00, // mov rax, 0x100
+        0x48, 0x2b, 0x44, 0x24, 0xf8,             // sub rax, [rsp-8]
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x80ULL) << "0x100 - 0x80 (loaded from memory)";
+}
+
+TEST_F(CpuRuntimeTest, And64_RegMem_LoadsAndAnds) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0xff, 0x00, 0x00, // mov rax, 0xFF00
+        0x48, 0x89, 0x44, 0x24, 0xf8,             // mov [rsp-8], rax
+        0x48, 0xc7, 0xc0, 0xff, 0xff, 0x00, 0x00, // mov rax, 0xFFFF
+        0x48, 0x23, 0x44, 0x24, 0xf8,             // and rax, [rsp-8]
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFF00ULL) << "0xFFFF & 0xFF00 = 0xFF00";
+}
+
+TEST_F(CpuRuntimeTest, Or64_RegMem_LoadsAndOrs) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 0x0F
+        0x48, 0x89, 0x44, 0x24, 0xf8,             // mov [rsp-8], rax
+        0x48, 0xc7, 0xc0, 0xf0, 0x00, 0x00, 0x00, // mov rax, 0xF0
+        0x48, 0x0b, 0x44, 0x24, 0xf8,             // or rax, [rsp-8]
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFULL) << "0xF0 | 0x0F = 0xFF";
+}
+
+TEST_F(CpuRuntimeTest, Xor64_RegMem_LoadsAndXors) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0xff, 0x00, 0x00, 0x00, // mov rax, 0xFF
+        0x48, 0x89, 0x44, 0x24, 0xf8,             // mov [rsp-8], rax
+        0x48, 0xc7, 0xc0, 0x0f, 0x00, 0x00, 0x00, // mov rax, 0x0F
+        0x48, 0x33, 0x44, 0x24, 0xf8,             // xor rax, [rsp-8]
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xF0ULL) << "0x0F ^ 0xFF = 0xF0";
+}
+
+// ============================================================================
+// 32-bit LEA — the zero-extension trap.
+//
+// x86-64's "32-bit destination write zero-extends bits 63:32" is a
+// *register* rule, not a memory rule. EmitLea emits a qword store
+// to the guest GPR slot, so we must zero the upper 32 BEFORE the
+// store (via `mov edx, edx` — the canonical self-zero idiom).
+// This test fails if EmitLea forgets that step: it would store only
+// the low 32 via the address calc, leaving the slot's upper bytes
+// containing the previous rax value.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Lea32_ZerosUpper32OfDestination) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEF12345678 — pollute rax with junk in upper
+        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad,
+        0xde, 0x48, 0xc7, 0xc1, 0x00, 0x01, 0x00, 0x00, // mov rcx, 0x100
+        0x8d, 0x41, 0x40,                               // lea eax, [rcx + 0x40]
+        0xc3,                                           // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x140ULL)
+        << "lea eax, [rcx+0x40] must zero-extend; expected 0x140, not 0xDEADBEEF00000140";
+}
+
+// ============================================================================
+// ANDN — BMI1 three-operand bitwise NOT-AND. EmitAndn handles both
+// 64- and 32-bit forms; the 32-bit variant relies on the host's
+// register-write zero-extension to clear bits 63:32 of the result.
+// ============================================================================
+
+// ANDN eax, ecx, edx — eax = (~ecx) & edx, with upper 32 zeroed.
+// VEX encoding: C4 E2 70 F2 /r. The ModR/M byte C2 selects
+// reg=eax, rm=edx; the VEX.vvvv field encodes ecx (inverted).
+TEST_F(CpuRuntimeTest, Andn32_RegReg_ComputesAndZeroExtends) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEF12345678 — pollute upper of dst
+        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad,
+        0xde, 0x48, 0xc7, 0xc1, 0xf0, 0x00, 0x00, 0x00, // mov rcx, 0xF0  (src1)
+        0x48, 0xc7, 0xc2, 0xff, 0x00, 0x00, 0x00,       // mov rdx, 0xFF  (src2)
+        0xc4, 0xe2, 0x70, 0xf2, 0xc2,                   // andn eax, ecx, edx
+        0xc3,                                           // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // (~0xF0) & 0xFF in 32-bit = 0xFFFFFF0F & 0xFF = 0x0F
+    EXPECT_EQ(r.state.gpr[0], 0x0FULL)
+        << "(~ecx) & edx low 32 = 0x0F, upper 32 must be zero-extended";
+}
+
+// ============================================================================
+// High-byte register access (AH/BH/CH/DH).
+//
+// These are the legacy "high byte of low word" registers, which can
+// only be encoded WITHOUT a REX prefix. EmitNarrowArith8 supports
+// them via the ZydisGpr8ToByteOffset helper, which returns byte 1
+// of the parent slot (since the parent qword is laid out little-
+// endian, byte 1 holds bits 15:8). The other 8-bit emitters
+// (EmitShift8, EmitSetcc) still reject these as no production code
+// has been observed using them in those contexts.
+// ============================================================================
+
+// TEST ah, imm8 — exercises high-byte READ. Set rax so AL and AH
+// have different low bits; if the lifter accidentally loaded AL
+// instead of AH the ZF check would flip. Encoding: F6 C4 ib.
+TEST_F(CpuRuntimeTest, Test8_HighByteAh_AccessesByte1OfRax) {
+    const u8 program[] = {
+        // mov rax, 0x100F — AL = 0x0F (bit 0 set), AH = 0x10 (bit 0 clear)
+        0x48, 0xc7, 0xc0, 0x0f, 0x10, 0x00, 0x00, 0xf6, 0xc4, 0x01, // test ah, 0x01
+        0xc3,                                                       // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AH=0x10, 0x10 & 0x01 = 0 → ZF must be set.
+    // If the lifter mistakenly read AL (0x0F), 0x0F & 0x01 = 1 → ZF clear.
+    EXPECT_EQ(r.state.rflags & 0x40ULL, 0x40ULL)
+        << "test ah, 0x01 with AH=0x10 must set ZF; if ZF is clear the "
+           "lifter read AL by mistake";
+    EXPECT_EQ(r.state.gpr[0], 0x100FULL) << "TEST writes only flags, not rax";
+}
+
+// AND ch, imm8 — exercises high-byte WRITE. Verifies that only byte 1
+// of the rcx slot is modified, with byte 0 (CL) and bytes 2..7
+// preserved. Encoding: 80 E5 ib (ModR/M byte selects CH).
+TEST_F(CpuRuntimeTest, And8_HighByteCh_WritesOnlyByte1OfRcx) {
+    const u8 program[] = {
+        // mov rcx, 0xDEADBE00CAFE12AA — diverse bytes across the slot:
+        //   byte 0 (CL) = 0xAA
+        //   byte 1 (CH) = 0x12
+        //   bytes 2..7  = 0xFECA00BEADDE
+        0x48, 0xb9, 0xaa, 0x12, 0xfe, 0xca, 0x00,
+        0xbe, 0xad, 0xde, 0x80, 0xe5, 0x0f, // and ch, 0x0F → ch = 0x02
+        0xc3,                               // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1], 0xDEADBE00CAFE02AAULL)
+        << "and ch, 0x0F must modify only byte 1; CL and bytes 2..7 preserved";
+}
+
 } // namespace
 } // namespace Core::Runtime
