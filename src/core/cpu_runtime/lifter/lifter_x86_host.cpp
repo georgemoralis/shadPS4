@@ -6511,43 +6511,68 @@ bool EmitVecFpCvt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
     return true;
 }
 
-/// VPSRAD — Packed Shift Right Arithmetic Dword. Per-element 32-bit
-/// arithmetic (sign-extending) right shift.
+/// VPSRA{W,D} / VPSRL{W,D,Q} / VPSLL{W,D,Q} — packed shift by imm8.
+/// 8 cells across {SRA, SRL, SLL} × {W, D, Q except SRA-Q which is
+/// AVX-512 only}.
 ///
-///   VPSRAD xmm1, xmm2, imm8         ; shift count is constant
-///   VPSRAD xmm1, xmm2, xmm3/m128    ; shift count from xmm3.low64 / [m]
+///   VPxxx xmm1, xmm2, imm8         ; per-element shift by constant count
+///   VPxxx ymm1, ymm2, imm8         ; same, 256-bit form
 ///
-/// For each 32-bit element i:
-///   if count > 31: dst[i] = (src1[i] < 0) ? 0xFFFFFFFF : 0   (sign-fill clamp)
-///   else:          dst[i] = (int32_t)src1[i] >> count
+/// For each element of width E:
+///   SRA: dst[i] = (signed)src[i] >> count, sign-fill; count > E-1 → sign-mask
+///   SRL: dst[i] = (unsigned)src[i] >> count, zero-fill; count > E-1 → 0
+///   SLL: dst[i] = src[i] << count, zero-fill;          count > E-1 → 0
 ///
-/// "Arithmetic" means sign-extend the vacated high bits. VPSRLD is
-/// the logical sibling (zero-fill). VPSLLD is the left-shift sibling.
 /// No flags written. Per-lane independent (256-bit form = two 128-bit
-/// halves), VEX-128 zeros upper YMM.
+/// halves). VEX-128 zeros upper YMM.
 ///
-/// Initial cut: imm8 shift count only (the length=5 form observed
-/// from the game). The xmm/mem shift-count form needs a different
-/// codepath — when we see it, this becomes the refactor seed for the
-/// broader vector-shift family (VPSRLD/VPSLLD/VPSRAW/etc., 9 ops in
-/// total across {SRA, SRL, SLL} × {W, D, Q except SRA-Q}).
+/// Initial cut handles only the imm8 form (length=5 in the encoding).
+/// The xmm/mem-count form (`op dst, src, xmm3/m128` where the count
+/// comes from xmm3.low64) is a different shape and gets its own
+/// helper when first observed — that's a single shift count
+/// broadcast across all lanes from the source register's low 64.
 ///
-/// Implementation: host VPSRAD on scratch xmm0. The imm8 is encoded
-/// in the guest instruction stream so we read it at lift time and
-/// pass it through to xbyak's 3-operand imm8 form. Same scratch-XMM
-/// approach as VPCMPEQ / VPSUBD / VBLENDPS.
-bool EmitVpsrad(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-                Xbyak::CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_VPSRAD)
+/// Refactored from EmitVpsrad (first instance) at the second
+/// instance (VPSRLD). All cells share the same scaffolding —
+/// scratch xmm0 load, host op with imm8, storeback. The 9-LOC-per-
+/// cell payoff applies once an op enters the dispatch.
+enum class VecShiftImm { SraW, SraD, SrlW, SrlD, SrlQ, SllW, SllD, SllQ };
+
+bool EmitVecShiftImm(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                     Xbyak::CodeGenerator& c, VecShiftImm kind) {
+    // Mnemonic gating — defensive routing check.
+    auto expected = [&]() -> ZydisMnemonic {
+        switch (kind) {
+        case VecShiftImm::SraW:
+            return ZYDIS_MNEMONIC_VPSRAW;
+        case VecShiftImm::SraD:
+            return ZYDIS_MNEMONIC_VPSRAD;
+        case VecShiftImm::SrlW:
+            return ZYDIS_MNEMONIC_VPSRLW;
+        case VecShiftImm::SrlD:
+            return ZYDIS_MNEMONIC_VPSRLD;
+        case VecShiftImm::SrlQ:
+            return ZYDIS_MNEMONIC_VPSRLQ;
+        case VecShiftImm::SllW:
+            return ZYDIS_MNEMONIC_VPSLLW;
+        case VecShiftImm::SllD:
+            return ZYDIS_MNEMONIC_VPSLLD;
+        case VecShiftImm::SllQ:
+            return ZYDIS_MNEMONIC_VPSLLQ;
+        }
+        return ZYDIS_MNEMONIC_INVALID;
+    }();
+    if (insn.mnemonic != expected)
         return false;
+
     if (insn.operand_count_visible != 3)
         return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
         return false;
     if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
         return false;
-    // Initial-cut restriction: imm8 form only. The xmm/mem-count form
-    // will get added when first observed.
+    // imm8 form only at this layer. The xmm/mem-count form has
+    // different shape and goes through a parallel helper.
     if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
         return false;
 
@@ -6563,9 +6588,39 @@ bool EmitVpsrad(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 
     const u8 imm = static_cast<u8>(ops[2].imm.value.u);
 
+    // Helper: emit the right host op for the kind on (xmm0, xmm0, imm).
+    auto emit_op = [&]() {
+        switch (kind) {
+        case VecShiftImm::SraW:
+            c.vpsraw(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SraD:
+            c.vpsrad(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SrlW:
+            c.vpsrlw(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SrlD:
+            c.vpsrld(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SrlQ:
+            c.vpsrlq(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SllW:
+            c.vpsllw(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SllD:
+            c.vpslld(xmm0, xmm0, imm);
+            break;
+        case VecShiftImm::SllQ:
+            c.vpsllq(xmm0, xmm0, imm);
+            break;
+        }
+    };
+
     for (int lane = 0; lane < lanes; ++lane) {
         c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src1_idx, lane * 2)]);
-        c.vpsrad(xmm0, xmm0, imm);
+        emit_op();
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, lane * 2)], xmm0);
     }
 
@@ -7961,8 +8016,29 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPMULLD:
             handled = EmitVecIntArith(insn, ops, next_rip, c, VecIntArith::MulD);
             break;
+        case ZYDIS_MNEMONIC_VPSRAW:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SraW);
+            break;
         case ZYDIS_MNEMONIC_VPSRAD:
-            handled = EmitVpsrad(insn, ops, c);
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SraD);
+            break;
+        case ZYDIS_MNEMONIC_VPSRLW:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SrlW);
+            break;
+        case ZYDIS_MNEMONIC_VPSRLD:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SrlD);
+            break;
+        case ZYDIS_MNEMONIC_VPSRLQ:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SrlQ);
+            break;
+        case ZYDIS_MNEMONIC_VPSLLW:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SllW);
+            break;
+        case ZYDIS_MNEMONIC_VPSLLD:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SllD);
+            break;
+        case ZYDIS_MNEMONIC_VPSLLQ:
+            handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SllQ);
             break;
         case ZYDIS_MNEMONIC_VMULPS:
             handled = EmitVecFpArith(insn, ops, next_rip, c, VecFpKind::Mul, VecFpPrec::Single);

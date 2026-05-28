@@ -7877,5 +7877,108 @@ TEST_F(CpuRuntimeTest, Vextractf128_MemoryDestination) {
         << "next qword must be untouched (only 16 bytes written)";
 }
 
+// ============================================================================
+// VPSRLD — packed Logical Shift Right of 32-bit dwords. Wired through
+// EmitVecShiftImm alongside VPSRAD via the second-instance refactor.
+// The distinguishing semantic is **zero-fill** of vacated high bits
+// (vs VPSRAD's sign-fill). For negative inputs the two produce very
+// different bit patterns — this test pins down zero-fill.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpsrld_PositiveValues_ShiftsRight) {
+    // vpsrld xmm0, xmm1, 2  — c5 f9 72 d1 02 (5 bytes)
+    const u8 program[] = {
+        0xc5, 0xf9, 0x72, 0xd1, 0x02, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [40, 100, 1000, 0x40000000]
+    st.ymm[4] = (static_cast<u64>(100u) << 32) | 40u;
+    st.ymm[5] = (static_cast<u64>(0x40000000u) << 32) | 1000u;
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Each element shifted right by 2 (same result as SRA for positives):
+    //   40 >> 2 = 10, 100 >> 2 = 25, 1000 >> 2 = 250, 0x40000000 >> 2 = 0x10000000
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 10u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 25u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 250u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0x10000000u);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// The "logical" semantic: vacated high bits zero-fill regardless of sign.
+// Compare with VPSRAD which would sign-extend. For 0xFFFFFFFF >> 4:
+//   SRA: 0xFFFFFFFF (sign bit propagates)
+//   SRL: 0x0FFFFFFF (zero-fill from MSB)
+// This test exists specifically to catch SRA-vs-SRL routing bugs in the
+// refactored EmitVecShiftImm switch.
+TEST_F(CpuRuntimeTest, Vpsrld_NegativeValues_ZeroFill_NotSignFill) {
+    // vpsrld xmm0, xmm1, 4
+    const u8 program[] = {
+        0xc5, 0xf9, 0x72, 0xd1, 0x04, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [0xFFFFFFFF, 0x80000000 (INT_MIN), 0xFEDCBA98, 0x12345678]
+    st.ymm[4] = (static_cast<u64>(0x80000000u) << 32) | 0xFFFFFFFFu;
+    st.ymm[5] = (static_cast<u64>(0x12345678u) << 32) | 0xFEDCBA98u;
+
+    Runtime rt;
+    rt.Run(st);
+    // SRL (zero-fill) expectations:
+    //   0xFFFFFFFF >>logical 4 = 0x0FFFFFFF (NOT 0xFFFFFFFF as SRA would give)
+    //   0x80000000 >>logical 4 = 0x08000000 (NOT 0xF8000000)
+    //   0xFEDCBA98 >>logical 4 = 0x0FEDCBA9
+    //   0x12345678 >>logical 4 = 0x01234567
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0x0FFFFFFFu)
+        << "0xFFFFFFFF >>logical 4 = 0x0FFFFFFF (zero-fill), NOT 0xFFFFFFFF (sign-fill)";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0x08000000u)
+        << "INT_MIN >>logical 4 = 0x08000000 (zero-fill), NOT 0xF8000000 (sign-fill)";
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0x0FEDCBA9u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0x01234567u);
+}
+
+// Large shift count: SRL clamps to 0 (because all bits shift out).
+// Compare with SRA which would produce sign-mask. Catches reciprocal
+// of the sign-fill regression: if SRA were accidentally routed here,
+// negative inputs would yield 0xFFFFFFFF instead of 0.
+TEST_F(CpuRuntimeTest, Vpsrld_LargeShiftCount_ClampsToZero) {
+    // vpsrld xmm0, xmm1, 100  (count > 31)
+    const u8 program[] = {
+        0xc5, 0xf9, 0x72, 0xd1, 0x64, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (static_cast<u64>(0x80000000u) << 32) | 0xFFFFFFFFu;
+    st.ymm[5] = (static_cast<u64>(0x00000001u) << 32) | 0x12345678u;
+
+    Runtime rt;
+    rt.Run(st);
+    // Per Intel SDM: shift count >= element width → all elements 0
+    // (independent of sign, unlike SRA which yields sign-mask).
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0u)
+        << "0xFFFFFFFF >>logical 100 = 0 (NOT 0xFFFFFFFF as SRA-clamp would give)";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0u)
+        << "INT_MIN >>logical 100 = 0 (NOT 0xFFFFFFFF)";
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0u);
+}
+
 } // namespace
 } // namespace Core::Runtime
