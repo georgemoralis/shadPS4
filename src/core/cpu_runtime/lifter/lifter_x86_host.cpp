@@ -1379,6 +1379,72 @@ bool EmitOr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
         return true;
     }
 
+    // 64-bit register destination with immediate source: `or r64, imm`.
+    // Same shape as EmitAnd's reg-imm 64-bit branch. Materialise the
+    // immediate into rdx so the OR has a register operand (xbyak can't
+    // encode `or rax, imm64`; imm32-sx via rdx is the canonical route).
+    if (insn.operand_width == 64 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0)
+            return false;
+        const auto imm = ops[1].imm.value.s;
+        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rdx, imm);
+        c.or_(rax, rdx);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
+    // 32-bit register destination with immediate source: `or r32, imm`.
+    // Mirrors the AND 32-bit reg-imm path; 32-bit write zero-extends rax.
+    if (insn.operand_width == 32 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0)
+            return false;
+        const u32 imm = static_cast<u32>(ops[1].imm.value.u & 0xFFFFFFFFu);
+        c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+        c.or_(eax, imm); // 32-bit op zero-extends rax
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
+    // 8-bit OR with memory destination and byte immediate: `or byte[mem], imm8`.
+    // Observed in Sonic Mania (libc flags field update pattern).
+    //
+    // Flags: OR clears CF/OF; ZF/SF/PF from the 8-bit result. We
+    // round-trip rflags through the host CPU (same pattern as 8-bit
+    // shifts / NEG / INC) so the host `or al, imm8` computes SF from
+    // bit 7 of the result — the wide EmitFlagsFromBitwise helper would
+    // incorrectly derive SF from bit 63 instead.
+    if (insn.operand_width == 8 && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+            return false;
+        // rdx = effective address. Stash it in r10 so the rflags
+        // round-trip (which uses rdx as the intermediate) doesn't
+        // clobber it.
+        c.mov(r10, rdx);
+        const u8 imm = static_cast<u8>(ops[1].imm.value.u & 0xFFu);
+        c.mov(al, byte[r10]);
+
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        c.or_(al, imm);
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        c.mov(byte[r10], al);
+        return true;
+    }
+
     if (insn.operand_width == 64) {
         return EmitBitwise64RegReg(ops[0], ops[1], c,
                                    [&](Xbyak::Reg64 a, Xbyak::Reg64 b) { c.or_(a, b); });
@@ -1650,25 +1716,50 @@ bool EmitDec(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
 ///   the architectural semantics for free.
 bool EmitBt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
             Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64)
-        return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
         return false;
-    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
-        return false;
-    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-    const int src_idx = ZydisGprToIndex(ops[1].reg.value);
-    if (dst_idx < 0 || src_idx < 0)
+    if (insn.operand_width != 64 && insn.operand_width != 32)
         return false;
 
-    // Load value and bit index.
-    c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
-    c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
-    // Host BT with reg-src already masks by opsize-1 (i.e. cl & 63
-    // for 64-bit). No explicit `and rcx, 63` needed.
-    c.bt(rax, rcx); // host CF := bit N of rax
+    const int src_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (src_idx < 0)
+        return false;
 
-    // Capture host CF into r11, then merge into guest rflags.
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        // bt r32/r64, r32/r64 — bit index from a GPR. Host BT
+        // architecturally masks the index by opsize-1 (cl & 63 for
+        // 64-bit, cl & 31 for 32-bit), matching guest semantics for
+        // both widths.
+        const int bit_idx = ZydisGprToIndex(ops[1].reg.value);
+        if (bit_idx < 0)
+            return false;
+        if (insn.operand_width == 64) {
+            c.mov(rax, qword[r13 + GprOffset(src_idx)]);
+            c.mov(rcx, qword[r13 + GprOffset(bit_idx)]);
+            c.bt(rax, rcx);
+        } else { // 32-bit
+            c.mov(eax, dword[r13 + GprOffset(src_idx)]);
+            c.mov(ecx, dword[r13 + GprOffset(bit_idx)]);
+            c.bt(eax, ecx);
+        }
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        // bt r32/r64, imm8 — Sonic Mania fast single-bit-test idiom.
+        // Observed as `bt r32, imm` / `jb target` in the Hello World
+        // and video-out init paths.
+        const unsigned int bit_pos = static_cast<unsigned int>(ops[1].imm.value.u & 0xFFu);
+        if (insn.operand_width == 64) {
+            c.mov(rax, qword[r13 + GprOffset(src_idx)]);
+            c.bt(rax, bit_pos);
+        } else { // 32-bit
+            c.mov(eax, dword[r13 + GprOffset(src_idx)]);
+            c.bt(eax, bit_pos);
+        }
+    } else {
+        return false;
+    }
+
+    // ZF/SF/PF/OF are undefined after BT (Intel SDM Vol. 2A). Capture
+    // only CF via setc+btr+or so other guest flags are undisturbed.
     c.setc(r11b);
     c.movzx(r11, r11b);
     c.mov(r10, qword[r13 + Offsets::Rflags]);
@@ -2644,47 +2735,95 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn, const ZydisDecodedOpe
     if (insn.operand_width != 8)
         return false;
 
-    // ----- Memory destination/lhs — Cmp/Test only -----
+    // ----- Memory destination/lhs -----
     //
-    // Common in compiled code as "test byte ptr [reg+disp], imm8"
-    // (boolean field check) and "cmp byte ptr [mem], imm8". Cmp/Test
-    // discard the result so there's no writeback, and rdx is free to
-    // repurpose for the flag round-trip after we no longer need the
-    // address.
+    // Cmp/Test are read-only — no writeback. They're common as
+    // "test byte ptr [reg+disp], imm8" boolean checks and similar.
+    //
+    // Or/And/Xor/Add/Sub with mem-dst + imm-src DO write back. The
+    // typical pattern is `or byte[reg+disp], imm8` (set-flag idiom)
+    // observed in glibc-style bitfield updates. The reg-src form
+    // exists too but isn't observed yet — when seen, add `mov cl,
+    // byte[r13+src_off]` and use the cl register variant of the op.
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
+        const bool is_readonly = (kind == NarrowArithKind::Cmp || kind == NarrowArithKind::Test);
+        const bool is_writeback_imm =
+            (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) &&
+            (kind == NarrowArithKind::Or || kind == NarrowArithKind::And ||
+             kind == NarrowArithKind::Xor || kind == NarrowArithKind::Add ||
+             kind == NarrowArithKind::Sub);
+        if (!is_readonly && !is_writeback_imm) {
             return false;
         }
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
             return false;
-        // rdx = effective address. Load 8-bit lhs into al.
-        c.mov(al, byte[rdx]);
 
-        // Load rhs into cl. Mem-mem doesn't exist for cmp/test.
-        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-            const int src_off = ZydisGpr8ToByteOffset(ops[1].reg.value);
-            if (src_off < 0)
+        if (is_readonly) {
+            // rdx = effective address. Load 8-bit lhs into al.
+            c.mov(al, byte[rdx]);
+
+            // Load rhs into cl. Mem-mem doesn't exist for cmp/test.
+            if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                const int src_off = ZydisGpr8ToByteOffset(ops[1].reg.value);
+                if (src_off < 0)
+                    return false;
+                c.mov(cl, byte[r13 + src_off]);
+            } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
+            } else {
                 return false;
-            c.mov(cl, byte[r13 + src_off]);
-        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-            c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
-        } else {
-            return false;
+            }
+
+            // Flag round-trip through host CPU (so it computes correct
+            // 8-bit-width flags). rdx is free now — address is no longer
+            // needed since cmp/test don't write back.
+            c.mov(rdx, qword[r13 + Offsets::Rflags]);
+            c.push(rdx);
+            c.popfq();
+
+            switch (kind) {
+            case NarrowArithKind::Cmp:
+                c.cmp(al, cl);
+                break;
+            case NarrowArithKind::Test:
+                c.test(al, cl);
+                break;
+            default:
+                return false; // unreachable: filtered above
+            }
+
+            c.pushfq();
+            c.pop(rdx);
+            c.mov(qword[r13 + Offsets::Rflags], rdx);
+            return true;
         }
 
-        // Flag round-trip through host CPU (so it computes correct
-        // 8-bit-width flags). rdx is free now — address is no longer
-        // needed for a writeback.
+        // Writeback path: read the byte, do op with imm, store back.
+        // Stash EA in r10 so the rflags round-trip's use of rdx
+        // doesn't clobber it before we store back.
+        c.mov(r10, rdx);
+        c.mov(al, byte[r10]);
+        const u8 imm = static_cast<u8>(ops[1].imm.value.u & 0xFFu);
+
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
         c.push(rdx);
         c.popfq();
 
         switch (kind) {
-        case NarrowArithKind::Cmp:
-            c.cmp(al, cl);
+        case NarrowArithKind::Or:
+            c.or_(al, imm);
             break;
-        case NarrowArithKind::Test:
-            c.test(al, cl);
+        case NarrowArithKind::And:
+            c.and_(al, imm);
+            break;
+        case NarrowArithKind::Xor:
+            c.xor_(al, imm);
+            break;
+        case NarrowArithKind::Add:
+            c.add(al, imm);
+            break;
+        case NarrowArithKind::Sub:
+            c.sub(al, imm);
             break;
         default:
             return false; // unreachable: filtered above
@@ -2693,6 +2832,8 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn, const ZydisDecodedOpe
         c.pushfq();
         c.pop(rdx);
         c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        c.mov(byte[r10], al);
         return true;
     }
 
@@ -4153,6 +4294,84 @@ bool EmitSetcc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
+/// VPCMPEQB dst, src1, src2 — packed byte compare-equal.
+///
+/// For each byte position i: dst[i] = (src1[i] == src2[i]) ? 0xFF : 0x00.
+///
+/// Observed in Sonic Mania (and Hello World / video-out init) at all
+/// three test-case sites; the mnemonic is used by libc's memcmp-derived
+/// fast-path and by initialisation code checking sentinel byte lanes.
+///
+/// We use the host VPCMPEQB instruction directly on host XMM registers
+/// per 128-bit lane — the same strategy VPSHUFB uses. This is cheaper
+/// than a scalar byte loop (16-32 conditional stores vs 3-4 host VEX
+/// instructions) and avoids any accuracy questions about scalar
+/// emulation of the lane-independence invariant.
+///
+/// VPCMPEQB does not affect any flags per the x86 spec (unlike scalar
+/// CMP / TEST), so no rflags writeback is needed.
+///
+/// Supported forms:
+///   3-operand VEX (normal assembler output): dst, src1, src2.
+///   2-operand (dst == src1 folded by assembler): dst, src2.
+/// Both 128-bit (xmm) and 256-bit (ymm) widths.
+bool EmitVpcmpeqb(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPCMPEQB)
+        return false;
+
+    int dst_idx, src1_idx, src2_idx;
+    if (insn.operand_count_visible == 3) {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[2].type != ZYDIS_OPERAND_TYPE_REGISTER)
+            return false;
+        dst_idx = ZydisVecToIndex(ops[0].reg.value);
+        src1_idx = ZydisVecToIndex(ops[1].reg.value);
+        src2_idx = ZydisVecToIndex(ops[2].reg.value);
+    } else if (insn.operand_count_visible == 2) {
+        // Assembler folded dst == src1: `vpcmpeqb xmm0, xmm1` means
+        // xmm0 = xmm0 OP xmm1.
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+            return false;
+        dst_idx = ZydisVecToIndex(ops[0].reg.value);
+        src1_idx = dst_idx; // implicit src1 == dst
+        src2_idx = ZydisVecToIndex(ops[1].reg.value);
+    } else {
+        return false;
+    }
+    if (dst_idx < 0 || src1_idx < 0 || src2_idx < 0)
+        return false;
+
+    // Zydis reports ops[0].size in bits for vector registers: 128 or 256.
+    // (insn.operand_width is the element width which Zydis encodes as a
+    // different field for VEX instructions; we ignore it here.)
+    const int vec_bits = ops[0].size;
+    if (vec_bits != 128 && vec_bits != 256)
+        return false;
+
+    // Process each 128-bit lane independently (VPCMPEQB AVX2 256-bit
+    // operates on two independent 128-bit halves, with no cross-lane
+    // byte movement — same invariant VPSHUFB relies on).
+    for (int lane = 0; lane < vec_bits / 128; ++lane) {
+        const u32 src1_off = YmmChunkOffset(src1_idx, lane * 2);
+        const u32 src2_off = YmmChunkOffset(src2_idx, lane * 2);
+        const u32 dst_off = YmmChunkOffset(dst_idx, lane * 2);
+        c.vmovdqu(xmm0, ptr[r13 + src1_off]);
+        c.vmovdqu(xmm1, ptr[r13 + src2_off]);
+        c.vpcmpeqb(xmm0, xmm0, xmm1);
+        c.vmovdqu(ptr[r13 + dst_off], xmm0);
+    }
+    // VEX 128-bit form zeros bits 255:128 of the destination YMM.
+    if (vec_bits == 128) {
+        c.xor_(rax, rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_idx, 2)], rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_idx, 3)], rax);
+    }
+    return true;
+}
+
 /// SFENCE — serialize all prior non-temporal stores. No operands.
 ///
 /// Observed at libc 0x805f2b42d, immediately after the VMOVNTDQ
@@ -4457,6 +4676,206 @@ bool EmitCpuid(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
     c.mov(qword[r13 + GprOffset(3)], r9);  // b → RBX
     c.mov(qword[r13 + GprOffset(1)], r10); // c → RCX
     c.mov(qword[r13 + GprOffset(2)], r11); // d → RDX
+    return true;
+}
+
+/// XGETBV — read an Extended Control Register (XCR).
+///   Input:   ECX = XCR index (only XCR0 is defined in Sandy
+///                  Bridge/Jaguar-era CPUs)
+///   Outputs: EDX:EAX = 64-bit XCR value
+///
+/// Games reach this after CPUID reports OSXSAVE+AVX: the canonical
+/// Intel-recommended AVX detection is
+///     `cpuid -> OSXSAVE && AVX feature set` then
+///     `xgetbv ecx=0 -> check bits 1 (SSE state) and 2 (AVX state)`.
+/// Without an XGETBV implementation, games that do the full check
+/// will disable their AVX paths — or, more commonly on this codebase,
+/// hit the unsupported-insn exit and stop dead.
+///
+/// We don't actually have an XSAVE area; we just need to return
+/// values that say "yes, the OS has enabled SSE+AVX state" so the
+/// guest's "is AVX usable?" gate succeeds. That's XCR0 = 0x7
+/// (bit 0 = x87 mandatory, bit 1 = SSE state, bit 2 = AVX state).
+/// Any other XCR index returns 0 — matches an OS that hasn't enabled
+/// extended features beyond AVX.
+///
+/// Implementation: tiny dispatcher. Load guest ECX into a host
+/// scratch, branch on ecx==0, write the constants to slots 0/2
+/// (RAX/RDX) via r8/r11. 32-bit writes zero-extend so the qword
+/// storebacks land clean upper halves, matching the architectural
+/// "EAX/EDX written, upper 32 zeroed by x86-64 rule" semantics.
+bool EmitXgetbv(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_XGETBV)
+        return false;
+
+    using LT = Xbyak::CodeGenerator::LabelType;
+    Xbyak::Label l_xcr0, l_done;
+
+    // Load guest ECX.
+    c.mov(ecx, dword[r13 + GprOffset(1)]);
+
+    // Default response: zero in both halves.
+    c.xor_(r8d, r8d);   // → EAX
+    c.xor_(r11d, r11d); // → EDX
+
+    c.test(ecx, ecx);
+    c.jz(l_xcr0, LT::T_NEAR);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // XCR0 — x87 (bit 0), SSE state (bit 1), AVX state (bit 2).
+    // Reporting these as enabled is what an OSXSAVE-aware AVX-capable
+    // OS would return; it's what the CPUID we spoofed promises.
+    c.L(l_xcr0);
+    c.mov(r8d, 0x7);
+    // r11d stays zero — upper 32 of the XCR are reserved on Jaguar.
+
+    c.L(l_done);
+    c.mov(qword[r13 + GprOffset(0)], r8);  // → RAX
+    c.mov(qword[r13 + GprOffset(2)], r11); // → RDX
+    return true;
+}
+
+/// VPTEST xmm1, xmm2 — AVX bit-test across the entire vector.
+///   ZF := ((xmm1 AND xmm2)        == 0)   "all bits common are zero"
+///   CF := ((NOT xmm1 AND xmm2)    == 0)   "every bit in xmm2 is in xmm1"
+///   OF/SF/AF/PF := 0
+///
+/// 256-bit ymm form follows the same definition with 256 bits per
+/// operand. Games commonly use VPTEST as a "branchless equality" or
+/// "any-bits-set" test after a vector compare; missing it cascades
+/// into wrong control flow rather than a crash, so it's worth
+/// getting right.
+///
+/// Implementation: stash the two operands into host xmm0/xmm1 via
+/// VMOVDQU from the GuestState YMM lanes (the JIT owns the full XMM
+/// file inside a block), run host VPTEST, then capture ZF and CF
+/// into the guest rflags slot. The pushfq/popfq round-trip is the
+/// cleanest way to copy all six arithmetic flags at once — host
+/// VPTEST does the right thing for OF/SF/AF/PF (clears them), and
+/// we preserve the non-arithmetic guest flag bits (TF/IF/DF/...)
+/// by masking.
+bool EmitVptest(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPTEST)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+
+    const int a_idx = ZydisVecToIndex(ops[0].reg.value);
+    const int b_idx = ZydisVecToIndex(ops[1].reg.value);
+    if (a_idx < 0 || b_idx < 0)
+        return false;
+
+    const int vec_bits = ops[0].size;
+    if (vec_bits != 128 && vec_bits != 256)
+        return false;
+
+    // Load operands into host xmm0/xmm1 (or ymm0/ymm1 for 256-bit).
+    // Host XMM0..XMM5 are JIT-scratch inside a block per the
+    // host-register convention; no save/restore needed.
+    if (vec_bits == 128) {
+        c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(a_idx, 0)]);
+        c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(b_idx, 0)]);
+        c.vptest(xmm0, xmm1);
+    } else {
+        c.vmovdqu(ymm0, ptr[r13 + YmmChunkOffset(a_idx, 0)]);
+        c.vmovdqu(ymm1, ptr[r13 + YmmChunkOffset(b_idx, 0)]);
+        c.vptest(ymm0, ymm1);
+    }
+
+    // Merge host arithmetic flags into the guest rflags slot. VPTEST
+    // produces CF/ZF/PF/AF/SF/OF — but the architectural spec sets
+    // OF/AF/PF/SF to 0 explicitly. pushfq captures everything; mask
+    // the host result to just the bits VPTEST writes (CF=0, PF=2,
+    // AF=4, ZF=6, SF=7, OF=11 → 0x8D5) and OR into the guest rflags
+    // with those same bits cleared first.
+    constexpr u64 kArithMask = 0x8D5; // CF|PF|AF|ZF|SF|OF
+    c.pushfq();
+    c.pop(rax);
+    c.and_(rax, kArithMask);
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.mov(rcx, ~kArithMask);
+    c.and_(rdx, rcx);
+    c.or_(rdx, rax);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    return true;
+}
+
+/// VPCMPISTRI xmm1, xmm2/m128, imm8 — SSE4.2 "compare implicit-length
+/// strings, return index". Used by glibc string functions (strlen,
+/// strchr, strcmp variants) for vectorized inner loops.
+///
+/// Architectural behavior:
+///   ECX  := result index (semantics controlled by imm8 bit 6)
+///   CF   := (intermediate boolean vector is not all zero)
+///   ZF   := (xmm2 contains a null character / terminator)
+///   SF   := (xmm1 contains a null character / terminator)
+///   OF   := bit 0 of intermediate boolean vector
+///   AF, PF := 0
+///
+/// Implementation: this is too complex to lift directly — the
+/// imm8 control byte selects between four aggregation operations
+/// (equal-any, ranges, equal-each, equal-ordered) across two data
+/// formats (signed/unsigned, bytes/words), with polarity inversion
+/// and output-sense bits. Running host VPCMPISTRI gets all of that
+/// for free, including the rflags layout.
+///
+/// We load the two xmm operands from the GuestState YMM lanes into
+/// host xmm0/xmm1 (JIT-scratch inside a block), run host VPCMPISTRI
+/// with the same imm8, then capture host ECX → guest RCX (zero-
+/// extended into the full slot) and merge the arithmetic flags into
+/// the guest rflags using the same mask-and-or pattern as VPTEST.
+///
+/// Reg-mem second-operand form is deferred — glibc's string loops
+/// use the reg-reg form after a load into a register operand.
+bool EmitVpcmpistri(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                    Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPCMPISTRI)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        return false;
+
+    const int a_idx = ZydisVecToIndex(ops[0].reg.value);
+    const int b_idx = ZydisVecToIndex(ops[1].reg.value);
+    if (a_idx < 0 || b_idx < 0)
+        return false;
+
+    const u8 imm = static_cast<u8>(ops[2].imm.value.u & 0xFFu);
+
+    // Load both 128-bit operands into host scratch xmm0/xmm1.
+    c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(a_idx, 0)]);
+    c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(b_idx, 0)]);
+
+    // Run host VPCMPISTRI. Side effects: host ECX = result index,
+    // host rflags has CF/ZF/SF/OF set per spec (PF/AF cleared).
+    c.vpcmpistri(xmm0, xmm1, imm);
+
+    // Capture host ECX into guest RCX. 32-bit mov zero-extends bits
+    // 63:32 of rax, then the qword storeback lands a clean slot
+    // (matching the architectural "EAX/ECX writes zero-extend"
+    // semantics that VPCMPISTRI's ECX write follows).
+    c.mov(eax, ecx);
+    c.mov(qword[r13 + GprOffset(1)], rax);
+
+    // Merge host arithmetic flag bits into guest rflags. Same shape
+    // as VPTEST. We need rax for the captured flags, but we just
+    // used rax above — fine to clobber, the guest RCX slot is
+    // already stored.
+    constexpr u64 kArithMask = 0x8D5; // CF|PF|AF|ZF|SF|OF
+    c.pushfq();
+    c.pop(rax);
+    c.and_(rax, kArithMask);
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.mov(rcx, ~kArithMask);
+    c.and_(rdx, rcx);
+    c.or_(rdx, rax);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
     return true;
 }
 
@@ -4857,6 +5276,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPSHUFB:
             handled = EmitVpshufb(insn, ops, c);
             break;
+        case ZYDIS_MNEMONIC_VPTEST:
+            handled = EmitVptest(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_VPCMPISTRI:
+            handled = EmitVpcmpistri(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_VPCMPEQB:
+            handled = EmitVpcmpeqb(insn, ops, c);
+            break;
         case ZYDIS_MNEMONIC_ANDN:
             handled = EmitAndn(insn, ops, c);
             break;
@@ -4865,6 +5293,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_CPUID:
             handled = EmitCpuid(insn, c);
+            break;
+        case ZYDIS_MNEMONIC_XGETBV:
+            handled = EmitXgetbv(insn, c);
             break;
         case ZYDIS_MNEMONIC_CMPXCHG:
             handled = EmitCmpxchg(insn, ops, next_rip, c);

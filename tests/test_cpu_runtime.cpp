@@ -3704,5 +3704,327 @@ TEST_F(CpuRuntimeTest, Cpuid_UnknownLeaf_ReturnsZeros) {
     EXPECT_EQ(r.state.gpr[2], 0ULL);
 }
 
+// ============================================================================
+// BT — bit test. Sets CF to the tested bit, leaves other guest rflags bits
+// unchanged. Original emitter handled only the 64-bit reg-reg form; the
+// 32-bit imm form (observed at libc 0x808bdad64 inside a CPUID probe) and
+// the 64-bit imm form now route through the same path.
+// ============================================================================
+
+// Bit set: BT eax, 5 with eax = 0x20 (bit 5 = 1) → CF=1.
+TEST_F(CpuRuntimeTest, Bt32_Imm_SetBit_RaisesCf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00, // mov rax, 0x20
+        0x0f, 0xba, 0xe0, 0x05,                   // bt eax, 5
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF must reflect bit 5 = 1";
+}
+
+// Bit clear differential: same shape, bit 5 not set → CF=0.
+TEST_F(CpuRuntimeTest, Bt32_Imm_ClearBit_ClearsCf) {
+    const u8 program[] = {
+        // First force CF=1 via STC so the test fails loudly if the BT
+        // emitter happens to leave CF alone instead of clearing it.
+        0xf9,                                     // stc
+        0x48, 0xc7, 0xc0, 0xdf, 0xff, 0x00, 0x00, // mov rax, 0xFFDF (bit 5 clear)
+        0x0f, 0xba, 0xe0, 0x05,                   // bt eax, 5
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "CF must reflect bit 5 = 0";
+}
+
+// "Other rflags bits preserved" regression: prime ZF via a cmp that
+// produces ZF=1 (cmp rax, rax), then run a BT that flips CF to 1.
+// Both ZF (bit 6) and CF (bit 0) must be set in the final rflags.
+TEST_F(CpuRuntimeTest, Bt32_Imm_PreservesOtherFlags) {
+    const u8 program[] = {
+        0x48, 0x39, 0xc0,                         // cmp rax, rax  → ZF=1, CF=0
+        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00, // mov rax, 0x20
+        0x0f, 0xba, 0xe0, 0x05,                   // bt eax, 5
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF must be 1 after BT";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set by earlier cmp must survive BT";
+}
+
+// 64-bit imm form — same skeleton, REX.W differentiates encoding.
+TEST_F(CpuRuntimeTest, Bt64_Imm_SetBit_RaisesCf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00, // mov rax, 0x20
+        0x48, 0x0f, 0xba, 0xe0, 0x05,             // bt rax, 5
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(r.state.rflags & 1ULL);
+}
+
+// 32-bit reg-reg form: bit index in ecx. Verifies the new width-32
+// reg path routes correctly.
+TEST_F(CpuRuntimeTest, Bt32_RegReg_BitIndexFromEcx) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00, 0x04, 0x00, 0x00, // mov rax, 0x400 (bit 10)
+        0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00, // mov rcx, 10
+        0x0f, 0xa3, 0xc8,                         // bt eax, ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(r.state.rflags & 1ULL);
+}
+
+// ============================================================================
+// XGETBV — read extended control register. Reports XCR0 = 0x7 (x87+SSE+AVX
+// state enabled) so the canonical post-CPUID AVX check passes. Any other
+// XCR index returns zero.
+// ============================================================================
+
+// `xgetbv` with ecx=0 must produce XCR0 = 0x7 in edx:eax. Specifically:
+// eax (= XCR0[31:0]) = 0x7, edx (= XCR0[63:32]) = 0. Pre-pollutes both
+// guest slots so missing zero-extends would be visible.
+TEST_F(CpuRuntimeTest, Xgetbv_Xcr0_ReportsAvxEnabled) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFDEADBEEF — pre-pollute future RAX
+        0x48,
+        0xb8,
+        0xef,
+        0xbe,
+        0xad,
+        0xde,
+        0xef,
+        0xbe,
+        0xad,
+        0xde,
+        // mov rdx, 0xCAFEBABECAFEBABE — pre-pollute future RDX
+        0x48,
+        0xba,
+        0xbe,
+        0xba,
+        0xfe,
+        0xca,
+        0xbe,
+        0xba,
+        0xfe,
+        0xca,
+        // xor rcx, rcx  (ecx = 0 = XCR0)
+        0x48,
+        0x31,
+        0xc9,
+        0x0f,
+        0x01,
+        0xd0, // xgetbv
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x7ULL) << "EAX = XCR0[31:0] = x87|SSE|AVX";
+    EXPECT_EQ(r.state.gpr[2], 0x0ULL) << "EDX = XCR0[63:32] = 0";
+}
+
+// Unknown XCR index returns zero. ecx=1 isn't a real XCR on Jaguar-era CPUs;
+// the emitter must not echo the XCR0 response.
+TEST_F(CpuRuntimeTest, Xgetbv_UnknownIndex_ReturnsZero) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1
+        0x0f, 0x01, 0xd0,                         // xgetbv
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0ULL) << "Unknown XCR → EAX = 0";
+    EXPECT_EQ(r.state.gpr[2], 0ULL) << "Unknown XCR → EDX = 0";
+}
+
+// ============================================================================
+// VPTEST — AVX bit-test across an entire vector. Sets ZF based on
+// (a AND b == 0), CF based on (NOT a AND b == 0). Other arithmetic
+// flags (OF/SF/AF/PF) cleared.
+// ============================================================================
+
+// All-zero AND: a=0xAAAA…, b=0x5555… → (a AND b) = 0 → ZF=1.
+// (NOT a) AND b = (0x5555…) AND (0x5555…) ≠ 0 → CF=0.
+TEST_F(CpuRuntimeTest, Vptest_DisjointBits_SetsZfNotCf) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x79, 0x17, 0xc1, // vptest xmm0, xmm1
+        0xc3,
+    };
+    GuestMemory& m = mem;
+    std::memcpy(m.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = m.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(m.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // ymm[0..1] = xmm0 low/high 64; ymm[4..5] = xmm1 low/high 64
+    // (lane stride is 4 u64s = 32 bytes).
+    st.ymm[0] = 0xAAAAAAAAAAAAAAAAULL;
+    st.ymm[1] = 0xAAAAAAAAAAAAAAAAULL;
+    st.ymm[4] = 0x5555555555555555ULL;
+    st.ymm[5] = 0x5555555555555555ULL;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF=1 — disjoint bit patterns";
+    EXPECT_FALSE(st.rflags & 1ULL) << "CF=0 — b is not a subset of a";
+}
+
+// Identical operands: a == b ≠ 0. (a AND b) = a ≠ 0 → ZF=0.
+// (NOT a) AND b = (NOT a) AND a = 0 → CF=1.
+TEST_F(CpuRuntimeTest, Vptest_Identical_SetsCfNotZf) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x79, 0x17, 0xc1, // vptest xmm0, xmm1
+        0xc3,
+    };
+    GuestMemory& m = mem;
+    std::memcpy(m.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = m.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(m.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[0] = 0x123456789ABCDEF0ULL;
+    st.ymm[1] = 0x0FEDCBA987654321ULL;
+    st.ymm[4] = 0x123456789ABCDEF0ULL;
+    st.ymm[5] = 0x0FEDCBA987654321ULL;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF=0 — non-zero common bits";
+    EXPECT_TRUE(st.rflags & 1ULL) << "CF=1 — b is a subset of a (b == a)";
+}
+
+// All-zero operands: both ZF and CF set (everything is the zero set).
+TEST_F(CpuRuntimeTest, Vptest_BothZero_SetsBothZfCf) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x79, 0x17, 0xc1, // vptest xmm0, xmm1
+        0xc3,
+    };
+    GuestMemory& m = mem;
+    std::memcpy(m.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = m.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(m.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // ymm zero by default
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_TRUE(st.rflags & (1ULL << 6));
+    EXPECT_TRUE(st.rflags & 1ULL);
+}
+
+// ============================================================================
+// 8-bit OR/AND/XOR mem-dst with imm src — bitfield-update idiom.
+// The dispatcher routes 8-bit OR to EmitNarrowArith8; that function now
+// handles mem-dst writeback (previously rejected for everything except
+// Cmp/Test). Same path covers AND/XOR/ADD/SUB for symmetry.
+// ============================================================================
+
+// `or byte[rax], 0x40` — sets bit 6 of the byte pointed to by rax.
+// Test verifies the byte is updated in place and CF/OF are cleared
+// (OR semantics) while other rflags bits survive.
+TEST_F(CpuRuntimeTest, Or8_MemImm_SetsBitInPlace) {
+    // Layout: program at code page start, scratch byte one page later.
+    u8* scratch = mem.CodePtr() + 0x100;
+    *scratch = 0x01; // bit 0 set, bit 6 clear
+
+    const u8 program[] = {
+        // mov rax, <scratch addr> (filled below)
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x08, 0x40, // or byte[rax], 0x40
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    const auto r = RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(*scratch, 0x41) << "bit 6 ORed into 0x01 → 0x41";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "OR clears CF";
+}
+
+// AND form: same dispatcher path, different op. Confirms the
+// extended NarrowArith8 mem-dst block handles AND too, not just OR.
+TEST_F(CpuRuntimeTest, And8_MemImm_ClearsBitInPlace) {
+    u8* scratch = mem.CodePtr() + 0x100;
+    *scratch = 0xFF;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0, 0, 0, 0, 0, 0, 0, // mov rax, <addr>
+        0x80, 0x20, 0xF0,                      // and byte[rax], 0xF0
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    RunProgram(prog, sizeof(prog), mem);
+    EXPECT_EQ(*scratch, 0xF0) << "0xFF AND 0xF0 = 0xF0";
+}
+
+// ============================================================================
+// VPCMPISTRI — SSE4.2 string compare, return index. Used in glibc
+// string functions. Captures host ECX → guest RCX and host arithmetic
+// flags → guest rflags.
+// ============================================================================
+
+// glibc-style strlen idiom: imm = 0x08 (unsigned bytes, equal-each
+// aggregation, no polarity, LSB output). xmm0 = string (first source);
+// xmm1 = zeros (second source). VPCMPISTRI computes for each byte
+// position whether xmm0[i] == xmm1[i] — i.e. where the string has a
+// zero byte. ECX gets the index of the first match.
+//
+// For "hello\0..." the first zero is at byte 5 → ECX = 5.
+TEST_F(CpuRuntimeTest, Vpcmpistri_StrlenIdiom_FindsNullTerminator) {
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x63, 0xc1, 0x08, // vpcmpistri xmm0, xmm1, 0x08
+        0xc3,
+    };
+    GuestMemory& m = mem;
+    std::memcpy(m.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = m.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(m.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // xmm0 = "hello\0\0\0...\0" (16 bytes total). Place via memcpy
+    // straight into the YMM lane bytes; ymm[0..1] covers xmm0's low
+    // 128 bits with lane stride = 32 bytes.
+    u8 xmm0_bytes[16] = {'h', 'e', 'l', 'l', 'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    std::memcpy(&st.ymm[0], xmm0_bytes, 16);
+    // xmm1 = zeros (already, since ymm[] zero-initialized).
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1] & 0xFFFFFFFFULL, 5ULL)
+        << "ECX = position of first match (the null terminator at byte 5)";
+    EXPECT_EQ(st.gpr[1] >> 32, 0ULL) << "Upper 32 of RCX must be zero-extended";
+}
+
+// No-match case for "equal each": string has no zero byte in any of
+// its 16 positions. Spec says ECX = 16 (element count) when no match.
+TEST_F(CpuRuntimeTest, Vpcmpistri_NoMatch_ReturnsElementCount) {
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x63, 0xc1, 0x08, // vpcmpistri xmm0, xmm1, 0x08
+        0xc3,
+    };
+    GuestMemory& m = mem;
+    std::memcpy(m.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = m.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(m.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // xmm0 = 16 nonzero bytes; xmm1 = zeros. With equal-each, no
+    // position matches because no byte in xmm0 equals zero.
+    std::memset(&st.ymm[0], 0x41, 16);
+    // xmm1 stays zero.
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1] & 0xFFFFFFFFULL, 16ULL) << "No match → ECX = element count (16 bytes)";
+}
+
 } // namespace
 } // namespace Core::Runtime
