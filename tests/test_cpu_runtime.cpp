@@ -15,9 +15,11 @@
 // end. They produce no output unless something fails, so they're
 // suitable for CI.
 
+#include <array>
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -3528,6 +3530,178 @@ TEST_F(CpuRuntimeTest, Cmov32_ConditionFalse_LeavesUpper32Untouched) {
     EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEBABEULL)
         << "CMOVZ 32-bit cond FALSE must leave the WHOLE qword unchanged, "
            "including bits 63:32 — different from ordinary 32-bit ops";
+}
+
+// ============================================================================
+// CPUID — spoofed to report an AMD Jaguar (PS4 APU). Tests verify the
+// canned response for each handled leaf, plus a regression test that an
+// unknown leaf returns zeros and that the subleaf input on leaf 7 is
+// honored (sub != 0 must yield zeros, not the sub-0 response).
+// ============================================================================
+
+// Leaf 0 — max standard leaf + "AuthenticAMD" vendor string in
+// EBX:EDX:ECX. Also asserts upper 32 of every result slot is zeroed
+// (the qword storeback after 32-bit writes does this implicitly).
+// Pre-pollutes RBX and RDX so a missing zero-extend would be visible.
+TEST_F(CpuRuntimeTest, Cpuid_Leaf0_ReportsAuthenticAMDVendor) {
+    const u8 program[] = {
+        // mov rbx, 0xDEADBEEFDEADBEEF — pre-pollute future RBX slot
+        0x48, 0xbb, 0xef, 0xbe, 0xad, 0xde, 0xef, 0xbe, 0xad, 0xde,
+        // mov rdx, 0xCAFEBABECAFEBABE — pre-pollute future RDX slot
+        0x48, 0xba, 0xbe, 0xba, 0xfe, 0xca, 0xbe, 0xba, 0xfe, 0xca,
+        // mov rax, 0
+        0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,
+        // mov rcx, 0
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xa2, // cpuid
+        0xc3,                                                 // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 7ULL) << "max standard leaf = 7";
+    EXPECT_EQ(r.state.gpr[3], 0x68747541ULL) << "EBX = 'Auth'";
+    EXPECT_EQ(r.state.gpr[1], 0x444D4163ULL) << "ECX = 'cAMD'";
+    EXPECT_EQ(r.state.gpr[2], 0x69746E65ULL) << "EDX = 'enti'";
+
+    // Reconstruct the vendor string from the bytes to make the
+    // intent of the EBX/EDX/ECX magic numbers easy to verify.
+    char vendor[13] = {0};
+    const u32 ebx = static_cast<u32>(r.state.gpr[3]);
+    const u32 edx = static_cast<u32>(r.state.gpr[2]);
+    const u32 ecx = static_cast<u32>(r.state.gpr[1]);
+    std::memcpy(vendor + 0, &ebx, 4);
+    std::memcpy(vendor + 4, &edx, 4);
+    std::memcpy(vendor + 8, &ecx, 4);
+    EXPECT_STREQ(vendor, "AuthenticAMD");
+}
+
+// Leaf 1 — signature and feature flags. Verifies the family/model/
+// stepping reports Jaguar (family 0x16) and that the advertised
+// features include AVX + SSE4.x + BMI1 carriers but NOT FMA, AVX2,
+// POPCNT (which would be present on most modern hosts via pass-through).
+TEST_F(CpuRuntimeTest, Cpuid_Leaf1_ReportsJaguarSignatureAndFeatures) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
+        0x48, 0x31, 0xc9,                         // xor rcx, rcx
+        0x0f, 0xa2,                               // cpuid
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    const u32 sig = static_cast<u32>(r.state.gpr[0]);
+    const u32 ecx = static_cast<u32>(r.state.gpr[1]);
+    const u32 edx = static_cast<u32>(r.state.gpr[2]);
+
+    // Signature: ExtFamily=7, BaseFamily=0xF → effective family 0x16.
+    EXPECT_EQ(sig, 0x00700F01u) << "Jaguar signature (fam 0x16, mod 0, step 1)";
+    const u32 family = ((sig >> 8) & 0xF) + ((sig >> 20) & 0xFF);
+    EXPECT_EQ(family, 0x16u) << "computed family from signature";
+
+    // Advertised features.
+    EXPECT_TRUE(ecx & (1u << 0)) << "SSE3 advertised";
+    EXPECT_TRUE(ecx & (1u << 19)) << "SSE4.1 advertised";
+    EXPECT_TRUE(ecx & (1u << 20)) << "SSE4.2 advertised";
+    EXPECT_TRUE(ecx & (1u << 28)) << "AVX advertised";
+
+    // Features we deliberately do NOT advertise (Jaguar lacks them
+    // and/or the JIT lacks emitters):
+    EXPECT_FALSE(ecx & (1u << 12)) << "FMA must not be advertised";
+    EXPECT_FALSE(ecx & (1u << 23)) << "POPCNT must not be advertised";
+    EXPECT_FALSE(ecx & (1u << 30)) << "RDRAND must not be advertised";
+
+    // EDX baseline.
+    EXPECT_TRUE(edx & (1u << 0)) << "FPU";
+    EXPECT_TRUE(edx & (1u << 25)) << "SSE";
+    EXPECT_TRUE(edx & (1u << 26)) << "SSE2";
+}
+
+// Leaf 7 subleaf 0 — extended features. We advertise BMI1 only;
+// AVX2 and BMI2 must be absent (Jaguar lacks them).
+TEST_F(CpuRuntimeTest, Cpuid_Leaf7_Sub0_BmiAdvertisedButNotAvx2) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
+        0x48, 0x31, 0xc9,                         // xor rcx, rcx (subleaf 0)
+        0x0f, 0xa2,                               // cpuid
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    const u32 ebx = static_cast<u32>(r.state.gpr[3]);
+    EXPECT_TRUE(ebx & (1u << 3)) << "BMI1 advertised";
+    EXPECT_FALSE(ebx & (1u << 5)) << "AVX2 must not be advertised";
+    EXPECT_FALSE(ebx & (1u << 8)) << "BMI2 must not be advertised";
+    EXPECT_FALSE(ebx & (1u << 16)) << "AVX-512 must not be advertised";
+}
+
+// Leaf 7 with non-zero subleaf must return all zeros — the emitter
+// gates the subleaf-0 response on `ecx == 0` and falls through to
+// the zero-default storeback otherwise. Regression catcher: a missing
+// gate would expose the subleaf-0 response for every subleaf.
+TEST_F(CpuRuntimeTest, Cpuid_Leaf7_NonzeroSubleafReturnsZero) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1 (sub 1)
+        0x0f, 0xa2, 0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0ULL);
+    EXPECT_EQ(r.state.gpr[3], 0ULL) << "Leaf 7 sub != 0 must not echo BMI1";
+    EXPECT_EQ(r.state.gpr[1], 0ULL);
+    EXPECT_EQ(r.state.gpr[2], 0ULL);
+}
+
+// Brand string leaves concatenated must reconstruct
+// "AMD Custom Jaguar 8-Core APU" + trailing space padding + NUL.
+// Calls CPUID three times back-to-back and stashes each result into
+// a separate buffer region via memory ops, then we verify the full
+// 48-byte payload at the end. Since our test harness only runs one
+// CPUID conveniently per program, instead drive each leaf in its own
+// test and stitch the 12-dword result here in C++.
+TEST_F(CpuRuntimeTest, Cpuid_BrandLeaves_SpellOutJaguarString) {
+    auto runLeaf = [&](u32 leaf) {
+        std::array<u32, 4> out{};
+        u8 program[] = {
+            0x48, 0xc7, 0xc0, 0, 0, 0, 0, // mov rax, imm32  (filled below)
+            0x48, 0x31, 0xc9,             // xor rcx, rcx
+            0x0f, 0xa2,                   // cpuid
+            0xc3,                         // ret
+        };
+        std::memcpy(program + 3, &leaf, 4);
+        const auto r = RunProgram(program, sizeof(program), mem);
+        out[0] = static_cast<u32>(r.state.gpr[0]); // EAX
+        out[1] = static_cast<u32>(r.state.gpr[3]); // EBX
+        out[2] = static_cast<u32>(r.state.gpr[1]); // ECX
+        out[3] = static_cast<u32>(r.state.gpr[2]); // EDX
+        return out;
+    };
+
+    char brand[49] = {0};
+    const auto b2 = runLeaf(0x80000002);
+    const auto b3 = runLeaf(0x80000003);
+    const auto b4 = runLeaf(0x80000004);
+    for (int i = 0; i < 4; ++i)
+        std::memcpy(brand + 0 + i * 4, &b2[i], 4);
+    for (int i = 0; i < 4; ++i)
+        std::memcpy(brand + 16 + i * 4, &b3[i], 4);
+    for (int i = 0; i < 4; ++i)
+        std::memcpy(brand + 32 + i * 4, &b4[i], 4);
+    // brand is now 48 chars + null. Trim trailing spaces for the
+    // comparison so the test isn't sensitive to the exact pad count.
+    std::string s(brand);
+    while (!s.empty() && s.back() == ' ')
+        s.pop_back();
+    EXPECT_EQ(s, "AMD Custom Jaguar 8-Core APU");
+}
+
+// Unknown leaf (well outside both the standard and extended ranges
+// we handle) must return all-zeros. Confirms the default-response
+// path in the emitter works.
+TEST_F(CpuRuntimeTest, Cpuid_UnknownLeaf_ReturnsZeros) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x55, 0x55, 0x00, 0x00, // mov rax, 0x5555
+        0x48, 0x31, 0xc9, 0x0f, 0xa2, 0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0ULL);
+    EXPECT_EQ(r.state.gpr[3], 0ULL);
+    EXPECT_EQ(r.state.gpr[1], 0ULL);
+    EXPECT_EQ(r.state.gpr[2], 0ULL);
 }
 
 } // namespace

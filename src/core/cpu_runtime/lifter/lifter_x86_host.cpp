@@ -4237,6 +4237,229 @@ bool EmitBextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
+/// CPUID — spoofed to report an AMD Jaguar (PS4 APU family 16h)
+/// rather than passing through to the host. The original pass-through
+/// implementation leaked host details: vendor (likely "GenuineIntel"
+/// rather than "AuthenticAMD"), feature bits the PS4 doesn't have
+/// (AVX2, FMA, AVX-512, BMI2, etc.) and feature bits we haven't
+/// emitted yet (e.g. POPCNT). Real PS4 binaries inspect this output
+/// to gate code paths; advertising features we don't support causes
+/// downstream "unsupported insn" exits — sometimes deep inside hot
+/// paths the user can't easily route around.
+///
+/// Strategy: synthesise responses for the leaves a guest is likely
+/// to query, returning zeros for everything else. The leaves
+/// covered are 0, 1, 7, 0x80000000, 0x80000001, and the brand-string
+/// triplet 0x80000002–0x80000004. Standard max-leaf is reported as
+/// 7 (not 0xD or higher), so anything not explicitly handled — leaf
+/// 0xB topology, leaf 0xD extended state, etc. — appears unsupported
+/// to the guest, which is honest about what we provide.
+///
+/// Advertised feature bits are intersection( Jaguar, JIT coverage ):
+///   Leaf 1 ECX  — SSE3, SSSE3, CMPXCHG16B, SSE4.1, SSE4.2,
+///                 OSXSAVE, AVX. Skipped: POPCNT, AES, XSAVE, FMA,
+///                 PCLMUL, F16C, RDRAND, MOVBE (no emitters yet).
+///   Leaf 1 EDX  — standard baseline (FPU/CMOV/MMX/FXSR/SSE/SSE2/…).
+///   Leaf 7 EBX  — BMI1 only (ANDN/BEXTR; we have these). Notably
+///                 NOT AVX2 nor BMI2 — Jaguar lacks both, and we
+///                 lack emitters either way.
+///   Leaf 0x8000_0001 ECX — LahfSahf, ABM (LZCNT), SSE4A.
+///   Leaf 0x8000_0001 EDX — LM (long mode), NX, RDTSCP, baseline.
+///
+/// Brand string is "AMD Custom Jaguar 8-Core APU" + space padding,
+/// 48 bytes total including trailing NUL, packed little-endian into
+/// the 12 dwords reported across the three brand-string leaves.
+///
+/// Implementation: branch-and-store table. The lifter loads the
+/// guest's leaf into eax and subleaf into ecx, zeroes r8d–r11d as
+/// the default (zero-fill) response, dispatches via cmp/je on eax,
+/// each leaf body overwrites r8d–r11d with the canned response,
+/// then a common tail stores all four to the guest RAX/RBX/RCX/RDX
+/// slots (slot indices 0/3/1/2 — Zydis GPR ordering).
+///
+/// rbx, r12, r14, r15 are all reserved (gateway-saved or
+/// dispatcher channels), so we use rax/rcx/r8–r11 as scratch.
+/// 32-bit writes to r8d–r11d zero-extend bits 63:32 automatically,
+/// so qword stores at the tail land clean values in every slot.
+bool EmitCpuid(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_CPUID)
+        return false;
+
+    // Vendor string "AuthenticAMD" — note the CPUID convention is
+    // EBX:EDX:ECX (not EBX:ECX:EDX), so the substrings are split
+    // accordingly. Each dword is little-endian-packed 4 chars.
+    constexpr u32 kVendorEbx = 0x68747541; // "Auth"
+    constexpr u32 kVendorEdx = 0x69746E65; // "enti"
+    constexpr u32 kVendorEcx = 0x444D4163; // "cAMD"
+
+    // Leaf 1 EAX — processor signature.
+    //   Format: [ExtFam:8][ExtMod:4][Rsv:2][Type:2][Fam:4][Mod:4][Step:4]
+    //   Jaguar reports Family = BaseFam(0xF) + ExtFam(0x7) = 0x16.
+    //   Model = 0, Stepping = 1.
+    constexpr u32 kLeaf1Eax = 0x00700F01;
+
+    // Leaf 1 EBX — [LocalAPIC:8][MaxAPICIDs:8][CLFLUSH/8:8][BrandIdx:8]
+    //   CLFLUSH line size / 8 = 8 (64-byte lines).
+    //   Max logical processors per package = 8 (PS4 is octa-core).
+    constexpr u32 kLeaf1Ebx = 0x08080000;
+
+    // Leaf 1 ECX — feature flags (advertised subset, see header).
+    constexpr u32 kLeaf1Ecx = (1u << 0) |  // SSE3
+                              (1u << 9) |  // SSSE3
+                              (1u << 13) | // CMPXCHG16B
+                              (1u << 19) | // SSE4.1
+                              (1u << 20) | // SSE4.2
+                              (1u << 27) | // OSXSAVE
+                              (1u << 28);  // AVX
+
+    // Leaf 1 EDX — baseline features, all set on Jaguar except HTT.
+    constexpr u32 kLeaf1Edx =
+        (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) |     // FPU,VME,DE,PSE
+        (1u << 4) | (1u << 5) | (1u << 6) | (1u << 7) |     // TSC,MSR,PAE,MCE
+        (1u << 8) | (1u << 9) | (1u << 11) | (1u << 12) |   // CX8,APIC,SEP,MTRR
+        (1u << 13) | (1u << 14) | (1u << 15) | (1u << 16) | // PGE,MCA,CMOV,PAT
+        (1u << 17) | (1u << 19) | (1u << 23) | (1u << 24) | // PSE36,CLFSH,MMX,FXSR
+        (1u << 25) | (1u << 26);                            // SSE, SSE2
+
+    // Leaf 7, subleaf 0 — structured extended features.
+    constexpr u32 kLeaf7Sub0Ebx = (1u << 3); // BMI1
+
+    // Leaf 0x80000001 ECX — AMD extended feature flags.
+    constexpr u32 kLeafExt1Ecx = (1u << 0) | // LahfSahf
+                                 (1u << 5) | // ABM (LZCNT/POPCNT extensions)
+                                 (1u << 6);  // SSE4A
+
+    // Leaf 0x80000001 EDX — AMD extended/64-bit features.
+    constexpr u32 kLeafExt1Edx = kLeaf1Edx | (1u << 20) | // NX (XD bit)
+                                 (1u << 27) |             // RDTSCP
+                                 (1u << 29);              // LM (64-bit long mode — mandatory)
+
+    // Brand string "AMD Custom Jaguar 8-Core APU" + 19 spaces + NUL,
+    // packed little-endian as 12 consecutive dwords across the three
+    // 0x80000002–0x80000004 leaves.
+    constexpr u32 kBrand2Eax = 0x20444D41; // "AMD "
+    constexpr u32 kBrand2Ebx = 0x74737543; // "Cust"
+    constexpr u32 kBrand2Ecx = 0x4A206D6F; // "om J"
+    constexpr u32 kBrand2Edx = 0x61756761; // "agua"
+    constexpr u32 kBrand3Eax = 0x2D382072; // "r 8-"
+    constexpr u32 kBrand3Ebx = 0x65726F43; // "Core"
+    constexpr u32 kBrand3Ecx = 0x55504120; // " APU"
+    constexpr u32 kBrand3Edx = 0x20202020; // "    "
+    constexpr u32 kBrand4Eax = 0x20202020; // "    "
+    constexpr u32 kBrand4Ebx = 0x20202020; // "    "
+    constexpr u32 kBrand4Ecx = 0x20202020; // "    "
+    constexpr u32 kBrand4Edx = 0x00202020; // "   \0"
+
+    Xbyak::Label l_0, l_1, l_7, l_e0, l_e1, l_b2, l_b3, l_b4, l_done;
+    using LT = Xbyak::CodeGenerator::LabelType;
+
+    // Load inputs: leaf into eax, subleaf into ecx.
+    c.mov(eax, dword[r13 + GprOffset(0)]);
+    c.mov(ecx, dword[r13 + GprOffset(1)]);
+
+    // Default response — zero-fill. Any leaf not specifically handled
+    // by the chain below falls through to the storeback at l_done
+    // with all four results still zero.
+    c.xor_(r8d, r8d);
+    c.xor_(r9d, r9d);
+    c.xor_(r10d, r10d);
+    c.xor_(r11d, r11d);
+
+    // Dispatch chain. T_NEAR forces a 32-bit-relative jump rather
+    // than the xbyak-default 8-bit form — the per-leaf bodies are
+    // far enough apart that an 8-bit displacement won't reach.
+    c.cmp(eax, 0);
+    c.je(l_0, LT::T_NEAR);
+    c.cmp(eax, 1);
+    c.je(l_1, LT::T_NEAR);
+    c.cmp(eax, 7);
+    c.je(l_7, LT::T_NEAR);
+    c.cmp(eax, 0x80000000);
+    c.je(l_e0, LT::T_NEAR);
+    c.cmp(eax, 0x80000001);
+    c.je(l_e1, LT::T_NEAR);
+    c.cmp(eax, 0x80000002);
+    c.je(l_b2, LT::T_NEAR);
+    c.cmp(eax, 0x80000003);
+    c.je(l_b3, LT::T_NEAR);
+    c.cmp(eax, 0x80000004);
+    c.je(l_b4, LT::T_NEAR);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // Leaf 0 — max standard leaf + vendor string.
+    c.L(l_0);
+    c.mov(r8d, 7);
+    c.mov(r9d, kVendorEbx);
+    c.mov(r10d, kVendorEcx);
+    c.mov(r11d, kVendorEdx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // Leaf 1 — signature + features.
+    c.L(l_1);
+    c.mov(r8d, kLeaf1Eax);
+    c.mov(r9d, kLeaf1Ebx);
+    c.mov(r10d, kLeaf1Ecx);
+    c.mov(r11d, kLeaf1Edx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // Leaf 7 — structured extended features. Only subleaf 0 has
+    // meaningful contents on Jaguar; other subleaves return zero
+    // (which is what we'd hit by falling through to l_done with
+    // r8d–r11d still zeroed from the default-response setup above).
+    c.L(l_7);
+    c.test(ecx, ecx);
+    c.jnz(l_done, LT::T_NEAR);
+    c.mov(r9d, kLeaf7Sub0Ebx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // Leaf 0x80000000 — max extended leaf + vendor string echo.
+    c.L(l_e0);
+    c.mov(r8d, 0x80000004);
+    c.mov(r9d, kVendorEbx);
+    c.mov(r10d, kVendorEcx);
+    c.mov(r11d, kVendorEdx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // Leaf 0x80000001 — AMD extended features.
+    c.L(l_e1);
+    c.mov(r8d, kLeaf1Eax);
+    c.mov(r10d, kLeafExt1Ecx);
+    c.mov(r11d, kLeafExt1Edx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    // Leaves 0x80000002–0x80000004 — brand string dwords 0..11.
+    c.L(l_b2);
+    c.mov(r8d, kBrand2Eax);
+    c.mov(r9d, kBrand2Ebx);
+    c.mov(r10d, kBrand2Ecx);
+    c.mov(r11d, kBrand2Edx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    c.L(l_b3);
+    c.mov(r8d, kBrand3Eax);
+    c.mov(r9d, kBrand3Ebx);
+    c.mov(r10d, kBrand3Ecx);
+    c.mov(r11d, kBrand3Edx);
+    c.jmp(l_done, LT::T_NEAR);
+
+    c.L(l_b4);
+    c.mov(r8d, kBrand4Eax);
+    c.mov(r9d, kBrand4Ebx);
+    c.mov(r10d, kBrand4Ecx);
+    c.mov(r11d, kBrand4Edx);
+    // Fall through to l_done.
+
+    // Common storeback. Store as qwords — the 32-bit writes above
+    // zero-extended bits 63:32, so the upper halves of the guest
+    // slots come out clean, matching x86-64 CPUID semantics.
+    c.L(l_done);
+    c.mov(qword[r13 + GprOffset(0)], r8);  // a → RAX
+    c.mov(qword[r13 + GprOffset(3)], r9);  // b → RBX
+    c.mov(qword[r13 + GprOffset(1)], r10); // c → RCX
+    c.mov(qword[r13 + GprOffset(2)], r11); // d → RDX
+    return true;
+}
+
 } // namespace
 
 // ============================================================================
@@ -4639,6 +4862,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_BEXTR:
             handled = EmitBextr(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_CPUID:
+            handled = EmitCpuid(insn, c);
             break;
         case ZYDIS_MNEMONIC_CMPXCHG:
             handled = EmitCmpxchg(insn, ops, next_rip, c);
