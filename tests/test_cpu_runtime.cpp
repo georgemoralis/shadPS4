@@ -4922,5 +4922,1884 @@ TEST_F(CpuRuntimeTest, Sbb32_RegImm_Underflow_SetsCf) {
     EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set on borrow out";
 }
 
+// ============================================================================
+// VMOVSS — scalar single-precision FP move. We don't use the host FP
+// register file; the GPR-relayed transfer is bitwise-identical and
+// avoids any MXCSR / denormal concerns.
+// ============================================================================
+
+// Load form (`vmovss xmm0, dword[rax]`): place the 32-bit value at
+// [mem] into xmm0.low32; zero everything else of the YMM. Pre-pollute
+// the destination so a missing zero would be visible.
+TEST_F(CpuRuntimeTest, Vmovss_Load_PlacesLow32ZeroesRest) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *scratch = 0x40490FDBu; // bit pattern of float(pi)
+
+    const u8 program[] = {
+        // mov rax, <scratch addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // vmovss xmm0, dword[rax]  (c5 fa 10 00 = 4 bytes)
+        0xc5,
+        0xfa,
+        0x10,
+        0x00,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Pre-pollute the destination YMM so missing zeroes show up.
+    st.ymm[0] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[1] = 0xCAFEBABECAFEBABEULL;
+    st.ymm[2] = 0x1234567812345678ULL;
+    st.ymm[3] = 0xABCDEF01ABCDEF01ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x40490FDBULL)
+        << "xmm0 low 32 = loaded value, upper 32 of chunk 0 must be zero";
+    EXPECT_EQ(st.ymm[1], 0ULL) << "xmm0[127:64] cleared";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "ymm0 lane 2 (VEX-128 zero) cleared";
+    EXPECT_EQ(st.ymm[3], 0ULL) << "ymm0 lane 3 (VEX-128 zero) cleared";
+}
+
+// Store form (`vmovss dword[rax], xmm0`): writes only xmm0.low32 to
+// [mem]; the surrounding memory must be untouched.
+TEST_F(CpuRuntimeTest, Vmovss_Store_WritesLow32Only) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *scratch = 0xCAFEBABEu;
+    // The 4 bytes immediately after `scratch` should NOT be touched.
+    u32* sentinel = scratch + 1;
+    *sentinel = 0xDEADBEEFu;
+
+    const u8 program[] = {
+        // mov rax, <scratch addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // vmovss dword[rax], xmm0  (c5 fa 11 00)
+        0xc5,
+        0xfa,
+        0x11,
+        0x00,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[0] = 0x1111111122222222ULL; // xmm0: low32=0x22222222, hi32=0x11111111
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*scratch, 0x22222222u) << "store wrote xmm0.low32";
+    EXPECT_EQ(*sentinel, 0xDEADBEEFu) << "adjacent memory must be untouched";
+}
+
+// Reg-reg-reg form: dst.low32 from src2, dst[127:32] from src1, ymm
+// upper lane zeroed. This is the form compilers emit for "splat the
+// low scalar back together with the upper from somewhere else".
+TEST_F(CpuRuntimeTest, Vmovss_RegRegReg_MergesFromTwoSources) {
+    // vmovss xmm0, xmm1, xmm2  — encoding c5 f2 10 c2
+    //   pp=10 (F3 prefix), L=0, ~vvvv = ~1 = 14 (xmm1 is "first src")
+    //   So byte 2 = 0xf2 (= 1111_0010 = W=0 vvvv=1110 L=0 pp=10).
+    const u8 program[] = {
+        0xc5, 0xf2, 0x10, 0xc2, // vmovss xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (lane 1): low32=AAAA, hi32=BBBB; chunk1 = CCCC...
+    st.ymm[4] = 0xBBBBBBBBAAAAAAAAULL;
+    st.ymm[5] = 0xCCCCCCCCCCCCCCCCULL;
+    // xmm2 (lane 2): low32=22222222, hi32=33333333
+    st.ymm[8] = 0x3333333322222222ULL;
+    st.ymm[9] = 0x4444444444444444ULL; // ignored — only src2 low32 used
+    // Pre-pollute xmm0
+    st.ymm[0] = 0xDEAD000000000000ULL;
+    st.ymm[1] = 0xDEAD000000000000ULL;
+    st.ymm[2] = 0xDEAD000000000000ULL;
+    st.ymm[3] = 0xDEAD000000000000ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // chunk 0: low32 = src2.low32 = 0x22222222, hi32 = src1.hi32 = 0xBBBBBBBB
+    EXPECT_EQ(st.ymm[0], 0xBBBBBBBB22222222ULL);
+    // chunk 1: full copy of src1.chunk1
+    EXPECT_EQ(st.ymm[1], 0xCCCCCCCCCCCCCCCCULL);
+    // upper YMM zeroed
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ============================================================================
+// VCVTSI2SS — convert scalar integer (32 or 64-bit) to scalar single-
+// precision float. First emitter that requires real host FP arithmetic
+// (vcvtsi2ss on host xmm0). MXCSR comes from host (round-to-nearest by
+// default) — guest MXCSR sync is a separate work item.
+// ============================================================================
+
+// Convert int32 = 42 to float. IEEE-754 float(42) = 0x42280000.
+TEST_F(CpuRuntimeTest, Vcvtsi2ss_Int32ToFloat_BasicValue) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x2a, 0x00, 0x00, 0x00, // mov rax, 42
+        0xc5, 0xf2, 0x2a, 0xc8,                   // vcvtsi2ss xmm1, xmm1, eax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 = lane 1; preserve upper bits via pre-pollution. The
+    // emitter overwrites the upper 96 of xmm1 from xmm1 itself (src1
+    // == dst here) — so what was already in chunks 0[63:32] and 1
+    // should survive.
+    st.ymm[4] = 0xAAAAAAAA00000000ULL; // chunk 0: low32 will be overwritten; hi32 preserved
+    st.ymm[5] = 0xBBBBBBBBBBBBBBBBULL; // chunk 1: preserved
+    st.ymm[6] = 0xDEADDEADDEADDEADULL; // chunk 2: must be zeroed (VEX-128)
+    st.ymm[7] = 0xDEADDEADDEADDEADULL; // chunk 3: must be zeroed
+
+    Runtime rt;
+    rt.Run(st);
+
+    // chunk 0 low32 = float(42), hi32 = preserved 0xAAAAAAAA
+    const u32 low32 = static_cast<u32>(st.ymm[4] & 0xFFFFFFFFULL);
+    const u32 hi32 = static_cast<u32>(st.ymm[4] >> 32);
+    float as_float;
+    std::memcpy(&as_float, &low32, sizeof(as_float));
+    EXPECT_EQ(as_float, 42.0f);
+    EXPECT_EQ(hi32, 0xAAAAAAAAu) << "src1[63:32] must be preserved (dst==src1 here)";
+    EXPECT_EQ(st.ymm[5], 0xBBBBBBBBBBBBBBBBULL) << "chunk 1 preserved";
+    EXPECT_EQ(st.ymm[6], 0ULL) << "VEX-128 zeroes upper YMM";
+    EXPECT_EQ(st.ymm[7], 0ULL);
+}
+
+// Convert negative int32 to float. (-100).f = 0xC2C80000.
+TEST_F(CpuRuntimeTest, Vcvtsi2ss_NegativeInt32) {
+    const u8 program[] = {
+        // mov rax, -100  (encoded as imm32 sign-extended)
+        0x48, 0xc7, 0xc0, 0x9c, 0xff, 0xff,
+        0xff, 0xc5, 0xf2, 0x2a, 0xc8, // vcvtsi2ss xmm1, xmm1, eax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[4] & 0xFFFFFFFFULL);
+    float as_float;
+    std::memcpy(&as_float, &low32, sizeof(as_float));
+    EXPECT_EQ(as_float, -100.0f);
+}
+
+// Three-operand form with distinct src1: `vcvtsi2ss xmm0, xmm1, eax`.
+// Verifies that the upper 96 of dst comes from src1 (NOT from dst's
+// pre-existing value).
+TEST_F(CpuRuntimeTest, Vcvtsi2ss_ThreeOperand_UpperFromSrc1) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
+        0xc5, 0xf2, 0x2a, 0xc0,                   // vcvtsi2ss xmm0, xmm1, eax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm0 (dst) = pre-pollution that must NOT survive (upper is from src1).
+    st.ymm[0] = 0xCCCCCCCCCCCCCCCCULL;
+    st.ymm[1] = 0xCCCCCCCCCCCCCCCCULL;
+    // xmm1 (src1) = distinct upper bits we expect to see in dst.
+    st.ymm[4] = 0x77777777EEEEEEEEULL; // chunk 0: low32 ignored, hi32 → dst chunk 0 hi32
+    st.ymm[5] = 0x8888888888888888ULL; // chunk 1: → dst chunk 1
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    float as_float;
+    std::memcpy(&as_float, &low32, sizeof(as_float));
+    EXPECT_EQ(as_float, 7.0f);
+    EXPECT_EQ(hi32, 0x77777777u) << "dst[63:32] must come from src1, not from pre-existing dst";
+    EXPECT_EQ(st.ymm[1], 0x8888888888888888ULL) << "dst chunk 1 from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ============================================================================
+// VMULSS — scalar single-precision multiply. Real host FP arithmetic
+// (using JIT-scratch xmm0/xmm1). The architectural "preserve src1[127:32]
+// into dst" is satisfied by host VMULSS's own merge semantics — loading
+// src1's full xmm into xmm0 leaves the upper 96 alone through the multiply.
+// ============================================================================
+
+// 3.0 * 4.0 = 12.0. Reg-reg-reg form.
+TEST_F(CpuRuntimeTest, Vmulss_BasicMultiply) {
+    // vmulss xmm0, xmm1, xmm2  — encoding c5 f2 59 c2
+    const u8 program[] = {
+        0xc5, 0xf2, 0x59, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1.low32 = float(3.0)
+    const u32 f3 = std::bit_cast<u32>(3.0f);
+    // xmm2.low32 = float(4.0)
+    const u32 f4 = std::bit_cast<u32>(4.0f);
+    st.ymm[4] = static_cast<u64>(f3); // xmm1, lane 1
+    st.ymm[8] = static_cast<u64>(f4); // xmm2, lane 2
+
+    Runtime rt;
+    rt.Run(st);
+
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 12.0f) << "3.0 * 4.0 = 12.0";
+}
+
+// `vmulss xmm0, xmm1, xmm2` with src1's upper 96 set to distinguishing
+// bits. The architectural rule: dst[127:32] = src1[127:32]. Verifies that
+// our "load full src1 into xmm0 → vmulss → 128-bit storeback" pattern
+// preserves the merge correctly.
+TEST_F(CpuRuntimeTest, Vmulss_PreservesSrc1Upper) {
+    const u8 program[] = {
+        0xc5, 0xf2, 0x59, 0xc2, // vmulss xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    const u32 f2 = std::bit_cast<u32>(2.0f);
+    const u32 f5 = std::bit_cast<u32>(5.0f);
+    // xmm1.low32 = 2.0, xmm1[63:32] = 0xDEADBEEF, xmm1[127:64] = 0xCAFEBABE5555AAAA
+    st.ymm[4] = (static_cast<u64>(0xDEADBEEFULL) << 32) | f2;
+    st.ymm[5] = 0xCAFEBABE5555AAAAULL;
+    // Pre-pollute dst beyond what the emitter should touch.
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+    // xmm2.low32 = 5.0
+    st.ymm[8] = static_cast<u64>(f5);
+
+    Runtime rt;
+    rt.Run(st);
+
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 10.0f);
+    EXPECT_EQ(hi32, 0xDEADBEEFu) << "src1[63:32] preserved";
+    EXPECT_EQ(st.ymm[1], 0xCAFEBABE5555AAAAULL) << "src1[127:64] preserved";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeroes upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Memory-source form: `vmulss xmm0, xmm1, dword[rax]`. Exercises the
+// EmitEffectiveAddress path for ops[2] = memory.
+TEST_F(CpuRuntimeTest, Vmulss_MemorySource) {
+    // Place the float-from-memory operand at an address we can take.
+    u32* fmem = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *fmem = std::bit_cast<u32>(6.0f);
+
+    const u8 program[] = {
+        // mov rax, <fmem addr>
+        0x48,
+        0xb8,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        // vmulss xmm0, xmm1, dword[rax]   (c5 f2 59 00)
+        0xc5,
+        0xf2,
+        0x59,
+        0x00,
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 fmem_addr = reinterpret_cast<u64>(fmem);
+    std::memcpy(prog + 2, &fmem_addr, sizeof(fmem_addr));
+
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1.low32 = 7.0
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(7.0f));
+
+    Runtime rt;
+    rt.Run(st);
+
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 42.0f) << "7.0 * 6.0 = 42.0";
+}
+
+// ============================================================================
+// VCVTTSS2SI — convert scalar float to signed integer with truncation
+// toward zero (not MXCSR-rounded). The inverse of VCVTSI2SS. Out-of-
+// range and NaN both produce the "indefinite integer value" (INT_MIN).
+// ============================================================================
+
+// 3.7f truncates to 3 (toward zero, not nearest-even rounding).
+TEST_F(CpuRuntimeTest, Vcvttss2si_PositiveTruncatesTowardZero) {
+    const u8 program[] = {
+        0xc5, 0xfa, 0x2c, 0xc1, // vcvttss2si eax, xmm1
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (lane 1) low32 = float(3.7)
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(3.7f));
+    // Pre-pollute guest RAX upper 32 to confirm zero-extension.
+    st.gpr[0] = 0xDEADBEEF00000000ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 3ULL) << "3.7f truncates to 3, upper 32 zeroed";
+}
+
+// Negative truncates toward zero too: -3.7f → -3, not -4.
+TEST_F(CpuRuntimeTest, Vcvttss2si_NegativeTruncatesTowardZero) {
+    const u8 program[] = {
+        0xc5, 0xfa, 0x2c, 0xc1, // vcvttss2si eax, xmm1
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(-3.7f));
+    Runtime rt;
+    rt.Run(st);
+    // -3 as int32 = 0xFFFFFFFD; zero-extended to 64-bit = 0xFFFFFFFD
+    EXPECT_EQ(st.gpr[0], 0xFFFFFFFDULL) << "-3.7f truncates to -3 (sign-bit pattern in low 32, "
+                                           "upper 32 zero per x86-64 32-bit-write rule)";
+}
+
+// NaN converts to the "indefinite integer value" — INT32_MIN
+// (0x80000000) for the 32-bit form.
+TEST_F(CpuRuntimeTest, Vcvttss2si_NanProducesIntMin) {
+    const u8 program[] = {
+        0xc5, 0xfa, 0x2c, 0xc1, // vcvttss2si eax, xmm1
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Quiet NaN bit pattern (exponent all-ones, mantissa MSB set).
+    st.ymm[4] = static_cast<u64>(0x7FC00000u);
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x80000000ULL)
+        << "NaN → indefinite integer = INT32_MIN, upper 32 zero-extended";
+}
+
+// ============================================================================
+// VDIVSS — scalar single-precision divide. Structurally identical to
+// VMULSS (shares EmitScalarFpSs); separate tests just confirm the
+// dispatch reaches the Div case correctly and the result is right.
+// ============================================================================
+
+// 12.0 / 4.0 = 3.0
+TEST_F(CpuRuntimeTest, Vdivss_BasicDivide) {
+    // vdivss xmm0, xmm1, xmm2  — encoding c5 f2 5e c2 (opcode 0x5E vs MUL's 0x59)
+    const u8 program[] = {
+        0xc5, 0xf2, 0x5e, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(12.0f)); // xmm1
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(4.0f));  // xmm2
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 3.0f) << "12.0 / 4.0 = 3.0";
+}
+
+// Preserves src1[127:32]. Same property as VMULSS — both go through
+// EmitScalarFpSs. Distinguishes a regression that breaks the merge
+// from a regression that just breaks the arithmetic dispatch.
+TEST_F(CpuRuntimeTest, Vdivss_PreservesSrc1Upper) {
+    const u8 program[] = {
+        0xc5, 0xf2, 0x5e, 0xc2, // vdivss xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (static_cast<u64>(0x11223344ULL) << 32) | std::bit_cast<u32>(20.0f);
+    st.ymm[5] = 0x5566778899AABBCCULL;
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(5.0f));
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 4.0f) << "20.0 / 5.0 = 4.0";
+    EXPECT_EQ(hi32, 0x11223344u) << "src1[63:32] preserved";
+    EXPECT_EQ(st.ymm[1], 0x5566778899AABBCCULL) << "src1[127:64] preserved";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Memory-source form (the 8-byte length observed in the game's log).
+TEST_F(CpuRuntimeTest, Vdivss_MemorySource) {
+    u32* fmem = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *fmem = std::bit_cast<u32>(2.0f);
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <fmem>
+        0xc5, 0xf2, 0x5e, 0x00,                   // vdivss xmm0, xmm1, dword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 fmem_addr = reinterpret_cast<u64>(fmem);
+    std::memcpy(prog + 2, &fmem_addr, sizeof(fmem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(10.0f));
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 5.0f) << "10.0 / 2.0 = 5.0";
+}
+
+// ============================================================================
+// VADDSS — scalar single-precision add. Same EmitScalarFpSs scaffolding
+// as VMULSS/VDIVSS; tests confirm the dispatch reaches the Add case and
+// that addition results are correct.
+// ============================================================================
+
+// 1.5 + 2.25 = 3.75 — clean binary fractions, no rounding ambiguity.
+TEST_F(CpuRuntimeTest, Vaddss_BasicAdd) {
+    // vaddss xmm0, xmm1, xmm2  — encoding c5 f2 58 c2
+    const u8 program[] = {
+        0xc5, 0xf2, 0x58, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(1.5f));  // xmm1
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(2.25f)); // xmm2
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 3.75f) << "1.5 + 2.25 = 3.75";
+}
+
+// Memory-source form (matches the 8-byte length seen in the game's log).
+TEST_F(CpuRuntimeTest, Vaddss_MemorySource) {
+    u32* fmem = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *fmem = std::bit_cast<u32>(0.5f);
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf2, 0x58, 0x00, // vaddss xmm0, xmm1, dword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 fmem_addr = reinterpret_cast<u64>(fmem);
+    std::memcpy(prog + 2, &fmem_addr, sizeof(fmem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(100.0f));
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 100.5f) << "100.0 + 0.5 = 100.5";
+}
+
+// ============================================================================
+// VUCOMISS — Unordered Compare Scalar Single-precision, sets EFLAGS.
+// First scalar-FP flag-writing emitter. Truth table:
+//   unordered (NaN) → ZF=1 PF=1 CF=1
+//   src1 == src2    → ZF=1 PF=0 CF=0
+//   src1 <  src2    → ZF=0 PF=0 CF=1
+//   src1 >  src2    → ZF=0 PF=0 CF=0
+// In all cases OF/SF/AF are cleared.
+// ============================================================================
+
+// Common helper: run vucomiss xmm0, xmm1 and return the guest rflags.
+namespace {
+u64 RunVucomiss_Xmm0_Xmm1(GuestMemory& mem, float a, float b) {
+    // vucomiss xmm0, xmm1 — c5 f8 2e c1
+    const u8 program[] = {
+        0xc5, 0xf8, 0x2e, 0xc1, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Pre-set non-VUCOMISS flag bits to confirm they're preserved.
+    // Bit 9 (IF) is in ~kArithMask, so it should survive untouched.
+    st.rflags = 0x202; // IF=1 + reserved bit 1
+    st.ymm[0] = static_cast<u64>(std::bit_cast<u32>(a));
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(b));
+    Runtime rt;
+    rt.Run(st);
+    return st.rflags;
+}
+constexpr u64 CF_BIT = 1ULL << 0;
+constexpr u64 PF_BIT = 1ULL << 2;
+constexpr u64 AF_BIT = 1ULL << 4;
+constexpr u64 ZF_BIT = 1ULL << 6;
+constexpr u64 SF_BIT = 1ULL << 7;
+constexpr u64 OF_BIT = 1ULL << 11;
+constexpr u64 IF_BIT = 1ULL << 9;
+} // namespace
+
+TEST_F(CpuRuntimeTest, Vucomiss_Equal_SetsZF) {
+    const u64 rf = RunVucomiss_Xmm0_Xmm1(mem, 1.0f, 1.0f);
+    EXPECT_TRUE(rf & ZF_BIT);
+    EXPECT_FALSE(rf & PF_BIT);
+    EXPECT_FALSE(rf & CF_BIT);
+    EXPECT_FALSE(rf & OF_BIT);
+    EXPECT_FALSE(rf & SF_BIT);
+    EXPECT_FALSE(rf & AF_BIT);
+    EXPECT_TRUE(rf & IF_BIT) << "non-VUCOMISS flag bits preserved";
+}
+
+TEST_F(CpuRuntimeTest, Vucomiss_LessThan_SetsCF) {
+    const u64 rf = RunVucomiss_Xmm0_Xmm1(mem, 1.0f, 2.0f);
+    EXPECT_FALSE(rf & ZF_BIT);
+    EXPECT_FALSE(rf & PF_BIT);
+    EXPECT_TRUE(rf & CF_BIT);
+}
+
+TEST_F(CpuRuntimeTest, Vucomiss_GreaterThan_AllClear) {
+    const u64 rf = RunVucomiss_Xmm0_Xmm1(mem, 3.0f, 2.0f);
+    EXPECT_FALSE(rf & ZF_BIT);
+    EXPECT_FALSE(rf & PF_BIT);
+    EXPECT_FALSE(rf & CF_BIT);
+}
+
+TEST_F(CpuRuntimeTest, Vucomiss_NaN_SetsAllThree) {
+    const float nan_val = std::bit_cast<float>(0x7FC00000u);
+    const u64 rf = RunVucomiss_Xmm0_Xmm1(mem, nan_val, 1.0f);
+    EXPECT_TRUE(rf & ZF_BIT) << "NaN→unordered: ZF=1";
+    EXPECT_TRUE(rf & PF_BIT) << "NaN→unordered: PF=1";
+    EXPECT_TRUE(rf & CF_BIT) << "NaN→unordered: CF=1";
+}
+
+// ============================================================================
+// VCVTSS2SD — single-precision to double-precision widening.
+// First scalar conversion where output width (64) ≠ input width (32);
+// VEX merge boundary moves to bit 64. The "load src1 full → host op →
+// 128-bit storeback" pattern still works because host VCVTSS2SD only
+// writes xmm0.low64 and leaves xmm0[127:64] alone — same trick as
+// VMULSS at a different bit boundary.
+// ============================================================================
+
+// 3.5f → 3.5 (exact: every float has an equal double).
+TEST_F(CpuRuntimeTest, Vcvtss2sd_BasicWideningExact) {
+    // vcvtss2sd xmm0, xmm1, xmm2 — c5 f2 5a c2
+    const u8 program[] = {
+        0xc5, 0xf2, 0x5a, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(3.5f)); // xmm2
+
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 3.5) << "(double)3.5f should equal 3.5 exactly";
+}
+
+// Verify the merge: dst[127:64] must come from src1[127:64], NOT from
+// the float value or from dst's pre-existing bits. This is the new
+// constraint at the 64-bit boundary (vs the 32-bit boundary for SS
+// binops).
+TEST_F(CpuRuntimeTest, Vcvtss2sd_PreservesSrc1Upper64) {
+    const u8 program[] = {
+        0xc5, 0xf2, 0x5a, 0xc2, // vcvtss2sd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 = lane 1: chunk 0 is irrelevant (only [127:64] is preserved,
+    // which is chunk 1).
+    st.ymm[4] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[5] = 0xCAFEBABE12345678ULL; // <-- this is what should land in dst.chunk1
+    // xmm2 = lane 2: low 32 = 1.0f (the input to convert)
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(1.0f));
+    // dst pre-pollution
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 1.0);
+    EXPECT_EQ(st.ymm[1], 0xCAFEBABE12345678ULL) << "dst[127:64] must come from src1[127:64]";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeroes upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ============================================================================
+// VMULSD — scalar double-precision multiply. First double-precision
+// emitter. Shares scaffolding with the SS family via EmitScalarFp
+// parameterized by ScalarFpPrec; the merge boundary is at bit 64
+// (vs bit 32 for SS), but host hardware handles that transparently.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vmulsd_BasicMultiply) {
+    // vmulsd xmm0, xmm1, xmm2  — c5 f3 59 c2 (F2 prefix marks SD)
+    const u8 program[] = {
+        0xc5, 0xf3, 0x59, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1.low64 = 6.0 (as double); xmm2.low64 = 7.0
+    st.ymm[4] = std::bit_cast<u64>(6.0); // xmm1
+    st.ymm[8] = std::bit_cast<u64>(7.0); // xmm2
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 42.0);
+}
+
+// Verify the merge boundary moves to bit 64 (vs bit 32 in SS). The
+// architectural rule: dst[127:64] = src1[127:64]. This is the same
+// pattern as Vcvtss2sd_PreservesSrc1Upper64 but for a binary op.
+TEST_F(CpuRuntimeTest, Vmulsd_PreservesSrc1Upper64) {
+    const u8 program[] = {
+        0xc5, 0xf3, 0x59, 0xc2, // vmulsd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(2.0); // xmm1 low64
+    st.ymm[5] = 0xF00DBABEAABBCCDDULL;   // xmm1 high64 — must land in dst.chunk1
+    st.ymm[8] = std::bit_cast<u64>(3.0); // xmm2 low64
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 6.0);
+    EXPECT_EQ(st.ymm[1], 0xF00DBABEAABBCCDDULL) << "dst[127:64] must come from src1[127:64]";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Memory-source form — exercises the SD-specific `vmovsd qword[rdx]`
+// loader path (vs `vmovss dword[rdx]` for the SS variant).
+TEST_F(CpuRuntimeTest, Vmulsd_MemorySource) {
+    u64* dmem = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    *dmem = std::bit_cast<u64>(4.0);
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <dmem>
+        0xc5, 0xf3, 0x59, 0x00,                   // vmulsd xmm0, xmm1, qword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 dmem_addr = reinterpret_cast<u64>(dmem);
+    std::memcpy(prog + 2, &dmem_addr, sizeof(dmem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(2.5);
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 10.0) << "2.5 * 4.0 = 10.0";
+}
+
+// ============================================================================
+// VADDSD — scalar double-precision add. Same EmitScalarFp scaffolding
+// as VMULSD; tests confirm the Add dispatch reaches vaddsd correctly.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vaddsd_BasicAdd) {
+    // vaddsd xmm0, xmm1, xmm2  — c5 f3 58 c2
+    const u8 program[] = {
+        0xc5, 0xf3, 0x58, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(1.5);  // xmm1
+    st.ymm[8] = std::bit_cast<u64>(2.25); // xmm2
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 3.75);
+}
+
+// Memory-source form — matches the 8-byte length observed in the game's log.
+TEST_F(CpuRuntimeTest, Vaddsd_MemorySource) {
+    u64* dmem = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    *dmem = std::bit_cast<u64>(0.5);
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf3, 0x58, 0x00, // vaddsd xmm0, xmm1, qword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 dmem_addr = reinterpret_cast<u64>(dmem);
+    std::memcpy(prog + 2, &dmem_addr, sizeof(dmem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(100.0);
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 100.5);
+}
+
+// ============================================================================
+// VCVTSD2SS — double → float narrowing conversion. Inverse of VCVTSS2SD.
+// Merge boundary at bit 32 (result is float). MXCSR rounding applies
+// (unlike VCVTSS2SD which is exact widening).
+// ============================================================================
+
+// 3.5 exact representation in both float and double — no rounding.
+// Verifies the result is float(3.5) placed in dst.low32.
+TEST_F(CpuRuntimeTest, Vcvtsd2ss_BasicNarrowingExact) {
+    // vcvtsd2ss xmm0, xmm1, xmm2  — c5 f3 5a c2
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5a, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[8] = std::bit_cast<u64>(3.5); // xmm2 = double(3.5)
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 3.5f) << "(float)3.5 == 3.5f exactly";
+}
+
+// Merge boundary at bit 32 — dst[127:32] must come from src1[127:32].
+// This is the structural difference from VCVTSS2SD which preserves
+// at bit 64.
+TEST_F(CpuRuntimeTest, Vcvtsd2ss_PreservesSrc1Upper96) {
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5a, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (src1): chunk 0 low32 will be replaced, hi32 preserved into
+    // dst.chunk0 hi32; chunk 1 preserved as-is.
+    st.ymm[4] = (static_cast<u64>(0xCAFEFACEULL) << 32) | 0xAAAAAAAAULL;
+    st.ymm[5] = 0x1234567812345678ULL;
+    // xmm2 (src2): the double to convert
+    st.ymm[8] = std::bit_cast<u64>(1.0);
+    // Pre-pollute dst
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 1.0f);
+    EXPECT_EQ(hi32, 0xCAFEFACEu)
+        << "dst[63:32] must come from src1[63:32] (merge boundary at bit 32)";
+    EXPECT_EQ(st.ymm[1], 0x1234567812345678ULL) << "dst[127:64] from src1[127:64]";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Narrowing rounding: a double value that doesn't fit exactly in float
+// gets rounded under MXCSR. We verify the result matches what the host
+// C++ compiler produces for (float)d, which uses the same MXCSR.
+TEST_F(CpuRuntimeTest, Vcvtsd2ss_NarrowingRoundsCorrectly) {
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5a, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // pi as a double — has more precision than float can hold; rounded.
+    const double pi_d = 3.141592653589793;
+    st.ymm[8] = std::bit_cast<u64>(pi_d);
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, static_cast<float>(pi_d))
+        << "Narrowing rounded the same way (float) does on host";
+}
+
+// ============================================================================
+// VSUBSS — scalar single-precision subtract. Cheap addition via the
+// shared EmitScalarFp scaffolding. The interesting test is non-
+// commutativity: a - b ≠ b - a, so this catches "I wired up the
+// operand order backwards" the way an ADD test wouldn't.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vsubss_BasicSubtract) {
+    // vsubss xmm0, xmm1, xmm2  — c5 f2 5c c2
+    const u8 program[] = {
+        0xc5, 0xf2, 0x5c, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // 10.0 - 3.5 = 6.5
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(10.0f)); // xmm1
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(3.5f));  // xmm2
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 6.5f) << "src1 - src2 = 10.0 - 3.5 = 6.5";
+}
+
+// Order matters: confirm src1 is the minuend and src2 is the subtrahend.
+// If the dispatch had src1/src2 swapped, this would produce +5 instead
+// of -5.
+TEST_F(CpuRuntimeTest, Vsubss_OperandOrderCheck) {
+    const u8 program[] = {
+        0xc5, 0xf2, 0x5c, 0xc2, // vsubss xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // 5 - 10 = -5  (NOT 10 - 5 = +5)
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(5.0f));
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(10.0f));
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, -5.0f) << "src1 - src2 ordering: 5 - 10 = -5 (not +5)";
+}
+
+// ============================================================================
+// VMOVSD — scalar double-precision move. Cleaner than VMOVSS because the
+// 64-bit boundary aligns with the qword-sized GuestState chunks: no
+// shift+or compose, just whole-chunk moves.
+// ============================================================================
+
+// Load form: dst.low64 = [mem], rest of YMM zeroed.
+TEST_F(CpuRuntimeTest, Vmovsd_Load_PlacesLow64ZeroesRest) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    *scratch = std::bit_cast<u64>(2.718281828459045);
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <scratch>
+        0xc5, 0xfb, 0x10, 0x00,                   // vmovsd xmm0, qword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Pre-pollute to confirm zero-extension.
+    st.ymm[0] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[1] = 0xCAFEBABECAFEBABEULL;
+    st.ymm[2] = 0x1234567812345678ULL;
+    st.ymm[3] = 0xABCDEF01ABCDEF01ULL;
+    Runtime rt;
+    rt.Run(st);
+    double loaded;
+    std::memcpy(&loaded, &st.ymm[0], sizeof(loaded));
+    EXPECT_EQ(loaded, 2.718281828459045);
+    EXPECT_EQ(st.ymm[1], 0ULL) << "chunk 1 (xmm[127:64]) zeroed";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "upper YMM zeroed (VEX-128)";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Store form: [mem] = xmm.low64; surrounding memory untouched.
+TEST_F(CpuRuntimeTest, Vmovsd_Store_WritesLow64Only) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    *scratch = 0xAAAAAAAA00000000ULL;
+    u64* sentinel = scratch + 1;
+    *sentinel = 0xDEADBEEFDEADBEEFULL;
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xfb, 0x11, 0x00, // vmovsd qword[rax], xmm0
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[0] = std::bit_cast<u64>(1.5); // xmm0.low64
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;   // xmm0[127:64] — must NOT be stored
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*scratch, std::bit_cast<u64>(1.5));
+    EXPECT_EQ(*sentinel, 0xDEADBEEFDEADBEEFULL)
+        << "next qword must be untouched (only 8 bytes written)";
+}
+
+// Reg-reg-reg merge: dst.low64 from src2, dst[127:64] from src1.
+TEST_F(CpuRuntimeTest, Vmovsd_RegRegReg_MergesFromTwoSources) {
+    // vmovsd xmm0, xmm1, xmm2  — c5 f3 10 c2
+    const u8 program[] = {
+        0xc5, 0xf3, 0x10, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 = xmm1 (lane 4): chunk 0 ignored, chunk 1 preserved into dst.chunk1
+    st.ymm[4] = 0xDEAD000000000000ULL; // chunk 0 - ignored
+    st.ymm[5] = 0xCAFEBABE11223344ULL; // chunk 1 - preserved
+    // src2 = xmm2 (lane 8): chunk 0 → dst.chunk0
+    st.ymm[8] = 0x123456789ABCDEF0ULL;
+    st.ymm[9] = 0x9999999999999999ULL; // ignored
+    // pre-pollute dst (xmm0, lane 0)
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x123456789ABCDEF0ULL) << "dst.low64 from src2";
+    EXPECT_EQ(st.ymm[1], 0xCAFEBABE11223344ULL) << "dst[127:64] from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ============================================================================
+// VSUBSD — scalar double-precision subtract. Same EmitScalarFp scaffolding
+// as VSUBSS; non-commutativity test catches operand-order regressions.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vsubsd_BasicSubtract) {
+    // vsubsd xmm0, xmm1, xmm2  — c5 f3 5c c2
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5c, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(10.0); // xmm1
+    st.ymm[8] = std::bit_cast<u64>(3.5);  // xmm2
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 6.5);
+}
+
+// Non-commutativity check (5 - 10 = -5, not +5).
+TEST_F(CpuRuntimeTest, Vsubsd_OperandOrderCheck) {
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5c, 0xc2, // vsubsd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(5.0);
+    st.ymm[8] = std::bit_cast<u64>(10.0);
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, -5.0) << "src1 - src2 ordering: 5 - 10 = -5";
+}
+
+// ============================================================================
+// VDIVSD — scalar double-precision divide. Completes the scalar-FP
+// binop matrix (4 ops × 2 precisions). Last 9-LOC payoff from the
+// EmitScalarFp scaffolding.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vdivsd_BasicDivide) {
+    // vdivsd xmm0, xmm1, xmm2  — c5 f3 5e c2
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5e, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(12.0); // xmm1
+    st.ymm[8] = std::bit_cast<u64>(4.0);  // xmm2
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 3.0) << "12.0 / 4.0 = 3.0";
+}
+
+// Non-commutativity check (10 / 2 = 5, not 0.2). Catches src1/src2
+// ordering regressions on a divide-specific value.
+TEST_F(CpuRuntimeTest, Vdivsd_OperandOrderCheck) {
+    const u8 program[] = {
+        0xc5, 0xf3, 0x5e, 0xc2, // vdivsd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(10.0);
+    st.ymm[8] = std::bit_cast<u64>(2.0);
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 5.0) << "src1 / src2 ordering: 10 / 2 = 5 (not 0.2)";
+}
+
+// ============================================================================
+// VXORPS mem-src — extending the existing EmitVecBitXor (previously
+// reg-reg-reg only). The mem operand is full xmm width (128 bits = 16
+// bytes); we XOR the source register chunk-by-chunk against memory
+// starting at the computed EA.
+//
+// Typical pattern in compiled code: `vxorps xmm, xmm, [rip+sign_mask]`
+// for floating-point sign-flip via a static -0.0 / -0.0... mask.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vxorps_MemSource_128_XorsAcrossChunks) {
+    // 16-byte aligned-ish memory operand. Layout: chunk 0 = 0xFF...,
+    // chunk 1 = 0x55... — verifies BOTH qwords of the xmm get xor'd.
+    u64* mem_op = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    mem_op[0] = 0xFFFFFFFFFFFFFFFFULL;
+    mem_op[1] = 0x5555555555555555ULL;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <mem_op>
+        0xc5, 0xf0, 0x57, 0x00,                   // vxorps xmm0, xmm1, xmmword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 mem_addr = reinterpret_cast<u64>(mem_op);
+    std::memcpy(prog + 2, &mem_addr, sizeof(mem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (src1): chunk 0 = 0x0F0F...0F, chunk 1 = 0xAAAA...AA
+    st.ymm[4] = 0x0F0F0F0F0F0F0F0FULL;
+    st.ymm[5] = 0xAAAAAAAAAAAAAAAAULL;
+    // pre-pollute xmm0 (dst) lanes 2/3 to confirm zeroing.
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xF0F0F0F0F0F0F0F0ULL) << "chunk 0 = 0x0F0F... XOR 0xFFFF... = 0xF0F0...";
+    EXPECT_EQ(st.ymm[1], 0xFFFFFFFFFFFFFFFFULL) << "chunk 1 = 0xAAAA... XOR 0x5555... = 0xFFFF...";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Sign-flip idiom: VXORPS xmm, xmm, [sign_mask] where sign_mask =
+// {0x80000000, 0, 0, 0}. Negates the low-32 float; upper bits passed
+// through.
+TEST_F(CpuRuntimeTest, Vxorps_MemSource_SignFlipPattern) {
+    u32* mask = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    mask[0] = 0x80000000u; // sign-bit only
+    mask[1] = mask[2] = mask[3] = 0;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf0, 0x57, 0x00, 0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 mask_addr = reinterpret_cast<u64>(mask);
+    std::memcpy(prog + 2, &mask_addr, sizeof(mask_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1.low32 = +3.5; everything else 0
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(3.5f));
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, -3.5f) << "sign-flip via XOR with 0x80000000 mask";
+}
+
+// ============================================================================
+// VPAND — vector bitwise AND. Shares EmitVecBitOp scaffolding with
+// VPXOR/VXORPS; this just exercises the And kind. VPAND and VANDPS
+// produce identical bit patterns and are aliased to the same emitter.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpand_RegSrc_AndsAcrossChunks) {
+    // vpand xmm0, xmm1, xmm2 — c5 f1 db c2
+    const u8 program[] = {
+        0xc5, 0xf1, 0xdb, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (lane 4): chunk 0 = 0xFF00FF00..., chunk 1 = 0xAAAA...
+    st.ymm[4] = 0xFF00FF00FF00FF00ULL;
+    st.ymm[5] = 0xAAAAAAAAAAAAAAAAULL;
+    // xmm2 (lane 8): chunk 0 = 0x0FF00FF0..., chunk 1 = 0xCCCC...
+    st.ymm[8] = 0x0FF00FF00FF00FF0ULL;
+    st.ymm[9] = 0xCCCCCCCCCCCCCCCCULL;
+    // Pre-pollute upper YMM to confirm zeroing.
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x0F000F000F000F00ULL)
+        << "chunk 0 = 0xFF00FF00... AND 0x0FF00FF0... = 0x0F000F00...";
+    EXPECT_EQ(st.ymm[1], 0x8888888888888888ULL) << "chunk 1 = 0xAAAA... AND 0xCCCC... = 0x8888...";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Absolute-value idiom for float: AND with 0x7FFFFFFF clears the sign bit.
+// Same use case as VXORPS sign-flip, just AND instead of XOR.
+TEST_F(CpuRuntimeTest, Vpand_MemSource_AbsValuePattern) {
+    u32* mask = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    mask[0] = 0x7FFFFFFFu;                     // clears sign bit
+    mask[1] = mask[2] = mask[3] = 0xFFFFFFFFu; // leave other lanes alone
+
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0,    0,    0,    0,
+        0,    0,    0, 0xc5, 0xf1, 0xdb, 0x00, // vpand xmm0, xmm1, xmmword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 mask_addr = reinterpret_cast<u64>(mask);
+    std::memcpy(prog + 2, &mask_addr, sizeof(mask_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1.low32 = -3.5f
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(-3.5f));
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    float result;
+    std::memcpy(&result, &low32, sizeof(result));
+    EXPECT_EQ(result, 3.5f) << "abs() via AND with 0x7FFFFFFF mask";
+}
+
+// ============================================================================
+// VSQRTSD — scalar double-precision square root. Conceptually unary
+// (dst.low64 = sqrt(src2.low64)) but encoded as 3-operand (dst, src1,
+// src2) where src1 supplies the preserved upper 64 of dst. Slots into
+// EmitScalarFp via the Sqrt kind alongside the binops.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vsqrtsd_BasicSquareRoot) {
+    // vsqrtsd xmm0, xmm1, xmm2  — c5 f3 51 c2
+    const u8 program[] = {
+        0xc5, 0xf3, 0x51, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm2.low64 = 16.0 (the input to sqrt)
+    st.ymm[8] = std::bit_cast<u64>(16.0);
+
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 4.0) << "sqrt(16.0) = 4.0";
+}
+
+// Verify src1 (NOT src2) supplies the preserved upper 64. The merge
+// here is the same as VMULSD's: dst[127:64] = src1[127:64]. Even
+// though src2 carries the actual numerical input, src2's upper bits
+// must NOT leak into dst.
+TEST_F(CpuRuntimeTest, Vsqrtsd_PreservesSrc1Upper64) {
+    const u8 program[] = {
+        0xc5, 0xf3, 0x51, 0xc2, // vsqrtsd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (src1): chunk 0 ignored, chunk 1 = the value that must land in dst.chunk1
+    st.ymm[4] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[5] = 0xCAFEBABE12345678ULL;
+    // xmm2 (src2): low64 = 25.0, hi64 = pattern that must NOT land in dst
+    st.ymm[8] = std::bit_cast<u64>(25.0);
+    st.ymm[9] = 0xFEEDFACEFEEDFACEULL; // distinguish from src1 upper
+    // Pre-pollute dst
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    double result;
+    std::memcpy(&result, &st.ymm[0], sizeof(result));
+    EXPECT_EQ(result, 5.0);
+    EXPECT_EQ(st.ymm[1], 0xCAFEBABE12345678ULL)
+        << "dst[127:64] from src1, not from src2 (which had 0xFEEDFACE...)";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ============================================================================
+// VBLENDPS — packed single-precision blend with imm8 mask. Each bit of
+// the imm8 selects per-element between src1 (bit=0) and src2 (bit=1).
+// Tests exercise distinguishing mask patterns to verify both directions
+// of the selection.
+// ============================================================================
+
+// imm8 = 0x0A = 0b1010 — alternating, picks src2 for elements 1 and 3,
+// src1 for elements 0 and 2. Catches "selected the wrong source" or
+// "got the bit order backwards" regressions.
+TEST_F(CpuRuntimeTest, Vblendps_AlternatingMask) {
+    // vblendps xmm0, xmm1, xmm2, 0x0A
+    // c4 e3 71 0c c2 0a  (6 bytes)
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0a, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (lane 4): 4 floats = 1.0, 2.0, 3.0, 4.0
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(2.0f)) << 32) |
+                static_cast<u64>(std::bit_cast<u32>(1.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(4.0f)) << 32) |
+                static_cast<u64>(std::bit_cast<u32>(3.0f));
+    // xmm2 (lane 8): 4 floats = 10.0, 20.0, 30.0, 40.0
+    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(20.0f)) << 32) |
+                static_cast<u64>(std::bit_cast<u32>(10.0f));
+    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(40.0f)) << 32) |
+                static_cast<u64>(std::bit_cast<u32>(30.0f));
+
+    Runtime rt;
+    rt.Run(st);
+
+    // Expected with imm8=0x0A=0b1010:
+    //   element 0 (bit 0 = 0): src1[0] = 1.0
+    //   element 1 (bit 1 = 1): src2[1] = 20.0
+    //   element 2 (bit 2 = 0): src1[2] = 3.0
+    //   element 3 (bit 3 = 1): src2[3] = 40.0
+    const u32 e0 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 e1 = static_cast<u32>(st.ymm[0] >> 32);
+    const u32 e2 = static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL);
+    const u32 e3 = static_cast<u32>(st.ymm[1] >> 32);
+    EXPECT_EQ(std::bit_cast<float>(e0), 1.0f);
+    EXPECT_EQ(std::bit_cast<float>(e1), 20.0f);
+    EXPECT_EQ(std::bit_cast<float>(e2), 3.0f);
+    EXPECT_EQ(std::bit_cast<float>(e3), 40.0f);
+}
+
+// imm8 = 0x00 — all src1 (identity-like blend, no src2 contribution).
+// Tests that bit=0 reliably selects src1.
+TEST_F(CpuRuntimeTest, Vblendps_AllZeroMask_PicksSrc1) {
+    // vblendps xmm0, xmm1, xmm2, 0x00
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x00, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0xAAAAAAAA11111111ULL; // src1 distinguishing
+    st.ymm[5] = 0xCCCCCCCC33333333ULL;
+    st.ymm[8] = 0xBBBBBBBB22222222ULL; // src2 — must NOT appear
+    st.ymm[9] = 0xDDDDDDDD44444444ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xAAAAAAAA11111111ULL) << "all src1";
+    EXPECT_EQ(st.ymm[1], 0xCCCCCCCC33333333ULL);
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// imm8 = 0x0F — all src2 (only the low 4 bits matter for the 128-bit
+// form; bits 7:4 are reserved).
+TEST_F(CpuRuntimeTest, Vblendps_AllOnesMask_PicksSrc2) {
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0f, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0xAAAAAAAA11111111ULL; // src1 — must NOT appear
+    st.ymm[5] = 0xCCCCCCCC33333333ULL;
+    st.ymm[8] = 0xBBBBBBBB22222222ULL; // src2 distinguishing
+    st.ymm[9] = 0xDDDDDDDD44444444ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xBBBBBBBB22222222ULL) << "all src2";
+    EXPECT_EQ(st.ymm[1], 0xDDDDDDDD44444444ULL);
+}
+
+// ============================================================================
+// VPCMPEQD — compare packed signed dwords for equality. Shares the
+// EmitVecCmpEq scaffolding with VPCMPEQB; this exercises the Dword
+// kind and the new mem-src code path.
+// ============================================================================
+
+// Each 32-bit element compared independently; equal → 0xFFFFFFFF, else 0.
+TEST_F(CpuRuntimeTest, Vpcmpeqd_RegSrc_PerElementEquality) {
+    // vpcmpeqd xmm0, xmm1, xmm2  — c5 f1 76 c2
+    const u8 program[] = {
+        0xc5, 0xf1, 0x76, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (4 dwords): [0x11111111, 0x22222222, 0x33333333, 0x44444444]
+    st.ymm[4] = 0x2222222211111111ULL;
+    st.ymm[5] = 0x4444444433333333ULL;
+    // xmm2: [0x11111111, 0xFFFFFFFF, 0x33333333, 0x00000000]
+    //   elements 0,2 match; elements 1,3 differ.
+    st.ymm[8] = 0xFFFFFFFF11111111ULL;
+    st.ymm[9] = 0x0000000033333333ULL;
+    // Pre-pollute upper YMM
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected per element: [0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000]
+    EXPECT_EQ(st.ymm[0], 0x00000000FFFFFFFFULL) << "elements 0 (eq) and 1 (neq)";
+    EXPECT_EQ(st.ymm[1], 0x00000000FFFFFFFFULL) << "elements 2 (eq) and 3 (neq)";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Mem-src form — matches the 8-byte length observed in the game's log.
+// This is also the first test exercising the new mem-src path in
+// EmitVecCmpEq (extracted from the original EmitVpcmpeqb refactor).
+TEST_F(CpuRuntimeTest, Vpcmpeqd_MemSource) {
+    u32* mem_op = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    mem_op[0] = 0x55555555u; // matches src1 element 0
+    mem_op[1] = 0x99999999u; // does NOT match src1 element 1
+    mem_op[2] = 0xAAAAAAAAu; // matches src1 element 2
+    mem_op[3] = 0x12345678u; // does NOT match src1 element 3
+
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0,    0,    0,    0,
+        0,    0,    0, 0xc5, 0xf1, 0x76, 0x00, // vpcmpeqd xmm0, xmm1, xmmword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 mem_addr = reinterpret_cast<u64>(mem_op);
+    std::memcpy(prog + 2, &mem_addr, sizeof(mem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [0x55555555, 0x77777777, 0xAAAAAAAA, 0xBBBBBBBB]
+    st.ymm[4] = 0x7777777755555555ULL;
+    st.ymm[5] = 0xBBBBBBBBAAAAAAAAULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected: [0xFFFFFFFF, 0x00000000, 0xFFFFFFFF, 0x00000000]
+    EXPECT_EQ(st.ymm[0], 0x00000000FFFFFFFFULL);
+    EXPECT_EQ(st.ymm[1], 0x00000000FFFFFFFFULL);
+}
+
+// ============================================================================
+// VPSUBD — packed subtract of 32-bit dwords. Per-element wraparound,
+// no flags. The non-trivial correctness check is that subtraction
+// borrows must NOT propagate across the 32-bit element boundary
+// inside a 64-bit chunk — which would happen if we mistakenly tried
+// to GPR-relay at 64-bit granularity like VPXOR does.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpsubd_BasicPerElementSubtract) {
+    // vpsubd xmm0, xmm1, xmm2  — c5 f1 fa c2
+    const u8 program[] = {
+        0xc5, 0xf1, 0xfa, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [100, 200, 300, 400]
+    st.ymm[4] = (static_cast<u64>(200u) << 32) | 100u;
+    st.ymm[5] = (static_cast<u64>(400u) << 32) | 300u;
+    // xmm2: [10, 20, 30, 40]
+    st.ymm[8] = (static_cast<u64>(20u) << 32) | 10u;
+    st.ymm[9] = (static_cast<u64>(40u) << 32) | 30u;
+    // Pre-pollute upper YMM
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected: [90, 180, 270, 360]
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 90u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 180u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 270u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 360u);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Borrow-isolation: each 32-bit element subtracts independently.
+// element 0: 0x00000000 - 0x00000001 = 0xFFFFFFFF (wraparound)
+// element 1: 0x12345678 - 0x00000000 = 0x12345678 (must NOT decrement!)
+// If a 64-bit subtraction were used by mistake, element 1 would
+// observe a borrow from element 0 and yield 0x12345677.
+TEST_F(CpuRuntimeTest, Vpsubd_BorrowDoesNotCrossElementBoundary) {
+    const u8 program[] = {
+        0xc5, 0xf1, 0xfa, 0xc2, // vpsubd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 chunk 0: high32 = 0x12345678 (element 1), low32 = 0x00000000 (element 0)
+    st.ymm[4] = 0x1234567800000000ULL;
+    // xmm2 chunk 0: high32 = 0x00000000 (element 1), low32 = 0x00000001 (element 0)
+    st.ymm[8] = 0x0000000000000001ULL;
+    // Other chunks zero (uninteresting elements).
+    st.ymm[5] = st.ymm[9] = 0;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected chunk 0: element 0 = 0 - 1 = 0xFFFFFFFF (wrap),
+    //                   element 1 = 0x12345678 - 0 = 0x12345678 (NOT 0x12345677).
+    const u32 e0 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 e1 = static_cast<u32>(st.ymm[0] >> 32);
+    EXPECT_EQ(e0, 0xFFFFFFFFu) << "element 0 underflow wraps to 0xFFFFFFFF";
+    EXPECT_EQ(e1, 0x12345678u)
+        << "element 1 must NOT see borrow from element 0 (would be 0x12345677)";
+}
+
+// ============================================================================
+// VPSRAD — packed arithmetic-shift-right of 32-bit dwords. The "A" in
+// SRAD means *arithmetic*: vacated high bits get filled with the sign
+// bit, not zero. This is the distinguishing test from a hypothetical
+// VPSRLD (logical right shift, zero-fill).
+// ============================================================================
+
+// Positive values: arithmetic right shift looks the same as logical
+// (sign bit is 0). Basic sanity for the imm8 plumbing.
+TEST_F(CpuRuntimeTest, Vpsrad_PositiveValues_ShiftRight) {
+    // vpsrad xmm0, xmm1, 2  — c5 f9 72 e1 02 (5 bytes)
+    const u8 program[] = {
+        0xc5, 0xf9, 0x72, 0xe1, 0x02, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [40, 100, 1000, 0x40000000]
+    st.ymm[4] = (static_cast<u64>(100u) << 32) | 40u;
+    st.ymm[5] = (static_cast<u64>(0x40000000u) << 32) | 1000u;
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Each element shifted right by 2: 40>>2=10, 100>>2=25, 1000>>2=250, 0x40000000>>2=0x10000000
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 10u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 25u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 250u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0x10000000u);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// The "arithmetic" semantic: negative values get sign-extended.
+// VPSRLD (logical) would zero-fill, producing very different
+// values. This test pins down that VPSRAD sign-fills.
+TEST_F(CpuRuntimeTest, Vpsrad_NegativeValues_SignFill) {
+    // vpsrad xmm0, xmm1, 4
+    const u8 program[] = {
+        0xc5, 0xf9, 0x72, 0xe1, 0x04, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [-16, -1, 0xFFFFFFF0 (-16), 0x80000000 (INT32_MIN)]
+    // Use bit_cast for clarity.
+    const u32 neg16 = static_cast<u32>(-16);
+    const u32 neg1 = static_cast<u32>(-1);
+    st.ymm[4] = (static_cast<u64>(neg1) << 32) | neg16;
+    st.ymm[5] = (static_cast<u64>(0x80000000u) << 32) | neg16;
+
+    Runtime rt;
+    rt.Run(st);
+    // Sign-fill expectations:
+    //   -16 >> 4 = -1  (0xFFFFFFFF), arith
+    //   -1  >> 4 = -1  (0xFFFFFFFF), still all-ones
+    //   -16 >> 4 = -1  (0xFFFFFFFF)
+    //   0x80000000 >> 4 = 0xF8000000  (high bit propagates to top 4 bits)
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0xFFFFFFFFu)
+        << "-16 >>arith 4 = -1 (sign-extended)";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0xFFFFFFFFu) << "-1 >>arith 4 = -1";
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0xFFFFFFFFu);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0xF8000000u)
+        << "INT32_MIN >>arith 4 = 0xF8000000 (top 4 bits = sign-extension)";
+}
+
+// Shift count > 31 saturates per element to sign(src1[i]):
+// negative → all-ones, non-negative → zero. Common idiom for
+// generating a "sign mask" used elsewhere in the pipeline.
+TEST_F(CpuRuntimeTest, Vpsrad_ShiftCountClampedAt31) {
+    // vpsrad xmm0, xmm1, 100  (> 31)
+    const u8 program[] = {
+        0xc5, 0xf9, 0x72, 0xe1, 0x64, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [0x7FFFFFFF, 0x80000000, 0x00000001, 0xFFFFFFFF]
+    st.ymm[4] = (static_cast<u64>(0x80000000u) << 32) | 0x7FFFFFFFu;
+    st.ymm[5] = (static_cast<u64>(0xFFFFFFFFu) << 32) | 0x00000001u;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected: large shift → sign-mask per element
+    //   0x7FFFFFFF positive → 0
+    //   0x80000000 negative → 0xFFFFFFFF
+    //   0x00000001 positive → 0
+    //   0xFFFFFFFF negative → 0xFFFFFFFF
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0xFFFFFFFFu);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0xFFFFFFFFu);
+}
+
+// ============================================================================
+// VPADDD — packed add of 32-bit dwords. Wired through EmitVecIntArith
+// alongside VPSUBD via the second-instance refactor.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpaddd_BasicPerElementAdd) {
+    // vpaddd xmm0, xmm1, xmm2  — c5 f1 fe c2
+    const u8 program[] = {
+        0xc5, 0xf1, 0xfe, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [10, 20, 30, 40]
+    st.ymm[4] = (static_cast<u64>(20u) << 32) | 10u;
+    st.ymm[5] = (static_cast<u64>(40u) << 32) | 30u;
+    // xmm2: [100, 200, 300, 400]
+    st.ymm[8] = (static_cast<u64>(200u) << 32) | 100u;
+    st.ymm[9] = (static_cast<u64>(400u) << 32) | 300u;
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected: [110, 220, 330, 440]
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 110u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 220u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 330u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 440u);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Carry-isolation: 32-bit additions must NOT propagate carry into the
+// next element. The addition counterpart of VPSUBD's borrow-isolation
+// check.
+// element 0: 0xFFFFFFFF + 0x00000001 = 0x00000000 (wraparound)
+// element 1: 0x00000000 + 0x12345678 = 0x12345678 (must NOT increment!)
+TEST_F(CpuRuntimeTest, Vpaddd_CarryDoesNotCrossElementBoundary) {
+    const u8 program[] = {
+        0xc5, 0xf1, 0xfe, 0xc2, // vpaddd xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 chunk 0: e1 = 0x00000000, e0 = 0xFFFFFFFF
+    st.ymm[4] = 0x00000000FFFFFFFFULL;
+    // xmm2 chunk 0: e1 = 0x12345678, e0 = 0x00000001
+    st.ymm[8] = 0x1234567800000001ULL;
+    st.ymm[5] = st.ymm[9] = 0;
+
+    Runtime rt;
+    rt.Run(st);
+    const u32 e0 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
+    const u32 e1 = static_cast<u32>(st.ymm[0] >> 32);
+    EXPECT_EQ(e0, 0u) << "element 0 overflow wraps to 0";
+    EXPECT_EQ(e1, 0x12345678u)
+        << "element 1 must NOT see carry from element 0 (would be 0x12345679)";
+}
+
+// Mem-src form — the 8-byte length case observed from the game's log.
+TEST_F(CpuRuntimeTest, Vpaddd_MemSource) {
+    u32* mem_op = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    mem_op[0] = 1u;
+    mem_op[1] = 2u;
+    mem_op[2] = 3u;
+    mem_op[3] = 4u;
+
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0,    0,    0,    0,
+        0,    0,    0, 0xc5, 0xf1, 0xfe, 0x00, // vpaddd xmm0, xmm1, xmmword[rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 mem_addr = reinterpret_cast<u64>(mem_op);
+    std::memcpy(prog + 2, &mem_addr, sizeof(mem_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1: [100, 200, 300, 400]
+    st.ymm[4] = (static_cast<u64>(200u) << 32) | 100u;
+    st.ymm[5] = (static_cast<u64>(400u) << 32) | 300u;
+
+    Runtime rt;
+    rt.Run(st);
+    // Expected: [101, 202, 303, 404]
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 101u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 202u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 303u);
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 404u);
+}
+
 } // namespace
 } // namespace Core::Runtime
