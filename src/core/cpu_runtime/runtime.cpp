@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
+#include <unordered_set>
 
 #include "common/assert.h"
 #include "common/arch.h"
@@ -697,6 +698,122 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
     const u64 used_before = code_cache_->Used();
     void* host_ptr = lifter_->CompileBlock(guest_rip);
     if (host_ptr != nullptr) {
+        // Optional: disassemble EVERY compiled block straight into the log,
+        // once per guest RIP, so blocks are human-readable without any offline
+        // tool. Off by default (this floods the log); enable by setting the
+        // environment variable SHADPS4_DUMP_BLOCKS=1 before launching. Output
+        // is one header line per block plus one line per host instruction:
+        //   block 0x800274c09 (32 host bytes):
+        //     +0x00  mov eax, [r13+0x50]        ; guest R10
+        //     +0x04  mov [r13+0x10], rax        ; guest RDX
+        //     ...
+        // The r13-relative annotation maps the access back to the guest
+        // register / state field, since r13 is pinned to the GuestState base.
+        static const bool dump_all_blocks = [] {
+            const char* e = std::getenv("SHADPS4_DUMP_BLOCKS");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        if (dump_all_blocks) {
+            // De-dup per guest RIP so re-dispatched blocks don't re-print.
+            static thread_local std::unordered_set<u64> seen_blocks;
+            if (seen_blocks.insert(guest_rip).second) {
+                const u64 used_after = code_cache_->Used();
+                u64 n = used_after - used_before;
+                constexpr u64 kMaxDump = 1024;
+                if (n > kMaxDump) n = kMaxDump;
+                const auto* code = reinterpret_cast<const u8*>(host_ptr);
+
+                LOG_ERROR(Core, "block {:#x} ({} host bytes):", guest_rip, n);
+
+                // Map an r13-relative displacement to a guest register / state
+                // field name (GuestState layout: gpr[0..15] at 0x00..0x78,
+                // then rip/rflags/lazy-flag fields/fs_base/gs_base).
+                auto slot_name = [](u64 off) -> const char* {
+                    static const char* kGpr[16] = {
+                        "RAX","RCX","RDX","RBX","RSP","RBP","RSI","RDI",
+                        "R8","R9","R10","R11","R12","R13","R14","R15"};
+                    if (off < 0x80 && (off % 8) == 0) return kGpr[off / 8];
+                    switch (off) {
+                    case 0x80: return "rip";
+                    case 0x88: return "rflags";
+                    case 0x90: return "flag_op";
+                    case 0x98: return "flag_lhs";
+                    case 0xa0: return "flag_rhs";
+                    case 0xa8: return "flag_result";
+                    case 0xb0: return "fs_base";
+                    case 0xb8: return "gs_base";
+                    default:   return nullptr;
+                    }
+                };
+
+                ZydisDecoder dec;
+                ZydisFormatter fmt;
+                if (ZYAN_SUCCESS(ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64,
+                                                  ZYDIS_STACK_WIDTH_64)) &&
+                    ZYAN_SUCCESS(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL))) {
+                    u64 off = 0;
+                    while (off < n) {
+                        // Stop at zero-padding: the code-cache "used" delta
+                        // can over-report a block's true length (alignment /
+                        // post-flush bump), and the tail is zeroed cache that
+                        // decodes as a meaningless run of `add [rax], al`
+                        // (opcode 00 00). A 00 00 here is never real emitted
+                        // code, so treat it as the end of the block.
+                        if (off + 1 < n && code[off] == 0x00 && code[off + 1] == 0x00) {
+                            break;
+                        }
+                        ZydisDecodedInstruction insn;
+                        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                                &dec, code + off, n - off, &insn, ops))) {
+                            LOG_ERROR(Core, "  +{:#04x}  <bad decode>", off);
+                            break;
+                        }
+                        char text[160];
+                        ZydisFormatterFormatInstruction(&fmt, &insn, ops,
+                                                        insn.operand_count_visible,
+                                                        text, sizeof(text),
+                                                        /*runtime_address=*/off,
+                                                        ZYAN_NULL);
+                        // Annotate the first r13-relative memory operand with
+                        // the guest slot it touches. We read disp.value
+                        // directly: a zero displacement is a valid slot
+                        // access ([r13] == guest RAX), and the
+                        // `has_displacement` flag isn't present across all
+                        // Zydis versions in the tree.
+                        const char* note = nullptr;
+                        for (u32 i = 0; i < insn.operand_count; ++i) {
+                            if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                                ops[i].mem.base == ZYDIS_REGISTER_R13) {
+                                const u64 d =
+                                    static_cast<u64>(ops[i].mem.disp.value);
+                                note = slot_name(d);
+                                break;
+                            }
+                        }
+                        if (note != nullptr) {
+                            LOG_ERROR(Core, "  +{:#04x}  {}    ; guest {}",
+                                      off, text, note);
+                        } else {
+                            LOG_ERROR(Core, "  +{:#04x}  {}", off, text);
+                        }
+                        off += insn.length;
+
+                        // A block ends with its terminator: an indirect jump
+                        // through r14 (dispatcher loop) or r15 (clean/fatal
+                        // exit). Once we've emitted that, everything after is
+                        // the next block or padding — stop here so we don't
+                        // walk past the real end.
+                        if (insn.mnemonic == ZYDIS_MNEMONIC_JMP &&
+                            ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                            (ops[0].reg.value == ZYDIS_REGISTER_R14 ||
+                             ops[0].reg.value == ZYDIS_REGISTER_R15)) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         // [RAXTRACE] Dump emitted host bytes for the loop blocks involved
         // in the bit-33 corruption (0x800274c00 / ...c09 / ...cae), so the
         // exact lifted sequence can be disassembled. Computed from the
