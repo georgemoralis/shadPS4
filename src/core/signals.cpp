@@ -5,8 +5,15 @@
 #include "common/assert.h"
 #include "common/decoder.h"
 #include "common/signal_context.h"
+#include "core/cpu_runtime/runtime.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
+
+// ZydisMnemonicGetString (used to name the faulting guest instruction
+// in the crash report) lives here; needed on every x86_64 host.
+#ifdef ARCH_X86_64
+#include <Zydis/Zydis.h>
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -60,7 +67,101 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+    // Enrich the unhandled-fault report with CPU-runtime context. If
+    // this thread was executing guest code under the JIT, the raw host
+    // fault address alone is hard to triage — DescribeFaultContext pins
+    // it to the guest RIP that was executing, says whether the fault
+    // was inside JIT code, and snapshots the guest GPRs so we can see
+    // which register carried the bad pointer. Async-signal-safe.
+    //
+    // For an access violation, ExceptionInformation[1] is the faulting
+    // DATA address (distinct from `address`, the code/instruction
+    // address). Logging both is essential: "executing at <code> while
+    // dereferencing <data>" — and the data address is what we match
+    // against the GPR snapshot to find the offending register.
+    const void* data_addr = nullptr;
+    if (code == EXCEPTION_ACCESS_VIOLATION && pExp != nullptr &&
+        pExp->ExceptionRecord != nullptr &&
+        pExp->ExceptionRecord->NumberParameters >= 2) {
+        data_addr = reinterpret_cast<const void*>(
+            pExp->ExceptionRecord->ExceptionInformation[1]);
+    }
+
+    const auto fctx = Core::Runtime::DescribeFaultContext(address);
+    if (fctx.in_runtime) {
+        const char* mnem =
+#ifdef ARCH_X86_64
+            fctx.faulting_insn_decoded
+                ? ZydisMnemonicGetString(static_cast<ZydisMnemonic>(fctx.faulting_mnemonic))
+                : "<undecoded>";
+#else
+            "<n/a>";
+#endif
+        LOG_CRITICAL(Debug,
+                     "Unhandled Exception code {:#x} | [diag-v2 hostpc+rawbytes] "
+                     "code_addr={} data_addr={} | "
+                     "CPU-runtime: guest_rip={:#x} faulting_insn={} (len={}) site={} exit_reason={}",
+                     code, address, data_addr, fctx.guest_rip, mnem,
+                     fctx.faulting_insn_length,
+                     fctx.in_jit_code ? "in-JIT-code" : "not-in-JIT-code (HLE or bad-ptr deref)",
+                     fctx.guest_exit_reason);
+        if (fctx.have_gprs) {
+            // Dump the guest GPRs so the bad-pointer register is
+            // identifiable by matching against data_addr.
+            LOG_CRITICAL(Debug,
+                "  guest GPRs: rax={:#x} rcx={:#x} rdx={:#x} rbx={:#x} "
+                "rsp={:#x} rbp={:#x} rsi={:#x} rdi={:#x}",
+                fctx.guest_gpr[0], fctx.guest_gpr[1], fctx.guest_gpr[2], fctx.guest_gpr[3],
+                fctx.guest_gpr[4], fctx.guest_gpr[5], fctx.guest_gpr[6], fctx.guest_gpr[7]);
+            LOG_CRITICAL(Debug,
+                "              r8={:#x} r9={:#x} r10={:#x} r11={:#x} "
+                "r12={:#x} r13={:#x} r14={:#x} r15={:#x}",
+                fctx.guest_gpr[8], fctx.guest_gpr[9], fctx.guest_gpr[10], fctx.guest_gpr[11],
+                fctx.guest_gpr[12], fctx.guest_gpr[13], fctx.guest_gpr[14], fctx.guest_gpr[15]);
+        }
+        // Report the faulting access shape: load vs store and which base
+        // register fed the effective address. This tells us whether the
+        // bad pointer was being read FROM or used as a write destination.
+        if (fctx.have_mem_operand) {
+            const char* reg =
+#ifdef ARCH_X86_64
+                ZydisRegisterGetString(static_cast<ZydisRegister>(fctx.mem_base_reg));
+#else
+                "<n/a>";
+#endif
+            LOG_CRITICAL(Debug, "  fault access: {} via base={} (read={} write={})",
+                         fctx.mem_is_write ? "WRITE/store" : "READ/load",
+                         reg ? reg : "<none>", fctx.mem_is_read, fctx.mem_is_write);
+        }
+        // Always dump the fault-PC byte window AND the preceding bytes, as
+        // hex. The faulting instruction is usually just the consumer of a
+        // bad pointer; the instructions before it computed it, so the
+        // preceding window is where the actual bug (e.g. a stray bit set
+        // in address math) is visible. Disassemble offline with:
+        //   echo <bytes> | llvm-mc --disassemble -triple=x86_64
+        {
+            const char* digits = "0123456789abcdef";
+            auto dump = [&](const u8* b, int n, const char* label) {
+                if (n <= 0) return;
+                char hex[48 * 3 + 1];
+                if (n > 48) n = 48;
+                for (int i = 0; i < n; ++i) {
+                    hex[i * 3 + 0] = digits[(b[i] >> 4) & 0xF];
+                    hex[i * 3 + 1] = digits[b[i] & 0xF];
+                    hex[i * 3 + 2] = ' ';
+                }
+                hex[n * 3] = '\0';
+                LOG_CRITICAL(Debug, "  {}: {}", label, hex);
+            };
+            if (fctx.pre_byte_count > 0)
+                dump(fctx.pre_fault_bytes, fctx.pre_byte_count, "host bytes BEFORE fault PC");
+            if (fctx.raw_byte_count > 0)
+                dump(fctx.faulting_raw_bytes, fctx.raw_byte_count, "host bytes AT fault PC");
+        }
+    } else {
+        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {} | not in CPU runtime",
+                     code, address);
+    }
     Common::Log::Flush();
 
     return EXCEPTION_CONTINUE_SEARCH;
@@ -105,9 +206,13 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                                                     reinterpret_cast<ucontext_t*>(raw_context));
                 return;
             }
-            UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
+            const auto fctx = Core::Runtime::DescribeFaultContext(code_address);
+            UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {} | "
+                            "CPU-runtime: {} guest_rip={:#x} site={}",
                             fmt::ptr(code_address), is_write ? "Write to" : "Read from",
-                            fmt::ptr(info->si_addr));
+                            fmt::ptr(info->si_addr),
+                            fctx.in_runtime ? "yes" : "no", fctx.guest_rip,
+                            fctx.in_jit_code ? "in-JIT-code" : "not-in-JIT-code");
         }
         break;
     }
@@ -118,8 +223,12 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                                                     reinterpret_cast<ucontext_t*>(raw_context));
                 return;
             }
-            UNREACHABLE_MSG("Unhandled illegal instruction at code address {}: {}",
-                            fmt::ptr(code_address), DisassembleInstruction(code_address));
+            const auto fctx = Core::Runtime::DescribeFaultContext(code_address);
+            UNREACHABLE_MSG("Unhandled illegal instruction at code address {}: {} | "
+                            "CPU-runtime: {} guest_rip={:#x} site={}",
+                            fmt::ptr(code_address), DisassembleInstruction(code_address),
+                            fctx.in_runtime ? "yes" : "no", fctx.guest_rip,
+                            fctx.in_jit_code ? "in-JIT-code" : "not-in-JIT-code");
         }
         break;
     default:

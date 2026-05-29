@@ -3179,9 +3179,9 @@ TEST_F(CpuRuntimeTest, HleBridge_UnregisteredHostCall_StillExecutes) {
 TEST_F(CpuRuntimeTest, Shl8_Imm_PreservesUpperBitsOfParentSlot) {
     const u8 program[] = {
         // mov rax, 0xDEADBEEF00000005 — junk in upper, al = 0x05
-        0x48, 0xb8, 0x05, 0x00, 0x00, 0x00, 0xef,
-        0xbe, 0xad, 0xde, 0xc0, 0xe0, 0x02, // shl al, 2 → al = 0x14
-        0xc3,                               // ret
+        0x48, 0xb8, 0x05, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde,
+        0xc0, 0xe0, 0x02,                         // shl al, 2 → al = 0x14
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0xDEADBEEF00000014ULL)
@@ -3195,9 +3195,9 @@ TEST_F(CpuRuntimeTest, Shl8_Imm_PreservesUpperBitsOfParentSlot) {
 TEST_F(CpuRuntimeTest, Shr8_Imm_OnRbxLowByte) {
     const u8 program[] = {
         // mov rbx, 0xFFFFFFFF000000A0 — bl = 0xA0
-        0x48, 0xbb, 0xa0, 0x00, 0x00, 0x00, 0xff,
-        0xff, 0xff, 0xff, 0xc0, 0xeb, 0x04, // shr bl, 4 → bl = 0x0A
-        0xc3,                               // ret
+        0x48, 0xbb, 0xa0, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
+        0xc0, 0xeb, 0x04,                         // shr bl, 4 → bl = 0x0A
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[3], 0xFFFFFFFF0000000AULL)
@@ -3212,9 +3212,9 @@ TEST_F(CpuRuntimeTest, Shr8_Imm_OnRbxLowByte) {
 TEST_F(CpuRuntimeTest, Sar8_Imm_SignExtendsLowByteOnly) {
     const u8 program[] = {
         // mov rax, 0xF0  (full mov-imm64 form so the upper 56 are zero)
-        0x48, 0xb8, 0xf0, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0xc0, 0xf8, 0x02, // sar al, 2 → al = 0xFC
-        0xc3,                               // ret
+        0x48, 0xb8, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xc0, 0xf8, 0x02,                         // sar al, 2 → al = 0xFC
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0x00000000000000FCULL)
@@ -3229,8 +3229,9 @@ TEST_F(CpuRuntimeTest, Shl8_Cl_DynamicCountOnLowByte) {
         // mov rax, 0x01 ; al = 1
         0x48, 0xb8, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         // mov rcx, 0x03 ; shift count = 3
-        0x48, 0xb9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xd2, 0xe0, // shl al, cl
-        0xc3,                                                                   // ret
+        0x48, 0xb9, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0xd2, 0xe0,                               // shl al, cl
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0] & 0xFFULL, 0x08ULL) << "1 << 3 = 8";
@@ -3321,10 +3322,10 @@ TEST_F(CpuRuntimeTest, Xor64_RegMem_LoadsAndXors) {
 TEST_F(CpuRuntimeTest, Lea32_ZerosUpper32OfDestination) {
     const u8 program[] = {
         // mov rax, 0xDEADBEEF12345678 — pollute rax with junk in upper
-        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad,
-        0xde, 0x48, 0xc7, 0xc1, 0x00, 0x01, 0x00, 0x00, // mov rcx, 0x100
-        0x8d, 0x41, 0x40,                               // lea eax, [rcx + 0x40]
-        0xc3,                                           // ret
+        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde,
+        0x48, 0xc7, 0xc1, 0x00, 0x01, 0x00, 0x00, // mov rcx, 0x100
+        0x8d, 0x41, 0x40,                         // lea eax, [rcx + 0x40]
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0x140ULL)
@@ -3343,11 +3344,11 @@ TEST_F(CpuRuntimeTest, Lea32_ZerosUpper32OfDestination) {
 TEST_F(CpuRuntimeTest, Andn32_RegReg_ComputesAndZeroExtends) {
     const u8 program[] = {
         // mov rax, 0xDEADBEEF12345678 — pollute upper of dst
-        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad,
-        0xde, 0x48, 0xc7, 0xc1, 0xf0, 0x00, 0x00, 0x00, // mov rcx, 0xF0  (src1)
-        0x48, 0xc7, 0xc2, 0xff, 0x00, 0x00, 0x00,       // mov rdx, 0xFF  (src2)
-        0xc4, 0xe2, 0x70, 0xf2, 0xc2,                   // andn eax, ecx, edx
-        0xc3,                                           // ret
+        0x48, 0xb8, 0x78, 0x56, 0x34, 0x12, 0xef, 0xbe, 0xad, 0xde,
+        0x48, 0xc7, 0xc1, 0xf0, 0x00, 0x00, 0x00, // mov rcx, 0xF0  (src1)
+        0x48, 0xc7, 0xc2, 0xff, 0x00, 0x00, 0x00, // mov rdx, 0xFF  (src2)
+        0xc4, 0xe2, 0x70, 0xf2, 0xc2,             // andn eax, ecx, edx
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     // (~0xF0) & 0xFF in 32-bit = 0xFFFFFF0F & 0xFF = 0x0F
@@ -3373,8 +3374,9 @@ TEST_F(CpuRuntimeTest, Andn32_RegReg_ComputesAndZeroExtends) {
 TEST_F(CpuRuntimeTest, Test8_HighByteAh_AccessesByte1OfRax) {
     const u8 program[] = {
         // mov rax, 0x100F — AL = 0x0F (bit 0 set), AH = 0x10 (bit 0 clear)
-        0x48, 0xc7, 0xc0, 0x0f, 0x10, 0x00, 0x00, 0xf6, 0xc4, 0x01, // test ah, 0x01
-        0xc3,                                                       // ret
+        0x48, 0xc7, 0xc0, 0x0f, 0x10, 0x00, 0x00,
+        0xf6, 0xc4, 0x01,                         // test ah, 0x01
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     // AH=0x10, 0x10 & 0x01 = 0 → ZF must be set.
@@ -3394,9 +3396,9 @@ TEST_F(CpuRuntimeTest, And8_HighByteCh_WritesOnlyByte1OfRcx) {
         //   byte 0 (CL) = 0xAA
         //   byte 1 (CH) = 0x12
         //   bytes 2..7  = 0xFECA00BEADDE
-        0x48, 0xb9, 0xaa, 0x12, 0xfe, 0xca, 0x00,
-        0xbe, 0xad, 0xde, 0x80, 0xe5, 0x0f, // and ch, 0x0F → ch = 0x02
-        0xc3,                               // ret
+        0x48, 0xb9, 0xaa, 0x12, 0xfe, 0xca, 0x00, 0xbe, 0xad, 0xde,
+        0x80, 0xe5, 0x0f,                         // and ch, 0x0F → ch = 0x02
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[1], 0xDEADBE00CAFE02AAULL)
@@ -3420,7 +3422,7 @@ TEST_F(CpuRuntimeTest, Div64_RegDivisor_ComputesQuotientAndRemainder) {
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 14ULL) << "quotient: 100 / 7 = 14";
-    EXPECT_EQ(r.state.gpr[2], 2ULL) << "remainder: 100 % 7 = 2";
+    EXPECT_EQ(r.state.gpr[2], 2ULL)  << "remainder: 100 % 7 = 2";
 }
 
 // 128-bit dividend with non-zero RDX. dividend = 2^64 (RDX=1, RAX=0),
@@ -3432,13 +3434,14 @@ TEST_F(CpuRuntimeTest, Div64_RegDivisor_UsesFullRdxRaxDividend) {
         0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00, // mov rdx, 1       (hi = 1)
         0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00, // mov rax, 0       (lo = 0)
         // mov rcx, 0x100000000 — needs full imm64 (won't fit in imm32)
-        0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x48, 0xf7, 0xf1, // div rcx
-        0xc3,                                                                         // ret
+        0x48, 0xb9, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0xf7, 0xf1,                         // div rcx
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     // (1 << 64) / (1 << 32) = (1 << 32)
     EXPECT_EQ(r.state.gpr[0], 0x100000000ULL) << "quotient = 2^32";
-    EXPECT_EQ(r.state.gpr[2], 0ULL) << "remainder = 0";
+    EXPECT_EQ(r.state.gpr[2], 0ULL)            << "remainder = 0";
 }
 
 // Memory divisor — the exact shape the game hit at 0x8079fd328.
@@ -3483,7 +3486,7 @@ TEST_F(CpuRuntimeTest, Bextr32_RegRegReg_ExtractsBitsAndZeroExtends) {
         0x48, 0xc7, 0xc2, 0x10, 0x08, 0x00, 0x00,
         // bextr eax, ecx, edx
         0xc4, 0xe2, 0x68, 0xf7, 0xc1,
-        0xc3, // ret
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     // Extracting 8 bits starting at bit 16 from 0xFFFF0000 yields 0xFF.
@@ -3506,7 +3509,7 @@ TEST_F(CpuRuntimeTest, Cmov32_ConditionTrue_ZeroExtendsSrc) {
         0x31, 0xd2,
         // cmovz eax, ecx — cond TRUE (ZF=1) → eax = ecx low 32, upper zeroed
         0x0f, 0x44, 0xc1,
-        0xc3, // ret
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0x12345678ULL)
@@ -3524,10 +3527,11 @@ TEST_F(CpuRuntimeTest, Cmov32_ConditionFalse_LeavesUpper32Untouched) {
         // mov rcx, 0x00000000_12345678
         0x48, 0xb9, 0x78, 0x56, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00,
         // mov rdx, 1; test rdx, rdx → ZF=0
-        0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00, 0x48, 0x85, 0xd2,
+        0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00,
+        0x48, 0x85, 0xd2,
         // cmovz eax, ecx — cond FALSE (ZF=0) → no write to rax at all
         0x0f, 0x44, 0xc1,
-        0xc3, // ret
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEBABEULL)
@@ -3555,8 +3559,9 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf0_ReportsAuthenticAMDVendor) {
         // mov rax, 0
         0x48, 0xc7, 0xc0, 0x00, 0x00, 0x00, 0x00,
         // mov rcx, 0
-        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xa2, // cpuid
-        0xc3,                                                 // ret
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x00,
+        0x0f, 0xa2,                               // cpuid
+        0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 7ULL) << "max standard leaf = 7";
@@ -3582,9 +3587,9 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf0_ReportsAuthenticAMDVendor) {
 // POPCNT (which would be present on most modern hosts via pass-through).
 TEST_F(CpuRuntimeTest, Cpuid_Leaf1_ReportsJaguarSignatureAndFeatures) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00, // mov rax, 1
-        0x48, 0x31, 0xc9,                         // xor rcx, rcx
-        0x0f, 0xa2,                               // cpuid
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,  // mov rax, 1
+        0x48, 0x31, 0xc9,                          // xor rcx, rcx
+        0x0f, 0xa2,                                // cpuid
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3598,7 +3603,7 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf1_ReportsJaguarSignatureAndFeatures) {
     EXPECT_EQ(family, 0x16u) << "computed family from signature";
 
     // Advertised features.
-    EXPECT_TRUE(ecx & (1u << 0)) << "SSE3 advertised";
+    EXPECT_TRUE(ecx & (1u << 0))  << "SSE3 advertised";
     EXPECT_TRUE(ecx & (1u << 19)) << "SSE4.1 advertised";
     EXPECT_TRUE(ecx & (1u << 20)) << "SSE4.2 advertised";
     EXPECT_TRUE(ecx & (1u << 23)) << "POPCNT advertised";
@@ -3610,7 +3615,7 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf1_ReportsJaguarSignatureAndFeatures) {
     EXPECT_FALSE(ecx & (1u << 30)) << "RDRAND must not be advertised";
 
     // EDX baseline.
-    EXPECT_TRUE(edx & (1u << 0)) << "FPU";
+    EXPECT_TRUE(edx & (1u << 0))  << "FPU";
     EXPECT_TRUE(edx & (1u << 25)) << "SSE";
     EXPECT_TRUE(edx & (1u << 26)) << "SSE2";
 }
@@ -3619,16 +3624,16 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf1_ReportsJaguarSignatureAndFeatures) {
 // AVX2 and BMI2 must be absent (Jaguar lacks them).
 TEST_F(CpuRuntimeTest, Cpuid_Leaf7_Sub0_BmiAdvertisedButNotAvx2) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
-        0x48, 0x31, 0xc9,                         // xor rcx, rcx (subleaf 0)
-        0x0f, 0xa2,                               // cpuid
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7
+        0x48, 0x31, 0xc9,                          // xor rcx, rcx (subleaf 0)
+        0x0f, 0xa2,                                // cpuid
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     const u32 ebx = static_cast<u32>(r.state.gpr[3]);
-    EXPECT_TRUE(ebx & (1u << 3)) << "BMI1 advertised";
-    EXPECT_FALSE(ebx & (1u << 5)) << "AVX2 must not be advertised";
-    EXPECT_FALSE(ebx & (1u << 8)) << "BMI2 must not be advertised";
+    EXPECT_TRUE(ebx  & (1u << 3))  << "BMI1 advertised";
+    EXPECT_FALSE(ebx & (1u << 5))  << "AVX2 must not be advertised";
+    EXPECT_FALSE(ebx & (1u << 8))  << "BMI2 must not be advertised";
     EXPECT_FALSE(ebx & (1u << 16)) << "AVX-512 must not be advertised";
 }
 
@@ -3638,9 +3643,10 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf7_Sub0_BmiAdvertisedButNotAvx2) {
 // gate would expose the subleaf-0 response for every subleaf.
 TEST_F(CpuRuntimeTest, Cpuid_Leaf7_NonzeroSubleafReturnsZero) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
-        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1 (sub 1)
-        0x0f, 0xa2, 0xc3,
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,  // mov rax, 7
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00,  // mov rcx, 1 (sub 1)
+        0x0f, 0xa2,
+        0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0ULL);
@@ -3660,17 +3666,17 @@ TEST_F(CpuRuntimeTest, Cpuid_BrandLeaves_SpellOutJaguarString) {
     auto runLeaf = [&](u32 leaf) {
         std::array<u32, 4> out{};
         u8 program[] = {
-            0x48, 0xc7, 0xc0, 0, 0, 0, 0, // mov rax, imm32  (filled below)
-            0x48, 0x31, 0xc9,             // xor rcx, rcx
-            0x0f, 0xa2,                   // cpuid
-            0xc3,                         // ret
+            0x48, 0xc7, 0xc0, 0,0,0,0,      // mov rax, imm32  (filled below)
+            0x48, 0x31, 0xc9,               // xor rcx, rcx
+            0x0f, 0xa2,                     // cpuid
+            0xc3,                           // ret
         };
         std::memcpy(program + 3, &leaf, 4);
         const auto r = RunProgram(program, sizeof(program), mem);
-        out[0] = static_cast<u32>(r.state.gpr[0]); // EAX
-        out[1] = static_cast<u32>(r.state.gpr[3]); // EBX
-        out[2] = static_cast<u32>(r.state.gpr[1]); // ECX
-        out[3] = static_cast<u32>(r.state.gpr[2]); // EDX
+        out[0] = static_cast<u32>(r.state.gpr[0]);  // EAX
+        out[1] = static_cast<u32>(r.state.gpr[3]);  // EBX
+        out[2] = static_cast<u32>(r.state.gpr[1]);  // ECX
+        out[3] = static_cast<u32>(r.state.gpr[2]);  // EDX
         return out;
     };
 
@@ -3678,17 +3684,13 @@ TEST_F(CpuRuntimeTest, Cpuid_BrandLeaves_SpellOutJaguarString) {
     const auto b2 = runLeaf(0x80000002);
     const auto b3 = runLeaf(0x80000003);
     const auto b4 = runLeaf(0x80000004);
-    for (int i = 0; i < 4; ++i)
-        std::memcpy(brand + 0 + i * 4, &b2[i], 4);
-    for (int i = 0; i < 4; ++i)
-        std::memcpy(brand + 16 + i * 4, &b3[i], 4);
-    for (int i = 0; i < 4; ++i)
-        std::memcpy(brand + 32 + i * 4, &b4[i], 4);
+    for (int i = 0; i < 4; ++i) std::memcpy(brand +  0 + i*4, &b2[i], 4);
+    for (int i = 0; i < 4; ++i) std::memcpy(brand + 16 + i*4, &b3[i], 4);
+    for (int i = 0; i < 4; ++i) std::memcpy(brand + 32 + i*4, &b4[i], 4);
     // brand is now 48 chars + null. Trim trailing spaces for the
     // comparison so the test isn't sensitive to the exact pad count.
     std::string s(brand);
-    while (!s.empty() && s.back() == ' ')
-        s.pop_back();
+    while (!s.empty() && s.back() == ' ') s.pop_back();
     EXPECT_EQ(s, "AMD Custom Jaguar 8-Core APU");
 }
 
@@ -3697,8 +3699,10 @@ TEST_F(CpuRuntimeTest, Cpuid_BrandLeaves_SpellOutJaguarString) {
 // path in the emitter works.
 TEST_F(CpuRuntimeTest, Cpuid_UnknownLeaf_ReturnsZeros) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x55, 0x55, 0x00, 0x00, // mov rax, 0x5555
-        0x48, 0x31, 0xc9, 0x0f, 0xa2, 0xc3,
+        0x48, 0xc7, 0xc0, 0x55, 0x55, 0x00, 0x00,  // mov rax, 0x5555
+        0x48, 0x31, 0xc9,
+        0x0f, 0xa2,
+        0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 0ULL);
@@ -3717,8 +3721,8 @@ TEST_F(CpuRuntimeTest, Cpuid_UnknownLeaf_ReturnsZeros) {
 // Bit set: BT eax, 5 with eax = 0x20 (bit 5 = 1) → CF=1.
 TEST_F(CpuRuntimeTest, Bt32_Imm_SetBit_RaisesCf) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00, // mov rax, 0x20
-        0x0f, 0xba, 0xe0, 0x05,                   // bt eax, 5
+        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00,   // mov rax, 0x20
+        0x0f, 0xba, 0xe0, 0x05,                     // bt eax, 5
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3730,9 +3734,9 @@ TEST_F(CpuRuntimeTest, Bt32_Imm_ClearBit_ClearsCf) {
     const u8 program[] = {
         // First force CF=1 via STC so the test fails loudly if the BT
         // emitter happens to leave CF alone instead of clearing it.
-        0xf9,                                     // stc
-        0x48, 0xc7, 0xc0, 0xdf, 0xff, 0x00, 0x00, // mov rax, 0xFFDF (bit 5 clear)
-        0x0f, 0xba, 0xe0, 0x05,                   // bt eax, 5
+        0xf9,                                       // stc
+        0x48, 0xc7, 0xc0, 0xdf, 0xff, 0x00, 0x00,   // mov rax, 0xFFDF (bit 5 clear)
+        0x0f, 0xba, 0xe0, 0x05,                     // bt eax, 5
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3744,21 +3748,21 @@ TEST_F(CpuRuntimeTest, Bt32_Imm_ClearBit_ClearsCf) {
 // Both ZF (bit 6) and CF (bit 0) must be set in the final rflags.
 TEST_F(CpuRuntimeTest, Bt32_Imm_PreservesOtherFlags) {
     const u8 program[] = {
-        0x48, 0x39, 0xc0,                         // cmp rax, rax  → ZF=1, CF=0
-        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00, // mov rax, 0x20
-        0x0f, 0xba, 0xe0, 0x05,                   // bt eax, 5
+        0x48, 0x39, 0xc0,                           // cmp rax, rax  → ZF=1, CF=0
+        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00,   // mov rax, 0x20
+        0x0f, 0xba, 0xe0, 0x05,                     // bt eax, 5
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF must be 1 after BT";
+    EXPECT_TRUE(r.state.rflags & 1ULL)        << "CF must be 1 after BT";
     EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set by earlier cmp must survive BT";
 }
 
 // 64-bit imm form — same skeleton, REX.W differentiates encoding.
 TEST_F(CpuRuntimeTest, Bt64_Imm_SetBit_RaisesCf) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00, // mov rax, 0x20
-        0x48, 0x0f, 0xba, 0xe0, 0x05,             // bt rax, 5
+        0x48, 0xc7, 0xc0, 0x20, 0x00, 0x00, 0x00,   // mov rax, 0x20
+        0x48, 0x0f, 0xba, 0xe0, 0x05,               // bt rax, 5
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3769,9 +3773,9 @@ TEST_F(CpuRuntimeTest, Bt64_Imm_SetBit_RaisesCf) {
 // reg path routes correctly.
 TEST_F(CpuRuntimeTest, Bt32_RegReg_BitIndexFromEcx) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x00, 0x04, 0x00, 0x00, // mov rax, 0x400 (bit 10)
-        0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00, // mov rcx, 10
-        0x0f, 0xa3, 0xc8,                         // bt eax, ecx
+        0x48, 0xc7, 0xc0, 0x00, 0x04, 0x00, 0x00,   // mov rax, 0x400 (bit 10)
+        0x48, 0xc7, 0xc1, 0x0a, 0x00, 0x00, 0x00,   // mov rcx, 10
+        0x0f, 0xa3, 0xc8,                           // bt eax, ecx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3790,34 +3794,12 @@ TEST_F(CpuRuntimeTest, Bt32_RegReg_BitIndexFromEcx) {
 TEST_F(CpuRuntimeTest, Xgetbv_Xcr0_ReportsAvxEnabled) {
     const u8 program[] = {
         // mov rax, 0xDEADBEEFDEADBEEF — pre-pollute future RAX
-        0x48,
-        0xb8,
-        0xef,
-        0xbe,
-        0xad,
-        0xde,
-        0xef,
-        0xbe,
-        0xad,
-        0xde,
+        0x48, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0xef, 0xbe, 0xad, 0xde,
         // mov rdx, 0xCAFEBABECAFEBABE — pre-pollute future RDX
-        0x48,
-        0xba,
-        0xbe,
-        0xba,
-        0xfe,
-        0xca,
-        0xbe,
-        0xba,
-        0xfe,
-        0xca,
+        0x48, 0xba, 0xbe, 0xba, 0xfe, 0xca, 0xbe, 0xba, 0xfe, 0xca,
         // xor rcx, rcx  (ecx = 0 = XCR0)
-        0x48,
-        0x31,
-        0xc9,
-        0x0f,
-        0x01,
-        0xd0, // xgetbv
+        0x48, 0x31, 0xc9,
+        0x0f, 0x01, 0xd0,                          // xgetbv
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3829,8 +3811,8 @@ TEST_F(CpuRuntimeTest, Xgetbv_Xcr0_ReportsAvxEnabled) {
 // the emitter must not echo the XCR0 response.
 TEST_F(CpuRuntimeTest, Xgetbv_UnknownIndex_ReturnsZero) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1
-        0x0f, 0x01, 0xd0,                         // xgetbv
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00,  // mov rcx, 1
+        0x0f, 0x01, 0xd0,                          // xgetbv
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -3848,7 +3830,7 @@ TEST_F(CpuRuntimeTest, Xgetbv_UnknownIndex_ReturnsZero) {
 // (NOT a) AND b = (0x5555…) AND (0x5555…) ≠ 0 → CF=0.
 TEST_F(CpuRuntimeTest, Vptest_DisjointBits_SetsZfNotCf) {
     const u8 program[] = {
-        0xc4, 0xe2, 0x79, 0x17, 0xc1, // vptest xmm0, xmm1
+        0xc4, 0xe2, 0x79, 0x17, 0xc1,              // vptest xmm0, xmm1
         0xc3,
     };
     GuestMemory& m = mem;
@@ -3867,14 +3849,14 @@ TEST_F(CpuRuntimeTest, Vptest_DisjointBits_SetsZfNotCf) {
     Runtime rt;
     rt.Run(st);
     EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF=1 — disjoint bit patterns";
-    EXPECT_FALSE(st.rflags & 1ULL) << "CF=0 — b is not a subset of a";
+    EXPECT_FALSE(st.rflags & 1ULL)       << "CF=0 — b is not a subset of a";
 }
 
 // Identical operands: a == b ≠ 0. (a AND b) = a ≠ 0 → ZF=0.
 // (NOT a) AND b = (NOT a) AND a = 0 → CF=1.
 TEST_F(CpuRuntimeTest, Vptest_Identical_SetsCfNotZf) {
     const u8 program[] = {
-        0xc4, 0xe2, 0x79, 0x17, 0xc1, // vptest xmm0, xmm1
+        0xc4, 0xe2, 0x79, 0x17, 0xc1,              // vptest xmm0, xmm1
         0xc3,
     };
     GuestMemory& m = mem;
@@ -3891,13 +3873,13 @@ TEST_F(CpuRuntimeTest, Vptest_Identical_SetsCfNotZf) {
     Runtime rt;
     rt.Run(st);
     EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF=0 — non-zero common bits";
-    EXPECT_TRUE(st.rflags & 1ULL) << "CF=1 — b is a subset of a (b == a)";
+    EXPECT_TRUE(st.rflags & 1ULL)         << "CF=1 — b is a subset of a (b == a)";
 }
 
 // All-zero operands: both ZF and CF set (everything is the zero set).
 TEST_F(CpuRuntimeTest, Vptest_BothZero_SetsBothZfCf) {
     const u8 program[] = {
-        0xc4, 0xe2, 0x79, 0x17, 0xc1, // vptest xmm0, xmm1
+        0xc4, 0xe2, 0x79, 0x17, 0xc1,              // vptest xmm0, xmm1
         0xc3,
     };
     GuestMemory& m = mem;
@@ -3927,11 +3909,12 @@ TEST_F(CpuRuntimeTest, Vptest_BothZero_SetsBothZfCf) {
 TEST_F(CpuRuntimeTest, Or8_MemImm_SetsBitInPlace) {
     // Layout: program at code page start, scratch byte one page later.
     u8* scratch = mem.CodePtr() + 0x100;
-    *scratch = 0x01; // bit 0 set, bit 6 clear
+    *scratch = 0x01;                                  // bit 0 set, bit 6 clear
 
     const u8 program[] = {
         // mov rax, <scratch addr> (filled below)
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0x08, 0x40, // or byte[rax], 0x40
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x80, 0x08, 0x40,                             // or byte[rax], 0x40
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -3951,8 +3934,8 @@ TEST_F(CpuRuntimeTest, And8_MemImm_ClearsBitInPlace) {
     *scratch = 0xFF;
 
     const u8 program[] = {
-        0x48, 0xb8, 0,    0, 0, 0, 0, 0, 0, 0, // mov rax, <addr>
-        0x80, 0x20, 0xF0,                      // and byte[rax], 0xF0
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                  // mov rax, <addr>
+        0x80, 0x20, 0xF0,                             // and byte[rax], 0xF0
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -3979,7 +3962,7 @@ TEST_F(CpuRuntimeTest, And8_MemImm_ClearsBitInPlace) {
 // For "hello\0..." the first zero is at byte 5 → ECX = 5.
 TEST_F(CpuRuntimeTest, Vpcmpistri_StrlenIdiom_FindsNullTerminator) {
     const u8 program[] = {
-        0xc4, 0xe3, 0x79, 0x63, 0xc1, 0x08, // vpcmpistri xmm0, xmm1, 0x08
+        0xc4, 0xe3, 0x79, 0x63, 0xc1, 0x08,           // vpcmpistri xmm0, xmm1, 0x08
         0xc3,
     };
     GuestMemory& m = mem;
@@ -3993,7 +3976,7 @@ TEST_F(CpuRuntimeTest, Vpcmpistri_StrlenIdiom_FindsNullTerminator) {
     // xmm0 = "hello\0\0\0...\0" (16 bytes total). Place via memcpy
     // straight into the YMM lane bytes; ymm[0..1] covers xmm0's low
     // 128 bits with lane stride = 32 bytes.
-    u8 xmm0_bytes[16] = {'h', 'e', 'l', 'l', 'o', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    u8 xmm0_bytes[16] = {'h','e','l','l','o',0,0,0,0,0,0,0,0,0,0,0};
     std::memcpy(&st.ymm[0], xmm0_bytes, 16);
     // xmm1 = zeros (already, since ymm[] zero-initialized).
 
@@ -4008,7 +3991,7 @@ TEST_F(CpuRuntimeTest, Vpcmpistri_StrlenIdiom_FindsNullTerminator) {
 // its 16 positions. Spec says ECX = 16 (element count) when no match.
 TEST_F(CpuRuntimeTest, Vpcmpistri_NoMatch_ReturnsElementCount) {
     const u8 program[] = {
-        0xc4, 0xe3, 0x79, 0x63, 0xc1, 0x08, // vpcmpistri xmm0, xmm1, 0x08
+        0xc4, 0xe3, 0x79, 0x63, 0xc1, 0x08,           // vpcmpistri xmm0, xmm1, 0x08
         0xc3,
     };
     GuestMemory& m = mem;
@@ -4026,7 +4009,8 @@ TEST_F(CpuRuntimeTest, Vpcmpistri_NoMatch_ReturnsElementCount) {
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.gpr[1] & 0xFFFFFFFFULL, 16ULL) << "No match → ECX = element count (16 bytes)";
+    EXPECT_EQ(st.gpr[1] & 0xFFFFFFFFULL, 16ULL)
+        << "No match → ECX = element count (16 bytes)";
 }
 
 // ============================================================================
@@ -4040,35 +4024,17 @@ TEST_F(CpuRuntimeTest, Vpcmpistri_NoMatch_ReturnsElementCount) {
 TEST_F(CpuRuntimeTest, Div32_DividendStraddlesEdxEax) {
     const u8 program[] = {
         // mov rax, 1     (low half = 1)
-        0x48,
-        0xc7,
-        0xc0,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,
         // mov rdx, 1     (high half = 1 → dividend = 0x1_0000_0001)
-        0x48,
-        0xc7,
-        0xc2,
-        0x01,
-        0x00,
-        0x00,
-        0x00,
+        0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00,
         // mov rcx, 2     (divisor)
-        0x48,
-        0xc7,
-        0xc1,
-        0x02,
-        0x00,
-        0x00,
-        0x00,
-        0xf7,
-        0xf1, // div ecx
+        0x48, 0xc7, 0xc1, 0x02, 0x00, 0x00, 0x00,
+        0xf7, 0xf1,                                 // div ecx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_EQ(r.state.gpr[0], 0x80000000ULL) << "Quotient = 0x1_0000_0001 / 2 = 0x8000_0000";
+    EXPECT_EQ(r.state.gpr[0], 0x80000000ULL)
+        << "Quotient = 0x1_0000_0001 / 2 = 0x8000_0000";
     EXPECT_EQ(r.state.gpr[2], 1ULL) << "Remainder = 1";
     EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "RAX upper 32 must zero-extend";
     EXPECT_EQ(r.state.gpr[2] >> 32, 0u) << "RDX upper 32 must zero-extend";
@@ -4081,42 +4047,17 @@ TEST_F(CpuRuntimeTest, Div32_DividendStraddlesEdxEax) {
 TEST_F(CpuRuntimeTest, Div32_IgnoresUpper32OfDividend) {
     const u8 program[] = {
         // mov rax, 0xCAFEBABE0000000A  — upper junk, low = 10
-        0x48,
-        0xb8,
-        0x0a,
-        0x00,
-        0x00,
-        0x00,
-        0xbe,
-        0xba,
-        0xfe,
-        0xca,
+        0x48, 0xb8, 0x0a, 0x00, 0x00, 0x00, 0xbe, 0xba, 0xfe, 0xca,
         // mov rdx, 0xDEADBEEF00000000  — upper junk, low = 0
-        0x48,
-        0xba,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0xef,
-        0xbe,
-        0xad,
-        0xde,
+        0x48, 0xba, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde,
         // mov rcx, 3
-        0x48,
-        0xc7,
-        0xc1,
-        0x03,
-        0x00,
-        0x00,
-        0x00,
-        0xf7,
-        0xf1, // div ecx
+        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00,
+        0xf7, 0xf1,                                 // div ecx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_EQ(r.state.gpr[0], 3ULL) << "10 / 3 = 3 (32-bit DIV should ignore upper-32 junk)";
-    EXPECT_EQ(r.state.gpr[2], 1ULL) << "10 % 3 = 1";
+    EXPECT_EQ(r.state.gpr[0], 3ULL)  << "10 / 3 = 3 (32-bit DIV should ignore upper-32 junk)";
+    EXPECT_EQ(r.state.gpr[2], 1ULL)  << "10 % 3 = 1";
 }
 
 // ============================================================================
@@ -4132,27 +4073,10 @@ TEST_F(CpuRuntimeTest, Xadd32_ExchangesAndAdds) {
 
     const u8 program[] = {
         // mov rax, <scratch addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // mov rcx, 3
-        0x48,
-        0xc7,
-        0xc1,
-        0x03,
-        0x00,
-        0x00,
-        0x00,
-        0x0f,
-        0xc1,
-        0x08, // xadd dword[rax], ecx
+        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00,
+        0x0f, 0xc1, 0x08,                           // xadd dword[rax], ecx
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4161,7 +4085,7 @@ TEST_F(CpuRuntimeTest, Xadd32_ExchangesAndAdds) {
     std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
 
     const auto r = RunProgram(prog, sizeof(prog), mem);
-    EXPECT_EQ(*scratch, 8u) << "[mem] = old_mem + reg = 5 + 3";
+    EXPECT_EQ(*scratch, 8u)         << "[mem] = old_mem + reg = 5 + 3";
     EXPECT_EQ(r.state.gpr[1], 5ULL) << "reg gets the OLD mem value (5)";
     EXPECT_EQ(r.state.gpr[1] >> 32, 0u) << "RCX upper 32 zero-extended";
 }
@@ -4173,9 +4097,9 @@ TEST_F(CpuRuntimeTest, Xadd32_WrapToZero_SetsCfAndZf) {
     *scratch = 0xFFFFFFFEu;
 
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0,    0,    0,    0, 0, 0, // mov rax, <addr>
-        0x48, 0xc7, 0xc1, 0x02, 0x00, 0x00, 0x00,          // mov rcx, 2
-        0x0f, 0xc1, 0x08,                                  // xadd dword[rax], ecx
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <addr>
+        0x48, 0xc7, 0xc1, 0x02, 0x00, 0x00, 0x00,   // mov rcx, 2
+        0x0f, 0xc1, 0x08,                           // xadd dword[rax], ecx
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4184,8 +4108,8 @@ TEST_F(CpuRuntimeTest, Xadd32_WrapToZero_SetsCfAndZf) {
     std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
 
     const auto r = RunProgram(prog, sizeof(prog), mem);
-    EXPECT_EQ(*scratch, 0u) << "0xFFFF_FFFE + 2 wraps to 0";
-    EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set on 32-bit add wrap";
+    EXPECT_EQ(*scratch, 0u)         << "0xFFFF_FFFE + 2 wraps to 0";
+    EXPECT_TRUE(r.state.rflags & 1ULL)        << "CF set on 32-bit add wrap";
     EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set on zero result";
 }
 
@@ -4198,7 +4122,7 @@ TEST_F(CpuRuntimeTest, Xadd32_WrapToZero_SetsCfAndZf) {
 // Expected: xmm0 = {1+2, 3+4, 10+20, 30+40} = {3, 7, 30, 70}.
 TEST_F(CpuRuntimeTest, Vphaddd_Xmm_PairwiseAddsAcrossOperands) {
     const u8 program[] = {
-        0xc4, 0xe2, 0x79, 0x02, 0xc1, // vphaddd xmm0, xmm0, xmm1
+        0xc4, 0xe2, 0x79, 0x02, 0xc1,               // vphaddd xmm0, xmm0, xmm1
         0xc3,
     };
     GuestMemory& m = mem;
@@ -4221,8 +4145,8 @@ TEST_F(CpuRuntimeTest, Vphaddd_Xmm_PairwiseAddsAcrossOperands) {
 
     u32 out[4];
     std::memcpy(out, &st.ymm[0], 16);
-    EXPECT_EQ(out[0], 1u + 2u) << "dst[0] = src1[0] + src1[1]";
-    EXPECT_EQ(out[1], 3u + 4u) << "dst[1] = src1[2] + src1[3]";
+    EXPECT_EQ(out[0], 1u + 2u)   << "dst[0] = src1[0] + src1[1]";
+    EXPECT_EQ(out[1], 3u + 4u)   << "dst[1] = src1[2] + src1[3]";
     EXPECT_EQ(out[2], 10u + 20u) << "dst[2] = src2[0] + src2[1]";
     EXPECT_EQ(out[3], 30u + 40u) << "dst[3] = src2[2] + src2[3]";
 
@@ -4245,21 +4169,9 @@ TEST_F(CpuRuntimeTest, Vmovaps_StoresXmmToMemory) {
 
     const u8 program[] = {
         // mov rax, <scratch addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // vmovaps [rax], xmm0   (3-byte VEX form: c5 f8 29 00)
-        0xc5,
-        0xf8,
-        0x29,
-        0x00,
+        0xc5, 0xf8, 0x29, 0x00,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4299,8 +4211,8 @@ TEST_F(CpuRuntimeTest, Vmovaps_StoresXmmToMemory) {
 TEST_F(CpuRuntimeTest, Vmovq_XmmFromGpr_ZeroesUpper) {
     const u8 program[] = {
         // mov rax, 0xDEADBEEFCAFEBABE
-        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe,
-        0xad, 0xde, 0xc4, 0xe1, 0xf9, 0x6e, 0xc0, // vmovq xmm0, rax
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
+        0xc4, 0xe1, 0xf9, 0x6e, 0xc0,               // vmovq xmm0, rax
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -4328,7 +4240,7 @@ TEST_F(CpuRuntimeTest, Vmovq_XmmFromGpr_ZeroesUpper) {
 // `vmovq rax, xmm0` encodes as `c4 e1 f9 7e c0` (5 bytes).
 TEST_F(CpuRuntimeTest, Vmovq_GprFromXmm_FullWidth) {
     const u8 program[] = {
-        0xc4, 0xe1, 0xf9, 0x7e, 0xc0, // vmovq rax, xmm0
+        0xc4, 0xe1, 0xf9, 0x7e, 0xc0,               // vmovq rax, xmm0
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -4358,20 +4270,9 @@ TEST_F(CpuRuntimeTest, Setnbe_MemDst_ConditionTrue_StoresOne) {
 
     const u8 program[] = {
         // mov rax, <scratch addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // setnbe byte[rax]   (3-byte: 0F 97 /0 = 00 mod, /0 ext, [rax])
-        0x0f,
-        0x97,
-        0x00,
+        0x0f, 0x97, 0x00,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4398,8 +4299,8 @@ TEST_F(CpuRuntimeTest, Setnbe_MemDst_ConditionFalse_StoresZero) {
     *scratch = 0xAA;
 
     const u8 program[] = {
-        0x48, 0xb8, 0,    0, 0, 0, 0, 0, 0, 0, // mov rax, <addr>
-        0x0f, 0x97, 0x00,                      // setnbe byte[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <addr>
+        0x0f, 0x97, 0x00,                           // setnbe byte[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4428,8 +4329,8 @@ TEST_F(CpuRuntimeTest, Setnbe_MemDst_ConditionFalse_StoresZero) {
 // POPCNT of 0xFF (8 bits set) → 8, ZF=0.
 TEST_F(CpuRuntimeTest, Popcnt64_CountsBitsAndClearsZf) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc1, 0xff, 0x00, 0x00, 0x00, // mov rcx, 0xFF
-        0xf3, 0x48, 0x0f, 0xb8, 0xc1,             // popcnt rax, rcx
+        0x48, 0xc7, 0xc1, 0xff, 0x00, 0x00, 0x00,   // mov rcx, 0xFF
+        0xf3, 0x48, 0x0f, 0xb8, 0xc1,               // popcnt rax, rcx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4440,8 +4341,8 @@ TEST_F(CpuRuntimeTest, Popcnt64_CountsBitsAndClearsZf) {
 // POPCNT of 0 → 0, ZF=1.
 TEST_F(CpuRuntimeTest, Popcnt64_Zero_SetsZf) {
     const u8 program[] = {
-        0x48, 0x31, 0xc9,             // xor rcx, rcx
-        0xf3, 0x48, 0x0f, 0xb8, 0xc1, // popcnt rax, rcx
+        0x48, 0x31, 0xc9,                           // xor rcx, rcx
+        0xf3, 0x48, 0x0f, 0xb8, 0xc1,               // popcnt rax, rcx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4460,7 +4361,7 @@ TEST_F(CpuRuntimeTest, Popcnt64_Zero_SetsZf) {
 // Expected: xmm0 = {A, B} (B in the high 64 of xmm0).
 TEST_F(CpuRuntimeTest, Vpunpcklqdq_InterleavesLowQuadwords) {
     const u8 program[] = {
-        0xc5, 0xf1, 0x6c, 0xc2, // vpunpcklqdq xmm0, xmm1, xmm2
+        0xc5, 0xf1, 0x6c, 0xc2,                     // vpunpcklqdq xmm0, xmm1, xmm2
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -4506,30 +4407,11 @@ TEST_F(CpuRuntimeTest, Bextr32_MemSrc_ExtractsByteFromMid) {
 
     const u8 program[] = {
         // mov rdi, <scratch addr>
-        0x48,
-        0xbf,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,
         // mov rcx, 0x0808
-        0x48,
-        0xc7,
-        0xc1,
-        0x08,
-        0x08,
-        0x00,
-        0x00,
+        0x48, 0xc7, 0xc1, 0x08, 0x08, 0x00, 0x00,
         // bextr eax, dword[rdi], ecx
-        0xc4,
-        0xe2,
-        0x70,
-        0xf7,
-        0x07,
+        0xc4, 0xe2, 0x70, 0xf7, 0x07,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4556,21 +4438,11 @@ TEST_F(CpuRuntimeTest, Inc8_MemDst_AdvancesByteAndPreservesCf) {
     *scratch = 0x41; // 'A'
 
     const u8 program[] = {
-        0xf9, // stc  → CF=1
+        0xf9,                                        // stc  → CF=1
         // mov rax, <scratch addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // inc byte[rax]   (FE /0 [rax] = 2 bytes; with disp8 = 3)
-        0xfe,
-        0x00,
+        0xfe, 0x00,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4590,8 +4462,8 @@ TEST_F(CpuRuntimeTest, Inc8_MemDst_SignedOverflow_SetsOfSf) {
     *scratch = 0x7F;
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, // mov rax, <addr>
-        0xfe, 0x00,                         // inc byte[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,                // mov rax, <addr>
+        0xfe, 0x00,                                  // inc byte[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4602,7 +4474,7 @@ TEST_F(CpuRuntimeTest, Inc8_MemDst_SignedOverflow_SetsOfSf) {
     const auto r = RunProgram(prog, sizeof(prog), mem);
     EXPECT_EQ(*scratch, 0x80);
     EXPECT_TRUE(r.state.rflags & (1ULL << 11)) << "OF set on signed wrap +→−";
-    EXPECT_TRUE(r.state.rflags & (1ULL << 7)) << "SF set (result MSB = 1)";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 7))  << "SF set (result MSB = 1)";
     EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear (result ≠ 0)";
 }
 
@@ -4614,7 +4486,7 @@ TEST_F(CpuRuntimeTest, Inc8_MemDst_SignedOverflow_SetsOfSf) {
 // Broadcast: imm = 0x00 → all four output dwords = src[0].
 TEST_F(CpuRuntimeTest, Vpshufd_BroadcastsLowestDword) {
     const u8 program[] = {
-        0xc5, 0xf9, 0x70, 0xc1, 0x00, // vpshufd xmm0, xmm1, 0x00
+        0xc5, 0xf9, 0x70, 0xc1, 0x00,                // vpshufd xmm0, xmm1, 0x00
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -4651,7 +4523,7 @@ TEST_F(CpuRuntimeTest, Vpshufd_BroadcastsLowestDword) {
 // out[2]=src[1], out[3]=src[0].
 TEST_F(CpuRuntimeTest, Vpshufd_ReversesDwords) {
     const u8 program[] = {
-        0xc5, 0xf9, 0x70, 0xc1, 0x1b, // vpshufd xmm0, xmm1, 0x1b
+        0xc5, 0xf9, 0x70, 0xc1, 0x1b,                // vpshufd xmm0, xmm1, 0x1b
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -4683,21 +4555,21 @@ TEST_F(CpuRuntimeTest, Vpshufd_ReversesDwords) {
 // LZCNT of 0xFF (low byte): 32-bit operand → 24 leading zeros.
 TEST_F(CpuRuntimeTest, Lzcnt32_CountsHighZeroBits) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc1, 0xff, 0x00, 0x00, 0x00, // mov rcx, 0xFF
-        0xf3, 0x0f, 0xbd, 0xc1,                   // lzcnt eax, ecx
+        0x48, 0xc7, 0xc1, 0xff, 0x00, 0x00, 0x00,    // mov rcx, 0xFF
+        0xf3, 0x0f, 0xbd, 0xc1,                      // lzcnt eax, ecx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
     EXPECT_EQ(r.state.gpr[0], 24ULL) << "lzcnt(0xFF) for 32-bit = 24";
-    EXPECT_FALSE(r.state.rflags & 1ULL) << "CF clear when src ≠ 0";
+    EXPECT_FALSE(r.state.rflags & 1ULL)        << "CF clear when src ≠ 0";
     EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear (result ≠ 0)";
 }
 
 // LZCNT of 0: result = operand size (32), CF = 1 (signals "no bits set").
 TEST_F(CpuRuntimeTest, Lzcnt32_ZeroSrc_ReturnsOperandSizeAndSetsCf) {
     const u8 program[] = {
-        0x48, 0x31, 0xc9,       // xor rcx, rcx
-        0xf3, 0x0f, 0xbd, 0xc1, // lzcnt eax, ecx
+        0x48, 0x31, 0xc9,                            // xor rcx, rcx
+        0xf3, 0x0f, 0xbd, 0xc1,                      // lzcnt eax, ecx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4709,7 +4581,8 @@ TEST_F(CpuRuntimeTest, Lzcnt32_ZeroSrc_ReturnsOperandSizeAndSetsCf) {
 TEST_F(CpuRuntimeTest, Lzcnt32_MsbSet_ResultIsZero_SetsZf) {
     const u8 program[] = {
         // mov rcx, 0x80000000
-        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x80, 0xf3, 0x0f, 0xbd, 0xc1, // lzcnt eax, ecx
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x80,
+        0xf3, 0x0f, 0xbd, 0xc1,                      // lzcnt eax, ecx
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4727,10 +4600,10 @@ TEST_F(CpuRuntimeTest, Lzcnt32_MsbSet_ResultIsZero_SetsZf) {
 TEST_F(CpuRuntimeTest, Sbb8_BorrowClear_StraightSubtraction) {
     const u8 program[] = {
         // Force CF=0 via a CMP that produces CF=0 (any A-A).
-        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00, // mov rax, 0x0A
-        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 0x03
-        0xf8,                                     // clc → CF=0
-        0x18, 0xc8,                               // sbb al, cl
+        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00,    // mov rax, 0x0A
+        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00,    // mov rcx, 0x03
+        0xf8,                                         // clc → CF=0
+        0x18, 0xc8,                                   // sbb al, cl
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4741,10 +4614,10 @@ TEST_F(CpuRuntimeTest, Sbb8_BorrowClear_StraightSubtraction) {
 // 10 - 3 - 1(CF) = 6. Verifies the CF input is actually consumed.
 TEST_F(CpuRuntimeTest, Sbb8_BorrowSet_SubtractsExtraOne) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00, // mov rax, 0x0A
-        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00, // mov rcx, 0x03
-        0xf9,                                     // stc → CF=1
-        0x18, 0xc8,                               // sbb al, cl
+        0x48, 0xc7, 0xc0, 0x0a, 0x00, 0x00, 0x00,    // mov rax, 0x0A
+        0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00,    // mov rcx, 0x03
+        0xf9,                                         // stc → CF=1
+        0x18, 0xc8,                                   // sbb al, cl
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4755,10 +4628,10 @@ TEST_F(CpuRuntimeTest, Sbb8_BorrowSet_SubtractsExtraOne) {
 // 0 - 1 - 0 wraps to 0xFF (-1 in two's complement 8-bit). CF=1 (borrow out).
 TEST_F(CpuRuntimeTest, Sbb8_Underflow_SetsCf) {
     const u8 program[] = {
-        0x48, 0x31, 0xc0,                         // xor rax, rax  (al=0)
-        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00, // mov rcx, 1
-        0xf8,                                     // clc → CF=0
-        0x18, 0xc8,                               // sbb al, cl
+        0x48, 0x31, 0xc0,                             // xor rax, rax  (al=0)
+        0x48, 0xc7, 0xc1, 0x01, 0x00, 0x00, 0x00,    // mov rcx, 1
+        0xf8,                                         // clc → CF=0
+        0x18, 0xc8,                                   // sbb al, cl
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
@@ -4781,35 +4654,12 @@ TEST_F(CpuRuntimeTest, Cmovns16_MemSrc_TrueMergesLow16PreservingUpper48) {
 
     const u8 program[] = {
         // mov rdi, <scratch addr>
-        0x48,
-        0xbf,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,
         // mov rax, 0xDEADBEEFCAFEBABE — pre-pollute dst's upper 48
-        0x48,
-        0xb8,
-        0xbe,
-        0xba,
-        0xfe,
-        0xca,
-        0xef,
-        0xbe,
-        0xad,
-        0xde,
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
         // Force SF=0 via xor rcx,rcx (which clears SF). Then cmovns ax, word[rdi].
-        0x48,
-        0x31,
-        0xc9, // xor rcx, rcx (SF=0 now)
-        0x66,
-        0x0f,
-        0x49,
-        0x07, // cmovns ax, word[rdi]
+        0x48, 0x31, 0xc9,                             // xor rcx, rcx (SF=0 now)
+        0x66, 0x0f, 0x49, 0x07,                       // cmovns ax, word[rdi]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4829,44 +4679,14 @@ TEST_F(CpuRuntimeTest, Cmovns16_MemSrc_FalseLeavesDstUnchanged) {
 
     const u8 program[] = {
         // mov rdi, <scratch addr>
-        0x48,
-        0xbf,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,
         // mov rax, 0xDEADBEEFCAFEBABE — should remain entirely unchanged
-        0x48,
-        0xb8,
-        0xbe,
-        0xba,
-        0xfe,
-        0xca,
-        0xef,
-        0xbe,
-        0xad,
-        0xde,
+        0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
         // Force SF=1 by computing a negative result (cmp 0, 1 → SF=1, CF=1).
-        0x48,
-        0xc7,
-        0xc1,
-        0x00,
-        0x00,
-        0x00,
-        0x00, // mov rcx, 0
-        0x48,
-        0x83,
-        0xf9,
-        0x01, // cmp rcx, 1   → SF=1
+        0x48, 0xc7, 0xc1, 0x00, 0x00, 0x00, 0x00,    // mov rcx, 0
+        0x48, 0x83, 0xf9, 0x01,                       // cmp rcx, 1   → SF=1
         // cmovns ax, word[rdi]  — condition FALSE → no change
-        0x66,
-        0x0f,
-        0x49,
-        0x07,
+        0x66, 0x0f, 0x49, 0x07,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4890,38 +4710,42 @@ TEST_F(CpuRuntimeTest, Sbb32_RegImm_BorrowClear_AndZeroExtends) {
     const u8 program[] = {
         // mov rcx, 0xDEADBEEF_00000100  — pre-pollute upper 32
         0x48, 0xb9, 0x00, 0x01, 0x00, 0x00, 0xef, 0xbe, 0xad, 0xde,
-        0xf8,             // clc → CF=0
-        0x83, 0xd9, 0x10, // sbb ecx, 0x10
+        0xf8,                                         // clc → CF=0
+        0x83, 0xd9, 0x10,                             // sbb ecx, 0x10
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_EQ(r.state.gpr[1], 0xF0ULL) << "0x100 - 0x10 - 0 = 0xF0; upper 32 zero-extended";
+    EXPECT_EQ(r.state.gpr[1], 0xF0ULL)
+        << "0x100 - 0x10 - 0 = 0xF0; upper 32 zero-extended";
     EXPECT_FALSE(r.state.rflags & 1ULL) << "no borrow out";
 }
 
 // `sbb ecx, 0x10` with rcx = 0x100 and CF = 1 → result = 0xEF.
 TEST_F(CpuRuntimeTest, Sbb32_RegImm_BorrowSet_SubtractsExtraOne) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc1, 0x00, 0x01, 0x00, 0x00, // mov rcx, 0x100
-        0xf9,                                     // stc → CF=1
-        0x83, 0xd9, 0x10,                         // sbb ecx, 0x10
+        0x48, 0xc7, 0xc1, 0x00, 0x01, 0x00, 0x00,    // mov rcx, 0x100
+        0xf9,                                         // stc → CF=1
+        0x83, 0xd9, 0x10,                             // sbb ecx, 0x10
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_EQ(r.state.gpr[1], 0xEFULL) << "0x100 - 0x10 - 1 = 0xEF; CF input consumed";
+    EXPECT_EQ(r.state.gpr[1], 0xEFULL)
+        << "0x100 - 0x10 - 1 = 0xEF; CF input consumed";
 }
 
 // Underflow: 0 - 1 - 0 wraps to 0xFFFFFFFF with CF=1.
 TEST_F(CpuRuntimeTest, Sbb32_RegImm_Underflow_SetsCf) {
     const u8 program[] = {
-        0x48, 0x31, 0xc9, // xor rcx, rcx
-        0xf8,             // clc
-        0x83, 0xd9, 0x01, // sbb ecx, 1
+        0x48, 0x31, 0xc9,                             // xor rcx, rcx
+        0xf8,                                         // clc
+        0x83, 0xd9, 0x01,                             // sbb ecx, 1
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_EQ(r.state.gpr[1], 0xFFFFFFFFULL) << "0 - 1 wraps to 0xFFFFFFFF (low 32)";
-    EXPECT_EQ(r.state.gpr[1] >> 32, 0u) << "32-bit op must zero-extend bits 63:32";
+    EXPECT_EQ(r.state.gpr[1], 0xFFFFFFFFULL)
+        << "0 - 1 wraps to 0xFFFFFFFF (low 32)";
+    EXPECT_EQ(r.state.gpr[1] >> 32, 0u)
+        << "32-bit op must zero-extend bits 63:32";
     EXPECT_TRUE(r.state.rflags & 1ULL) << "CF set on borrow out";
 }
 
@@ -4940,21 +4764,9 @@ TEST_F(CpuRuntimeTest, Vmovss_Load_PlacesLow32ZeroesRest) {
 
     const u8 program[] = {
         // mov rax, <scratch addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // vmovss xmm0, dword[rax]  (c5 fa 10 00 = 4 bytes)
-        0xc5,
-        0xfa,
-        0x10,
-        0x00,
+        0xc5, 0xfa, 0x10, 0x00,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -4994,21 +4806,9 @@ TEST_F(CpuRuntimeTest, Vmovss_Store_WritesLow32Only) {
 
     const u8 program[] = {
         // mov rax, <scratch addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // vmovss dword[rax], xmm0  (c5 fa 11 00)
-        0xc5,
-        0xfa,
-        0x11,
-        0x00,
+        0xc5, 0xfa, 0x11, 0x00,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5079,8 +4879,8 @@ TEST_F(CpuRuntimeTest, Vmovss_RegRegReg_MergesFromTwoSources) {
 // Convert int32 = 42 to float. IEEE-754 float(42) = 0x42280000.
 TEST_F(CpuRuntimeTest, Vcvtsi2ss_Int32ToFloat_BasicValue) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x2a, 0x00, 0x00, 0x00, // mov rax, 42
-        0xc5, 0xf2, 0x2a, 0xc8,                   // vcvtsi2ss xmm1, xmm1, eax
+        0x48, 0xc7, 0xc0, 0x2a, 0x00, 0x00, 0x00,    // mov rax, 42
+        0xc5, 0xf2, 0x2a, 0xc8,                       // vcvtsi2ss xmm1, xmm1, eax
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -5103,11 +4903,12 @@ TEST_F(CpuRuntimeTest, Vcvtsi2ss_Int32ToFloat_BasicValue) {
 
     // chunk 0 low32 = float(42), hi32 = preserved 0xAAAAAAAA
     const u32 low32 = static_cast<u32>(st.ymm[4] & 0xFFFFFFFFULL);
-    const u32 hi32 = static_cast<u32>(st.ymm[4] >> 32);
+    const u32 hi32  = static_cast<u32>(st.ymm[4] >> 32);
     float as_float;
     std::memcpy(&as_float, &low32, sizeof(as_float));
     EXPECT_EQ(as_float, 42.0f);
-    EXPECT_EQ(hi32, 0xAAAAAAAAu) << "src1[63:32] must be preserved (dst==src1 here)";
+    EXPECT_EQ(hi32, 0xAAAAAAAAu)
+        << "src1[63:32] must be preserved (dst==src1 here)";
     EXPECT_EQ(st.ymm[5], 0xBBBBBBBBBBBBBBBBULL) << "chunk 1 preserved";
     EXPECT_EQ(st.ymm[6], 0ULL) << "VEX-128 zeroes upper YMM";
     EXPECT_EQ(st.ymm[7], 0ULL);
@@ -5117,8 +4918,8 @@ TEST_F(CpuRuntimeTest, Vcvtsi2ss_Int32ToFloat_BasicValue) {
 TEST_F(CpuRuntimeTest, Vcvtsi2ss_NegativeInt32) {
     const u8 program[] = {
         // mov rax, -100  (encoded as imm32 sign-extended)
-        0x48, 0xc7, 0xc0, 0x9c, 0xff, 0xff,
-        0xff, 0xc5, 0xf2, 0x2a, 0xc8, // vcvtsi2ss xmm1, xmm1, eax
+        0x48, 0xc7, 0xc0, 0x9c, 0xff, 0xff, 0xff,
+        0xc5, 0xf2, 0x2a, 0xc8,                       // vcvtsi2ss xmm1, xmm1, eax
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -5140,8 +4941,8 @@ TEST_F(CpuRuntimeTest, Vcvtsi2ss_NegativeInt32) {
 // pre-existing value).
 TEST_F(CpuRuntimeTest, Vcvtsi2ss_ThreeOperand_UpperFromSrc1) {
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7
-        0xc5, 0xf2, 0x2a, 0xc0,                   // vcvtsi2ss xmm0, xmm1, eax
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,    // mov rax, 7
+        0xc5, 0xf2, 0x2a, 0xc0,                       // vcvtsi2ss xmm0, xmm1, eax
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -5160,11 +4961,12 @@ TEST_F(CpuRuntimeTest, Vcvtsi2ss_ThreeOperand_UpperFromSrc1) {
     Runtime rt;
     rt.Run(st);
     const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
-    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    const u32 hi32  = static_cast<u32>(st.ymm[0] >> 32);
     float as_float;
     std::memcpy(&as_float, &low32, sizeof(as_float));
     EXPECT_EQ(as_float, 7.0f);
-    EXPECT_EQ(hi32, 0x77777777u) << "dst[63:32] must come from src1, not from pre-existing dst";
+    EXPECT_EQ(hi32, 0x77777777u)
+        << "dst[63:32] must come from src1, not from pre-existing dst";
     EXPECT_EQ(st.ymm[1], 0x8888888888888888ULL) << "dst chunk 1 from src1";
     EXPECT_EQ(st.ymm[2], 0ULL);
     EXPECT_EQ(st.ymm[3], 0ULL);
@@ -5181,7 +4983,8 @@ TEST_F(CpuRuntimeTest, Vcvtsi2ss_ThreeOperand_UpperFromSrc1) {
 TEST_F(CpuRuntimeTest, Vmulss_BasicMultiply) {
     // vmulss xmm0, xmm1, xmm2  — encoding c5 f2 59 c2
     const u8 program[] = {
-        0xc5, 0xf2, 0x59, 0xc2, 0xc3,
+        0xc5, 0xf2, 0x59, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5238,7 +5041,7 @@ TEST_F(CpuRuntimeTest, Vmulss_PreservesSrc1Upper) {
     rt.Run(st);
 
     const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
-    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    const u32 hi32  = static_cast<u32>(st.ymm[0] >> 32);
     float result;
     std::memcpy(&result, &low32, sizeof(result));
     EXPECT_EQ(result, 10.0f);
@@ -5257,21 +5060,9 @@ TEST_F(CpuRuntimeTest, Vmulss_MemorySource) {
 
     const u8 program[] = {
         // mov rax, <fmem addr>
-        0x48,
-        0xb8,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
         // vmulss xmm0, xmm1, dword[rax]   (c5 f2 59 00)
-        0xc5,
-        0xf2,
-        0x59,
-        0x00,
+        0xc5, 0xf2, 0x59, 0x00,
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5341,8 +5132,9 @@ TEST_F(CpuRuntimeTest, Vcvttss2si_NegativeTruncatesTowardZero) {
     Runtime rt;
     rt.Run(st);
     // -3 as int32 = 0xFFFFFFFD; zero-extended to 64-bit = 0xFFFFFFFD
-    EXPECT_EQ(st.gpr[0], 0xFFFFFFFDULL) << "-3.7f truncates to -3 (sign-bit pattern in low 32, "
-                                           "upper 32 zero per x86-64 32-bit-write rule)";
+    EXPECT_EQ(st.gpr[0], 0xFFFFFFFDULL)
+        << "-3.7f truncates to -3 (sign-bit pattern in low 32, "
+           "upper 32 zero per x86-64 32-bit-write rule)";
 }
 
 // NaN converts to the "indefinite integer value" — INT32_MIN
@@ -5376,7 +5168,8 @@ TEST_F(CpuRuntimeTest, Vcvttss2si_NanProducesIntMin) {
 TEST_F(CpuRuntimeTest, Vdivss_BasicDivide) {
     // vdivss xmm0, xmm1, xmm2  — encoding c5 f2 5e c2 (opcode 0x5E vs MUL's 0x59)
     const u8 program[] = {
-        0xc5, 0xf2, 0x5e, 0xc2, 0xc3,
+        0xc5, 0xf2, 0x5e, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5408,7 +5201,8 @@ TEST_F(CpuRuntimeTest, Vdivss_PreservesSrc1Upper) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.ymm[4] = (static_cast<u64>(0x11223344ULL) << 32) | std::bit_cast<u32>(20.0f);
+    st.ymm[4] = (static_cast<u64>(0x11223344ULL) << 32)
+              | std::bit_cast<u32>(20.0f);
     st.ymm[5] = 0x5566778899AABBCCULL;
     st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(5.0f));
     st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
@@ -5419,7 +5213,7 @@ TEST_F(CpuRuntimeTest, Vdivss_PreservesSrc1Upper) {
     Runtime rt;
     rt.Run(st);
     const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
-    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    const u32 hi32  = static_cast<u32>(st.ymm[0] >> 32);
     float result;
     std::memcpy(&result, &low32, sizeof(result));
     EXPECT_EQ(result, 4.0f) << "20.0 / 5.0 = 4.0";
@@ -5434,8 +5228,8 @@ TEST_F(CpuRuntimeTest, Vdivss_MemorySource) {
     u32* fmem = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
     *fmem = std::bit_cast<u32>(2.0f);
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <fmem>
-        0xc5, 0xf2, 0x5e, 0x00,                   // vdivss xmm0, xmm1, dword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,    // mov rax, <fmem>
+        0xc5, 0xf2, 0x5e, 0x00,          // vdivss xmm0, xmm1, dword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5467,7 +5261,8 @@ TEST_F(CpuRuntimeTest, Vdivss_MemorySource) {
 TEST_F(CpuRuntimeTest, Vaddss_BasicAdd) {
     // vaddss xmm0, xmm1, xmm2  — encoding c5 f2 58 c2
     const u8 program[] = {
-        0xc5, 0xf2, 0x58, 0xc2, 0xc3,
+        0xc5, 0xf2, 0x58, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5475,8 +5270,8 @@ TEST_F(CpuRuntimeTest, Vaddss_BasicAdd) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(1.5f));  // xmm1
-    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(2.25f)); // xmm2
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(1.5f));   // xmm1
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(2.25f));  // xmm2
     Runtime rt;
     rt.Run(st);
     const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
@@ -5490,7 +5285,8 @@ TEST_F(CpuRuntimeTest, Vaddss_MemorySource) {
     u32* fmem = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
     *fmem = std::bit_cast<u32>(0.5f);
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf2, 0x58, 0x00, // vaddss xmm0, xmm1, dword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf2, 0x58, 0x00,  // vaddss xmm0, xmm1, dword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5527,7 +5323,8 @@ namespace {
 u64 RunVucomiss_Xmm0_Xmm1(GuestMemory& mem, float a, float b) {
     // vucomiss xmm0, xmm1 — c5 f8 2e c1
     const u8 program[] = {
-        0xc5, 0xf8, 0x2e, 0xc1, 0xc3,
+        0xc5, 0xf8, 0x2e, 0xc1,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5599,7 +5396,8 @@ TEST_F(CpuRuntimeTest, Vucomiss_NaN_SetsAllThree) {
 TEST_F(CpuRuntimeTest, Vcvtss2sd_BasicWideningExact) {
     // vcvtss2sd xmm0, xmm1, xmm2 — c5 f2 5a c2
     const u8 program[] = {
-        0xc5, 0xf2, 0x5a, 0xc2, 0xc3,
+        0xc5, 0xf2, 0x5a, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5648,7 +5446,8 @@ TEST_F(CpuRuntimeTest, Vcvtss2sd_PreservesSrc1Upper64) {
     double result;
     std::memcpy(&result, &st.ymm[0], sizeof(result));
     EXPECT_EQ(result, 1.0);
-    EXPECT_EQ(st.ymm[1], 0xCAFEBABE12345678ULL) << "dst[127:64] must come from src1[127:64]";
+    EXPECT_EQ(st.ymm[1], 0xCAFEBABE12345678ULL)
+        << "dst[127:64] must come from src1[127:64]";
     EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeroes upper YMM";
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -5663,7 +5462,8 @@ TEST_F(CpuRuntimeTest, Vcvtss2sd_PreservesSrc1Upper64) {
 TEST_F(CpuRuntimeTest, Vmulsd_BasicMultiply) {
     // vmulsd xmm0, xmm1, xmm2  — c5 f3 59 c2 (F2 prefix marks SD)
     const u8 program[] = {
-        0xc5, 0xf3, 0x59, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x59, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5695,9 +5495,9 @@ TEST_F(CpuRuntimeTest, Vmulsd_PreservesSrc1Upper64) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.ymm[4] = std::bit_cast<u64>(2.0); // xmm1 low64
-    st.ymm[5] = 0xF00DBABEAABBCCDDULL;   // xmm1 high64 — must land in dst.chunk1
-    st.ymm[8] = std::bit_cast<u64>(3.0); // xmm2 low64
+    st.ymm[4] = std::bit_cast<u64>(2.0);                  // xmm1 low64
+    st.ymm[5] = 0xF00DBABEAABBCCDDULL;                    // xmm1 high64 — must land in dst.chunk1
+    st.ymm[8] = std::bit_cast<u64>(3.0);                  // xmm2 low64
     st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
     st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
     st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
@@ -5708,7 +5508,8 @@ TEST_F(CpuRuntimeTest, Vmulsd_PreservesSrc1Upper64) {
     double result;
     std::memcpy(&result, &st.ymm[0], sizeof(result));
     EXPECT_EQ(result, 6.0);
-    EXPECT_EQ(st.ymm[1], 0xF00DBABEAABBCCDDULL) << "dst[127:64] must come from src1[127:64]";
+    EXPECT_EQ(st.ymm[1], 0xF00DBABEAABBCCDDULL)
+        << "dst[127:64] must come from src1[127:64]";
     EXPECT_EQ(st.ymm[2], 0ULL);
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -5719,8 +5520,8 @@ TEST_F(CpuRuntimeTest, Vmulsd_MemorySource) {
     u64* dmem = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     *dmem = std::bit_cast<u64>(4.0);
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <dmem>
-        0xc5, 0xf3, 0x59, 0x00,                   // vmulsd xmm0, xmm1, qword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0, // mov rax, <dmem>
+        0xc5, 0xf3, 0x59, 0x00,       // vmulsd xmm0, xmm1, qword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5749,7 +5550,8 @@ TEST_F(CpuRuntimeTest, Vmulsd_MemorySource) {
 TEST_F(CpuRuntimeTest, Vaddsd_BasicAdd) {
     // vaddsd xmm0, xmm1, xmm2  — c5 f3 58 c2
     const u8 program[] = {
-        0xc5, 0xf3, 0x58, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x58, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5757,8 +5559,8 @@ TEST_F(CpuRuntimeTest, Vaddsd_BasicAdd) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.ymm[4] = std::bit_cast<u64>(1.5);  // xmm1
-    st.ymm[8] = std::bit_cast<u64>(2.25); // xmm2
+    st.ymm[4] = std::bit_cast<u64>(1.5);    // xmm1
+    st.ymm[8] = std::bit_cast<u64>(2.25);   // xmm2
     Runtime rt;
     rt.Run(st);
     double result;
@@ -5771,7 +5573,8 @@ TEST_F(CpuRuntimeTest, Vaddsd_MemorySource) {
     u64* dmem = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     *dmem = std::bit_cast<u64>(0.5);
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf3, 0x58, 0x00, // vaddsd xmm0, xmm1, qword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf3, 0x58, 0x00,  // vaddsd xmm0, xmm1, qword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5803,7 +5606,8 @@ TEST_F(CpuRuntimeTest, Vaddsd_MemorySource) {
 TEST_F(CpuRuntimeTest, Vcvtsd2ss_BasicNarrowingExact) {
     // vcvtsd2ss xmm0, xmm1, xmm2  — c5 f3 5a c2
     const u8 program[] = {
-        0xc5, 0xf3, 0x5a, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x5a, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5826,7 +5630,8 @@ TEST_F(CpuRuntimeTest, Vcvtsd2ss_BasicNarrowingExact) {
 // at bit 64.
 TEST_F(CpuRuntimeTest, Vcvtsd2ss_PreservesSrc1Upper96) {
     const u8 program[] = {
-        0xc5, 0xf3, 0x5a, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x5a, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5849,13 +5654,14 @@ TEST_F(CpuRuntimeTest, Vcvtsd2ss_PreservesSrc1Upper96) {
     Runtime rt;
     rt.Run(st);
     const u32 low32 = static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL);
-    const u32 hi32 = static_cast<u32>(st.ymm[0] >> 32);
+    const u32 hi32  = static_cast<u32>(st.ymm[0] >> 32);
     float result;
     std::memcpy(&result, &low32, sizeof(result));
     EXPECT_EQ(result, 1.0f);
     EXPECT_EQ(hi32, 0xCAFEFACEu)
         << "dst[63:32] must come from src1[63:32] (merge boundary at bit 32)";
-    EXPECT_EQ(st.ymm[1], 0x1234567812345678ULL) << "dst[127:64] from src1[127:64]";
+    EXPECT_EQ(st.ymm[1], 0x1234567812345678ULL)
+        << "dst[127:64] from src1[127:64]";
     EXPECT_EQ(st.ymm[2], 0ULL);
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -5865,7 +5671,8 @@ TEST_F(CpuRuntimeTest, Vcvtsd2ss_PreservesSrc1Upper96) {
 // C++ compiler produces for (float)d, which uses the same MXCSR.
 TEST_F(CpuRuntimeTest, Vcvtsd2ss_NarrowingRoundsCorrectly) {
     const u8 program[] = {
-        0xc5, 0xf3, 0x5a, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x5a, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5896,7 +5703,8 @@ TEST_F(CpuRuntimeTest, Vcvtsd2ss_NarrowingRoundsCorrectly) {
 TEST_F(CpuRuntimeTest, Vsubss_BasicSubtract) {
     // vsubss xmm0, xmm1, xmm2  — c5 f2 5c c2
     const u8 program[] = {
-        0xc5, 0xf2, 0x5c, 0xc2, 0xc3,
+        0xc5, 0xf2, 0x5c, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -5951,8 +5759,8 @@ TEST_F(CpuRuntimeTest, Vmovsd_Load_PlacesLow64ZeroesRest) {
     u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     *scratch = std::bit_cast<u64>(2.718281828459045);
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <scratch>
-        0xc5, 0xfb, 0x10, 0x00,                   // vmovsd xmm0, qword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0, // mov rax, <scratch>
+        0xc5, 0xfb, 0x10, 0x00,       // vmovsd xmm0, qword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -5987,7 +5795,8 @@ TEST_F(CpuRuntimeTest, Vmovsd_Store_WritesLow64Only) {
     u64* sentinel = scratch + 1;
     *sentinel = 0xDEADBEEFDEADBEEFULL;
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xfb, 0x11, 0x00, // vmovsd qword[rax], xmm0
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xfb, 0x11, 0x00,       // vmovsd qword[rax], xmm0
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -6000,8 +5809,8 @@ TEST_F(CpuRuntimeTest, Vmovsd_Store_WritesLow64Only) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.ymm[0] = std::bit_cast<u64>(1.5); // xmm0.low64
-    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;   // xmm0[127:64] — must NOT be stored
+    st.ymm[0] = std::bit_cast<u64>(1.5);  // xmm0.low64
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;    // xmm0[127:64] — must NOT be stored
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(*scratch, std::bit_cast<u64>(1.5));
@@ -6013,7 +5822,8 @@ TEST_F(CpuRuntimeTest, Vmovsd_Store_WritesLow64Only) {
 TEST_F(CpuRuntimeTest, Vmovsd_RegRegReg_MergesFromTwoSources) {
     // vmovsd xmm0, xmm1, xmm2  — c5 f3 10 c2
     const u8 program[] = {
-        0xc5, 0xf3, 0x10, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x10, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6022,11 +5832,11 @@ TEST_F(CpuRuntimeTest, Vmovsd_RegRegReg_MergesFromTwoSources) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // src1 = xmm1 (lane 4): chunk 0 ignored, chunk 1 preserved into dst.chunk1
-    st.ymm[4] = 0xDEAD000000000000ULL; // chunk 0 - ignored
-    st.ymm[5] = 0xCAFEBABE11223344ULL; // chunk 1 - preserved
+    st.ymm[4] = 0xDEAD000000000000ULL;          // chunk 0 - ignored
+    st.ymm[5] = 0xCAFEBABE11223344ULL;          // chunk 1 - preserved
     // src2 = xmm2 (lane 8): chunk 0 → dst.chunk0
     st.ymm[8] = 0x123456789ABCDEF0ULL;
-    st.ymm[9] = 0x9999999999999999ULL; // ignored
+    st.ymm[9] = 0x9999999999999999ULL;          // ignored
     // pre-pollute dst (xmm0, lane 0)
     st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
     st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
@@ -6049,7 +5859,8 @@ TEST_F(CpuRuntimeTest, Vmovsd_RegRegReg_MergesFromTwoSources) {
 TEST_F(CpuRuntimeTest, Vsubsd_BasicSubtract) {
     // vsubsd xmm0, xmm1, xmm2  — c5 f3 5c c2
     const u8 program[] = {
-        0xc5, 0xf3, 0x5c, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x5c, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6096,7 +5907,8 @@ TEST_F(CpuRuntimeTest, Vsubsd_OperandOrderCheck) {
 TEST_F(CpuRuntimeTest, Vdivsd_BasicDivide) {
     // vdivsd xmm0, xmm1, xmm2  — c5 f3 5e c2
     const u8 program[] = {
-        0xc5, 0xf3, 0x5e, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x5e, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6153,8 +5965,8 @@ TEST_F(CpuRuntimeTest, Vxorps_MemSource_128_XorsAcrossChunks) {
     mem_op[1] = 0x5555555555555555ULL;
 
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0, 0, 0, 0, 0, 0, // mov rax, <mem_op>
-        0xc5, 0xf0, 0x57, 0x00,                   // vxorps xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,  // mov rax, <mem_op>
+        0xc5, 0xf0, 0x57, 0x00,        // vxorps xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -6176,8 +5988,10 @@ TEST_F(CpuRuntimeTest, Vxorps_MemSource_128_XorsAcrossChunks) {
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.ymm[0], 0xF0F0F0F0F0F0F0F0ULL) << "chunk 0 = 0x0F0F... XOR 0xFFFF... = 0xF0F0...";
-    EXPECT_EQ(st.ymm[1], 0xFFFFFFFFFFFFFFFFULL) << "chunk 1 = 0xAAAA... XOR 0x5555... = 0xFFFF...";
+    EXPECT_EQ(st.ymm[0], 0xF0F0F0F0F0F0F0F0ULL)
+        << "chunk 0 = 0x0F0F... XOR 0xFFFF... = 0xF0F0...";
+    EXPECT_EQ(st.ymm[1], 0xFFFFFFFFFFFFFFFFULL)
+        << "chunk 1 = 0xAAAA... XOR 0x5555... = 0xFFFF...";
     EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -6191,7 +6005,9 @@ TEST_F(CpuRuntimeTest, Vxorps_MemSource_SignFlipPattern) {
     mask[1] = mask[2] = mask[3] = 0;
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf0, 0x57, 0x00, 0xc3,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf0, 0x57, 0x00,
+        0xc3,
     };
     u8 prog[sizeof(program)];
     std::memcpy(prog, program, sizeof(program));
@@ -6223,7 +6039,8 @@ TEST_F(CpuRuntimeTest, Vxorps_MemSource_SignFlipPattern) {
 TEST_F(CpuRuntimeTest, Vpand_RegSrc_AndsAcrossChunks) {
     // vpand xmm0, xmm1, xmm2 — c5 f1 db c2
     const u8 program[] = {
-        0xc5, 0xf1, 0xdb, 0xc2, 0xc3,
+        0xc5, 0xf1, 0xdb, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6245,7 +6062,8 @@ TEST_F(CpuRuntimeTest, Vpand_RegSrc_AndsAcrossChunks) {
     rt.Run(st);
     EXPECT_EQ(st.ymm[0], 0x0F000F000F000F00ULL)
         << "chunk 0 = 0xFF00FF00... AND 0x0FF00FF0... = 0x0F000F00...";
-    EXPECT_EQ(st.ymm[1], 0x8888888888888888ULL) << "chunk 1 = 0xAAAA... AND 0xCCCC... = 0x8888...";
+    EXPECT_EQ(st.ymm[1], 0x8888888888888888ULL)
+        << "chunk 1 = 0xAAAA... AND 0xCCCC... = 0x8888...";
     EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -6254,12 +6072,12 @@ TEST_F(CpuRuntimeTest, Vpand_RegSrc_AndsAcrossChunks) {
 // Same use case as VXORPS sign-flip, just AND instead of XOR.
 TEST_F(CpuRuntimeTest, Vpand_MemSource_AbsValuePattern) {
     u32* mask = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
-    mask[0] = 0x7FFFFFFFu;                     // clears sign bit
+    mask[0] = 0x7FFFFFFFu; // clears sign bit
     mask[1] = mask[2] = mask[3] = 0xFFFFFFFFu; // leave other lanes alone
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0,    0,    0,    0,
-        0,    0,    0, 0xc5, 0xf1, 0xdb, 0x00, // vpand xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf1, 0xdb, 0x00, // vpand xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -6293,7 +6111,8 @@ TEST_F(CpuRuntimeTest, Vpand_MemSource_AbsValuePattern) {
 TEST_F(CpuRuntimeTest, Vsqrtsd_BasicSquareRoot) {
     // vsqrtsd xmm0, xmm1, xmm2  — c5 f3 51 c2
     const u8 program[] = {
-        0xc5, 0xf3, 0x51, 0xc2, 0xc3,
+        0xc5, 0xf3, 0x51, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6363,7 +6182,8 @@ TEST_F(CpuRuntimeTest, Vblendps_AlternatingMask) {
     // vblendps xmm0, xmm1, xmm2, 0x0A
     // c4 e3 71 0c c2 0a  (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0a, 0xc3,
+        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0a,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6372,15 +6192,15 @@ TEST_F(CpuRuntimeTest, Vblendps_AlternatingMask) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1 (lane 4): 4 floats = 1.0, 2.0, 3.0, 4.0
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(2.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(1.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(4.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(3.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(2.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(1.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(4.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(3.0f));
     // xmm2 (lane 8): 4 floats = 10.0, 20.0, 30.0, 40.0
-    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(20.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(10.0f));
-    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(40.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(30.0f));
+    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(20.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(10.0f));
+    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(40.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(30.0f));
 
     Runtime rt;
     rt.Run(st);
@@ -6405,7 +6225,8 @@ TEST_F(CpuRuntimeTest, Vblendps_AlternatingMask) {
 TEST_F(CpuRuntimeTest, Vblendps_AllZeroMask_PicksSrc1) {
     // vblendps xmm0, xmm1, xmm2, 0x00
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x00, 0xc3,
+        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x00,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6430,7 +6251,8 @@ TEST_F(CpuRuntimeTest, Vblendps_AllZeroMask_PicksSrc1) {
 // form; bits 7:4 are reserved).
 TEST_F(CpuRuntimeTest, Vblendps_AllOnesMask_PicksSrc2) {
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0f, 0xc3,
+        0xc4, 0xe3, 0x71, 0x0c, 0xc2, 0x0f,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6459,7 +6281,8 @@ TEST_F(CpuRuntimeTest, Vblendps_AllOnesMask_PicksSrc2) {
 TEST_F(CpuRuntimeTest, Vpcmpeqd_RegSrc_PerElementEquality) {
     // vpcmpeqd xmm0, xmm1, xmm2  — c5 f1 76 c2
     const u8 program[] = {
-        0xc5, 0xf1, 0x76, 0xc2, 0xc3,
+        0xc5, 0xf1, 0x76, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6498,8 +6321,8 @@ TEST_F(CpuRuntimeTest, Vpcmpeqd_MemSource) {
     mem_op[3] = 0x12345678u; // does NOT match src1 element 3
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0,    0,    0,    0,
-        0,    0,    0, 0xc5, 0xf1, 0x76, 0x00, // vpcmpeqd xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf1, 0x76, 0x00, // vpcmpeqd xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -6534,7 +6357,8 @@ TEST_F(CpuRuntimeTest, Vpcmpeqd_MemSource) {
 TEST_F(CpuRuntimeTest, Vpsubd_BasicPerElementSubtract) {
     // vpsubd xmm0, xmm1, xmm2  — c5 f1 fa c2
     const u8 program[] = {
-        0xc5, 0xf1, 0xfa, 0xc2, 0xc3,
+        0xc5, 0xf1, 0xfa, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6609,7 +6433,8 @@ TEST_F(CpuRuntimeTest, Vpsubd_BorrowDoesNotCrossElementBoundary) {
 TEST_F(CpuRuntimeTest, Vpsrad_PositiveValues_ShiftRight) {
     // vpsrad xmm0, xmm1, 2  — c5 f9 72 e1 02 (5 bytes)
     const u8 program[] = {
-        0xc5, 0xf9, 0x72, 0xe1, 0x02, 0xc3,
+        0xc5, 0xf9, 0x72, 0xe1, 0x02,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6640,7 +6465,8 @@ TEST_F(CpuRuntimeTest, Vpsrad_PositiveValues_ShiftRight) {
 TEST_F(CpuRuntimeTest, Vpsrad_NegativeValues_SignFill) {
     // vpsrad xmm0, xmm1, 4
     const u8 program[] = {
-        0xc5, 0xf9, 0x72, 0xe1, 0x04, 0xc3,
+        0xc5, 0xf9, 0x72, 0xe1, 0x04,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6651,7 +6477,7 @@ TEST_F(CpuRuntimeTest, Vpsrad_NegativeValues_SignFill) {
     // xmm1: [-16, -1, 0xFFFFFFF0 (-16), 0x80000000 (INT32_MIN)]
     // Use bit_cast for clarity.
     const u32 neg16 = static_cast<u32>(-16);
-    const u32 neg1 = static_cast<u32>(-1);
+    const u32 neg1  = static_cast<u32>(-1);
     st.ymm[4] = (static_cast<u64>(neg1) << 32) | neg16;
     st.ymm[5] = (static_cast<u64>(0x80000000u) << 32) | neg16;
 
@@ -6664,7 +6490,8 @@ TEST_F(CpuRuntimeTest, Vpsrad_NegativeValues_SignFill) {
     //   0x80000000 >> 4 = 0xF8000000  (high bit propagates to top 4 bits)
     EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0xFFFFFFFFu)
         << "-16 >>arith 4 = -1 (sign-extended)";
-    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0xFFFFFFFFu) << "-1 >>arith 4 = -1";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0xFFFFFFFFu)
+        << "-1 >>arith 4 = -1";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0xFFFFFFFFu);
     EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0xF8000000u)
         << "INT32_MIN >>arith 4 = 0xF8000000 (top 4 bits = sign-extension)";
@@ -6676,7 +6503,8 @@ TEST_F(CpuRuntimeTest, Vpsrad_NegativeValues_SignFill) {
 TEST_F(CpuRuntimeTest, Vpsrad_ShiftCountClampedAt31) {
     // vpsrad xmm0, xmm1, 100  (> 31)
     const u8 program[] = {
-        0xc5, 0xf9, 0x72, 0xe1, 0x64, 0xc3,
+        0xc5, 0xf9, 0x72, 0xe1, 0x64,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6709,7 +6537,8 @@ TEST_F(CpuRuntimeTest, Vpsrad_ShiftCountClampedAt31) {
 TEST_F(CpuRuntimeTest, Vpaddd_BasicPerElementAdd) {
     // vpaddd xmm0, xmm1, xmm2  — c5 f1 fe c2
     const u8 program[] = {
-        0xc5, 0xf1, 0xfe, 0xc2, 0xc3,
+        0xc5, 0xf1, 0xfe, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6777,8 +6606,8 @@ TEST_F(CpuRuntimeTest, Vpaddd_MemSource) {
     mem_op[3] = 4u;
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0,    0,    0,    0,
-        0,    0,    0, 0xc5, 0xf1, 0xfe, 0x00, // vpaddd xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf1, 0xfe, 0x00,  // vpaddd xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -6814,7 +6643,8 @@ TEST_F(CpuRuntimeTest, Vpaddd_MemSource) {
 TEST_F(CpuRuntimeTest, Vdivps_BasicPerElementDivide) {
     // vdivps xmm0, xmm1, xmm2  — c5 f0 5e c2
     const u8 program[] = {
-        0xc5, 0xf0, 0x5e, 0xc2, 0xc3,
+        0xc5, 0xf0, 0x5e, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6823,15 +6653,15 @@ TEST_F(CpuRuntimeTest, Vdivps_BasicPerElementDivide) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1: [12.0, 100.0, 25.0, 7.5]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(100.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(12.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(7.5f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(25.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(100.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(12.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(7.5f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(25.0f));
     // xmm2: [4.0, 5.0, 5.0, 2.5]
-    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(4.0f));
-    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(2.5f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(5.0f));
+    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(4.0f));
+    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(2.5f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(5.0f));
     st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
     st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
 
@@ -6841,14 +6671,13 @@ TEST_F(CpuRuntimeTest, Vdivps_BasicPerElementDivide) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     EXPECT_EQ(fetch_f(0, false), 3.0f);
-    EXPECT_EQ(fetch_f(0, true), 20.0f);
+    EXPECT_EQ(fetch_f(0, true),  20.0f);
     EXPECT_EQ(fetch_f(1, false), 5.0f);
-    EXPECT_EQ(fetch_f(1, true), 3.0f);
+    EXPECT_EQ(fetch_f(1, true),  3.0f);
     EXPECT_EQ(st.ymm[2], 0ULL);
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -6882,8 +6711,8 @@ TEST_F(CpuRuntimeTest, Vdivps_OperandOrderCheck) {
     float result;
     std::memcpy(&result, &e0, sizeof(result));
     EXPECT_EQ(result, 5.0f) << "src1 / src2 ordering: 10/2 = 5 (not 0.2)";
-    EXPECT_EQ(st.ymm[0], (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32) |
-                             static_cast<u64>(std::bit_cast<u32>(5.0f)))
+    EXPECT_EQ(st.ymm[0], (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32)
+                       |  static_cast<u64>(std::bit_cast<u32>(5.0f)))
         << "all 4 elements should match — 10/2 is identical across lanes";
 }
 
@@ -6893,7 +6722,8 @@ TEST_F(CpuRuntimeTest, Vdivps_OperandOrderCheck) {
 // scratch-XMM relay without us inadvertently masking them.
 TEST_F(CpuRuntimeTest, Vdivps_DivByZeroProducesInfNotNaN) {
     const u8 program[] = {
-        0xc5, 0xf0, 0x5e, 0xc2, 0xc3,
+        0xc5, 0xf0, 0x5e, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -6902,15 +6732,15 @@ TEST_F(CpuRuntimeTest, Vdivps_DivByZeroProducesInfNotNaN) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1: [+1.0, -1.0, 0.0, +1.0]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(-1.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(1.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(1.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(0.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(-1.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(1.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(1.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(0.0f));
     // xmm2: [0.0, 0.0, 0.0, 1.0]
-    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(0.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(0.0f));
-    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(1.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(0.0f));
+    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(0.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(0.0f));
+    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(1.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(0.0f));
 
     Runtime rt;
     rt.Run(st);
@@ -6922,12 +6752,13 @@ TEST_F(CpuRuntimeTest, Vdivps_DivByZeroProducesInfNotNaN) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
-    EXPECT_EQ(fetch_f(0, false), std::numeric_limits<float>::infinity()) << "1.0 / 0.0 = +inf";
-    EXPECT_EQ(fetch_f(0, true), -std::numeric_limits<float>::infinity()) << "-1.0 / 0.0 = -inf";
+    EXPECT_EQ(fetch_f(0, false), std::numeric_limits<float>::infinity())
+        << "1.0 / 0.0 = +inf";
+    EXPECT_EQ(fetch_f(0, true), -std::numeric_limits<float>::infinity())
+        << "-1.0 / 0.0 = -inf";
     EXPECT_TRUE(std::isnan(fetch_f(1, false))) << "0.0 / 0.0 = NaN";
     EXPECT_EQ(fetch_f(1, true), 1.0f);
 }
@@ -6946,8 +6777,8 @@ TEST_F(CpuRuntimeTest, Vbroadcastss_128_BroadcastsToAllFourLanes) {
     // vbroadcastss xmm0, dword[rax]
     // c4 e2 79 18 00  (5 bytes for short addressing; we use mov-rax+modrm)
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0,    0, 0, 0, 0, 0, // mov rax, <src_value>
-        0xc4, 0xe2, 0x79, 0x18, 0x00,                // vbroadcastss xmm0, dword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,           // mov rax, <src_value>
+        0xc4, 0xe2, 0x79, 0x18, 0x00,           // vbroadcastss xmm0, dword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -6984,7 +6815,9 @@ TEST_F(CpuRuntimeTest, Vbroadcastss_256_BroadcastsToAllEightLanes) {
 
     // vbroadcastss ymm0, dword[rax]  — c4 e2 7d 18 00
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xe2, 0x7d, 0x18, 0x00, 0xc3,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc4, 0xe2, 0x7d, 0x18, 0x00,
+        0xc3,
     };
     u8 prog[sizeof(program)];
     std::memcpy(prog, program, sizeof(program));
@@ -7022,7 +6855,8 @@ TEST_F(CpuRuntimeTest, Vblendvps_AlternatingMask) {
     // vblendvps xmm0, xmm1, xmm2, xmm3
     // c4 e3 71 4a c2 30  (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x4a, 0xc2, 0x30, 0xc3,
+        0xc4, 0xe3, 0x71, 0x4a, 0xc2, 0x30,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7031,15 +6865,15 @@ TEST_F(CpuRuntimeTest, Vblendvps_AlternatingMask) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // src1 = xmm1 (lane 4): [10.0, 20.0, 30.0, 40.0]  — picked when mask sign=0
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(20.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(10.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(40.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(30.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(20.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(10.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(40.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(30.0f));
     // src2 = xmm2 (lane 8): [100.0, 200.0, 300.0, 400.0]  — picked when mask sign=1
-    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(200.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(100.0f));
-    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(400.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(300.0f));
+    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(200.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(100.0f));
+    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(400.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(300.0f));
     // mask = xmm3 (lane 12): sign bits [1, 0, 1, 0]
     //   element 0 = 0x80000000 (sign=1) → src2 = 100
     //   element 1 = 0x00000000 (sign=0) → src1 = 20
@@ -7053,14 +6887,13 @@ TEST_F(CpuRuntimeTest, Vblendvps_AlternatingMask) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     EXPECT_EQ(fetch_f(0, false), 100.0f) << "mask[0].sign=1 → src2";
-    EXPECT_EQ(fetch_f(0, true), 20.0f) << "mask[1].sign=0 → src1";
+    EXPECT_EQ(fetch_f(0, true),  20.0f)  << "mask[1].sign=0 → src1";
     EXPECT_EQ(fetch_f(1, false), 300.0f) << "mask[2].sign=1 → src2";
-    EXPECT_EQ(fetch_f(1, true), 40.0f) << "mask[3].sign=0 → src1";
+    EXPECT_EQ(fetch_f(1, true),  40.0f)  << "mask[3].sign=0 → src1";
     EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -7075,7 +6908,8 @@ TEST_F(CpuRuntimeTest, Vblendvps_AlternatingMask) {
 // VPTEST-style mask, not a VBLENDV-style mask.
 TEST_F(CpuRuntimeTest, Vblendvps_OnlySignBitMatters) {
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x4a, 0xc2, 0x30, 0xc3,
+        0xc4, 0xe3, 0x71, 0x4a, 0xc2, 0x30,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7103,14 +6937,13 @@ TEST_F(CpuRuntimeTest, Vblendvps_OnlySignBitMatters) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     EXPECT_EQ(fetch_f(0, false), 1.0f) << "mask=0x7FFFFFFF (sign=0) → src1 (1.0)";
-    EXPECT_EQ(fetch_f(0, true), 2.0f) << "mask=0x80000000 (sign=1) → src2 (2.0)";
+    EXPECT_EQ(fetch_f(0, true),  2.0f) << "mask=0x80000000 (sign=1) → src2 (2.0)";
     EXPECT_EQ(fetch_f(1, false), 1.0f) << "mask=0x00000001 (sign=0) → src1 (1.0)";
-    EXPECT_EQ(fetch_f(1, true), 2.0f) << "mask=0xFFFFFFFF (sign=1) → src2 (2.0)";
+    EXPECT_EQ(fetch_f(1, true),  2.0f) << "mask=0xFFFFFFFF (sign=1) → src2 (2.0)";
 }
 
 // ============================================================================
@@ -7122,7 +6955,8 @@ TEST_F(CpuRuntimeTest, Vblendvps_OnlySignBitMatters) {
 TEST_F(CpuRuntimeTest, Vmulps_BasicPerElementMul_RegSrc) {
     // vmulps xmm0, xmm1, xmm2  — c5 f0 59 c2
     const u8 program[] = {
-        0xc5, 0xf0, 0x59, 0xc2, 0xc3,
+        0xc5, 0xf0, 0x59, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7131,10 +6965,10 @@ TEST_F(CpuRuntimeTest, Vmulps_BasicPerElementMul_RegSrc) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1: [2.0, 3.0, 4.0, 5.0]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(3.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(2.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(4.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(3.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(2.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(4.0f));
     // xmm2: [10.0, 10.0, 10.0, 10.0]
     const u32 ten = std::bit_cast<u32>(10.0f);
     st.ymm[8] = (static_cast<u64>(ten) << 32) | ten;
@@ -7147,14 +6981,13 @@ TEST_F(CpuRuntimeTest, Vmulps_BasicPerElementMul_RegSrc) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     EXPECT_EQ(fetch_f(0, false), 20.0f);
-    EXPECT_EQ(fetch_f(0, true), 30.0f);
+    EXPECT_EQ(fetch_f(0, true),  30.0f);
     EXPECT_EQ(fetch_f(1, false), 40.0f);
-    EXPECT_EQ(fetch_f(1, true), 50.0f);
+    EXPECT_EQ(fetch_f(1, true),  50.0f);
     EXPECT_EQ(st.ymm[2], 0ULL);
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -7169,8 +7002,8 @@ TEST_F(CpuRuntimeTest, Vmulps_MemSource) {
     mem_op[3] = 2.0f;
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0,    0,    0,    0,
-        0,    0,    0, 0xc5, 0xf0, 0x59, 0x00, // vmulps xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf0, 0x59, 0x00,  // vmulps xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -7184,25 +7017,24 @@ TEST_F(CpuRuntimeTest, Vmulps_MemSource) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1: [100.0, 200.0, 300.0, 400.0]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(200.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(100.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(400.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(300.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(200.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(100.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(400.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(300.0f));
 
     Runtime rt;
     rt.Run(st);
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     // Expected: [50.0, 50.0, -300.0, 800.0]
     EXPECT_EQ(fetch_f(0, false), 50.0f);
-    EXPECT_EQ(fetch_f(0, true), 50.0f);
+    EXPECT_EQ(fetch_f(0, true),  50.0f);
     EXPECT_EQ(fetch_f(1, false), -300.0f);
-    EXPECT_EQ(fetch_f(1, true), 800.0f);
+    EXPECT_EQ(fetch_f(1, true),  800.0f);
 }
 
 // ============================================================================
@@ -7218,7 +7050,8 @@ TEST_F(CpuRuntimeTest, Vmulps_MemSource) {
 TEST_F(CpuRuntimeTest, Vcmpps_LessThan_BasicPattern) {
     // vcmpps xmm0, xmm1, xmm2, 0x01  — c5 f0 c2 c2 01
     const u8 program[] = {
-        0xc5, 0xf0, 0xc2, 0xc2, 0x01, 0xc3,
+        0xc5, 0xf0, 0xc2, 0xc2, 0x01,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7227,10 +7060,10 @@ TEST_F(CpuRuntimeTest, Vcmpps_LessThan_BasicPattern) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1 (src1): [1.0, 2.0, 3.0, 4.0]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(2.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(1.0f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(4.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(3.0f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(2.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(1.0f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(4.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(3.0f));
     // xmm2 (src2): [2.0, 2.0, 2.0, 2.0]
     const u32 two = std::bit_cast<u32>(2.0f);
     st.ymm[8] = (static_cast<u64>(two) << 32) | two;
@@ -7241,8 +7074,10 @@ TEST_F(CpuRuntimeTest, Vcmpps_LessThan_BasicPattern) {
     Runtime rt;
     rt.Run(st);
     // Expected: [1<2 → -1, 2<2 → 0, 3<2 → 0, 4<2 → 0]
-    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0xFFFFFFFFu) << "1.0 < 2.0 → all-ones";
-    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0u) << "2.0 < 2.0 (equal, NOT less) → zero";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0xFFFFFFFFu)
+        << "1.0 < 2.0 → all-ones";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0u)
+        << "2.0 < 2.0 (equal, NOT less) → zero";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0u);
     EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0u);
     EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
@@ -7265,15 +7100,15 @@ TEST_F(CpuRuntimeTest, Vcmpps_LessThan_NaN_IsFalse) {
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     const float quiet_nan = std::numeric_limits<float>::quiet_NaN();
     // xmm1: [NaN,  1.0,  NaN, 5.0]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(1.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(quiet_nan));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(quiet_nan));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(1.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(quiet_nan));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(5.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(quiet_nan));
     // xmm2: [10.0, NaN, NaN, 10.0]
-    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(quiet_nan)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(10.0f));
-    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(10.0f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(quiet_nan));
+    st.ymm[8] = (static_cast<u64>(std::bit_cast<u32>(quiet_nan)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(10.0f));
+    st.ymm[9] = (static_cast<u64>(std::bit_cast<u32>(10.0f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(quiet_nan));
 
     Runtime rt;
     rt.Run(st);
@@ -7283,7 +7118,7 @@ TEST_F(CpuRuntimeTest, Vcmpps_LessThan_NaN_IsFalse) {
     //   NaN  < NaN → false             → 0
     //   5.0  < 10 → true               → 0xFFFFFFFF
     EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0u) << "NaN < 10 = unordered = 0";
-    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0u) << "1 < NaN = unordered = 0";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0u)         << "1 < NaN = unordered = 0";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0u) << "NaN < NaN = unordered = 0";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0xFFFFFFFFu) << "5 < 10 = ordered true = -1";
 }
@@ -7297,7 +7132,8 @@ TEST_F(CpuRuntimeTest, Vcmpps_LessThan_NaN_IsFalse) {
 TEST_F(CpuRuntimeTest, Vpcmpgtd_RegSrc_PerElementGreaterThan) {
     // vpcmpgtd xmm0, xmm1, xmm2  — c5 f1 66 c2
     const u8 program[] = {
-        0xc5, 0xf1, 0x66, 0xc2, 0xc3,
+        0xc5, 0xf1, 0x66, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7354,7 +7190,8 @@ TEST_F(CpuRuntimeTest, Vpcmpgtd_SignedSemantics) {
     //   -1  >   0     → false (0)            ; unsigned would say "true"!
     //   INT_MAX > -1  → true (-1)
     //   INT_MIN > -1  → false (0)            ; unsigned would say "true"!
-    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0xFFFFFFFFu) << "1 > -1 (signed) = true";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0xFFFFFFFFu)
+        << "1 > -1 (signed) = true";
     EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0u)
         << "-1 > 0 (signed) = false (NOT 0xFFFFFFFF > 0)";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0xFFFFFFFFu);
@@ -7371,8 +7208,8 @@ TEST_F(CpuRuntimeTest, Vpcmpgtd_MemSource) {
     mem_op[3] = -1;
 
     const u8 program[] = {
-        0x48, 0xb8, 0, 0,    0,    0,    0,
-        0,    0,    0, 0xc5, 0xf1, 0x66, 0x00, // vpcmpgtd xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf1, 0x66, 0x00,    // vpcmpgtd xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -7410,7 +7247,8 @@ TEST_F(CpuRuntimeTest, Vpcmpgtd_MemSource) {
 TEST_F(CpuRuntimeTest, Vpmulld_BasicPerElementMultiply) {
     // vpmulld xmm0, xmm1, xmm2  — c4 e2 71 40 c2  (5 bytes, 3-byte VEX)
     const u8 program[] = {
-        0xc4, 0xe2, 0x71, 0x40, 0xc2, 0xc3,
+        0xc4, 0xe2, 0x71, 0x40, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7475,7 +7313,8 @@ TEST_F(CpuRuntimeTest, Vpmulld_WrapOnOverflow) {
         << "0x10000 * 0x10000 wraps to 0";
     EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0x00000001u)
         << "(-1) * (-1) = +1 (consistent across signed/unsigned)";
-    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0x00000000u) << "INT_MIN * 2 wraps to 0";
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0x00000000u)
+        << "INT_MIN * 2 wraps to 0";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0x00000000u);
 }
 
@@ -7488,8 +7327,8 @@ TEST_F(CpuRuntimeTest, Vpmulld_MemSource) {
     mem_op[3] = 9;
 
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0,    0,    0,    0,
-        0,    0,    0xc4, 0xe2, 0x71, 0x40, 0x00, // vpmulld xmm0, xmm1, xmmword[rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc4, 0xe2, 0x71, 0x40, 0x00, // vpmulld xmm0, xmm1, xmmword[rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -7525,7 +7364,8 @@ TEST_F(CpuRuntimeTest, Vpmulld_MemSource) {
 TEST_F(CpuRuntimeTest, Vinsertf128_Imm0_InsertsIntoLowHalf) {
     // vinsertf128 ymm0, ymm1, xmm2, 0  — c4 e3 75 18 c2 00  (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x75, 0x18, 0xc2, 0x00, 0xc3,
+        0xc4, 0xe3, 0x75, 0x18, 0xc2, 0x00,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7534,10 +7374,10 @@ TEST_F(CpuRuntimeTest, Vinsertf128_Imm0_InsertsIntoLowHalf) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // src1 = ymm1 (lane 4): distinguishable across all 4 chunks
-    st.ymm[4] = 0x1111111111111111ULL; // low128.lo64
-    st.ymm[5] = 0x2222222222222222ULL; // low128.hi64
-    st.ymm[6] = 0x3333333333333333ULL; // high128.lo64
-    st.ymm[7] = 0x4444444444444444ULL; // high128.hi64
+    st.ymm[4] = 0x1111111111111111ULL;  // low128.lo64
+    st.ymm[5] = 0x2222222222222222ULL;  // low128.hi64
+    st.ymm[6] = 0x3333333333333333ULL;  // high128.lo64
+    st.ymm[7] = 0x4444444444444444ULL;  // high128.hi64
     // src2 = xmm2 (lane 8): the 128-bit value to insert
     st.ymm[8] = 0xAAAAAAAAAAAAAAAAULL;
     st.ymm[9] = 0xBBBBBBBBBBBBBBBBULL;
@@ -7562,7 +7402,8 @@ TEST_F(CpuRuntimeTest, Vinsertf128_Imm0_InsertsIntoLowHalf) {
 TEST_F(CpuRuntimeTest, Vinsertf128_Imm1_InsertsIntoHighHalf) {
     // vinsertf128 ymm0, ymm1, xmm2, 1
     const u8 program[] = {
-        0xc4, 0xe3, 0x75, 0x18, 0xc2, 0x01, 0xc3,
+        0xc4, 0xe3, 0x75, 0x18, 0xc2, 0x01,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7600,7 +7441,8 @@ TEST_F(CpuRuntimeTest, Vinsertf128_Imm1_InsertsIntoHighHalf) {
 TEST_F(CpuRuntimeTest, Vcvtdq2ps_SmallPositive_ExactConversion) {
     // vcvtdq2ps xmm0, xmm1  — c5 f8 5b c1
     const u8 program[] = {
-        0xc5, 0xf8, 0x5b, 0xc1, 0xc3,
+        0xc5, 0xf8, 0x5b, 0xc1,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7619,14 +7461,13 @@ TEST_F(CpuRuntimeTest, Vcvtdq2ps_SmallPositive_ExactConversion) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     EXPECT_EQ(fetch_f(0, false), 1.0f);
-    EXPECT_EQ(fetch_f(0, true), 100.0f);
+    EXPECT_EQ(fetch_f(0, true),  100.0f);
     EXPECT_EQ(fetch_f(1, false), 16777216.0f) << "2^24 fits exactly (boundary)";
-    EXPECT_EQ(fetch_f(1, true), 12345.0f);
+    EXPECT_EQ(fetch_f(1, true),  12345.0f);
     EXPECT_EQ(st.ymm[2], 0ULL);
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -7656,13 +7497,13 @@ TEST_F(CpuRuntimeTest, Vcvtdq2ps_NegativeIntegers_SignedConversion) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     EXPECT_EQ(fetch_f(0, false), -1.0f) << "0xFFFFFFFF = -1 signed, NOT 4294967295";
     EXPECT_EQ(fetch_f(0, true), -100.0f);
-    EXPECT_EQ(fetch_f(1, false), -2147483648.0f) << "INT32_MIN converts to -2^31 (exact as float)";
+    EXPECT_EQ(fetch_f(1, false), -2147483648.0f)
+        << "INT32_MIN converts to -2^31 (exact as float)";
     EXPECT_EQ(fetch_f(1, true), -16777216.0f);
 }
 
@@ -7672,7 +7513,8 @@ TEST_F(CpuRuntimeTest, Vcvtdq2ps_NegativeIntegers_SignedConversion) {
 // as our JIT (default round-to-nearest-even).
 TEST_F(CpuRuntimeTest, Vcvtdq2ps_LargeMagnitude_InexactRounding) {
     const u8 program[] = {
-        0xc5, 0xf8, 0x5b, 0xc1, 0xc3,
+        0xc5, 0xf8, 0x5b, 0xc1,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7690,8 +7532,7 @@ TEST_F(CpuRuntimeTest, Vcvtdq2ps_LargeMagnitude_InexactRounding) {
     auto fetch_f = [&](int chunk, bool hi) {
         const u32 bits = hi ? static_cast<u32>(st.ymm[chunk] >> 32)
                             : static_cast<u32>(st.ymm[chunk] & 0xFFFFFFFFULL);
-        float v;
-        std::memcpy(&v, &bits, sizeof(v));
+        float v; std::memcpy(&v, &bits, sizeof(v));
         return v;
     };
     // Each result matches what host (int32_t → float) cast produces
@@ -7701,7 +7542,7 @@ TEST_F(CpuRuntimeTest, Vcvtdq2ps_LargeMagnitude_InexactRounding) {
     EXPECT_EQ(fetch_f(0, true), static_cast<float>(static_cast<s32>(0x01000001)))
         << "2^24+1 (just past exact range) — rounds down to 2^24";
     EXPECT_EQ(fetch_f(1, false), static_cast<float>(static_cast<s32>(0x12345678)));
-    EXPECT_EQ(fetch_f(1, true), static_cast<float>(static_cast<s32>(0x76543210)));
+    EXPECT_EQ(fetch_f(1, true),  static_cast<float>(static_cast<s32>(0x76543210)));
 }
 
 // ============================================================================
@@ -7719,7 +7560,8 @@ TEST_F(CpuRuntimeTest, Vcvtdq2ps_LargeMagnitude_InexactRounding) {
 TEST_F(CpuRuntimeTest, Vcvttps2dq_TruncationTowardZero) {
     // vcvttps2dq xmm0, xmm1  — c5 fa 5b c1
     const u8 program[] = {
-        0xc5, 0xfa, 0x5b, 0xc1, 0xc3,
+        0xc5, 0xfa, 0x5b, 0xc1,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7728,10 +7570,10 @@ TEST_F(CpuRuntimeTest, Vcvttps2dq_TruncationTowardZero) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // xmm1: [3.7, -3.7, 0.999, -0.5]
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(-3.7f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(3.7f));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(-0.5f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(0.999f));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(-3.7f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(3.7f));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(-0.5f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(0.999f));
     st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
     st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
 
@@ -7767,18 +7609,19 @@ TEST_F(CpuRuntimeTest, Vcvttps2dq_OutOfRange_ProducesIndefinite) {
     // xmm1: [+inf, -inf, NaN, 1e10 (way > INT_MAX)]
     const float pos_inf = std::numeric_limits<float>::infinity();
     const float quiet_nan = std::numeric_limits<float>::quiet_NaN();
-    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(-pos_inf)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(pos_inf));
-    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(1e10f)) << 32) |
-                static_cast<u64>(std::bit_cast<u32>(quiet_nan));
+    st.ymm[4] = (static_cast<u64>(std::bit_cast<u32>(-pos_inf)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(pos_inf));
+    st.ymm[5] = (static_cast<u64>(std::bit_cast<u32>(1e10f)) << 32)
+              |  static_cast<u64>(std::bit_cast<u32>(quiet_nan));
 
     Runtime rt;
     rt.Run(st);
     // All 4 results should be 0x80000000 (integer indefinite).
     EXPECT_EQ(static_cast<u32>(st.ymm[0] & 0xFFFFFFFFULL), 0x80000000u) << "+inf → INT32_MIN";
-    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0x80000000u) << "-inf → INT32_MIN";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0x80000000u)         << "-inf → INT32_MIN";
     EXPECT_EQ(static_cast<u32>(st.ymm[1] & 0xFFFFFFFFULL), 0x80000000u) << "NaN → INT32_MIN";
-    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0x80000000u) << "1e10 (overflow) → INT32_MIN";
+    EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0x80000000u)
+        << "1e10 (overflow) → INT32_MIN";
 }
 
 // ============================================================================
@@ -7792,7 +7635,8 @@ TEST_F(CpuRuntimeTest, Vcvttps2dq_OutOfRange_ProducesIndefinite) {
 TEST_F(CpuRuntimeTest, Vextractf128_Imm0_ExtractsLow128) {
     // vextractf128 xmm0, ymm1, 0  — c4 e3 7d 19 c8 00  (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x7d, 0x19, 0xc8, 0x00, 0xc3,
+        0xc4, 0xe3, 0x7d, 0x19, 0xc8, 0x00,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7822,7 +7666,8 @@ TEST_F(CpuRuntimeTest, Vextractf128_Imm0_ExtractsLow128) {
 // imm8 = 1: dst = src.hi128
 TEST_F(CpuRuntimeTest, Vextractf128_Imm1_ExtractsHigh128) {
     const u8 program[] = {
-        0xc4, 0xe3, 0x7d, 0x19, 0xc8, 0x01, 0xc3,
+        0xc4, 0xe3, 0x7d, 0x19, 0xc8, 0x01,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7853,7 +7698,9 @@ TEST_F(CpuRuntimeTest, Vextractf128_MemoryDestination) {
 
     // vextractf128 xmmword[rax], ymm1, 1
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xe3, 0x7d, 0x19, 0x08, 0x01, 0xc3,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc4, 0xe3, 0x7d, 0x19, 0x08, 0x01,
+        0xc3,
     };
     u8 prog[sizeof(program)];
     std::memcpy(prog, program, sizeof(program));
@@ -7889,7 +7736,8 @@ TEST_F(CpuRuntimeTest, Vextractf128_MemoryDestination) {
 TEST_F(CpuRuntimeTest, Vpsrld_PositiveValues_ShiftsRight) {
     // vpsrld xmm0, xmm1, 2  — c5 f9 72 d1 02 (5 bytes)
     const u8 program[] = {
-        0xc5, 0xf9, 0x72, 0xd1, 0x02, 0xc3,
+        0xc5, 0xf9, 0x72, 0xd1, 0x02,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7924,7 +7772,8 @@ TEST_F(CpuRuntimeTest, Vpsrld_PositiveValues_ShiftsRight) {
 TEST_F(CpuRuntimeTest, Vpsrld_NegativeValues_ZeroFill_NotSignFill) {
     // vpsrld xmm0, xmm1, 4
     const u8 program[] = {
-        0xc5, 0xf9, 0x72, 0xd1, 0x04, 0xc3,
+        0xc5, 0xf9, 0x72, 0xd1, 0x04,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7958,7 +7807,8 @@ TEST_F(CpuRuntimeTest, Vpsrld_NegativeValues_ZeroFill_NotSignFill) {
 TEST_F(CpuRuntimeTest, Vpsrld_LargeShiftCount_ClampsToZero) {
     // vpsrld xmm0, xmm1, 100  (count > 31)
     const u8 program[] = {
-        0xc5, 0xf9, 0x72, 0xd1, 0x64, 0xc3,
+        0xc5, 0xf9, 0x72, 0xd1, 0x64,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -7994,7 +7844,8 @@ TEST_F(CpuRuntimeTest, Vpsrld_LargeShiftCount_ClampsToZero) {
 TEST_F(CpuRuntimeTest, Vpblendw_AlternatingMask_SelectsWords) {
     // vpblendw xmm0, xmm1, xmm2, 0xAA — c4 e3 71 0e c2 aa (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0xaa, 0xc3,
+        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0xaa,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8017,8 +7868,10 @@ TEST_F(CpuRuntimeTest, Vpblendw_AlternatingMask_SelectsWords) {
     // imm8=0xAA: words 0,2,4,6 from src1 (0x1111); words 1,3,5,7 from
     // src2 (0x2222). Each 64-bit chunk holds 4 words; pattern per chunk
     // (little-endian, word0 in low bits): 0x2222 1111 2222 1111.
-    EXPECT_EQ(st.ymm[0], 0x2222111122221111ULL) << "low chunk: w0=src1 w1=src2 w2=src1 w3=src2";
-    EXPECT_EQ(st.ymm[1], 0x2222111122221111ULL) << "high chunk: w4=src1 w5=src2 w6=src1 w7=src2";
+    EXPECT_EQ(st.ymm[0], 0x2222111122221111ULL)
+        << "low chunk: w0=src1 w1=src2 w2=src1 w3=src2";
+    EXPECT_EQ(st.ymm[1], 0x2222111122221111ULL)
+        << "high chunk: w4=src1 w5=src2 w6=src1 w7=src2";
     EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
@@ -8059,7 +7912,8 @@ TEST_F(CpuRuntimeTest, Vpblendw_AllZeroAllOne_PickPureSource) {
 TEST_F(CpuRuntimeTest, Vpblendw_DistinctWords_ExactLaneMapping) {
     // vpblendw xmm0, xmm1, xmm2, 0x03
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0x03, 0xc3,
+        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0x03,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8079,7 +7933,8 @@ TEST_F(CpuRuntimeTest, Vpblendw_DistinctWords_ExactLaneMapping) {
     // imm8=0x03: word0=src2(B0), word1=src2(B1), word2..7=src1(A2..A7).
     EXPECT_EQ(st.ymm[0], 0x00A300A200B100B0ULL)
         << "w0=B0 w1=B1 (from src2), w2=A2 w3=A3 (from src1)";
-    EXPECT_EQ(st.ymm[1], 0x00A700A600A500A4ULL) << "w4..w7 all from src1 (imm8 high bits 0)";
+    EXPECT_EQ(st.ymm[1], 0x00A700A600A500A4ULL)
+        << "w4..w7 all from src1 (imm8 high bits 0)";
 }
 
 // ============================================================================
@@ -8095,7 +7950,8 @@ TEST_F(CpuRuntimeTest, Vpblendw_DistinctWords_ExactLaneMapping) {
 TEST_F(CpuRuntimeTest, Vpackusdw_Layout_Src1LowSrc2High) {
     // vpackusdw xmm0, xmm1, xmm2 — c4 e2 71 2b c2 (5 bytes)
     const u8 program[] = {
-        0xc4, 0xe2, 0x71, 0x2b, 0xc2, 0xc3,
+        0xc4, 0xe2, 0x71, 0x2b, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8104,8 +7960,8 @@ TEST_F(CpuRuntimeTest, Vpackusdw_Layout_Src1LowSrc2High) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // src1 = xmm1 (lane 4): dwords 0,1,2,3
-    st.ymm[4] = (1ULL << 32) | 0ULL; // dword0=0, dword1=1
-    st.ymm[5] = (3ULL << 32) | 2ULL; // dword2=2, dword3=3
+    st.ymm[4] = (1ULL << 32) | 0ULL;   // dword0=0, dword1=1
+    st.ymm[5] = (3ULL << 32) | 2ULL;   // dword2=2, dword3=3
     // src2 = xmm2 (lane 8): dwords 0x10,0x11,0x12,0x13
     st.ymm[8] = (0x11ULL << 32) | 0x10ULL;
     st.ymm[9] = (0x13ULL << 32) | 0x12ULL;
@@ -8129,7 +7985,8 @@ TEST_F(CpuRuntimeTest, Vpackusdw_Layout_Src1LowSrc2High) {
 TEST_F(CpuRuntimeTest, Vpackusdw_UnsignedSaturation) {
     // vpackusdw xmm0, xmm1, xmm2
     const u8 program[] = {
-        0xc4, 0xe2, 0x71, 0x2b, 0xc2, 0xc3,
+        0xc4, 0xe2, 0x71, 0x2b, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8172,8 +8029,11 @@ TEST_F(CpuRuntimeTest, Vpextrd_AllLanes_ToGpr_ZeroExtends) {
     //   vpextrd edx, xmm1, 2   c4 e3 79 16 ca 02
     //   vpextrd ebx, xmm1, 3   c4 e3 79 16 cb 03
     const u8 program[] = {
-        0xc4, 0xe3, 0x79, 0x16, 0xc8, 0x00, 0xc4, 0xe3, 0x79, 0x16, 0xc9, 0x01, 0xc4,
-        0xe3, 0x79, 0x16, 0xca, 0x02, 0xc4, 0xe3, 0x79, 0x16, 0xcb, 0x03, 0xc3,
+        0xc4, 0xe3, 0x79, 0x16, 0xc8, 0x00,
+        0xc4, 0xe3, 0x79, 0x16, 0xc9, 0x01,
+        0xc4, 0xe3, 0x79, 0x16, 0xca, 0x02,
+        0xc4, 0xe3, 0x79, 0x16, 0xcb, 0x03,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8206,8 +8066,8 @@ TEST_F(CpuRuntimeTest, Vpextrd_MemoryDestination_Writes4Bytes) {
     scratch[1] = 0xBBBBBBBBu; // sentinel after the 4-byte target
     // mov rax, scratch ; vpextrd dword[rax], xmm1, 2
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0,    0,    0,    0,
-        0,    0,    0xc4, 0xe3, 0x79, 0x16, 0x08, 0x02, // vpextrd [rax], xmm1, 2
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc4, 0xe3, 0x79, 0x16, 0x08, 0x02, // vpextrd [rax], xmm1, 2
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8243,8 +8103,7 @@ TEST_F(CpuRuntimeTest, Rol32_ByCl_RotatesAndSetsCarry) {
     // ops=reg,reg; that is rol r/m32, cl with a modrm. Use the generic
     // encoding rol ecx-target. Here: rol eax, cl = d3 c0.
     const u8 program[] = {
-        0xd3,
-        0xc0, // rol eax, cl
+        0xd3, 0xc0, // rol eax, cl
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -8268,8 +8127,7 @@ TEST_F(CpuRuntimeTest, Rol32_ByCl_RotatesAndSetsCarry) {
 // Count masks to 5 bits: rol by 36 == rol by 4.
 TEST_F(CpuRuntimeTest, Rol32_CountMasksTo5Bits) {
     const u8 program[] = {
-        0xd3,
-        0xc0, // rol eax, cl
+        0xd3, 0xc0, // rol eax, cl
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -8279,7 +8137,7 @@ TEST_F(CpuRuntimeTest, Rol32_CountMasksTo5Bits) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[0] = 0x12345678ULL;
-    st.gpr[1] = 36; // 36 & 31 = 4
+    st.gpr[1] = 36;     // 36 & 31 = 4
     st.rflags = 0x202;
 
     Runtime rt;
@@ -8291,8 +8149,7 @@ TEST_F(CpuRuntimeTest, Rol32_CountMasksTo5Bits) {
 // flags and confirm they survive a rotate.
 TEST_F(CpuRuntimeTest, Rol32_DoesNotDisturbSZP) {
     const u8 program[] = {
-        0xd3,
-        0xc0, // rol eax, cl
+        0xd3, 0xc0, // rol eax, cl
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -8304,7 +8161,7 @@ TEST_F(CpuRuntimeTest, Rol32_DoesNotDisturbSZP) {
     st.gpr[0] = 0x00000001ULL;
     st.gpr[1] = 1;
     // Pre-set ZF(bit6), SF(bit7), PF(bit2) plus IF(bit9).
-    const u64 ZF = 1ULL << 6, SF = 1ULL << 7, PF = 1ULL << 2, IF = 1ULL << 9;
+    const u64 ZF = 1ULL<<6, SF = 1ULL<<7, PF = 1ULL<<2, IF = 1ULL<<9;
     st.rflags = ZF | SF | PF | IF | 0x2;
 
     Runtime rt;
@@ -8320,9 +8177,7 @@ TEST_F(CpuRuntimeTest, Rol32_DoesNotDisturbSZP) {
 // ROR by imm8.
 TEST_F(CpuRuntimeTest, Ror32_ByImm) {
     const u8 program[] = {
-        0xc1,
-        0xc8,
-        0x08, // ror eax, 8
+        0xc1, 0xc8, 0x08, // ror eax, 8
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -8351,7 +8206,8 @@ TEST_F(CpuRuntimeTest, Ror32_ByImm) {
 TEST_F(CpuRuntimeTest, Vpinsrd_Lane2_OtherLanesFromSrc1) {
     // vpinsrd xmm0, xmm1, eax, 2  — c4 e3 71 22 c0 02 (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x22, 0xc0, 0x02, 0xc3,
+        0xc4, 0xe3, 0x71, 0x22, 0xc0, 0x02,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8384,7 +8240,8 @@ TEST_F(CpuRuntimeTest, Vpinsrd_Lane2_OtherLanesFromSrc1) {
 TEST_F(CpuRuntimeTest, Vpinsrd_Lane0) {
     // vpinsrd xmm0, xmm1, eax, 0
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x22, 0xc0, 0x00, 0xc3,
+        0xc4, 0xe3, 0x71, 0x22, 0xc0, 0x00,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8408,7 +8265,8 @@ TEST_F(CpuRuntimeTest, Vpinsrd_Lane0) {
 TEST_F(CpuRuntimeTest, Vpinsrd_InPlace_DstEqualsSrc1) {
     // vpinsrd xmm1, xmm1, eax, 3  — c4 e3 71 22 c8 03
     const u8 program[] = {
-        0xc4, 0xe3, 0x71, 0x22, 0xc8, 0x03, 0xc3,
+        0xc4, 0xe3, 0x71, 0x22, 0xc8, 0x03,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8443,7 +8301,8 @@ TEST_F(CpuRuntimeTest, Vmovq_LoadFromMemory_ZeroesUpper) {
     scratch[0] = 0x0123456789ABCDEFULL;
     // mov rax, scratch ; vmovq xmm0, [rax]
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xfa, 0x7e, 0x00, // vmovq xmm0, [rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xfa, 0x7e, 0x00, // vmovq xmm0, [rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8477,7 +8336,8 @@ TEST_F(CpuRuntimeTest, Vmovq_StoreToMemory_Writes8Bytes) {
     scratch[1] = 0xBBBBBBBBBBBBBBBBULL; // sentinel after the 8-byte target
     // mov rax, scratch ; vmovq [rax], xmm0
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf9, 0xd6, 0x00, // vmovq [rax], xmm0
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc5, 0xf9, 0xd6, 0x00, // vmovq [rax], xmm0
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8510,7 +8370,8 @@ TEST_F(CpuRuntimeTest, Vmovq_StoreToMemory_Writes8Bytes) {
 TEST_F(CpuRuntimeTest, Vpslldq_By4Bytes) {
     // vpslldq xmm0, xmm1, 4  — c5 f9 73 f9 04 (5 bytes)
     const u8 program[] = {
-        0xc5, 0xf9, 0x73, 0xf9, 0x04, 0xc3,
+        0xc5, 0xf9, 0x73, 0xf9, 0x04,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8536,7 +8397,8 @@ TEST_F(CpuRuntimeTest, Vpslldq_By4Bytes) {
 TEST_F(CpuRuntimeTest, Vpslldq_Count16_ZeroesLane) {
     // vpslldq xmm0, xmm1, 16  — c5 f9 73 f9 10
     const u8 program[] = {
-        0xc5, 0xf9, 0x73, 0xf9, 0x10, 0xc3,
+        0xc5, 0xf9, 0x73, 0xf9, 0x10,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8557,7 +8419,8 @@ TEST_F(CpuRuntimeTest, Vpslldq_Count16_ZeroesLane) {
 TEST_F(CpuRuntimeTest, Vpsrldq_By3Bytes) {
     // vpsrldq xmm0, xmm1, 3  — c5 f9 73 d9 03
     const u8 program[] = {
-        0xc5, 0xf9, 0x73, 0xd9, 0x03, 0xc3,
+        0xc5, 0xf9, 0x73, 0xd9, 0x03,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8594,7 +8457,8 @@ TEST_F(CpuRuntimeTest, Vpsrldq_By3Bytes) {
 TEST_F(CpuRuntimeTest, Vpcmpistrm_BitMask_EqualAny) {
     // vpcmpistrm xmm1, xmm2, 0x00  — c4 e3 79 62 ca 00 (6 bytes)
     const u8 program[] = {
-        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x00, 0xc3,
+        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x00,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8606,8 +8470,8 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_BitMask_EqualAny) {
     st.ymm[4] = 0x4847464544434241ULL; // "ABCDEFGH"
     st.ymm[5] = 0x504F4E4D4C4B4A49ULL; // "IJKLMNOP"
     // b = xmm2 (lane 8) = "XBXDXFXHXXXXXXXX"
-    st.ymm[8] = 0x4858465844584258ULL; // "XBXDXFXH"
-    st.ymm[9] = 0x5858585858585858ULL; // "XXXXXXXX"
+    st.ymm[8]  = 0x4858465844584258ULL; // "XBXDXFXH"
+    st.ymm[9]  = 0x5858585858585858ULL; // "XXXXXXXX"
     // pre-pollute guest XMM0 (the implicit dest, vec index 0) entirely
     st.ymm[0] = 0xDEADBEEFDEADBEEFULL;
     st.ymm[1] = 0xDEADBEEFDEADBEEFULL;
@@ -8624,15 +8488,16 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_BitMask_EqualAny) {
     EXPECT_EQ(st.ymm[3], 0ULL);
     // CF = mask not all zero = 1; ZF/SF = 0 (no nulls); OF = 0.
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF: matches exist";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF: b has no null";
-    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF: a has no null";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF: b has no null";
+    EXPECT_EQ(st.rflags & (1ULL<<7), 0ULL) << "SF: a has no null";
 }
 
 // Byte-mask form (imm 0x40, bit6=1): each element 0x00 or 0xFF.
 TEST_F(CpuRuntimeTest, Vpcmpistrm_ByteMask_EqualAny) {
     // vpcmpistrm xmm1, xmm2, 0x40  — c4 e3 79 62 ca 40
     const u8 program[] = {
-        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x40, 0xc3,
+        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x40,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8642,8 +8507,8 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_ByteMask_EqualAny) {
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.ymm[4] = 0x4847464544434241ULL;
     st.ymm[5] = 0x504F4E4D4C4B4A49ULL;
-    st.ymm[8] = 0x4858465844584258ULL;
-    st.ymm[9] = 0x5858585858585858ULL;
+    st.ymm[8]  = 0x4858465844584258ULL;
+    st.ymm[9]  = 0x5858585858585858ULL;
     st.rflags = 0x2;
 
     Runtime rt;
@@ -8659,7 +8524,8 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_ByteMask_EqualAny) {
 // ZF reflects a null terminator in the second operand (b).
 TEST_F(CpuRuntimeTest, Vpcmpistrm_ZFOnNullInB) {
     const u8 program[] = {
-        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x00, 0xc3,
+        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x00,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8670,14 +8536,14 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_ZFOnNullInB) {
     st.ymm[4] = 0x4847464544434241ULL; // a "ABCDEFGH"
     st.ymm[5] = 0x504F4E4D4C4B4A49ULL; // a "IJKLMNOP"
     // b = "XBX\0XF\0\0" then zeros -> contains nulls (terminator)
-    st.ymm[8] = 0x0000460058044258ULL; // bytes: 58 42 04 00 58 46 00 00
-    st.ymm[9] = 0x0000000000000000ULL;
+    st.ymm[8]  = 0x0000460058044258ULL; // bytes: 58 42 04 00 58 46 00 00
+    st.ymm[9]  = 0x0000000000000000ULL;
     st.rflags = 0x2;
 
     Runtime rt;
     rt.Run(st);
     // ZF set because b contains a null terminator.
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF: b has a null terminator";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF: b has a null terminator";
 }
 
 // ============================================================================
@@ -8690,7 +8556,8 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_ZFOnNullInB) {
 TEST_F(CpuRuntimeTest, Vpandn_AndNot_128) {
     // vpandn xmm0, xmm1, xmm2  — c5 f1 df c2 (4 bytes)
     const u8 program[] = {
-        0xc5, 0xf1, 0xdf, 0xc2, 0xc3,
+        0xc5, 0xf1, 0xdf, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8724,7 +8591,8 @@ TEST_F(CpuRuntimeTest, Vpandn_AndNot_128) {
 TEST_F(CpuRuntimeTest, Vpandn_IsAsymmetric) {
     // vpandn xmm0, xmm1, xmm2
     const u8 program[] = {
-        0xc5, 0xf1, 0xdf, 0xc2, 0xc3,
+        0xc5, 0xf1, 0xdf, 0xc2,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8762,7 +8630,8 @@ TEST_F(CpuRuntimeTest, Cmp16_MemImm_Equal) {
     // length 4 (likely imm8-sign-extended form 66 83 38 imm8), but we
     // test the imm16 form here which exercises the same path.
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x66, 0x81, 0x38, 0x34, 0x12, // cmp word [rax], 0x1234
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x66, 0x81, 0x38, 0x34, 0x12, // cmp word [rax], 0x1234
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8779,7 +8648,7 @@ TEST_F(CpuRuntimeTest, Cmp16_MemImm_Equal) {
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: equal";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: equal";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no borrow";
 }
 
@@ -8788,7 +8657,8 @@ TEST_F(CpuRuntimeTest, Cmp16_MemImm_Borrow) {
     u16* scratch = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
     scratch[0] = 0x0010;
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x66, 0x81, 0x38, 0x20, 0x00, // cmp word [rax], 0x0020
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x66, 0x81, 0x38, 0x20, 0x00, // cmp word [rax], 0x0020
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8807,8 +8677,8 @@ TEST_F(CpuRuntimeTest, Cmp16_MemImm_Borrow) {
     rt.Run(st);
     // 0x10 - 0x20 borrows: CF=1, result 0xFFF0 -> SF=1, ZF=0.
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: 0x10 < 0x20";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result 0xFFF0";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result 0xFFF0";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
 // The 16-bit-specific case: cmp 0x8000, 0x7FFF sets OF=1 at 16-bit
@@ -8817,7 +8687,8 @@ TEST_F(CpuRuntimeTest, Cmp16_MemImm_Borrow) {
 TEST_F(CpuRuntimeTest, Cmp16_RegImm_WidthSpecificOverflow) {
     // cmp ax, 0x7FFF  =  66 3d ff 7f (4 bytes) — cmp AX, imm16
     const u8 program[] = {
-        0x66, 0x3d, 0xff, 0x7f, 0xc3,
+        0x66, 0x3d, 0xff, 0x7f,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8832,10 +8703,10 @@ TEST_F(CpuRuntimeTest, Cmp16_RegImm_WidthSpecificOverflow) {
     Runtime rt;
     rt.Run(st);
     // 0x8000 - 0x7FFF = 1: CF=0, ZF=0, SF=0, OF=1 (signed overflow at 16-bit).
-    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: 16-bit signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL<<11), (1ULL<<11)) << "OF set: 16-bit signed overflow";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no unsigned borrow";
-    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF clear: result positive (0x0001)";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+    EXPECT_EQ(st.rflags & (1ULL<<7), 0ULL) << "SF clear: result positive (0x0001)";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
 // ============================================================================
@@ -8849,7 +8720,8 @@ TEST_F(CpuRuntimeTest, Cmp16_RegImm_WidthSpecificOverflow) {
 TEST_F(CpuRuntimeTest, Blsi_IsolatesLowestBit) {
     // blsi eax, ecx  — c4 e2 78 f3 d9 (5 bytes)
     const u8 program[] = {
-        0xc4, 0xe2, 0x78, 0xf3, 0xd9, 0xc3,
+        0xc4, 0xe2, 0x78, 0xf3, 0xd9,
+        0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
@@ -8865,8 +8737,8 @@ TEST_F(CpuRuntimeTest, Blsi_IsolatesLowestBit) {
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0x0000000000000002ULL) << "lowest set bit isolated, zero-extended";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: src != 0";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear: result nonzero";
-    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF clear: bit1 result";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear: result nonzero";
+    EXPECT_EQ(st.rflags & (1ULL<<7), 0ULL) << "SF clear: bit1 result";
 }
 
 // Zero source: result 0, CF=0, ZF=1 (the polarity that distinguishes
@@ -8891,7 +8763,7 @@ TEST_F(CpuRuntimeTest, Blsi_ZeroSource_ClearsCFSetsZF) {
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0ULL) << "zero source -> zero result";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF cleared: src == 0 (BLSI polarity)";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: result zero";
 }
 
 // SF reflects the result MSB: blsi 0x80000000 = 0x80000000 -> SF=1.
@@ -8912,7 +8784,7 @@ TEST_F(CpuRuntimeTest, Blsi_HighBit_SetsSF) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0x0000000080000000ULL) << "only bit 31 set";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB (bit31)";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result MSB (bit31)";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: src != 0";
 }
 
@@ -8930,7 +8802,8 @@ TEST_F(CpuRuntimeTest, Inc32_Mem_PreservesCF) {
     scratch[1] = 0x99999999u; // sentinel after the 4-byte target
     // mov rax, scratch ; inc dword [rax]
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x00, // inc dword [rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xff, 0x00, // inc dword [rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8950,7 +8823,7 @@ TEST_F(CpuRuntimeTest, Inc32_Mem_PreservesCF) {
     EXPECT_EQ(scratch[0], 0x42u) << "memory incremented";
     EXPECT_EQ(scratch[1], 0x99999999u) << "next dword untouched (only 4 bytes written)";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not affect CF)";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
 // Wraparound 0xFFFFFFFF -> 0: ZF=1, and CF stays clear (INC never
@@ -8959,7 +8832,8 @@ TEST_F(CpuRuntimeTest, Inc32_Mem_WrapSetsZFNotCF) {
     u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
     scratch[0] = 0xFFFFFFFFu;
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x00, // inc dword [rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xff, 0x00, // inc dword [rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -8977,7 +8851,7 @@ TEST_F(CpuRuntimeTest, Inc32_Mem_WrapSetsZFNotCF) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(scratch[0], 0x0u) << "wrapped to zero";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: result zero";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear (INC never sets CF on wrap)";
 }
 
@@ -8986,7 +8860,8 @@ TEST_F(CpuRuntimeTest, Inc32_Mem_SignedOverflow) {
     u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
     scratch[0] = 0x7FFFFFFFu;
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x00, // inc dword [rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xff, 0x00, // inc dword [rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -9004,8 +8879,8 @@ TEST_F(CpuRuntimeTest, Inc32_Mem_SignedOverflow) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(scratch[0], 0x80000000u) << "incremented past INT_MAX";
-    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: signed overflow";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+    EXPECT_EQ(st.rflags & (1ULL<<11), (1ULL<<11)) << "OF set: signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result negative";
 }
 
 // ============================================================================
@@ -9028,8 +8903,11 @@ TEST_F(CpuRuntimeTest, Prefetchnta_IsNoOp_ExecutionContinues) {
     // mov edx, 0xCAFE         (ba fe ca 00 00) -- proves we continued
     // ret
     const u8 program[] = {
-        0x48, 0xb8, 0,    0,    0,    0,    0,    0,    0,    0,    0x48, 0x31, 0xc9, 0x0f,
-        0x18, 0x84, 0x88, 0x00, 0x01, 0x00, 0x00, 0xba, 0xfe, 0xca, 0x00, 0x00, 0xc3,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0x31, 0xc9,
+        0x0f, 0x18, 0x84, 0x88, 0x00, 0x01, 0x00, 0x00,
+        0xba, 0xfe, 0xca, 0x00, 0x00,
+        0xc3,
     };
     u8 prog[sizeof(program)];
     std::memcpy(prog, program, sizeof(program));
@@ -9043,9 +8921,9 @@ TEST_F(CpuRuntimeTest, Prefetchnta_IsNoOp_ExecutionContinues) {
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // Pre-set registers and flags to known values; the prefetch must
     // leave everything except what the surrounding movs touch.
-    st.gpr[2] = 0xAAAAAAAAAAAAAAAAULL;   // rdx (will be set by the trailing mov edx)
-    st.gpr[6] = 0x1234567812345678ULL;   // rsi: must be untouched
-    st.rflags = 0x2 | 0x1 | (1ULL << 6); // CF + ZF pre-set
+    st.gpr[2] = 0xAAAAAAAAAAAAAAAAULL; // rdx (will be set by the trailing mov edx)
+    st.gpr[6] = 0x1234567812345678ULL; // rsi: must be untouched
+    st.rflags = 0x2 | 0x1 | (1ULL<<6); // CF + ZF pre-set
 
     Runtime rt;
     rt.Run(st);
@@ -9065,9 +8943,9 @@ TEST_F(CpuRuntimeTest, Prefetchnta_IsNoOp_ExecutionContinues) {
 TEST_F(CpuRuntimeTest, Prefetchnta_BogusAddress_DoesNotFault) {
     // mov rax, 0xDEAD0000DEAD0000 ; prefetchnta [rax] ; mov ecx, 7 ; ret
     const u8 program[] = {
-        0x48, 0xb8, 0x00, 0x00, 0xad, 0xde, 0x00,
-        0x00, 0xad, 0xde, 0x0f, 0x18, 0x00, // prefetchnta [rax]
-        0xb9, 0x07, 0x00, 0x00, 0x00,       // mov ecx, 7
+        0x48, 0xb8, 0x00,0x00,0xad,0xde,0x00,0x00,0xad,0xde,
+        0x0f, 0x18, 0x00,             // prefetchnta [rax]
+        0xb9, 0x07, 0x00, 0x00, 0x00, // mov ecx, 7
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9100,7 +8978,8 @@ TEST_F(CpuRuntimeTest, Vmovntdqa_Load128_ZeroesUpper) {
     scratch[1] = 0x99AABBCCDDEEFF00ULL;
     // mov rax, scratch ; vmovntdqa xmm1, [rax]  (c4 e2 79 2a 08)
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xe2, 0x79, 0x2a, 0x08, // vmovntdqa xmm1, [rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc4, 0xe2, 0x79, 0x2a, 0x08, // vmovntdqa xmm1, [rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -9134,7 +9013,8 @@ TEST_F(CpuRuntimeTest, Vmovntdqa_Load256) {
     scratch[3] = 0x18191A1B1C1D1E1FULL;
     // mov rax, scratch ; vmovntdqa ymm0, [rax]  (c4 e2 7d 2a 00)
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xe2, 0x7d, 0x2a, 0x00, // vmovntdqa ymm0, [rax]
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xc4, 0xe2, 0x7d, 0x2a, 0x00, // vmovntdqa ymm0, [rax]
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -9172,8 +9052,8 @@ TEST_F(CpuRuntimeTest, Xor64_Imm_SignExtends) {
     // forms we could use a ModRM imm, but 48 35 (XOR RAX, imm32) is the
     // canonical RAX form. We assert behavior, not encoding length.
     const u8 program[] = {
-        0x48, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00, // mov rax, 0xDEADBEEF
-        0x48, 0x35, 0xef, 0xbe, 0xad, 0xde,                         // xor rax, 0xDEADBEEF (sx)
+        0x48, 0xb8, 0xef,0xbe,0xad,0xde,0x00,0x00,0x00,0x00, // mov rax, 0xDEADBEEF
+        0x48, 0x35, 0xef, 0xbe, 0xad, 0xde,                  // xor rax, 0xDEADBEEF (sx)
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9189,8 +9069,8 @@ TEST_F(CpuRuntimeTest, Xor64_Imm_SignExtends) {
     // 0x00000000DEADBEEF ^ 0xFFFFFFFFDEADBEEF = 0xFFFFFFFF00000000.
     EXPECT_EQ(st.gpr[0], 0xFFFFFFFF00000000ULL) << "imm sign-extended to 64 bits";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF cleared by XOR";
-    EXPECT_EQ(st.rflags & (1ULL << 11), 0ULL) << "OF cleared by XOR";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB set";
+    EXPECT_EQ(st.rflags & (1ULL<<11), 0ULL) << "OF cleared by XOR";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result MSB set";
 }
 
 // xor r64, imm with a register other than RAX (uses the ModRM imm32
@@ -9199,8 +9079,8 @@ TEST_F(CpuRuntimeTest, Xor64_Imm_NonRax) {
     // mov rcx, 0x0123456789ABCDEF ; xor rcx, 0xFFFFFFFF (= -1 sx)
     // xor rcx, imm32 = 48 81 f1 ff ff ff ff (7 bytes)
     const u8 program[] = {
-        0x48, 0xb9, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, // mov rcx, 0x0123456789ABCDEF
-        0x48, 0x81, 0xf1, 0xff, 0xff, 0xff, 0xff, // xor rcx, 0xFFFFFFFF (sx -> -1)
+        0x48, 0xb9, 0xef,0xcd,0xab,0x89,0x67,0x45,0x23,0x01, // mov rcx, 0x0123456789ABCDEF
+        0x48, 0x81, 0xf1, 0xff, 0xff, 0xff, 0xff,            // xor rcx, 0xFFFFFFFF (sx -> -1)
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9215,16 +9095,16 @@ TEST_F(CpuRuntimeTest, Xor64_Imm_NonRax) {
     rt.Run(st);
     // ^ all-ones = bitwise NOT: 0x0123456789ABCDEF -> 0xFEDCBA9876543210.
     EXPECT_EQ(st.gpr[1], 0xFEDCBA9876543210ULL) << "xor with -1 flips all bits";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB set";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear: result nonzero";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result MSB set";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear: result nonzero";
 }
 
 // xor r64, imm producing zero -> ZF set (value XOR itself).
 TEST_F(CpuRuntimeTest, Xor64_Imm_ToZeroSetsZF) {
     // mov eax, 0x7F ; xor rax, 0x7F  -> 0, ZF=1
     const u8 program[] = {
-        0xb8, 0x7f, 0x00, 0x00, 0x00, // mov eax, 0x7F (zero-extends rax)
-        0x48, 0x83, 0xf0, 0x7f,       // xor rax, 0x7F (imm8 sx)
+        0xb8, 0x7f,0x00,0x00,0x00,           // mov eax, 0x7F (zero-extends rax)
+        0x48, 0x83, 0xf0, 0x7f,              // xor rax, 0x7F (imm8 sx)
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9238,7 +9118,7 @@ TEST_F(CpuRuntimeTest, Xor64_Imm_ToZeroSetsZF) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0ULL) << "x ^ x = 0";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: result zero";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF cleared by XOR";
 }
 
@@ -9256,8 +9136,8 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_Basic) {
     scratch[1] = 0xBBBBBBBBBBBBBBBBULL; // sentinel after the 8-byte target
     // mov rax, scratch ; add qword [rax], 0x10
     const u8 program[] = {
-        0x48, 0xb8, 0, 0,    0,    0,    0,
-        0,    0,    0, 0x48, 0x83, 0x00, 0x10, // add qword [rax], 0x10 (imm8 sx)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0x83, 0x00, 0x10, // add qword [rax], 0x10 (imm8 sx)
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -9277,7 +9157,7 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_Basic) {
     EXPECT_EQ(scratch[0], 0x110ULL) << "memory accumulator incremented";
     EXPECT_EQ(scratch[1], 0xBBBBBBBBBBBBBBBBULL) << "next qword untouched";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no carry";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
 // Unsigned carry + wrap to zero: add 1 to 0xFFFF...FF -> 0, CF=1, ZF=1.
@@ -9285,7 +9165,8 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_CarryWrap) {
     u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     scratch[0] = 0xFFFFFFFFFFFFFFFFULL;
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x83, 0x00, 0x01, // add qword [rax], 1
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0x83, 0x00, 0x01, // add qword [rax], 1
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -9304,7 +9185,7 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_CarryWrap) {
     rt.Run(st);
     EXPECT_EQ(scratch[0], 0ULL) << "wrapped to zero";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: unsigned carry out";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: result zero";
 }
 
 // Signed overflow: add 1 to INT64_MAX -> 0x8000.., OF=1, SF=1.
@@ -9312,7 +9193,8 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_SignedOverflow) {
     u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     scratch[0] = 0x7FFFFFFFFFFFFFFFULL;
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x83, 0x00, 0x01, // add qword [rax], 1
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0x83, 0x00, 0x01, // add qword [rax], 1
         0xc3,
     };
     u8 prog[sizeof(program)];
@@ -9330,8 +9212,8 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_SignedOverflow) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(scratch[0], 0x8000000000000000ULL);
-    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: signed overflow";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+    EXPECT_EQ(st.rflags & (1ULL<<11), (1ULL<<11)) << "OF set: signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result negative";
 }
 
 // Negative immediate via sign-extended imm32: add -1 (0xFFFFFFFF sx).
@@ -9341,7 +9223,9 @@ TEST_F(CpuRuntimeTest, Add64_MemImm_NegativeSignExtended) {
     // mov rax, scratch ; add qword [rax], 0xFFFFFFFF (imm32, sx -> -1)
     // 48 81 00 ff ff ff ff (7 bytes)
     const u8 program[] = {
-        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x81, 0x00, 0xff, 0xff, 0xff, 0xff, 0xc3,
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0x81, 0x00, 0xff, 0xff, 0xff, 0xff,
+        0xc3,
     };
     u8 prog[sizeof(program)];
     std::memcpy(prog, program, sizeof(program));
@@ -9375,8 +9259,7 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_NoBorrowIn) {
     // sbb eax, ecx  — 19 c8 (2 bytes... but Zydis reports len 3 for the
     // game's encoding; the operation is identical). We use 19 c8.
     const u8 program[] = {
-        0x19,
-        0xc8, // sbb eax, ecx
+        0x19, 0xc8, // sbb eax, ecx
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9385,9 +9268,9 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_NoBorrowIn) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[0] = 0x100; // eax
-    st.gpr[1] = 0x10;  // ecx
-    st.rflags = 0x2;   // CF = 0
+    st.gpr[0] = 0x100;  // eax
+    st.gpr[1] = 0x10;   // ecx
+    st.rflags = 0x2;    // CF = 0
 
     Runtime rt;
     rt.Run(st);
@@ -9399,8 +9282,7 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_NoBorrowIn) {
 // This is the test that proves the borrow-in is honored.
 TEST_F(CpuRuntimeTest, Sbb32_RegReg_BorrowIn) {
     const u8 program[] = {
-        0x19,
-        0xc8, // sbb eax, ecx
+        0x19, 0xc8, // sbb eax, ecx
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9423,8 +9305,7 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_BorrowIn) {
 // SF=1, and the result zero-extends into the full 64-bit slot.
 TEST_F(CpuRuntimeTest, Sbb32_RegReg_BorrowOut_ZeroExtends) {
     const u8 program[] = {
-        0x19,
-        0xc8, // sbb eax, ecx
+        0x19, 0xc8, // sbb eax, ecx
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9435,20 +9316,19 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_BorrowOut_ZeroExtends) {
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[0] = 0xFFFFFFFF00000005ULL; // eax=5, high junk -> must be zero-extended
     st.gpr[1] = 0x5;                   // ecx
-    st.rflags = 0x2 | 0x1;             // CF=1
+    st.rflags = 0x2 | 0x1; // CF=1
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0x00000000FFFFFFFFULL) << "5-5-1 wraps; upper 32 zero-extended";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: borrow out";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB (bit31) set";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result MSB (bit31) set";
 }
 
 // Result zero -> ZF. 0x10 - 0x10 - 0 = 0.
 TEST_F(CpuRuntimeTest, Sbb32_RegReg_ToZero) {
     const u8 program[] = {
-        0x19,
-        0xc8, // sbb eax, ecx
+        0x19, 0xc8, // sbb eax, ecx
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9464,7 +9344,7 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_ToZero) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0ULL);
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: result zero";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear";
 }
 
@@ -9479,8 +9359,7 @@ TEST_F(CpuRuntimeTest, Sbb32_RegReg_ToZero) {
 TEST_F(CpuRuntimeTest, Inc8_AL_PreservesUpperAndCF) {
     // inc al  — fe c0 (2 bytes)
     const u8 program[] = {
-        0xfe,
-        0xc0,
+        0xfe, 0xc0,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9490,13 +9369,13 @@ TEST_F(CpuRuntimeTest, Inc8_AL_PreservesUpperAndCF) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[0] = 0xDEADBEEFDEAD0041ULL; // al = 0x41, upper must survive
-    st.rflags = 0x2 | 0x1;             // CF pre-set
+    st.rflags = 0x2 | 0x1; // CF pre-set
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0xDEADBEEFDEAD0042ULL) << "al incremented, upper 56 bits preserved";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not affect CF)";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
 // inc ah: the high-byte register increments byte 1 of rax, leaving
@@ -9504,8 +9383,7 @@ TEST_F(CpuRuntimeTest, Inc8_AL_PreservesUpperAndCF) {
 TEST_F(CpuRuntimeTest, Inc8_AH_HighByte) {
     // inc ah  — fe c4 (2 bytes)
     const u8 program[] = {
-        0xfe,
-        0xc4,
+        0xfe, 0xc4,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9526,8 +9404,7 @@ TEST_F(CpuRuntimeTest, Inc8_AH_HighByte) {
 // Wrap 0xFF -> 0: ZF set, CF stays clear (INC never sets CF on wrap).
 TEST_F(CpuRuntimeTest, Inc8_AL_WrapSetsZF) {
     const u8 program[] = {
-        0xfe,
-        0xc0, // inc al
+        0xfe, 0xc0, // inc al
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9537,21 +9414,20 @@ TEST_F(CpuRuntimeTest, Inc8_AL_WrapSetsZF) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[0] = 0xAAAAAAAAAAAAAAFFULL; // al = 0xFF
-    st.rflags = 0x2;                   // CF clear
+    st.rflags = 0x2; // CF clear
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0] & 0xFFULL, 0ULL) << "al wrapped to 0";
     EXPECT_EQ(st.gpr[0] & ~0xFFULL, 0xAAAAAAAAAAAAAA00ULL) << "upper bytes preserved";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: byte result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: byte result zero";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear on wrap";
 }
 
 // Signed overflow at 8-bit boundary: 0x7F -> 0x80 sets OF and SF.
 TEST_F(CpuRuntimeTest, Inc8_AL_SignedOverflow) {
     const u8 program[] = {
-        0xfe,
-        0xc0, // inc al
+        0xfe, 0xc0, // inc al
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9566,8 +9442,8 @@ TEST_F(CpuRuntimeTest, Inc8_AL_SignedOverflow) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0] & 0xFFULL, 0x80ULL);
-    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: 8-bit signed overflow";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+    EXPECT_EQ(st.rflags & (1ULL<<11), (1ULL<<11)) << "OF set: 8-bit signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result negative";
 }
 
 // ============================================================================
@@ -9582,8 +9458,7 @@ TEST_F(CpuRuntimeTest, Inc8_AL_SignedOverflow) {
 TEST_F(CpuRuntimeTest, Div8_Basic) {
     // div cl  — f6 f1 (2 bytes)
     const u8 program[] = {
-        0xf6,
-        0xf1,
+        0xf6, 0xf1,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9607,8 +9482,7 @@ TEST_F(CpuRuntimeTest, Div8_Basic) {
 // dividend (not just AL). q=39 (0x27), r=19 (0x13) -> AX = 0x1327.
 TEST_F(CpuRuntimeTest, Div8_FullAxDividend) {
     const u8 program[] = {
-        0xf6,
-        0xf1, // div cl
+        0xf6, 0xf1, // div cl
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9630,8 +9504,7 @@ TEST_F(CpuRuntimeTest, Div8_FullAxDividend) {
 TEST_F(CpuRuntimeTest, Div8_ExactDivision_NonClDivisor) {
     // div bl  — f6 f3 (2 bytes)
     const u8 program[] = {
-        0xf6,
-        0xf3,
+        0xf6, 0xf3,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9640,8 +9513,8 @@ TEST_F(CpuRuntimeTest, Div8_ExactDivision_NonClDivisor) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[0] = 0xF0; // ax = 240
-    st.gpr[3] = 0x10; // bl = 16 (divisor; RBX = gpr index 3)
+    st.gpr[0] = 0xF0;  // ax = 240
+    st.gpr[3] = 0x10;  // bl = 16 (divisor; RBX = gpr index 3)
 
     Runtime rt;
     rt.Run(st);
@@ -9660,8 +9533,7 @@ TEST_F(CpuRuntimeTest, Div8_ExactDivision_NonClDivisor) {
 TEST_F(CpuRuntimeTest, Dec8_AL_PreservesUpperAndCF) {
     // dec al  — fe c8 (2 bytes)
     const u8 program[] = {
-        0xfe,
-        0xc8,
+        0xfe, 0xc8,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9671,20 +9543,19 @@ TEST_F(CpuRuntimeTest, Dec8_AL_PreservesUpperAndCF) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[0] = 0xDEADBEEFDEAD0042ULL; // al = 0x42, upper must survive
-    st.rflags = 0x2 | 0x1;             // CF pre-set
+    st.rflags = 0x2 | 0x1; // CF pre-set
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0], 0xDEADBEEFDEAD0041ULL) << "al decremented, upper 56 bits preserved";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (DEC does not affect CF)";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
 // dec to zero: 0x01 -> 0x00 sets ZF.
 TEST_F(CpuRuntimeTest, Dec8_AL_ToZeroSetsZF) {
     const u8 program[] = {
-        0xfe,
-        0xc8, // dec al
+        0xfe, 0xc8, // dec al
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9699,15 +9570,14 @@ TEST_F(CpuRuntimeTest, Dec8_AL_ToZeroSetsZF) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0] & 0xFFULL, 0ULL);
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: result zero";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear";
 }
 
 // Underflow 0x00 -> 0xFF: SF set (result negative), CF stays clear.
 TEST_F(CpuRuntimeTest, Dec8_AL_UnderflowSetsSFNotCF) {
     const u8 program[] = {
-        0xfe,
-        0xc8, // dec al
+        0xfe, 0xc8, // dec al
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9717,21 +9587,20 @@ TEST_F(CpuRuntimeTest, Dec8_AL_UnderflowSetsSFNotCF) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[0] = 0xAAAAAAAAAAAAAA00ULL; // al = 0x00
-    st.rflags = 0x2;                   // CF clear
+    st.rflags = 0x2; // CF clear
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0] & 0xFFULL, 0xFFULL) << "al underflowed to 0xFF";
     EXPECT_EQ(st.gpr[0] & ~0xFFULL, 0xAAAAAAAAAAAAAA00ULL) << "upper bytes preserved";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result negative";
     EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear on underflow";
 }
 
 // Signed overflow: 0x80 (INT8_MIN) -> 0x7F sets OF.
 TEST_F(CpuRuntimeTest, Dec8_AL_SignedOverflow) {
     const u8 program[] = {
-        0xfe,
-        0xc8, // dec al
+        0xfe, 0xc8, // dec al
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9746,16 +9615,15 @@ TEST_F(CpuRuntimeTest, Dec8_AL_SignedOverflow) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[0] & 0xFFULL, 0x7FULL);
-    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: 0x80 - 1 signed overflow";
-    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF clear: result 0x7F positive";
+    EXPECT_EQ(st.rflags & (1ULL<<11), (1ULL<<11)) << "OF set: 0x80 - 1 signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL<<7), 0ULL) << "SF clear: result 0x7F positive";
 }
 
 // High-byte register: dec ah decrements byte 1 of rax, al untouched.
 TEST_F(CpuRuntimeTest, Dec8_AH_HighByte) {
     // dec ah  — fe cc (2 bytes)
     const u8 program[] = {
-        0xfe,
-        0xcc,
+        0xfe, 0xcc,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9785,8 +9653,7 @@ TEST_F(CpuRuntimeTest, Dec8_AH_HighByte) {
 TEST_F(CpuRuntimeTest, Mov8_RegReg_LowBytes) {
     // mov cl, al  — 88 c1 (2 bytes)
     const u8 program[] = {
-        0x88,
-        0xc1,
+        0x88, 0xc1,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9809,8 +9676,7 @@ TEST_F(CpuRuntimeTest, Mov8_RegReg_LowBytes) {
 TEST_F(CpuRuntimeTest, Mov8_RegReg_HighByteDest) {
     // mov ah, bl  — 88 dc (2 bytes)
     const u8 program[] = {
-        0x88,
-        0xdc,
+        0x88, 0xdc,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9833,8 +9699,7 @@ TEST_F(CpuRuntimeTest, Mov8_RegReg_HighByteDest) {
 TEST_F(CpuRuntimeTest, Mov8_RegReg_HighByteSource) {
     // mov bl, ah  — 88 e3 (2 bytes)
     const u8 program[] = {
-        0x88,
-        0xe3,
+        0x88, 0xe3,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9857,8 +9722,7 @@ TEST_F(CpuRuntimeTest, Mov8_RegReg_HighByteSource) {
 TEST_F(CpuRuntimeTest, Mov8_RegReg_AhToAl) {
     // mov al, ah  — 88 e0 (2 bytes)
     const u8 program[] = {
-        0x88,
-        0xe0,
+        0x88, 0xe0,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -9898,8 +9762,7 @@ TEST(CodeCacheFlush, RecycleAfterFull) {
     int allocated = 0;
     for (;;) {
         u8* p = cache.Allocate(chunk);
-        if (p == nullptr)
-            break;
+        if (p == nullptr) break;
         blocks.Insert(fake_rip, p);
         fake_rip += 0x100;
         ++allocated;
@@ -9961,13 +9824,13 @@ TEST_F(CpuRuntimeTest, Cld_ClearsDirectionFlag) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     // DF set, plus CF and ZF set, to confirm only DF is cleared.
-    st.rflags = 0x2 | (1ULL << 10) | 0x1 | (1ULL << 6);
+    st.rflags = 0x2 | (1ULL<<10) | 0x1 | (1ULL<<6);
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.rflags & (1ULL << 10), 0ULL) << "DF cleared";
+    EXPECT_EQ(st.rflags & (1ULL<<10), 0ULL) << "DF cleared";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF preserved";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF preserved";
 }
 
 // CLD when DF already clear is a no-op (idempotent), other flags intact.
@@ -9982,11 +9845,11 @@ TEST_F(CpuRuntimeTest, Cld_AlreadyClear_Idempotent) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.rflags = 0x2 | (1ULL << 7); // DF clear, SF set
+    st.rflags = 0x2 | (1ULL<<7); // DF clear, SF set
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.rflags & (1ULL << 10), 0ULL) << "DF stays clear";
-    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF preserved";
+    EXPECT_EQ(st.rflags & (1ULL<<10), 0ULL) << "DF stays clear";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF preserved";
 }
 
 // STD sets DF (bit 10) while leaving the surrounding flags intact.
@@ -10007,7 +9870,7 @@ TEST_F(CpuRuntimeTest, Std_SetsDirectionFlag) {
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.rflags & (1ULL << 10), (1ULL << 10)) << "DF set";
+    EXPECT_EQ(st.rflags & (1ULL<<10), (1ULL<<10)) << "DF set";
     EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved";
 }
 
@@ -10024,12 +9887,9 @@ TEST_F(CpuRuntimeTest, Std_SetsDirectionFlag) {
 TEST_F(CpuRuntimeTest, RepeCmpsq_EqualArrays_RunsToCount) {
     u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
-    for (int i = 0; i < 4; ++i) {
-        a[i] = 100 + i;
-        b[i] = 100 + i;
-    }
+    for (int i = 0; i < 4; ++i) { a[i] = 100 + i; b[i] = 100 + i; }
     // repe cmpsq  — f3 48 a7 (3 bytes)
-    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    const u8 program[] = { 0xf3, 0x48, 0xa7, 0xc3 };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -10038,13 +9898,13 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_EqualArrays_RunsToCount) {
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[6] = reinterpret_cast<u64>(a); // RSI
     st.gpr[7] = reinterpret_cast<u64>(b); // RDI
-    st.gpr[1] = 4;                        // RCX = element count
-    st.rflags = 0x2;                      // DF=0 (forward)
+    st.gpr[1] = 4;                         // RCX = element count
+    st.rflags = 0x2; // DF=0 (forward)
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[1], 0ULL) << "RCX exhausted";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF=1: last compare equal";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF=1: last compare equal";
     EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a) + 32) << "RSI += 4*8";
     EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b) + 32) << "RDI += 4*8";
 }
@@ -10054,15 +9914,9 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_EqualArrays_RunsToCount) {
 TEST_F(CpuRuntimeTest, RepeCmpsq_StopsOnMismatch) {
     u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
-    a[0] = 1;
-    a[1] = 2;
-    a[2] = 9;
-    a[3] = 4;
-    b[0] = 1;
-    b[1] = 2;
-    b[2] = 3;
-    b[3] = 4; // differ at index 2
-    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    a[0]=1; a[1]=2; a[2]=9; a[3]=4;
+    b[0]=1; b[1]=2; b[2]=3; b[3]=4; // differ at index 2
+    const u8 program[] = { 0xf3, 0x48, 0xa7, 0xc3 };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -10077,7 +9931,7 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_StopsOnMismatch) {
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[1], 1ULL) << "RCX = 1 (3 compares done)";
-    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF=0: mismatch found";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF=0: mismatch found";
     EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a) + 24) << "RSI past mismatch (3*8)";
     EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b) + 24) << "RDI past mismatch (3*8)";
     // 9 > 3 unsigned -> last compare (a-b) had no borrow: CF=0.
@@ -10089,9 +9943,8 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_StopsOnMismatch) {
 TEST_F(CpuRuntimeTest, RepeCmpsq_ZeroCount_NoOp) {
     u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
-    a[0] = 0xAAAA;
-    b[0] = 0xBBBB; // would mismatch if compared
-    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    a[0]=0xAAAA; b[0]=0xBBBB; // would mismatch if compared
+    const u8 program[] = { 0xf3, 0x48, 0xa7, 0xc3 };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -10100,15 +9953,15 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_ZeroCount_NoOp) {
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[6] = reinterpret_cast<u64>(a);
     st.gpr[7] = reinterpret_cast<u64>(b);
-    st.gpr[1] = 0;                 // RCX = 0
-    st.rflags = 0x2 | (1ULL << 6); // ZF pre-set; must survive untouched
+    st.gpr[1] = 0; // RCX = 0
+    st.rflags = 0x2 | (1ULL<<6); // ZF pre-set; must survive untouched
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[1], 0ULL) << "RCX stays 0";
     EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a)) << "RSI unmoved (no compare)";
     EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b)) << "RDI unmoved";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "flags unchanged on zero-trip";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "flags unchanged on zero-trip";
 }
 
 // DF=1 (backward): pointers DECREMENT. Compare a single pair then step
@@ -10116,9 +9969,8 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_ZeroCount_NoOp) {
 TEST_F(CpuRuntimeTest, RepeCmpsq_BackwardDirection) {
     u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
     u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
-    a[0] = 0x55;
-    b[0] = 0x55; // equal
-    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    a[0]=0x55; b[0]=0x55; // equal
+    const u8 program[] = { 0xf3, 0x48, 0xa7, 0xc3 };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -10128,14 +9980,1853 @@ TEST_F(CpuRuntimeTest, RepeCmpsq_BackwardDirection) {
     st.gpr[6] = reinterpret_cast<u64>(a);
     st.gpr[7] = reinterpret_cast<u64>(b);
     st.gpr[1] = 1;
-    st.rflags = 0x2 | (1ULL << 10); // DF=1 (backward)
+    st.rflags = 0x2 | (1ULL<<10); // DF=1 (backward)
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.gpr[1], 0ULL) << "one compare done";
-    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF=1: equal";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF=1: equal";
     EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a) - 8) << "RSI -= 8 (backward)";
     EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b) - 8) << "RDI -= 8 (backward)";
+}
+
+// ============================================================================
+// DescribeFaultContext — the async-signal-safe crash-diagnostic helper
+// the signal/SEH handler consults to turn a raw host fault address into
+// CPU-runtime context (was this thread in the runtime? what guest RIP?
+// was the fault inside JIT code?). We can only observe it from outside a
+// live fault here, but the out-of-runtime behavior and the null-address
+// path are exactly the safety-critical defaults, so we pin those.
+// ============================================================================
+
+// Outside any Run(), the calling thread has no active GuestState, so
+// the context reports not-in-runtime with zeroed fields. This is the
+// path taken when a fault happens in pure host code (the common case
+// for the audio/pad/user-service HLE threads).
+TEST(FaultDiagnostics, OutsideRuntime_ReportsNotInRuntime) {
+    const auto ctx = Core::Runtime::DescribeFaultContext(
+        reinterpret_cast<const void*>(0x1234ull));
+    EXPECT_FALSE(ctx.in_runtime) << "no active Run() on this thread";
+    EXPECT_EQ(ctx.guest_rip, 0ull) << "no guest RIP when not in runtime";
+    EXPECT_EQ(ctx.guest_exit_reason, 0u);
+    EXPECT_FALSE(ctx.have_gprs) << "no GPR snapshot when not in runtime";
+    EXPECT_EQ(ctx.guest_gpr[0], 0ull) << "GPR array zeroed by default";
+    EXPECT_EQ(ctx.guest_gpr[15], 0ull);
+    EXPECT_FALSE(ctx.faulting_insn_decoded) << "no instruction decoded when not in runtime";
+    EXPECT_EQ(ctx.faulting_mnemonic, 0u) << "mnemonic id zero (INVALID) by default";
+    EXPECT_EQ(ctx.faulting_insn_length, 0) << "insn length zero by default";
+}
+
+// A null host address must never be treated as inside JIT code (the
+// Contains range check must not fire on null), regardless of runtime
+// state. Defensive: the caller may not always have a code address.
+TEST(FaultDiagnostics, NullHostAddr_NotInJitCode) {
+    const auto ctx = Core::Runtime::DescribeFaultContext(nullptr);
+    EXPECT_FALSE(ctx.in_jit_code) << "null address is never inside the code cache";
+}
+
+// A host address far outside any plausible code-cache mapping (the
+// kind of wild ~1 TiB address a bad-pointer dereference produces) is
+// reported as NOT in JIT code — i.e. the fault is elsewhere (HLE or a
+// bad guest-pointer deref), which is the correct triage signal.
+TEST(FaultDiagnostics, WildAddr_NotInJitCode) {
+    const auto ctx = Core::Runtime::DescribeFaultContext(
+        reinterpret_cast<const void*>(0x1030afb0035ull));
+    EXPECT_FALSE(ctx.in_jit_code)
+        << "a wild far-out address is not inside the JIT code cache";
+}
+
+// After a normal Run() completes, the thread-local state is restored to
+// null, so a subsequent fault-context query again reports not-in-
+// runtime. Confirms the diagnostic doesn't latch stale state across
+// Run() boundaries (which would mis-attribute a later host-code fault
+// to guest execution).
+TEST_F(CpuRuntimeTest, FaultDiagnostics_ClearedAfterRun) {
+    // A trivial guest program: ret.
+    const u8 program[] = { 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(st);
+
+    // Run() has returned; tl_current_guest_state was restored to null.
+    const auto ctx = Core::Runtime::DescribeFaultContext(
+        reinterpret_cast<const void*>(st.rip));
+    EXPECT_FALSE(ctx.in_runtime) << "runtime TLS cleared after Run() returns";
+    EXPECT_EQ(ctx.guest_rip, 0ull);
+}
+
+// ============================================================================
+// 32-bit address-size override (0x67 prefix) — the effective address must
+// be computed modulo 2^32 and zero-extended to 64 bits. If the upper 32
+// bits of the base/index guest registers leak into the address, a load
+// or store targets a wild ~TiB host address instead of the intended
+// <4 GiB one. (This was the cause of an in-JIT-code access violation
+// whose fault address was (1 TiB ceiling + ~12 GiB): the low 32 bits
+// were the real target, the high bits leaked register garbage.)
+//
+// These tests plant a buffer below 4 GiB, load the base register with
+// GARBAGE in its upper 32 bits, and confirm the access hits the
+// truncated low address rather than faulting.
+// ============================================================================
+
+// Helper: map a scratch page below 4 GiB so a 32-bit-truncated address
+// is a valid host pointer. Returns nullptr if the OS won't oblige (then
+// the test self-skips rather than giving a false failure).
+static u8* MapLowScratch() {
+#if !defined(_WIN32)
+    void* p = ::mmap(reinterpret_cast<void*>(0x20000000ull), 4096,
+                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED) return nullptr;
+    if (reinterpret_cast<uintptr_t>(p) >= 0x100000000ull) { ::munmap(p, 4096); return nullptr; }
+    return static_cast<u8*>(p);
+#else
+    return nullptr;
+#endif
+}
+
+// mov [ebx], eax with RBX = garbage_upper | low_addr. The store must
+// land at low_addr (upper 32 bits of RBX ignored), not fault.
+TEST_F(CpuRuntimeTest, Addr32_BaseUpperBitsIgnored) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    const u32 target_off = 0x40; // write 0x40 bytes into the low page
+    u8* target = low + target_off;
+    *reinterpret_cast<u32*>(target) = 0; // clear
+
+    // mov [ebx], eax  — 67 89 03
+    const u8 program[] = { 0x67, 0x89, 0x03, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // RBX low32 = target address; upper32 = garbage that must be masked.
+    st.gpr[3] = (0xDEADBEEFull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+    st.gpr[0] = 0x12345678; // eax value to store
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x12345678u)
+        << "store landed at the 32-bit-truncated address";
+    ::munmap(low, 4096);
+}
+
+// mov [ebx + ecx*4], eax with BOTH base and index carrying garbage
+// upper bits. The entire base+index*scale sum must wrap at 32 bits.
+TEST_F(CpuRuntimeTest, Addr32_BasePlusIndexTruncated) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    // Effective low address = base_low + index_low*4.
+    const u32 base_low = static_cast<u32>(reinterpret_cast<uintptr_t>(low));
+    const u32 idx = 5;
+    u8* target = low + idx * 4;
+    *reinterpret_cast<u32*>(target) = 0;
+
+    // mov [ebx+ecx*4], eax  — 67 89 04 8b
+    const u8 program[] = { 0x67, 0x89, 0x04, 0x8b, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = (0xCAFEF00Dull << 32) | base_low; // RBX: garbage upper
+    st.gpr[1] = (0x99999999ull << 32) | idx;        // RCX: garbage upper
+    st.gpr[0] = 0xABCDEF01;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0xABCDEF01u)
+        << "base+index*scale truncated to 32 bits before access";
+    ::munmap(low, 4096);
+}
+
+// Regression guard: a NORMAL 64-bit-mode access (no 0x67 prefix) must
+// NOT be truncated — the full 64-bit base is used as-is. We can verify
+// this without a low mapping by storing through the regular scratch
+// region (which lives at its natural 64-bit host address).
+TEST_F(CpuRuntimeTest, Addr64_NotTruncated) {
+    u8* target = mem.CodePtr() + 0x100;
+    *reinterpret_cast<u32*>(target) = 0;
+    // mov [rbx], eax  — 89 03 (no 0x67)
+    const u8 program[] = { 0x89, 0x03, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(target); // full 64-bit pointer
+    st.gpr[0] = 0x5A5A5A5A;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x5A5A5A5Au)
+        << "64-bit address used in full (no truncation)";
+}
+
+// ============================================================================
+// CUSA07010 (Sonic Mania / RSDK) regression tests.
+//
+// These exercise the exact instruction *patterns* — byte-for-byte — pulled
+// from eboot.bin around the RSDK 2D-blit at guest 0x800274bb0, the function
+// that produced a long-standing deterministic access violation. The static
+// disassembly of that region proved the JIT translation was byte-exact and
+// the fault was a faithful consequence of a 32-bit zero-extension chain
+// feeding a 64-bit pointer index. These tests lock that behavior in so the
+// composition can't silently regress.
+//
+// Each program below uses the genuine eboot encoding (verified by objdump).
+// GPR index map: RAX=0 RCX=1 RDX=2 RBX=3 RSP=4 RBP=5 RSI=6 RDI=7
+//                R8=8 R9=9 R10=10 R11=11 R12=12 R13=13 R14=14 R15=15.
+// ============================================================================
+
+// --- T1: the R8 producer chain ---------------------------------------------
+// mov r8d,0x1 ; sub r8d,r10d ; add r8d,ecx   (@0x800274bcc, eboot bytes)
+//
+// 32-bit ALU into r8d MUST zero-extend bits 63:32. With the real crash inputs
+// (r10=432, ecx=31) the result is -400 = 0x00000000fffffe70 — exactly what the
+// emulator computed and what real hardware computes. The point of this test is
+// to pin the zero-extension: the upper half must be clear, NOT sign-extended.
+TEST_F(CpuRuntimeTest, EbootProducerChain_R8d_ZeroExtendsNotSignExtends) {
+    const u8 program[] = {
+        0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, // mov r8d, 0x1
+        0x45, 0x29, 0xd0,                   // sub r8d, r10d
+        0x41, 0x01, 0xc8,                   // add r8d, ecx
+        0xc3,                               // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Real crash inputs. Seed garbage in the upper 32 bits of r8/r10/rcx to
+    // prove the 32-bit ops both consume and produce clean 32-bit values.
+    st.gpr[8] = 0xDEAD'BEEF'0000'0000ULL;  // r8  (upper garbage; mov r8d must wipe it)
+    st.gpr[10] = 0xCAFE'0000'0000'01b0ULL; // r10 (low = 432)
+    st.gpr[1] = 0xF00D'0000'0000'001fULL;  // rcx (low = 31)
+
+    Runtime rt;
+    rt.Run(st);
+
+    EXPECT_EQ(st.gpr[8], 0xfffffe70ULL)
+        << "r8 = 1 - 432 + 31 = -400, zero-extended to 64 bits";
+    EXPECT_EQ(st.gpr[8] >> 32, 0u)
+        << "32-bit ALU writes MUST clear bits 63:32 (zero-extend, never sign-extend)";
+}
+
+// Same chain, "well-behaved" inputs where the engine intends a small delta:
+// r10=32, ecx=31 -> r8 = 1 - 32 + 31 = 0. Guards the arithmetic itself.
+TEST_F(CpuRuntimeTest, EbootProducerChain_SmallInputs_ProduceZero) {
+    const u8 program[] = {
+        0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, // mov r8d, 0x1
+        0x45, 0x29, 0xd0,                   // sub r8d, r10d
+        0x41, 0x01, 0xc8,                   // add r8d, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[10] = 32;
+    st.gpr[1] = 31;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[8], 0u) << "1 - 32 + 31 = 0";
+    EXPECT_EQ(st.gpr[8] >> 32, 0u);
+}
+
+// --- T2: the crash LEA, scale-2 64-bit index -------------------------------
+// lea rax,[rax+r8*2]   (@0x800274cb8, eboot bytes 4a 8d 04 40)
+//
+// The index register is used at full 64-bit width (REX.W, REX.X). This test
+// verifies the lifter feeds the *entire* r8 into the address math — the exact
+// behavior that, given a zero-extended r8, faithfully reproduces hardware.
+// Two cases: zero-extended r8 (the real run) and sign-extended r8 (the value
+// the blit geometry actually needs). Both must compute the architectural sum.
+TEST_F(CpuRuntimeTest, EbootCrashLea_RaxPlusR8x2_Uses64BitIndex) {
+    const u8 program[] = {
+        0x4a, 0x8d, 0x04, 0x40, // lea rax,[rax+r8*2]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    // Case A: zero-extended r8 = 0x00000000fffffe70 (the actual crash value).
+    {
+        GuestState st{};
+        st.rip = reinterpret_cast<u64>(mem.CodePtr());
+        st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+        st.gpr[0] = 0x214c40000ULL; // rax = dst base (in dmem pool)
+        st.gpr[8] = 0x00000000fffffe70ULL;
+        Runtime rt;
+        rt.Run(st);
+        EXPECT_EQ(st.gpr[0], 0x414c3fce0ULL)
+            << "rax + (0xfffffe70 << 1): full 64-bit index, no truncation";
+    }
+    // Case B: sign-extended r8 = 0xfffffffffffffe70 (-400). The same emitter,
+    // a different input, yields the in-pool address — confirming the lea is a
+    // faithful pass-through and the bug was never in this instruction.
+    {
+        *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+        GuestState st{};
+        st.rip = reinterpret_cast<u64>(mem.CodePtr());
+        st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+        st.gpr[0] = 0x214c40000ULL;
+        st.gpr[8] = 0xfffffffffffffe70ULL; // -400
+        Runtime rt;
+        rt.Run(st);
+        EXPECT_EQ(st.gpr[0], 0x214c3fce0ULL)
+            << "rax + (-400 << 1) = rax - 800: stays in pool";
+    }
+}
+
+// --- T3: the row-advance LEA, base r11 + r9*2 ------------------------------
+// lea rax,[r11+r9*2]   (@0x800274cae, eboot bytes 4b 8d 04 4b)
+// Both base and index are extended (REX.B + REX.X). r11=base, r9=index, scale 2.
+TEST_F(CpuRuntimeTest, EbootRowLea_R11PlusR9x2_ExtendedBaseAndIndex) {
+    const u8 program[] = {
+        0x4b, 0x8d, 0x04, 0x4b, // lea rax,[r11+r9*2]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[11] = 0x214c40020ULL; // r11 = rax_start + 0x20
+    st.gpr[9] = 0x1a0ULL;        // r9 = 416 (stride)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x214c40360ULL)
+        << "r11 + r9*2 = 0x214c40020 + 0x340";
+}
+
+// --- T4: sar / lea-r32 / shl interplay -------------------------------------
+// sar r10d,4 ; lea r9d,[r10-1] ; shl r9,4   (@0x800274bf1, eboot bytes)
+//
+// This is the stride derivation. It mixes a 32-bit arithmetic shift, a 32-bit
+// LEA (which zero-extends its 64-bit result), and a 64-bit shift. With the
+// real r10=432 it reproduces r9 = 416 = 0x1a0 exactly.
+TEST_F(CpuRuntimeTest, EbootStrideDerivation_Sar_LeaR32_Shl) {
+    const u8 program[] = {
+        0x41, 0xc1, 0xfa, 0x04, // sar r10d, 4
+        0x45, 0x8d, 0x4a, 0xff, // lea r9d, [r10-1]
+        0x49, 0xc1, 0xe1, 0x04, // shl r9, 4
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[10] = 0x1b0ULL; // r10 = 432
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[10], 27u) << "sar 432 >> 4 = 27";
+    EXPECT_EQ(st.gpr[9], 0x1a0u) << "((27-1) << 4) = 416 = 0x1a0 (matches eboot r9)";
+    EXPECT_EQ(st.gpr[9] >> 32, 0u) << "lea r32 zero-extends before the 64-bit shl";
+}
+
+// SAR sign-extension guard: arithmetic shift of a negative 32-bit value must
+// fill with sign bits within the 32-bit lane (and zero-extend the lane to 64).
+TEST_F(CpuRuntimeTest, EbootStride_SarNegative_SignFillsLane) {
+    const u8 program[] = {
+        0x41, 0xc1, 0xfa, 0x04, // sar r10d, 4
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[10] = 0xFFFF'FFFF'FFFF'FFF0ULL; // r10d = -16 (upper garbage too)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[10], 0xffffffffULL)
+        << "sar(-16, 4) = -1 within 32-bit lane = 0xffffffff, zero-extended to 64";
+}
+
+// --- T5: mov eax,eax then shl rax,8 ----------------------------------------
+// mov eax,eax ; shl rax,8   (@0x800274bd2, eboot bytes 89 c0 / 48 c1 e0 08)
+//
+// `mov eax,eax` is the canonical 32-bit zero-extend idiom: it DISCARDS bits
+// 63:32. This is how the dst pointer is rebuilt from a packed 32-bit handle.
+// Upper garbage in rax must vanish before the shift.
+TEST_F(CpuRuntimeTest, EbootDstPointer_MovEaxEax_DiscardsUpperThenShl) {
+    const u8 program[] = {
+        0x89, 0xc0,             // mov eax, eax
+        0x48, 0xc1, 0xe0, 0x08, // shl rax, 8
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEAD'BEEF'0214'C400ULL; // packed handle with upper garbage
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x214c40000ULL)
+        << "mov eax,eax drops upper 32, then <<8 reconstructs the dmem pointer";
+}
+
+// --- T6: memory-source BEXTR -----------------------------------------------
+// mov ecx,0xe0d ; bextr ecx,[rbx+r15+0x10],ecx   (@0x800274bc7, eboot bytes)
+//
+// The bitfield ctrl 0xe0d means start=13, len=14. This is the producer of the
+// engine's per-surface field. The source is a *memory* operand with base+index
+// +disp, exercising EmitEffectiveAddress feeding the host BEXTR. We seed the
+// scratch dword so the extracted field equals 415 (a plausible stride field).
+TEST_F(CpuRuntimeTest, EbootBextrMem_BaseIndexDisp_ExtractsField) {
+    // Scratch dword lives at CodePtr()+0x100; addressed as [rbx + r15 + 0x10],
+    // so put (rbx + r15) = scratch - 0x10.
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *scratch = (415u << 13); // bits[13:26] == 415
+
+    const u8 program[] = {
+        0xb9, 0x0d, 0x0e, 0x00, 0x00,             // mov ecx, 0xe0d (start=13,len=14)
+        0xc4, 0xa2, 0x70, 0xf7, 0x4c, 0x3b, 0x10, // bextr ecx,[rbx+r15*1+0x10],ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    const u64 base_plus_index = reinterpret_cast<u64>(scratch) - 0x10;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = base_plus_index; // rbx
+    st.gpr[15] = 0;              // r15 (so rbx+r15+0x10 = scratch)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 415u)
+        << "BEXTR(mem, start=13, len=14) over (415<<13) = 415";
+    EXPECT_EQ(st.gpr[1] >> 32, 0u) << "32-bit BEXTR zero-extends";
+}
+
+// Split base/index variant: same address via rbx=scratch-0x110, r15=0x100.
+// Guards that EmitEffectiveAddress sums base + index + disp (not just base).
+TEST_F(CpuRuntimeTest, EbootBextrMem_IndexContributes) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x200);
+    *scratch = (123u << 13);
+
+    const u8 program[] = {
+        0xb9, 0x0d, 0x0e, 0x00, 0x00,
+        0xc4, 0xa2, 0x70, 0xf7, 0x4c, 0x3b, 0x10, // bextr ecx,[rbx+r15+0x10],ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // rbx + r15 + 0x10 must equal scratch. Split it so the index is non-zero.
+    st.gpr[3] = reinterpret_cast<u64>(scratch) - 0x10 - 0x100; // rbx
+    st.gpr[15] = 0x100;                                         // r15 (index, scale 1)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 123u)
+        << "address must be base + index*1 + disp; a missing index term would misread";
+}
+
+// --- T7: the unrolled u16 copy primitive -----------------------------------
+// movzx edi,word[rsi] ; mov word[rax],di   (@0x800274c20, eboot bytes)
+// The core of the blit's inner loop: 16-bit load (zero-extended into edi) then
+// 16-bit store. Verifies the half-word store writes exactly 2 bytes and the
+// load zero-extends.
+TEST_F(CpuRuntimeTest, EbootBlitCopy_Movzx16_Store16) {
+    u16* src = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
+    u16* dst = reinterpret_cast<u16*>(mem.CodePtr() + 0x200);
+    *src = 0xBEEF;
+    *dst = 0x1111;
+    *(dst + 1) = 0x2222; // sentinel after dst; the 16-bit store must NOT touch it
+
+    const u8 program[] = {
+        0x0f, 0xb7, 0x3e, // movzx edi, word[rsi]
+        0x66, 0x89, 0x38, // mov word[rax], di
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(src); // rsi
+    st.gpr[0] = reinterpret_cast<u64>(dst); // rax
+    st.gpr[7] = 0xFFFF'FFFF'FFFF'0000ULL;   // rdi: prove movzx zero-extends low 16
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[7], 0xBEEFu) << "movzx edi,word: zero-extend the 16-bit load";
+    EXPECT_EQ(*dst, 0xBEEFu) << "16-bit store writes the copied halfword";
+    EXPECT_EQ(*(dst + 1), 0x2222u) << "16-bit store must NOT clobber the next halfword";
+}
+
+// --- T8: the post-loop MOVSXD ----------------------------------------------
+// movsxd rax,dword[r14+0x2c]   (@0x800274cc8, eboot bytes 49 63 46 2c)
+//
+// This is the sign-extending load the loop trip-count uses. It is the CORRECT
+// way to widen a signed 32-bit value to 64 bits — the contrast that explains
+// why the 32-bit producer chain (T1) legitimately does NOT sign-extend. A
+// negative source must fill the upper 32 bits with ones.
+TEST_F(CpuRuntimeTest, EbootMovsxdMem_SignExtendsNegative) {
+    s32* slot = reinterpret_cast<s32*>(mem.CodePtr() + 0x100 + 0x2c);
+    *slot = static_cast<s32>(0xFFFFFE70); // -400
+
+    const u8 program[] = {
+        0x49, 0x63, 0x46, 0x2c, // movsxd rax, dword[r14+0x2c]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[14] = reinterpret_cast<u64>(mem.CodePtr() + 0x100); // r14
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xfffffffffffffe70ULL)
+        << "movsxd sign-extends -400 to the full 64-bit register";
+}
+
+// Positive source: movsxd must zero the upper 32 (sign bit clear).
+TEST_F(CpuRuntimeTest, EbootMovsxdMem_PositiveZeroExtends) {
+    s32* slot = reinterpret_cast<s32*>(mem.CodePtr() + 0x100 + 0x2c);
+    *slot = 0x000000f0; // 240 (the outer row count)
+
+    const u8 program[] = {
+        0x49, 0x63, 0x46, 0x2c, // movsxd rax, dword[r14+0x2c]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xFFFF'FFFF'0000'0000ULL; // prove the upper half gets cleared
+    st.gpr[14] = reinterpret_cast<u64>(mem.CodePtr() + 0x100);
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xf0ULL)
+        << "movsxd of a positive value clears bits 63:32";
+}
+
+// --- T9: register-source BEXTR ---------------------------------------------
+// bextr r8d,edx,eax   (@0x8003055ef, eboot bytes c4 62 78 f7 c2)
+//
+// The dst-pointer helper (sub_8003055a0) decomposes a packed dword with a
+// sequence of register-source BEXTRs writing r8d/r9d/edi/esi. ctrl=eax here.
+TEST_F(CpuRuntimeTest, EbootBextrReg_R8d_FromEdxByEax) {
+    const u8 program[] = {
+        0xc4, 0x62, 0x78, 0xf7, 0xc2, // bextr r8d, edx, eax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[2] = 0x1234'5678ULL;            // edx = source
+    st.gpr[0] = 0x0808ULL;                 // eax = ctrl: start=8, len=8
+    st.gpr[8] = 0xDEAD'BEEF'DEAD'BEEFULL;  // r8 upper garbage
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[8], 0x56ULL)
+        << "BEXTR(0x12345678, start=8, len=8) = 0x56";
+    EXPECT_EQ(st.gpr[8] >> 32, 0u)
+        << "32-bit BEXTR result zero-extends bits 63:32";
+}
+
+// --- T10: integration — the full producer + lea, end to end ----------------
+// This stitches the producer chain and the crash lea into one block, exactly
+// as control flow reaches them, and asserts the *whole* computation matches
+// the observed crash (proving the composition is faithful, not just each op).
+// With crash inputs the dst escapes the pool; with the value the engine would
+// supply on a correct run (small r8) it stays in range. We assert the former
+// (the faithful, reproducible result) so any future drift is caught.
+TEST_F(CpuRuntimeTest, EbootProducerPlusLea_Integration_MatchesObservedCrash) {
+    const u8 program[] = {
+        0x41, 0xb8, 0x01, 0x00, 0x00, 0x00, // mov r8d, 0x1
+        0x45, 0x29, 0xd0,                   // sub r8d, r10d
+        0x41, 0x01, 0xc8,                   // add r8d, ecx
+        0x4a, 0x8d, 0x04, 0x40,             // lea rax,[rax+r8*2]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x214c40000ULL; // rax = dst base
+    st.gpr[10] = 432;           // r10
+    st.gpr[1] = 31;             // rcx (ecx)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[8], 0xfffffe70ULL)
+        << "producer yields zero-extended -400";
+    EXPECT_EQ(st.gpr[0], 0x414c3fce0ULL)
+        << "lea consumes the full 64-bit (zero-extended) r8 -> faithful OOB result";
+}
+
+// ============================================================================
+// String-instruction coverage (STOS / MOVS / LODS / SCAS).
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which fatally exited the JIT at the
+// first `rep stosb` inside libc memset (guest 0x8075ac00f, exit_reason=2
+// UnsupportedInstruction). These are the memset/memcpy/strlen primitives;
+// they were a known coverage gap. Tests below pin both the REP-counted forms
+// and the single forms, the direction flag (DF) controlling advance sign, and
+// the flag semantics of SCAS (only SCAS sets flags; STOS/MOVS/LODS do not).
+//
+// GPR index map: RAX=0 RCX=1 RDX=2 RBX=3 RSP=4 RBP=5 RSI=6 RDI=7.
+// rflags DF is bit 10 (0x400).
+// ============================================================================
+
+// rep stosb — the exact memset primitive that crashed CUSA02394.
+// Fill 5 bytes with 0xAB; RCX must reach 0 and RDI must advance by 5.
+TEST_F(CpuRuntimeTest, RepStosb_FillsBufferAndConsumesCount) {
+    u8* buf = mem.CodePtr() + 0x200;
+    std::memset(buf, 0x00, 16);
+    buf[5] = 0x77; // sentinel: must NOT be overwritten (only 5 bytes filled)
+
+    const u8 program[] = {0xf3, 0xaa, 0xc3}; // rep stosb ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAB;                        // AL = fill value
+    st.gpr[7] = reinterpret_cast<u64>(buf);  // RDI = dest
+    st.gpr[1] = 5;                           // RCX = count
+
+    Runtime rt;
+    rt.Run(st);
+
+    for (int i = 0; i < 5; ++i)
+        EXPECT_EQ(buf[i], 0xAB) << "byte " << i;
+    EXPECT_EQ(buf[5], 0x77) << "fill must stop exactly at RCX bytes";
+    EXPECT_EQ(st.gpr[1], 0u) << "RCX exhausted";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 5) << "RDI advanced by 5 (DF=0)";
+}
+
+// rep stosb with RCX=0 — must write nothing and not move RDI.
+TEST_F(CpuRuntimeTest, RepStosb_ZeroCount_NoOp) {
+    u8* buf = mem.CodePtr() + 0x200;
+    buf[0] = 0x55;
+
+    const u8 program[] = {0xf3, 0xaa, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAB;
+    st.gpr[7] = reinterpret_cast<u64>(buf);
+    st.gpr[1] = 0; // RCX = 0
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(buf[0], 0x55) << "zero-count REP must write nothing";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf)) << "RDI unchanged";
+}
+
+// rep stosq — qword fill (memset of 8-byte units).
+TEST_F(CpuRuntimeTest, RepStosq_FillsQwords) {
+    u64* buf = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
+    buf[0] = buf[1] = buf[2] = 0;
+    buf[3] = 0x1234'5678'9abc'def0ULL; // sentinel
+
+    const u8 program[] = {0xf3, 0x48, 0xab, 0xc3}; // rep stosq ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEAD'BEEF'CAFE'BABEULL;     // RAX = fill qword
+    st.gpr[7] = reinterpret_cast<u64>(buf);   // RDI
+    st.gpr[1] = 3;                            // RCX = 3 qwords
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(buf[0], 0xDEAD'BEEF'CAFE'BABEULL);
+    EXPECT_EQ(buf[1], 0xDEAD'BEEF'CAFE'BABEULL);
+    EXPECT_EQ(buf[2], 0xDEAD'BEEF'CAFE'BABEULL);
+    EXPECT_EQ(buf[3], 0x1234'5678'9abc'def0ULL) << "stop after 3 qwords";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 24) << "RDI += 3*8";
+}
+
+// Single stosb (no REP) — store one byte, advance RDI by 1, leave RCX alone.
+TEST_F(CpuRuntimeTest, Stosb_Single_StoresOneByte) {
+    u8* buf = mem.CodePtr() + 0x200;
+    buf[0] = 0; buf[1] = 0x99;
+
+    const u8 program[] = {0xaa, 0xc3}; // stosb ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x3C;
+    st.gpr[7] = reinterpret_cast<u64>(buf);
+    st.gpr[1] = 999; // RCX must be untouched by non-REP form
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(buf[0], 0x3C);
+    EXPECT_EQ(buf[1], 0x99) << "single store touches one byte only";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 1);
+    EXPECT_EQ(st.gpr[1], 999u) << "non-REP must not touch RCX";
+}
+
+// rep stosb with DF=1 — fill must go BACKWARD (RDI decrements).
+TEST_F(CpuRuntimeTest, RepStosb_DfSet_FillsBackward) {
+    u8* buf = mem.CodePtr() + 0x200;
+    std::memset(buf, 0, 16);
+    u8* start = buf + 5; // fill 5..3 going down
+
+    const u8 program[] = {0xf3, 0xaa, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xEE;
+    st.gpr[7] = reinterpret_cast<u64>(start);
+    st.gpr[1] = 3;
+    st.rflags |= 0x400; // DF = 1
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(buf[5], 0xEE);
+    EXPECT_EQ(buf[4], 0xEE);
+    EXPECT_EQ(buf[3], 0xEE);
+    EXPECT_EQ(buf[2], 0x00) << "should not write below the 3 filled bytes";
+    EXPECT_EQ(buf[6], 0x00) << "should not write above start";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(start) - 3) << "RDI decremented (DF=1)";
+    EXPECT_EQ(st.rflags & 0x400u, 0x400u) << "STOS must preserve DF";
+}
+
+// rep movsb — memcpy primitive. Copy 6 bytes src->dst, advance both, RCX=0.
+TEST_F(CpuRuntimeTest, RepMovsb_CopiesBuffer) {
+    u8* src = mem.CodePtr() + 0x200;
+    u8* dst = mem.CodePtr() + 0x300;
+    const u8 pattern[6] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    std::memcpy(src, pattern, 6);
+    std::memset(dst, 0, 8);
+    dst[6] = 0xC3; // sentinel after copy region
+
+    const u8 program[] = {0xf3, 0xa4, 0xc3}; // rep movsb ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(src); // RSI
+    st.gpr[7] = reinterpret_cast<u64>(dst); // RDI
+    st.gpr[1] = 6;                          // RCX
+
+    Runtime rt;
+    rt.Run(st);
+    for (int i = 0; i < 6; ++i)
+        EXPECT_EQ(dst[i], pattern[i]) << "copied byte " << i;
+    EXPECT_EQ(dst[6], 0xC3) << "copy stops at RCX bytes";
+    EXPECT_EQ(st.gpr[1], 0u);
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(src) + 6) << "RSI += 6";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(dst) + 6) << "RDI += 6";
+}
+
+// rep movsd — dword-granular copy (3 dwords).
+TEST_F(CpuRuntimeTest, RepMovsd_CopiesDwords) {
+    u32* src = reinterpret_cast<u32*>(mem.CodePtr() + 0x200);
+    u32* dst = reinterpret_cast<u32*>(mem.CodePtr() + 0x300);
+    src[0] = 0xAAAA0001; src[1] = 0xBBBB0002; src[2] = 0xCCCC0003;
+    dst[0] = dst[1] = dst[2] = 0; dst[3] = 0xFFFFFFFF;
+
+    const u8 program[] = {0xf3, 0xa5, 0xc3}; // rep movsd ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(src);
+    st.gpr[7] = reinterpret_cast<u64>(dst);
+    st.gpr[1] = 3;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(dst[0], 0xAAAA0001u);
+    EXPECT_EQ(dst[1], 0xBBBB0002u);
+    EXPECT_EQ(dst[2], 0xCCCC0003u);
+    EXPECT_EQ(dst[3], 0xFFFFFFFFu) << "stop after 3 dwords";
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(src) + 12);
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(dst) + 12);
+}
+
+// lodsb — load one byte into AL, advance RSI; upper bits of RAX preserved.
+TEST_F(CpuRuntimeTest, Lodsb_LoadsByteIntoAlPreservingUpper) {
+    u8* src = mem.CodePtr() + 0x200;
+    src[0] = 0x7E;
+
+    const u8 program[] = {0xac, 0xc3}; // lodsb ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(src);  // RSI
+    st.gpr[0] = 0xDEAD'BEEF'CAFE'BB00ULL;    // RAX with known upper bits
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xDEAD'BEEF'CAFE'BB7EULL)
+        << "lodsb writes AL only; RAX[63:8] preserved";
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(src) + 1) << "RSI += 1";
+}
+
+// repne scasb — the strlen primitive: scan for AL==byte, stop on match.
+// Buffer "AB\0..." with AL=0: REPNE scans while not-equal, stops at the NUL.
+// Classic strlen computes len = (start_rcx - residual_rcx) - 1.
+TEST_F(CpuRuntimeTest, RepneScasb_FindsTerminatorAndSetsZf) {
+    u8* buf = mem.CodePtr() + 0x200;
+    buf[0] = 'A'; buf[1] = 'B'; buf[2] = 'C'; buf[3] = 0x00; buf[4] = 'X';
+
+    const u8 program[] = {0xf2, 0xae, 0xc3}; // repne scasb ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x00;                        // AL = NUL (scan target)
+    st.gpr[7] = reinterpret_cast<u64>(buf);  // RDI
+    st.gpr[1] = 16;                          // RCX = max scan
+
+    Runtime rt;
+    rt.Run(st);
+    // Scans A,B,C,(NUL match). RDI lands one past the NUL (index 4).
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 4) << "RDI past the NUL";
+    EXPECT_EQ(st.gpr[1], 12u) << "RCX = 16 - 4 scanned";
+    EXPECT_EQ(st.rflags & 0x40u, 0x40u) << "ZF set: matched the NUL";
+    // strlen = (16 - 12) - 1 = 3 ("ABC")
+    EXPECT_EQ((16u - st.gpr[1]) - 1u, 3u) << "derived strlen == 3";
+}
+
+// repne scasb that never matches within RCX — ZF clear, RCX exhausted to 0.
+TEST_F(CpuRuntimeTest, RepneScasb_NoMatch_CountExhausted) {
+    u8* buf = mem.CodePtr() + 0x200;
+    for (int i = 0; i < 8; ++i) buf[i] = 'a' + i; // no NUL in first 4
+
+    const u8 program[] = {0xf2, 0xae, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x00; // scanning for NUL, none present
+    st.gpr[7] = reinterpret_cast<u64>(buf);
+    st.gpr[1] = 4;    // only scan 4
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0u) << "count exhausted";
+    EXPECT_EQ(st.rflags & 0x40u, 0u) << "ZF clear: no match found";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 4) << "RDI advanced by 4";
+}
+
+// Single scasb — one compare, sets flags, advances RDI, leaves RCX alone.
+// AL=0x40 ('@') vs [RDI]=0x40 -> equal -> ZF=1.
+TEST_F(CpuRuntimeTest, Scasb_Single_ComparesAndSetsZf) {
+    u8* buf = mem.CodePtr() + 0x200;
+    buf[0] = 0x40;
+
+    const u8 program[] = {0xae, 0xc3}; // scasb ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x40;
+    st.gpr[7] = reinterpret_cast<u64>(buf);
+    st.gpr[1] = 0x777; // must be untouched (non-REP)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.rflags & 0x40u, 0x40u) << "ZF set: AL == [RDI]";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 1);
+    EXPECT_EQ(st.gpr[1], 0x777u) << "non-REP must not touch RCX";
+}
+
+// SCAS must preserve DF and other non-arithmetic flag bits while updating the
+// arithmetic ones. Set DF=1, do a single mismatching scasb, confirm DF stays
+// and that the backward advance happened.
+TEST_F(CpuRuntimeTest, Scasb_PreservesDf_BackwardAdvance) {
+    u8* buf = mem.CodePtr() + 0x200;
+    buf[5] = 0x11;
+
+    const u8 program[] = {0xae, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x22;                            // AL != [RDI] -> ZF=0
+    st.gpr[7] = reinterpret_cast<u64>(buf) + 5;  // RDI
+    st.rflags |= 0x400;                          // DF=1
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.rflags & 0x40u, 0u) << "ZF clear: 0x22 != 0x11";
+    EXPECT_EQ(st.rflags & 0x400u, 0x400u) << "DF preserved across SCAS";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(buf) + 4) << "RDI decremented (DF=1)";
+}
+
+// CLD/STD round-trip on the actual DF bit (these gate every string op above).
+TEST_F(CpuRuntimeTest, CldStd_ToggleDirectionFlag) {
+    {
+        const u8 program[] = {0xfc, 0xc3}; // cld ; ret
+        std::memcpy(mem.CodePtr(), program, sizeof(program));
+        u8* guest_rsp = mem.StackTop() - 8;
+        *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+        GuestState st{};
+        st.rip = reinterpret_cast<u64>(mem.CodePtr());
+        st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+        st.rflags |= 0x400; // start DF=1
+        Runtime rt; rt.Run(st);
+        EXPECT_EQ(st.rflags & 0x400u, 0u) << "CLD clears DF";
+    }
+    {
+        const u8 program[] = {0xfd, 0xc3}; // std ; ret
+        std::memcpy(mem.CodePtr(), program, sizeof(program));
+        u8* guest_rsp = mem.StackTop() - 8;
+        *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+        GuestState st{};
+        st.rip = reinterpret_cast<u64>(mem.CodePtr());
+        st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+        st.rflags &= ~static_cast<u64>(0x400); // start DF=0
+        Runtime rt; rt.Run(st);
+        EXPECT_EQ(st.rflags & 0x400u, 0x400u) << "STD sets DF";
+    }
+}
+
+// ============================================================================
+// MUL (unsigned multiply) coverage.
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at `mul rcx`
+// (48 f7 e1) in the eboot at guest 0x80020642b (exit_reason=2). MUL is the
+// unsigned sibling of the already-supported IMUL; the product lands in a
+// register pair (RDX:RAX for 64-bit). CF/OF are set iff the high half is
+// non-zero. Tests cover all four widths, the overflow flag semantics, the
+// exact crashing reg,reg form, and a memory-operand source.
+//
+// GPR index map: RAX=0 RCX=1 RDX=2. rflags CF=bit0 (0x1), OF=bit11 (0x800).
+// ============================================================================
+
+// mul rcx (64-bit) — the exact instruction that crashed CUSA02394. Product
+// overflows into RDX, so CF and OF must be set.
+TEST_F(CpuRuntimeTest, MulR64_Overflow_SetsHighHalfAndCfOf) {
+    const u8 program[] = {0x48, 0xf7, 0xe1, 0xc3}; // mul rcx ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x1'0000'0000ULL; // RAX = 2^32
+    st.gpr[1] = 0x1'0000'0000ULL; // RCX = 2^32
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0ULL) << "low half (RAX) = 0";
+    EXPECT_EQ(st.gpr[2], 0x1ULL) << "high half (RDX) = 1 (2^64)";
+    EXPECT_EQ(st.rflags & 0x1u, 0x1u) << "CF set: high half non-zero";
+    EXPECT_EQ(st.rflags & 0x800u, 0x800u) << "OF set: high half non-zero";
+}
+
+// mul rcx (64-bit) with a product that fits — CF and OF must be clear.
+TEST_F(CpuRuntimeTest, MulR64_NoOverflow_ClearsCfOf) {
+    const u8 program[] = {0x48, 0xf7, 0xe1, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEAD'BEEFULL; // RAX
+    st.gpr[1] = 0x10ULL;        // RCX
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xDEAD'BEEF0ULL) << "low half";
+    EXPECT_EQ(st.gpr[2], 0x0ULL) << "high half = 0";
+    EXPECT_EQ(st.rflags & 0x1u, 0u) << "CF clear: fits in 64 bits";
+    EXPECT_EQ(st.rflags & 0x800u, 0u) << "OF clear";
+}
+
+// mul ecx (32-bit) — EDX:EAX = EAX*ECX, and the upper 32 bits of both RAX and
+// RDX must be zero-extended (x86-64 rule for 32-bit results).
+TEST_F(CpuRuntimeTest, MulR32_ZeroExtendsHighHalves) {
+    const u8 program[] = {0xf7, 0xe1, 0xc3}; // mul ecx ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAAAA'AAAA'FFFF'FFFFULL; // EAX = 0xFFFFFFFF (upper garbage)
+    st.gpr[1] = 0xBBBB'BBBB'FFFF'FFFFULL; // ECX = 0xFFFFFFFF (upper garbage)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x1ULL) << "EAX = low 32 of 0xFFFFFFFF^2, RAX upper32 zeroed";
+    EXPECT_EQ(st.gpr[2], 0xFFFF'FFFEULL) << "EDX = high 32, RDX upper32 zeroed";
+    EXPECT_EQ(st.rflags & 0x1u, 0x1u) << "CF set: EDX non-zero";
+    EXPECT_EQ(st.rflags & 0x800u, 0x800u) << "OF set";
+}
+
+// mul cx (16-bit) — DX:AX = AX*CX. Upper bits of RAX/RDX preserved.
+TEST_F(CpuRuntimeTest, MulR16_WritesDxAxPreservingUpper) {
+    const u8 program[] = {0x66, 0xf7, 0xe1, 0xc3}; // mul cx ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x1111'1111'1111'FFFFULL; // AX = 0xFFFF, upper preserved
+    st.gpr[1] = 0x2222'2222'2222'FFFFULL; // CX = 0xFFFF
+    st.gpr[2] = 0x3333'3333'3333'3333ULL; // RDX upper must survive
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFFF, 0x1u) << "AX = low 16 of 0xFFFF^2";
+    EXPECT_EQ(st.gpr[0] >> 16, 0x1111'1111'1111ULL) << "RAX upper 48 preserved";
+    EXPECT_EQ(st.gpr[2] & 0xFFFF, 0xFFFEu) << "DX = high 16";
+    EXPECT_EQ(st.gpr[2] >> 16, 0x3333'3333'3333ULL) << "RDX upper 48 preserved";
+    EXPECT_EQ(st.rflags & 0x1u, 0x1u) << "CF set: DX non-zero";
+}
+
+// mul cl (8-bit) — AX = AL*CL. Only RAX is written (no RDX destination).
+TEST_F(CpuRuntimeTest, MulR8_WritesAxOnly) {
+    const u8 program[] = {0xf6, 0xe1, 0xc3}; // mul cl ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x4444'4444'4444'44FFULL; // AL = 0xFF, upper preserved
+    st.gpr[1] = 0x00FFULL;                // CL = 0xFF
+    st.gpr[2] = 0x5555'5555'5555'5555ULL; // RDX must be UNTOUCHED (no MUL r/m8 dst)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFFF, 0xFE01u) << "AX = 0xFF*0xFF = 0xFE01";
+    EXPECT_EQ(st.gpr[0] >> 16, 0x4444'4444'4444ULL) << "RAX upper 48 preserved";
+    EXPECT_EQ(st.gpr[2], 0x5555'5555'5555'5555ULL) << "RDX untouched by 8-bit MUL";
+    EXPECT_EQ(st.rflags & 0x1u, 0x1u) << "CF set: AH (high byte) non-zero";
+}
+
+// mul qword[mem] — 64-bit multiply with a memory source operand. Exercises the
+// EmitEffectiveAddress path (dereference into rcx before loading RAX).
+TEST_F(CpuRuntimeTest, MulMem64_MultipliesFromMemory) {
+    u64* slot = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    *slot = 0x100ULL;
+
+    // mul qword[rbx]  = 48 f7 23
+    const u8 program[] = {0x48, 0xf7, 0x23, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xABCDEFULL;                  // RAX
+    st.gpr[3] = reinterpret_cast<u64>(slot);  // RBX -> memory factor
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xABCDEF00ULL) << "RAX = 0xABCDEF * 0x100";
+    EXPECT_EQ(st.gpr[2], 0x0ULL) << "high half = 0";
+    EXPECT_EQ(st.rflags & 0x1u, 0u) << "CF clear: fits";
+}
+
+// MUL by zero — product 0, CF/OF clear.
+TEST_F(CpuRuntimeTest, MulR64_ByZero_IsZeroAndClearsCf) {
+    const u8 program[] = {0x48, 0xf7, 0xe1, 0xc3}; // mul rcx ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEAD'BEEF'CAFE'BABEULL;
+    st.gpr[1] = 0x0ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0ULL);
+    EXPECT_EQ(st.gpr[2], 0x0ULL);
+    EXPECT_EQ(st.rflags & 0x1u, 0u) << "CF clear";
+    EXPECT_EQ(st.rflags & 0x800u, 0u) << "OF clear";
+}
+
+// ============================================================================
+// VINSERTPS — insert a scalar float lane (AVX, SSE4.1 semantics).
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at a reg,reg
+// `vinsertps` in the eboot at guest 0x80012f8d6 (exit_reason=2). The imm8
+// control selects source lane [7:6], dest lane [5:4], and a 4-bit zero mask
+// [3:0]. VEX form zeroes bits 255:128 of the dst YMM. Tests cover lane
+// routing, the zero mask, the in-place (dst==src1) aliasing case, and a
+// memory (m32) source.
+//
+// YMM layout in GuestState: ymm[n*4 + 0] = XMMn low 64 (dwords 0,1),
+// ymm[n*4 + 1] = XMMn high 64 of the low 128 (dwords 2,3); ymm[n*4+2,3] =
+// upper 128. XMM0 -> ymm[0..3], XMM1 -> ymm[4..7], XMM2 -> ymm[8..11].
+// ============================================================================
+
+// vinsertps xmm0, xmm1, xmm2, 0x10 — src lane0 -> dst lane1, no zero mask.
+// dst = {src1.0, src2.0, src1.2, src1.3}.
+TEST_F(CpuRuntimeTest, Vinsertps_SrcLane0_ToDstLane1) {
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0xc2, 0x10, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 = xmm1 (ymm[4],[5]) dwords A0,A1,A2,A3
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    // src2 = xmm2 (ymm[8],[9]) dwords B0,B1,B2,B3
+    st.ymm[8] = (0xB1ULL << 32) | 0xB0ULL;
+    st.ymm[9] = (0xB3ULL << 32) | 0xB2ULL;
+    // pollute dst (xmm0) incl upper YMM
+    st.ymm[0] = 0x1111111111111111ULL; st.ymm[1] = 0x1111111111111111ULL;
+    st.ymm[2] = 0x2222222222222222ULL; st.ymm[3] = 0x2222222222222222ULL;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x000000B0000000A0ULL) << "lane0=src1.0, lane1=src2.0";
+    EXPECT_EQ(st.ymm[1], 0x000000A3000000A2ULL) << "lanes2,3 from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vinsertps xmm0, xmm1, xmm2, 0x4e — src lane1 -> dst lane0, zmask=0xe
+// (zero lanes 1,2,3). Result keeps only the inserted dword in lane0.
+TEST_F(CpuRuntimeTest, Vinsertps_ZeroMaskClearsOtherLanes) {
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0xc2, 0x4e, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.ymm[8] = (0xB1ULL << 32) | 0xB0ULL; // src2 lane1 = 0xB1
+    st.ymm[9] = (0xB3ULL << 32) | 0xB2ULL;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x00000000000000B1ULL) << "lane0=src2.1, lane1 zeroed";
+    EXPECT_EQ(st.ymm[1], 0ULL) << "lanes2,3 zeroed by mask";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vinsertps xmm0, xmm1, xmm2, 0xc0 — src lane3 -> dst lane0, no zero.
+TEST_F(CpuRuntimeTest, Vinsertps_SrcLane3_ToDstLane0) {
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0xc2, 0xc0, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.ymm[8] = (0xB1ULL << 32) | 0xB0ULL;
+    st.ymm[9] = (0xB3ULL << 32) | 0xB2ULL; // src2 lane3 = 0xB3
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x000000A1000000B3ULL) << "lane0=src2.3, lane1 from src1";
+    EXPECT_EQ(st.ymm[1], 0x000000A3000000A2ULL) << "lanes2,3 from src1";
+}
+
+// vinsertps xmm0, xmm1, xmm2, 0x39 — src lane0 -> dst lane3, zmask=0x9
+// (zero lanes 0 and 3). Lane3 is inserted THEN zeroed by the mask (mask wins).
+TEST_F(CpuRuntimeTest, Vinsertps_ZeroMaskOverridesInsertedLane) {
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0xc2, 0x39, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.ymm[8] = (0xB1ULL << 32) | 0xB0ULL;
+    st.ymm[9] = (0xB3ULL << 32) | 0xB2ULL;
+
+    Runtime rt; rt.Run(st);
+    // dst before mask: {A0, A1, A2, B0(inserted)}; mask 0x9 zeroes lanes 0,3.
+    EXPECT_EQ(st.ymm[0], 0x000000A100000000ULL) << "lane0 zeroed, lane1 from src1";
+    EXPECT_EQ(st.ymm[1], 0x00000000000000A2ULL) << "lane2 from src1, lane3 inserted-then-zeroed";
+}
+
+// In-place: vinsertps xmm1, xmm1, xmm2, 0x20 — dst == src1. Read-before-write
+// ordering must make this a correct self-copy + patch. src lane0 -> dst lane2.
+TEST_F(CpuRuntimeTest, Vinsertps_InPlace_DstEqualsSrc1) {
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0xca, 0x20, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL; // xmm1 = src1 AND dst
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.ymm[6] = 0xDEADULL; st.ymm[7] = 0xBEEFULL; // upper YMM1, must be zeroed
+    st.ymm[8] = (0xB1ULL << 32) | 0xB0ULL; // src2 lane0 = 0xB0
+    st.ymm[9] = (0xB3ULL << 32) | 0xB2ULL;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[4], 0x000000A1000000A0ULL) << "lanes0,1 preserved from src1";
+    EXPECT_EQ(st.ymm[5], 0x000000A3000000B0ULL) << "lane2=src2.0 inserted, lane3 from src1";
+    EXPECT_EQ(st.ymm[6], 0ULL) << "VEX zeros upper YMM even in-place";
+    EXPECT_EQ(st.ymm[7], 0ULL);
+}
+
+// Memory source: vinsertps xmm0, xmm1, dword[rbx], 0x10. m32 form ignores the
+// imm src-lane field and loads the single dword from memory into dst lane1.
+TEST_F(CpuRuntimeTest, Vinsertps_MemorySource_LoadsM32) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *slot = 0xCAFEF00DU;
+
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0x03, 0x10, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.gpr[3] = reinterpret_cast<u64>(slot); // rbx -> m32
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xCAFEF00D000000A0ULL) << "lane1 = loaded m32, lane0 from src1";
+    EXPECT_EQ(st.ymm[1], 0x000000A3000000A2ULL) << "lanes2,3 from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Float-semantics sanity: build a vector {1.0f, 2.0f, 0, 0} by inserting 2.0f
+// from src2 lane0 into dst lane1 of a {1.0f,...} src1. Confirms the raw bit
+// movement matches IEEE-754 single bit patterns.
+TEST_F(CpuRuntimeTest, Vinsertps_FloatBitPattern) {
+    const u8 program[] = {0xc4, 0xe3, 0x71, 0x21, 0xc2, 0x10, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    const u32 f1 = std::bit_cast<u32>(1.0f); // 0x3f800000
+    const u32 f2 = std::bit_cast<u32>(2.0f); // 0x40000000
+    st.ymm[4] = static_cast<u64>(f1);           // src1 lane0 = 1.0f
+    st.ymm[5] = 0;
+    st.ymm[8] = static_cast<u64>(f2);           // src2 lane0 = 2.0f
+    st.ymm[9] = 0;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], (static_cast<u64>(f2) << 32) | f1)
+        << "lane0=1.0f, lane1=2.0f bit patterns";
+    EXPECT_EQ(st.ymm[1], 0ULL);
+}
+
+// ============================================================================
+// VPSHUFD with a MEMORY source operand.
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at a
+// `vpshufd xmm, [mem], imm8` in the eboot at guest 0x80012f8dc (exit_reason=2)
+// — the instruction immediately following the VINSERTPS fixed earlier. The
+// register-source form was already supported; only the m128/m256 source form
+// was missing. These tests pin the memory path: per-dword shuffle from a
+// memory operand, the broadcast (imm=0) and reverse (imm=0x1b) idioms, and the
+// 256-bit per-lane variant.
+//
+// VPSHUFD dst[i] = src[(imm >> (i*2)) & 3] for each dword i in a 128-bit lane.
+// YMM layout: ymm[n*4+0]=XMMn dwords0,1; ymm[n*4+1]=dwords2,3.
+// ============================================================================
+
+// vpshufd xmm0, [rbx], 0x1b — reverse the four dwords (3,2,1,0). Source in mem.
+TEST_F(CpuRuntimeTest, VpshufdMem_ReversesDwords) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    slot[0] = 0x11111111; slot[1] = 0x22222222;
+    slot[2] = 0x33333333; slot[3] = 0x44444444;
+
+    const u8 program[] = {0xc4, 0xe1, 0x79, 0x70, 0x03, 0x1b, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(slot); // rbx -> m128
+    // pollute dst incl upper YMM
+    st.ymm[0] = 0xDEAD; st.ymm[1] = 0xBEEF;
+    st.ymm[2] = 0xCAFE; st.ymm[3] = 0xF00D;
+
+    Runtime rt; rt.Run(st);
+    // imm 0x1b = 00 01 10 11 -> dst lanes pick src[3],src[2],src[1],src[0]
+    EXPECT_EQ(st.ymm[0], 0x3333333344444444ULL) << "lane0=src3, lane1=src2";
+    EXPECT_EQ(st.ymm[1], 0x1111111122222222ULL) << "lane2=src1, lane3=src0";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vpshufd xmm0, [rbx], 0x00 — broadcast src dword0 to all four lanes.
+TEST_F(CpuRuntimeTest, VpshufdMem_BroadcastsLowestDword) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    slot[0] = 0xABCD1234; slot[1] = 0x55555555;
+    slot[2] = 0x66666666; slot[3] = 0x77777777;
+
+    const u8 program[] = {0xc4, 0xe1, 0x79, 0x70, 0x03, 0x00, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(slot);
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0xABCD1234ABCD1234ULL) << "lanes0,1 = src0";
+    EXPECT_EQ(st.ymm[1], 0xABCD1234ABCD1234ULL) << "lanes2,3 = src0";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vpshufd xmm0, [rbx+disp], 0xe4 — identity shuffle (e4 = 11 10 01 00) from a
+// displaced memory address. Confirms EmitEffectiveAddress handles base+disp and
+// that the identity permutation copies the source verbatim.
+TEST_F(CpuRuntimeTest, VpshufdMem_IdentityWithDisplacement) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x140);
+    slot[0] = 0x0A0A0A0A; slot[1] = 0x0B0B0B0B;
+    slot[2] = 0x0C0C0C0C; slot[3] = 0x0D0D0D0D;
+
+    // vpshufd xmm0, [rbx+0x40], 0xe4  = c4 e1 79 70 43 40 e4
+    const u8 program[] = {0xc4, 0xe1, 0x79, 0x70, 0x43, 0x40, 0xe4, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(mem.CodePtr() + 0x100); // rbx; +0x40 -> 0x140
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x0B0B0B0B0A0A0A0AULL) << "identity: lanes0,1 unchanged";
+    EXPECT_EQ(st.ymm[1], 0x0D0D0D0D0C0C0C0CULL) << "identity: lanes2,3 unchanged";
+}
+
+// vpshufd ymm0, [rbx], 0x1b (256-bit) — per-128-bit-lane reverse on a memory
+// source. Each 128-bit half is shuffled independently (no cross-lane).
+TEST_F(CpuRuntimeTest, VpshufdMem_256Bit_PerLaneReverse) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    // low lane dwords 0..3, high lane dwords 4..7
+    slot[0] = 0x100; slot[1] = 0x101; slot[2] = 0x102; slot[3] = 0x103;
+    slot[4] = 0x200; slot[5] = 0x201; slot[6] = 0x202; slot[7] = 0x203;
+
+    const u8 program[] = {0xc4, 0xe1, 0x7d, 0x70, 0x03, 0x1b, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(slot);
+
+    Runtime rt; rt.Run(st);
+    // low lane reversed: 103,102,101,100
+    EXPECT_EQ(st.ymm[0], (0x102ULL << 32) | 0x103ULL) << "low lane0=src3,lane1=src2";
+    EXPECT_EQ(st.ymm[1], (0x100ULL << 32) | 0x101ULL) << "low lane2=src1,lane3=src0";
+    // high lane reversed independently: 203,202,201,200
+    EXPECT_EQ(st.ymm[2], (0x202ULL << 32) | 0x203ULL) << "high lane0=src3,lane1=src2";
+    EXPECT_EQ(st.ymm[3], (0x200ULL << 32) | 0x201ULL) << "high lane2=src1,lane3=src0";
+}
+
+// Regression guard: the register-source form must STILL work after adding the
+// memory path. vpshufd xmm0, xmm1, 0x1b.
+TEST_F(CpuRuntimeTest, VpshufdReg_StillWorksAfterMemAdded) {
+    const u8 program[] = {0xc4, 0xe1, 0x79, 0x70, 0xc1, 0x1b, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x2222222211111111ULL; // xmm1 lanes 0,1
+    st.ymm[5] = 0x4444444433333333ULL; // xmm1 lanes 2,3
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x3333333344444444ULL) << "lane0=src3,lane1=src2";
+    EXPECT_EQ(st.ymm[1], 0x1111111122222222ULL) << "lane2=src1,lane3=src0";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ============================================================================
+// VPMOVZXDQ — zero-extend packed dwords to qwords (AVX).
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at a reg,reg
+// 128-bit `vpmovzxdq` in the eboot at guest 0x8001f33ff (exit_reason=2). The
+// op widens 32-bit lanes to 64-bit with ZERO extension (the high dword of each
+// result qword is always 0, regardless of the source sign bit). 128-bit dst
+// consumes 2 source dwords; 256-bit dst consumes 4.
+//
+// YMM layout: ymm[n*4 + k] is the k-th qword of YMMn (k=0..3).
+// ============================================================================
+
+// vpmovzxdq xmm0, xmm1 — the exact crashing form. Zero-extend, NOT sign:
+// 0xFFFFFFFF must become 0x00000000FFFFFFFF, not 0xFFFFFFFFFFFFFFFF.
+TEST_F(CpuRuntimeTest, Vpmovzxdq_Xmm_ZeroExtendsNotSign) {
+    const u8 program[] = {0xc4, 0xe2, 0x79, 0x35, 0xc1, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src = xmm1 (ymm[4],[5]): low 2 dwords = 0xFFFFFFFF, 0x80000000;
+    // the upper dwords (in ymm[5]) must be ignored by the 128-bit form.
+    st.ymm[4] = (0x80000000ULL << 32) | 0xFFFFFFFFULL;
+    st.ymm[5] = 0xDEADBEEFCAFEF00DULL; // ignored
+    // pollute dst incl upper YMM
+    st.ymm[0] = 0x1111; st.ymm[1] = 0x2222;
+    st.ymm[2] = 0x3333; st.ymm[3] = 0x4444;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x00000000FFFFFFFFULL) << "qword0 = zext(0xFFFFFFFF)";
+    EXPECT_EQ(st.ymm[1], 0x0000000080000000ULL) << "qword1 = zext(0x80000000), NOT sign-extended";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vpmovzxdq ymm0, xmm1 — 256-bit form: 4 source dwords -> 4 qwords.
+TEST_F(CpuRuntimeTest, Vpmovzxdq_Ymm_WidensFourDwords) {
+    const u8 program[] = {0xc4, 0xe2, 0x7d, 0x35, 0xc1, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src xmm1 dwords 1,2,3,4
+    st.ymm[4] = (0x2ULL << 32) | 0x1ULL;
+    st.ymm[5] = (0x4ULL << 32) | 0x3ULL;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x1ULL) << "qword0";
+    EXPECT_EQ(st.ymm[1], 0x2ULL) << "qword1";
+    EXPECT_EQ(st.ymm[2], 0x3ULL) << "qword2";
+    EXPECT_EQ(st.ymm[3], 0x4ULL) << "qword3";
+}
+
+// vpmovzxdq xmm0, [rbx] — 64-bit memory source (2 dwords).
+TEST_F(CpuRuntimeTest, Vpmovzxdq_Mem64_WidensTwoDwords) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    slot[0] = 0xABCDEF01; slot[1] = 0x00000002;
+    slot[2] = 0xFFFFFFFF; slot[3] = 0xFFFFFFFF; // must NOT be read (m64 only)
+
+    const u8 program[] = {0xc4, 0xe2, 0x79, 0x35, 0x03, 0xc3}; // vpmovzxdq xmm0,[rbx]
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(slot); // rbx -> m64
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x00000000ABCDEF01ULL) << "qword0 = zext(dword0)";
+    EXPECT_EQ(st.ymm[1], 0x0000000000000002ULL) << "qword1 = zext(dword1)";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// In-place-ish aliasing: vpmovzxdq xmm1, xmm1. The low 2 dwords of xmm1 widen
+// into xmm1's two qwords; reading src into scratch before writing dst makes
+// this correct. (dst==src is c4 e2 79 35 c9.)
+TEST_F(CpuRuntimeTest, Vpmovzxdq_DstEqualsSrc) {
+    const u8 program[] = {0xc4, 0xe2, 0x79, 0x35, 0xc9, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0x0000000AULL << 32) | 0x0000000BULL; // dwords: 0x0B, 0x0A
+    st.ymm[5] = 0x9999999999999999ULL; // ignored, then overwritten by VEX zero
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[4], 0x000000000000000BULL) << "qword0 = zext(dword0=0x0B)";
+    EXPECT_EQ(st.ymm[5], 0x000000000000000AULL) << "qword1 = zext(dword1=0x0A)";
+    EXPECT_EQ(st.ymm[6], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[7], 0ULL);
+}
+
+// ============================================================================
+// VPEXTRQ — extract a 64-bit qword lane from an XMM to a GPR or memory.
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at a reg,reg
+// `vpextrq` in the eboot at guest 0x8001f3404 (exit_reason=2) — the
+// instruction right after the VPMOVZXDQ fixed earlier, in the same block. The
+// 64-bit sibling of the already-supported VPEXTRD: imm8[0] selects qword lane
+// 0 or 1; a GPR destination receives the full 64 bits (no zero-extension); a
+// memory destination receives 8 bytes.
+//
+// YMM layout: ymm[n*4 + 0] = XMMn qword0 (low 64), ymm[n*4 + 1] = qword1.
+// ============================================================================
+
+// vpextrq rax, xmm1, 0 — extract the low qword into a GPR (the crashing form).
+TEST_F(CpuRuntimeTest, Vpextrq_Lane0_ToGpr) {
+    const u8 program[] = {0xc4, 0xe3, 0xf9, 0x16, 0xc8, 0x00, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x1122334455667788ULL; // xmm1 qword0
+    st.ymm[5] = 0x99AABBCCDDEEFF00ULL; // xmm1 qword1
+    st.gpr[0] = 0xDEADBEEFDEADBEEFULL; // rax pre-pollute
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x1122334455667788ULL) << "rax = xmm1 qword0";
+}
+
+// vpextrq rax, xmm1, 1 — extract the high qword into a GPR.
+TEST_F(CpuRuntimeTest, Vpextrq_Lane1_ToGpr) {
+    const u8 program[] = {0xc4, 0xe3, 0xf9, 0x16, 0xc8, 0x01, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x1122334455667788ULL;
+    st.ymm[5] = 0x99AABBCCDDEEFF00ULL;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x99AABBCCDDEEFF00ULL) << "rax = xmm1 qword1";
+}
+
+// Full 64-bit write: even a value with a clear top bit must land verbatim,
+// confirming there is no spurious zero/sign masking on the GPR write.
+TEST_F(CpuRuntimeTest, Vpextrq_WritesFull64Bits) {
+    const u8 program[] = {0xc4, 0xe3, 0xf9, 0x16, 0xc8, 0x00, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0xFFFFFFFFFFFFFFFFULL; // all ones: top bits must survive
+    st.ymm[5] = 0;
+    st.gpr[0] = 0;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xFFFFFFFFFFFFFFFFULL) << "all 64 bits written, no masking";
+}
+
+// vpextrq [rbx], xmm1, 1 — extract the high qword to memory (8-byte store).
+TEST_F(CpuRuntimeTest, Vpextrq_Lane1_ToMemory) {
+    u64* slot = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    slot[0] = 0xAAAAAAAAAAAAAAAAULL;
+    slot[1] = 0xBBBBBBBBBBBBBBBBULL; // sentinel after the 8-byte store
+
+    const u8 program[] = {0xc4, 0xe3, 0xf9, 0x16, 0x0b, 0x01, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x1122334455667788ULL;
+    st.ymm[5] = 0x99AABBCCDDEEFF00ULL;
+    st.gpr[3] = reinterpret_cast<u64>(slot); // rbx -> m64
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(slot[0], 0x99AABBCCDDEEFF00ULL) << "m64 = xmm1 qword1";
+    EXPECT_EQ(slot[1], 0xBBBBBBBBBBBBBBBBULL) << "8-byte store must not spill";
+}
+
+// Regression guard: VPEXTRD (the dword sibling) must still work after adding
+// the qword path. vpextrd eax, xmm1, 2.
+TEST_F(CpuRuntimeTest, Vpextrd_StillWorksAfterVpextrqAdded) {
+    const u8 program[] = {0xc4, 0xe3, 0x79, 0x16, 0xc8, 0x02, 0xc3}; // vpextrd eax,xmm1,2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x2222222211111111ULL; // dwords 0,1 = 0x11111111, 0x22222222
+    st.ymm[5] = 0x4444444433333333ULL; // dwords 2,3 = 0x33333333, 0x44444444
+    st.gpr[0] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x33333333ULL) << "eax = dword2, zero-extended to rax";
+}
+
+// ============================================================================
+// VMINSS / VMAXSS / VMINSD / VMAXSD — scalar single/double min & max (AVX).
+//
+// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at a reg,reg
+// `vminss` in the eboot at guest 0x8001f3433 (exit_reason=2), in the same
+// vector block as the VPMOVZXDQ/VPEXTRQ fixed earlier. lane0 = min/max of the
+// two source lane0s; lanes 127:32 (Ss) / 127:64 (Sd) come from src1; VEX
+// zeroes bits 255:128. The key x86 subtlety pinned here: if either operand is
+// NaN (or they are equal), the result is the SECOND source operand — these
+// ops are deliberately non-commutative.
+//
+// YMM layout: ymm[n*4+0] = XMMn low 64 (lane0 float in low 32). XMM0->ymm[0..],
+// XMM1->ymm[4..], XMM2->ymm[8..].
+// ============================================================================
+
+// vminss xmm0, xmm1, xmm2 — the crashing form. min(3.0, 5.0) = 3.0.
+TEST_F(CpuRuntimeTest, Vminss_BasicMin) {
+    const u8 program[] = {0xc4, 0xe1, 0x72, 0x5d, 0xc2, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    const u32 f3 = std::bit_cast<u32>(3.0f), f5 = std::bit_cast<u32>(5.0f);
+    // src1=xmm1 lane0=3.0, with nonzero upper lanes to verify preservation
+    st.ymm[4] = (0xCAFEBABEULL << 32) | f3;
+    st.ymm[5] = 0;
+    st.ymm[8] = static_cast<u64>(f5); // src2=xmm2 lane0=5.0
+    st.ymm[9] = 0;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0]), f3) << "lane0 = min(3,5) = 3.0";
+    EXPECT_EQ(st.ymm[0] >> 32, 0xCAFEBABEULL) << "lane1 preserved from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vmaxss xmm0, xmm1, xmm2 — max(3.0, 5.0) = 5.0.
+TEST_F(CpuRuntimeTest, Vmaxss_BasicMax) {
+    const u8 program[] = {0xc4, 0xe1, 0x72, 0x5f, 0xc2, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    const u32 f3 = std::bit_cast<u32>(3.0f), f5 = std::bit_cast<u32>(5.0f);
+    st.ymm[4] = static_cast<u64>(f3);
+    st.ymm[8] = static_cast<u64>(f5);
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0]), f5) << "lane0 = max(3,5) = 5.0";
+}
+
+// NaN rule: VMINSS returns the SECOND operand when src1 is NaN.
+// vminss xmm0, xmm1(NaN), xmm2(5.0) -> 5.0 (src2), not NaN.
+TEST_F(CpuRuntimeTest, Vminss_NanSrc1_ReturnsSrc2) {
+    const u8 program[] = {0xc4, 0xe1, 0x72, 0x5d, 0xc2, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    const u32 fnan = std::bit_cast<u32>(std::numeric_limits<float>::quiet_NaN());
+    const u32 f5 = std::bit_cast<u32>(5.0f);
+    st.ymm[4] = static_cast<u64>(fnan); // src1 lane0 = NaN
+    st.ymm[8] = static_cast<u64>(f5);   // src2 lane0 = 5.0
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0]), f5)
+        << "min with NaN src1 returns src2 (x86 non-commutative rule)";
+}
+
+// NaN rule, other direction: src2 is NaN -> result is src2 (the NaN).
+// vminss xmm0, xmm1(3.0), xmm2(NaN) -> NaN.
+TEST_F(CpuRuntimeTest, Vminss_NanSrc2_ReturnsSrc2Nan) {
+    const u8 program[] = {0xc4, 0xe1, 0x72, 0x5d, 0xc2, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    const u32 f3 = std::bit_cast<u32>(3.0f);
+    const u32 fnan = std::bit_cast<u32>(std::numeric_limits<float>::quiet_NaN());
+    st.ymm[4] = static_cast<u64>(f3);
+    st.ymm[8] = static_cast<u64>(fnan);
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0]), fnan)
+        << "min with NaN src2 returns src2 (the NaN)";
+}
+
+// vminss xmm0, xmm1, [rbx] — memory source (m32).
+TEST_F(CpuRuntimeTest, Vminss_MemorySource) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *slot = std::bit_cast<u32>(2.0f);
+
+    const u8 program[] = {0xc4, 0xe1, 0x72, 0x5d, 0x03, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(3.0f)); // src1 = 3.0
+    st.gpr[3] = reinterpret_cast<u64>(slot);                // rbx -> 2.0
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0]), std::bit_cast<u32>(2.0f))
+        << "lane0 = min(3.0, mem 2.0) = 2.0";
+}
+
+// vminsd xmm0, xmm1, xmm2 — double precision: min(3.0, 5.0) = 3.0, lane upper
+// 64 bits preserved from src1.
+TEST_F(CpuRuntimeTest, Vminsd_BasicMin_PreservesUpper) {
+    const u8 program[] = {0xc4, 0xe1, 0x73, 0x5d, 0xc2, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(3.0); // src1 lane0 (double)
+    st.ymm[5] = 0x123456789ABCDEF0ULL;   // src1 upper 64 of low128, preserved
+    st.ymm[8] = std::bit_cast<u64>(5.0);
+    st.ymm[9] = 0;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], std::bit_cast<u64>(3.0)) << "lane0 = min(3.0,5.0)";
+    EXPECT_EQ(st.ymm[1], 0x123456789ABCDEF0ULL) << "upper 64 of low128 from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vmaxsd xmm0, xmm1, xmm2 — double precision max.
+TEST_F(CpuRuntimeTest, Vmaxsd_BasicMax) {
+    const u8 program[] = {0xc4, 0xe1, 0x73, 0x5f, 0xc2, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = std::bit_cast<u64>(3.0);
+    st.ymm[8] = std::bit_cast<u64>(5.0);
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[0], std::bit_cast<u64>(5.0)) << "lane0 = max(3.0,5.0)";
+}
+
+// Regression guard: the existing scalar-fp arith (vmulss) must still work
+// after the Min/Max enum extension. 3.0 * 5.0 = 15.0.
+TEST_F(CpuRuntimeTest, Vmulss_StillWorksAfterMinMaxAdded) {
+    const u8 program[] = {0xc4, 0xe1, 0x72, 0x59, 0xc2, 0xc3}; // vmulss xmm0,xmm1,xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = static_cast<u64>(std::bit_cast<u32>(3.0f));
+    st.ymm[8] = static_cast<u64>(std::bit_cast<u32>(5.0f));
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.ymm[0]), std::bit_cast<u32>(15.0f))
+        << "vmulss still computes 3*5=15";
 }
 
 } // namespace

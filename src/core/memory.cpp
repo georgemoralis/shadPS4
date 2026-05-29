@@ -450,6 +450,11 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     // Merge this VMA with similar nearby areas
     MergeAdjacent(vma_map, new_vma_handle);
 
+    // [DIAG] Log the committed pool VA range (see MapMemory diag note).
+    LOG_INFO(Kernel_Vmm,
+             "[DIAG] PoolCommit range {:#x}..{:#x} (size={:#x}) type=Pooled prot={:#x}",
+             mapped_addr, mapped_addr + size, size, static_cast<u32>(prot));
+
     lk2.unlock();
     if (IsValidGpuMapping(mapped_addr, size)) {
         rasterizer->MapMemory(mapped_addr, size);
@@ -659,6 +664,16 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
     }
 
     *out_addr = std::bit_cast<void*>(mapped_addr);
+
+    // [DIAG] Log the final mapped VA range so we can confirm whether a
+    // given fault address was ever backed by a mapping. Prints start,
+    // end (exclusive), size, VMA type and protection. Grep the log for
+    // the fault address to see if it falls inside any mapped range.
+    LOG_INFO(Kernel_Vmm,
+             "[DIAG] MapMemory range {:#x}..{:#x} (size={:#x}) type={} prot={:#x} name='{}'",
+             mapped_addr, mapped_addr + size, size, static_cast<u32>(type),
+             static_cast<u32>(prot), name);
+
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
         // Flexible address space mappings were performed while finding direct memory areas.
         if (type != VMAType::Flexible) {

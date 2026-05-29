@@ -10,12 +10,17 @@
 #include <type_traits>
 
 #include "common/assert.h"
+#include "common/arch.h"
 #include "common/logging/log.h"
 #include "core/cpu_runtime/block_cache.h"
 #include "core/cpu_runtime/code_cache.h"
 #include "core/cpu_runtime/gateway/gateway.h"
 #include "core/cpu_runtime/lifter/lifter.h"
 #include "core/cpu_runtime/hle_registry.h"
+
+#ifdef ARCH_X86_64
+#include <Zydis/Zydis.h>
+#endif
 
 namespace Core::Runtime {
 
@@ -276,6 +281,148 @@ void* DispatcherTrampoline(GuestState* state) {
         }
     }
 
+    // [DIAG-RAXTRACE] Corruption tracer. The crash at guest_rip
+    // 0x800274c09 dereferences a guest GPR (RAX) holding 0x414c40040 —
+    // an address ABOVE all mapped guest memory (which tops out around
+    // 0x8'xxxxxxxx for code/heap and 0x2'xxxxxxxx for dmem). That value
+    // is produced by an EARLIER block and persists in GuestState. To pin
+    // the producing instruction, watch for any GPR transitioning INTO the
+    // impossible range and log the RIP of the block that just ran (the
+    // culprit), plus the prior RIP for context. The dispatcher runs
+    // between blocks (a safe point, plain C++), so reading GPRs here is
+    // safe. Fires at most once per (gpr,rip) site to avoid loop spam.
+    {
+        // [RAXTRACE] One-time presence beacon: proves THIS runtime.cpp
+        // (with the tracer) is the binary actually running. If you see a
+        // crash but never see this line, runtime.o was not rebuilt.
+        static thread_local bool announced = false;
+        if (!announced) {
+            announced = true;
+            LOG_ERROR(Core, "[RAXTRACE] tracer-v3 active (dispatcher first entry, rip={:#x})",
+                      cur_rip);
+        }
+        // A guest VA is "impossible" if it's at/above 0x10'00000000 (the
+        // GPU carveout floor) yet not a normal code/heap (0x8__) or dmem
+        // (0x2__) pointer. Simplest robust filter: flag the specific high
+        // nibble pattern we keep seeing (bits >= 0x4'00000000 that aren't
+        // 0x8__ code/heap). We log any GPR whose top byte is in [0x3,0x7]
+        // — squarely in the unmapped gap between dmem and code.
+        static thread_local u64 last_block_rip = 0;
+        static thread_local u64 reported_sites = 0;  // bitset of gpr indices already reported
+        const char* const kGprNames[16] = {
+            "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+            "r8","r9","r10","r11","r12","r13","r14","r15",
+        };
+        for (int i = 0; i < 16; ++i) {
+            if (i == 4 || i == 5) continue;  // skip rsp/rbp (host-ish stack values)
+            const u64 v = state->gpr[i];
+            const u64 top = v >> 32;
+            // Unmapped gap: high dword in [0x3 .. 0x7] (above dmem 0x2__,
+            // below code/heap 0x8__). 0x414c40040 -> top = 0x4.
+            // EXCLUDE the legitimately-mapped high "anon" stack region
+            // (~0x7ef000000..0x7f0000000) which also has top byte 0x7 —
+            // those are valid pointers, not corruption (false positives).
+            const bool in_anon_stack = (v >= 0x7ef000000ull && v < 0x800000000ull);
+            if (top >= 0x3 && top <= 0x7 && !in_anon_stack) {
+                if (!(reported_sites & (1ull << i))) {
+                    reported_sites |= (1ull << i);
+                    LOG_ERROR(Core,
+                              "[RAXTRACE] guest {} = {:#x} (UNMAPPED gap) first seen after "
+                              "block rip={:#x}; next rip={:#x}",
+                              kGprNames[i], v, last_block_rip, cur_rip);
+                    // Auto-dump the culprit block's emitted host code. Look
+                    // up its host pointer in the block cache and dump a
+                    // fixed window (the block plus a little of the next —
+                    // fine for offline disassembly). This removes the need
+                    // for a per-RIP allowlist and any compile-time timing
+                    // dependence: whatever block produced the bad value
+                    // gets its code dumped right here.
+                    if (rt != nullptr && last_block_rip != 0) {
+                        BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
+                        if (void* hp = bc.Lookup(last_block_rip)) {
+                            const u8* p = reinterpret_cast<const u8*>(hp);
+                            const char* digits = "0123456789abcdef";
+                            char hex[256 * 3 + 1];
+                            for (int k = 0; k < 256; ++k) {
+                                hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
+                                hex[k * 3 + 1] = digits[p[k] & 0xF];
+                                hex[k * 3 + 2] = ' ';
+                            }
+                            hex[256 * 3] = '\0';
+                            LOG_ERROR(Core,
+                                      "[RAXTRACE] culprit block {:#x} host code (256 bytes): {}",
+                                      last_block_rip, hex);
+                        }
+                    }
+                }
+            }
+        }
+        last_block_rip = cur_rip;
+
+        // [RAXTRACE] R8 sign-extension probe. Reports only a GENUINE
+        // transition into 0xfffffe70 (R8 changing from some other value to
+        // the bad value), not the first observation — the producer runs
+        // very early and R8 is a stable invariant by the time the tracer is
+        // active, so a first-observation match is meaningless. `seen_first`
+        // primes prev_r8 from the first block so only a real change reports.
+        {
+            static thread_local u64 prev_r8 = 0;
+            static thread_local bool seen_first = false;
+            static thread_local bool r8_reported = false;
+            const u64 r8 = state->gpr[8];
+            if (seen_first && !r8_reported && r8 == 0xfffffe70ull &&
+                prev_r8 != 0xfffffe70ull) {
+                r8_reported = true;
+                LOG_ERROR(Core,
+                          "[RAXTRACE] guest R8 transitioned {:#x} -> 0xfffffe70 (should be "
+                          "0xfffffffffffffe70 sign-extended) at block rip={:#x}",
+                          prev_r8, last_block_rip);
+                if (rt != nullptr && last_block_rip != 0) {
+                    BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
+                    if (void* hp = bc.Lookup(last_block_rip)) {
+                        const u8* p = reinterpret_cast<const u8*>(hp);
+                        const char* digits = "0123456789abcdef";
+                        char hex[256 * 3 + 1];
+                        for (int k = 0; k < 256; ++k) {
+                            hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
+                            hex[k * 3 + 1] = digits[p[k] & 0xF];
+                            hex[k * 3 + 2] = ' ';
+                        }
+                        hex[256 * 3] = '\0';
+                        LOG_ERROR(Core,
+                                  "[RAXTRACE] R8-producer block {:#x} host code (256 bytes): {}",
+                                  last_block_rip, hex);
+                    }
+                }
+            }
+            prev_r8 = r8;
+            seen_first = true;
+        }
+
+        // [RAXTRACE] Block-RIP ring buffer. Records the last 32 block
+        // entries on this thread. When a corruption is first reported
+        // (above), we also dump this ring so the actual loop CYCLE is
+        // visible — which blocks repeat, in what order. This reveals the
+        // OUTER loop (the one resetting RBX and restarting the copy) that
+        // the per-block attribution can't name on its own. Dumped once,
+        // right after the first corruption report.
+        {
+            static thread_local u64 ring[32] = {};
+            static thread_local u32 ring_pos = 0;
+            static thread_local bool ring_dumped = false;
+            ring[ring_pos & 31] = cur_rip;
+            ring_pos++;
+            if (reported_sites != 0 && !ring_dumped) {
+                ring_dumped = true;
+                // Emit the last 32 block RIPs oldest→newest.
+                for (u32 k = 0; k < 32; ++k) {
+                    u32 idx = (ring_pos + k) & 31;
+                    LOG_ERROR(Core, "[RAXTRACE] ring[{}] block rip={:#x}", k, ring[idx]);
+                }
+            }
+        }
+    }
+
     while (true) {
         // Sentinel check: if guest code RET'd through the call chain
         // back to the host-return address, exit cleanly.
@@ -428,6 +575,24 @@ void* DispatcherTrampoline(GuestState* state) {
             const u64 xmm0_bits = std::bit_cast<u64>(ret.xmm0);
             std::memcpy(&state->ymm[0], &xmm0_bits, sizeof(u64));
 
+            // [RAXTRACE] If an HLE stub just returned a value in the
+            // unmapped gap (high dword 0x3..0x7) into guest RAX, that is
+            // very likely the source of the bad pointer dereferenced later
+            // at 0x800274c09. Name the function so we know which stub to
+            // fix. Fires once.
+            {
+                static thread_local bool hle_bad_reported = false;
+                const u64 top = ret.rax >> 32;
+                if (!hle_bad_reported && top >= 0x3 && top <= 0x7) {
+                    hle_bad_reported = true;
+                    LOG_ERROR(Core,
+                              "[RAXTRACE] HLE stub '{}' (host={:#x}) returned rax={:#x} "
+                              "in UNMAPPED gap — likely the bad-pointer source",
+                              name.empty() ? std::string_view{"<unregistered>"} : name,
+                              host_fn, ret.rax);
+                }
+            }
+
             // Post-return rax/xmm0 as TRACE detail. If a debug trace
             // shows the "call" line for a host_fn but never this "ret"
             // line, that function crashed inside the call.
@@ -447,6 +612,26 @@ void* DispatcherTrampoline(GuestState* state) {
 
         // Guest path: cache lookup, compile on miss.
         BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
+
+        // [RAXTRACE] Targeted pre-block dump: if we are about to enter the
+        // known faulting block, dump all guest GPRs HERE — this is the
+        // exact state feeding the crash, captured at a safe point before
+        // the block runs. Shows which register already holds the bad
+        // pointer and what the others look like one block earlier than the
+        // fault handler sees. Fires once.
+        {
+            static thread_local bool dumped = false;
+            if (!dumped && state->rip == 0x800274c09ull) {
+                dumped = true;
+                static const char* const kN[16] = {
+                    "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
+                    "r8","r9","r10","r11","r12","r13","r14","r15"};
+                LOG_ERROR(Core, "[RAXTRACE] about to enter faulting block 0x800274c09; guest GPRs:");
+                for (int i = 0; i < 16; ++i)
+                    LOG_ERROR(Core, "[RAXTRACE]   {} = {:#x}", kN[i], state->gpr[i]);
+            }
+        }
+
         if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
             return host_ptr;
         }
@@ -509,11 +694,41 @@ void Runtime::AsyncBreak() {
 }
 
 void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
+    const u64 used_before = code_cache_->Used();
     void* host_ptr = lifter_->CompileBlock(guest_rip);
     if (host_ptr != nullptr) {
+        // [RAXTRACE] Dump emitted host bytes for the loop blocks involved
+        // in the bit-33 corruption (0x800274c00 / ...c09 / ...cae), so the
+        // exact lifted sequence can be disassembled. Computed from the
+        // code-cache bump delta; host_ptr is the block's start. Fires once
+        // per guest_rip of interest.
+        if (guest_rip == 0x800274c00ull || guest_rip == 0x800274c09ull ||
+            guest_rip == 0x800274caeull || guest_rip == 0x800302f60ull) {
+            static thread_local u64 dumped_mask = 0;
+            int slot = (guest_rip == 0x800274c00ull) ? 0
+                     : (guest_rip == 0x800274c09ull) ? 1
+                     : (guest_rip == 0x800274caeull) ? 2 : 3;
+            if (!(dumped_mask & (1ull << slot))) {
+                dumped_mask |= (1ull << slot);
+                const u64 used_after = code_cache_->Used();
+                u64 n = used_after - used_before;
+                if (n > 256) n = 256;
+                const u8* p = reinterpret_cast<const u8*>(host_ptr);
+                const char* digits = "0123456789abcdef";
+                char hex[256 * 3 + 1];
+                u64 m = (n > 256) ? 256 : n;
+                for (u64 i = 0; i < m; ++i) {
+                    hex[i * 3 + 0] = digits[(p[i] >> 4) & 0xF];
+                    hex[i * 3 + 1] = digits[p[i] & 0xF];
+                    hex[i * 3 + 2] = ' ';
+                }
+                hex[m * 3] = '\0';
+                LOG_ERROR(Core, "[RAXTRACE] emitted block {:#x} ({} host bytes): {}",
+                          guest_rip, n, hex);
+            }
+        }
         return host_ptr;
     }
-
     // CompileBlock returned nullptr. The common (and benign) cause is
     // a full code cache — the bump allocator ran out of room. This is
     // not an error: we recycle the cache and recompile. The code
@@ -559,6 +774,124 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
                   guest_rip);
     }
     return host_ptr;
+}
+
+// ============================================================================
+// Crash-diagnostic support (see runtime.h). Async-signal-safe: only
+// thread-local pointer reads, integer field reads, and a pointer-range
+// comparison. No allocation, no locks, no logging.
+// ============================================================================
+FaultContext DescribeFaultContext(const void* host_addr) noexcept {
+    FaultContext ctx;
+
+    // Was the host fault/code address inside the JIT code cache? Compute
+    // this FIRST — the instruction-decode below depends on it. This
+    // distinguishes "faulted while executing lifted guest code" from
+    // "faulted in an HLE shim / while dereferencing a bad guest pointer
+    // (the code pointer is in normal host code, the *data* address is
+    // wild)". We reach the code cache via the thread-local active
+    // runtime pointer rather than Instance() to avoid the static-local
+    // init guard in signal context. Both the pointer read and
+    // CodeCache::Contains (a pure range compare) are signal-safe.
+    if (host_addr != nullptr) {
+        Runtime* rt = tl_active_runtime;
+        if (rt != nullptr) {
+            ctx.in_jit_code = rt->GetCodeCache().Contains(host_addr);
+        }
+    }
+
+    // tl_current_guest_state is the live GuestState for any Run() active
+    // on THIS thread. A plain thread-local pointer read — signal-safe.
+    // If it's null, this thread wasn't executing guest code (the fault
+    // is in pure host code), and we leave ctx at its defaults.
+    GuestState* gs = tl_current_guest_state;
+    if (gs != nullptr) {
+        ctx.in_runtime = true;
+        ctx.guest_rip = gs->rip;
+        ctx.guest_exit_reason = gs->exit_reason;
+        // Snapshot the 16 GPRs. Fixed-size integer copy — signal-safe.
+        // This lets the crash report show which register carried the
+        // bad pointer that the faulting instruction dereferenced.
+        for (int i = 0; i < 16; ++i) {
+            ctx.guest_gpr[i] = gs->gpr[i];
+        }
+        ctx.have_gprs = true;
+
+        // Decode the faulting HOST instruction (the bytes at host_addr,
+        // i.e. the JIT'd code that actually faulted). We deliberately
+        // decode host_addr rather than the guest bytes at gs->rip: the
+        // lifter only syncs gs->rip at block boundaries and branches, so
+        // mid-block gs->rip is the BLOCK-ENTRY guest RIP, not the
+        // faulting instruction — decoding there is misleading (and may
+        // not even land on an instruction boundary). host_addr is the
+        // precise fault PC, it lives in the code cache (readable), and
+        // the host instruction reveals the access shape directly: e.g.
+        // `mov rXX, [rYY]` (a load that brought a bad pointer in) vs.
+        // `mov [rYY], rXX` / an op on `[rYY]` (a store/use through a
+        // pointer computed earlier). Combined with the guest GPR dump
+        // and data_addr, that pins down whether the bad pointer was
+        // loaded from guest memory or computed by lifted code.
+        //
+        // Only decode when host_addr is inside the code cache — anywhere
+        // else it isn't our JIT code and the bytes are meaningless here.
+#ifdef ARCH_X86_64
+        if (host_addr != nullptr && ctx.in_jit_code) {
+            // Capture raw bytes first — this always succeeds for an
+            // in-cache address and is the fallback when decode doesn't.
+            const auto* hb = reinterpret_cast<const u8*>(host_addr);
+            for (int i = 0; i < 16; ++i) {
+                ctx.faulting_raw_bytes[i] = hb[i];
+            }
+            ctx.raw_byte_count = 16;
+
+            // Also capture the host bytes immediately PRECEDING the fault
+            // PC. The faulting instruction is only the *consumer* of the
+            // bad pointer (e.g. `mov rXX,[rax]`); the instruction(s) that
+            // *computed* that pointer are just before it in the emitted
+            // block. Capturing this window lets us disassemble the lifter
+            // sequence that produced the address and see where a stray bit
+            // (e.g. bit 33) is introduced. Reading backwards within the
+            // code cache is safe — it's all our own committed code.
+            for (int i = 0; i < 32; ++i) {
+                ctx.pre_fault_bytes[i] = hb[i - 32];
+            }
+            ctx.pre_byte_count = 32;
+
+            ZydisDecoder dec;
+            if (ZYAN_SUCCESS(ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64,
+                                              ZYDIS_STACK_WIDTH_64))) {
+                ZydisDecodedInstruction insn;
+                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(
+                        &dec, host_addr, 15, &insn, ops))) {
+                    ctx.faulting_mnemonic = static_cast<u32>(insn.mnemonic);
+                    ctx.faulting_insn_length = insn.length;
+                    ctx.faulting_insn_decoded = true;
+                    // Determine the memory-operand direction: is the
+                    // faulting access a READ (load that brought the bad
+                    // pointer/value in) or a WRITE (store through an
+                    // already-bad pointer)? And which base register feeds
+                    // the effective address? This pins whether the bad
+                    // value arrived from guest memory or from a prior
+                    // computed register.
+                    for (u32 i = 0; i < insn.operand_count; ++i) {
+                        if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                            ctx.mem_base_reg = static_cast<u32>(ops[i].mem.base);
+                            ctx.mem_is_write =
+                                (ops[i].actions & ZYDIS_OPERAND_ACTION_MASK_WRITE) != 0;
+                            ctx.mem_is_read =
+                                (ops[i].actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0;
+                            ctx.have_mem_operand = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+#endif
+    }
+
+    return ctx;
 }
 
 // ============================================================================
