@@ -715,6 +715,7 @@ constexpr u64 CF = 1ULL << 0;
 constexpr u64 PF = 1ULL << 2;
 constexpr u64 ZF = 1ULL << 6;
 constexpr u64 SF = 1ULL << 7;
+constexpr u64 DF = 1ULL << 10; // direction flag (string-op direction)
 constexpr u64 OF = 1ULL << 11;
 constexpr u64 AllArith = CF | PF | ZF | SF | OF;
 } // namespace RflagsBits
@@ -884,6 +885,26 @@ bool EmitAdd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         c.mov(r10, rdx);
         c.mov(rcx, qword[r10]);                      // rcx = lhs (orig [mem])
         c.mov(rdx, qword[r13 + GprOffset(src_idx)]); // rdx = rhs
+        c.mov(rax, rcx);
+        c.add(rax, rdx);
+        c.mov(qword[r10], rax); // store result
+        EmitFlagsFromAdd(c);
+        return true;
+    }
+
+    // 64-bit ADD with memory destination and immediate source:
+    // `add qword[mem], imm` (imm8/imm32 sign-extended). The RMW
+    // counterpart of the reg-dst imm form — seen at libc 0x808187113
+    // (an in-memory 64-bit accumulator/counter bumped by a constant).
+    // Same r10-stash discipline as the mem-dst reg form: keep the
+    // computed address in r10 so the flag helper can use rdx for rhs.
+    if (insn.operand_width == 64 && dst.type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        if (!EmitEffectiveAddress(dst.mem, next_rip, c))
+            return false;
+        c.mov(r10, rdx);             // r10 = address (survives helper)
+        c.mov(rcx, qword[r10]);      // rcx = lhs (orig [mem])
+        c.mov(rdx, src.imm.value.s); // rdx = rhs (sign-extended imm)
         c.mov(rax, rcx);
         c.add(rax, rdx);
         c.mov(qword[r10], rax); // store result
@@ -1196,6 +1217,31 @@ bool EmitXor(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
             return false;
         c.mov(rdx, qword[rdx]);
         c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.xor_(rax, rdx);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
+    // 32-bit reg-imm: `xor r32, imm`. Mirrors EmitAnd's 32-bit imm
+    // path — truncate the (possibly sign-extended) immediate to u32;
+    // the 32-bit op zero-extends rax.
+    if (insn.operand_width == 32 && src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const u32 imm = static_cast<u32>(src.imm.value.u & 0xFFFFFFFFu);
+        c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+        c.xor_(eax, imm);
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+        EmitFlagsFromBitwise(c);
+        return true;
+    }
+
+    // 64-bit reg-imm: `xor r64, imm` (imm8/imm32 sign-extended). Seen
+    // at libc 0x808186d09. Materialize the full s64 into rdx — same
+    // pattern EmitAnd/EmitAdd use to dodge xbyak imm-encoding limits.
+    if (insn.operand_width == 64 && src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const auto imm = src.imm.value.s;
+        c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+        c.mov(rdx, imm);
         c.xor_(rax, rdx);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
         EmitFlagsFromBitwise(c);
@@ -1595,23 +1641,101 @@ bool EmitNeg(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
 // after so the flag helper (which clobbers CF) can still be reused.
 // =============================================================================
 
-/// INC r64 — add 1, preserve CF.
+/// INC r/m — add 1, preserve CF. Register forms (32/64-bit) and
+/// memory forms (8/16/32/64-bit).
 bool EmitInc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
              Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64 && insn.operand_width != 32 && insn.operand_width != 8)
+    if (insn.operand_width != 64 && insn.operand_width != 32 && insn.operand_width != 16 &&
+        insn.operand_width != 8)
         return false;
 
-    // 8-bit mem-dst form: `inc byte[mem]`. Observed at libc 0x805f6a7f5
-    // (refcount-byte increment inside a hot path). x86 INC architecturally
-    // preserves CF — but unlike the 32/64-bit reg-dst paths above, here
-    // we let the host CPU produce the flags via the rflags round-trip,
-    // and host INC also preserves CF, so we get the right behavior
-    // automatically without an explicit save/restore.
-    if (insn.operand_width == 8 && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+    // Memory-destination form: `inc byte/word/dword/qword [mem]`.
+    // First seen 8-bit at libc 0x805f6a7f5 (refcount-byte increment);
+    // 32-bit form at 0x80027136c (a 32-bit in-memory counter increment).
+    // x86 INC architecturally preserves CF — and so does the host INC,
+    // so the rflags round-trip gives us CF-preservation automatically,
+    // without the explicit save/restore the register paths below need.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
             return false;
-        c.mov(r10, rdx); // stash EA across rflags round-trip
-        c.mov(al, byte[r10]);
+        c.mov(r10, rdx); // stash EA across the rflags round-trip
+
+        // Load the in-memory value at the operand width.
+        switch (insn.operand_width) {
+        case 8:
+            c.mov(al, byte[r10]);
+            break;
+        case 16:
+            c.mov(ax, word[r10]);
+            break;
+        case 32:
+            c.mov(eax, dword[r10]);
+            break;
+        case 64:
+            c.mov(rax, qword[r10]);
+            break;
+        default:
+            return false;
+        }
+
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        switch (insn.operand_width) {
+        case 8:
+            c.inc(al);
+            break;
+        case 16:
+            c.inc(ax);
+            break;
+        case 32:
+            c.inc(eax);
+            break;
+        case 64:
+            c.inc(rax);
+            break;
+        }
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        // Store back exactly the operand width (memory has no
+        // zero-extension semantics — only the touched bytes change).
+        switch (insn.operand_width) {
+        case 8:
+            c.mov(byte[r10], al);
+            break;
+        case 16:
+            c.mov(word[r10], ax);
+            break;
+        case 32:
+            c.mov(dword[r10], eax);
+            break;
+        case 64:
+            c.mov(qword[r10], rax);
+            break;
+        }
+        return true;
+    }
+
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+
+    // 8-bit register form: `inc r8` (AL/CL/.../R15B, incl. AH/CH/DH/BH
+    // high-byte regs). First seen at Retro-engine 0x8002ac2cb. Like the
+    // mem-dst path, we let the host INC produce the flags via the rflags
+    // round-trip — host INC preserves CF, so CF-preservation is
+    // automatic (no manual save/restore). The byte-offset helper points
+    // at the exact byte slot (handling high-byte regs), and a byte-sized
+    // store preserves the surrounding 56 bits of the parent register.
+    if (insn.operand_width == 8) {
+        const int byte_off = ZydisGpr8ToByteOffset(ops[0].reg.value);
+        if (byte_off < 0)
+            return false;
+
+        c.mov(al, byte[r13 + byte_off]);
 
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
         c.push(rdx);
@@ -1623,14 +1747,14 @@ bool EmitInc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         c.pop(rdx);
         c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-        c.mov(byte[r10], al);
+        c.mov(byte[r13 + byte_off], al);
         return true;
     }
 
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+    // Register-dst path below handles only 32/64-bit. 16-bit register
+    // INC hasn't been observed; the 16-bit form above is mem-dst only.
+    if (insn.operand_width == 16)
         return false;
-    if (insn.operand_width == 8)
-        return false; // reg-dst 8-bit not seen yet
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0)
         return false;
@@ -1691,12 +1815,44 @@ bool EmitInc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     return true;
 }
 
-/// DEC r/m — subtract 1, preserve CF. 64- and 32-bit register forms.
+/// DEC r/m — subtract 1, preserve CF. 8-bit (register) and 32/64-bit
+/// register forms.
 bool EmitDec(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
              Xbyak::CodeGenerator& c) {
-    if (insn.operand_width != 64 && insn.operand_width != 32)
-        return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+
+    // 8-bit register form: `dec r8` (incl. AH/CH/DH/BH high-byte regs).
+    // First seen at Retro-engine 0x80030e358 (3 bytes past the DIV r8
+    // at ...355 — same routine: divide, then step a byte counter). The
+    // symmetric companion of `inc r8`. We let the host DEC produce the
+    // flags via the rflags round-trip — host DEC preserves CF, so
+    // CF-preservation is automatic (no manual save/restore). The
+    // byte-offset helper points at the exact byte slot (handling
+    // high-byte regs), and a byte-sized store preserves the surrounding
+    // 56 bits of the parent register.
+    if (insn.operand_width == 8) {
+        const int byte_off = ZydisGpr8ToByteOffset(ops[0].reg.value);
+        if (byte_off < 0)
+            return false;
+
+        c.mov(al, byte[r13 + byte_off]);
+
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        c.dec(al);
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        c.mov(byte[r13 + byte_off], al);
+        return true;
+    }
+
+    if (insn.operand_width != 64 && insn.operand_width != 32)
         return false;
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0)
@@ -2377,9 +2533,63 @@ bool EmitRotate64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
     return true;
 }
 
-// =============================================================================
-// IMUL — three encoding forms, dispatched by Zydis's visible
-// operand count.
+/// 32-bit rotate emitter. Same structure as EmitRotate64 but operates
+/// at 32-bit width: the host `rol`/`ror` on `eax` masks the count to
+/// 5 bits (0..31) automatically, matching guest semantics, and the
+/// 32-bit write zero-extends so a full-qword storeback records the
+/// canonical zero-extension in the guest GPR slot.
+///
+/// Flag semantics (identical Intel/AMD for rotates): CF = last bit
+/// rotated through; OF defined only for 1-bit rotates (undefined for
+/// multi-bit, which the host round-trip reproduces); SF/ZF/AF/PF are
+/// NOT modified by rotates — the popfq round-trip loads them from the
+/// guest rflags before the host rotate, the host rotate leaves them
+/// alone, and pushfq carries the unchanged values back. Rotate-by-
+/// zero affects no flags, also handled by the round-trip.
+bool EmitRotate32(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  Xbyak::CodeGenerator& c, RotateKind kind) {
+    if (insn.operand_width != 32)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (dst_idx < 0)
+        return false;
+
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (ops[1].reg.value != ZYDIS_REGISTER_CL)
+            return false;
+        c.mov(cl, byte[r13 + GprOffset(1)]);
+    } else {
+        return false;
+    }
+
+    c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.push(rdx);
+    c.popfq();
+
+    switch (kind) {
+    case RotateKind::Rol:
+        c.rol(eax, cl);
+        break;
+    case RotateKind::Ror:
+        c.ror(eax, cl);
+        break;
+    }
+
+    c.pushfq();
+    c.pop(rdx);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+    // Full-qword store so the host's 32-bit zero-extension lands in
+    // the guest GPR slot (bits 63:32 cleared).
+    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    return true;
+}
 //
 //   1-op (operand_count_visible == 1):
 //     IMUL r/m64  →  RDX:RAX = sign_extend(RAX) * sign_extend(src)
@@ -2496,6 +2706,39 @@ bool EmitImul1Op(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
 
 bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
              Xbyak::CodeGenerator& c) {
+    // 8-bit DIV has a different implicit-operand layout than the wider
+    // forms: the dividend is the full 16-bit AX (not a DX:AX pair),
+    // the quotient goes to AL, and the remainder to AH. Seen at Retro-
+    // engine 0x80030e355. The host `div r8` does exactly this.
+    if (insn.operand_width == 8) {
+        // Load the 8-bit divisor into cl. The divisor may be a
+        // high-byte register (AH/CH/DH/BH), so use the byte-offset
+        // helper rather than assuming the low byte of a slot.
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int div_off = ZydisGpr8ToByteOffset(ops[0].reg.value);
+            if (div_off < 0)
+                return false;
+            c.mov(cl, byte[r13 + div_off]);
+        } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+                return false;
+            c.mov(cl, byte[rdx]);
+        } else {
+            return false;
+        }
+
+        // Dividend = guest AX (low 16 bits of RAX slot, GPR index 0).
+        c.mov(ax, word[r13 + GprOffset(0)]);
+
+        c.div(cl); // AX / cl -> AL = quotient, AH = remainder
+
+        // Store AL (quotient) and AH (remainder) back into the low 16
+        // bits of guest RAX. A 16-bit store writes both AL and AH at
+        // once while preserving the upper 48 bits of the slot.
+        c.mov(word[r13 + GprOffset(0)], ax);
+        return true;
+    }
+
     if (insn.operand_width != 64 && insn.operand_width != 32)
         return false;
 
@@ -2767,6 +3010,196 @@ bool EmitCmc(Xbyak::CodeGenerator& c) {
     return true;
 }
 
+// CLD / STD — clear / set the direction flag (DF, rflags bit 10). DF
+// controls whether the string instructions (MOVS/STOS/LODS/CMPS/SCAS)
+// auto-increment (DF=0) or auto-decrement (DF=1) their pointer
+// registers. These touch no other flag and no register. CLD seen at
+// libc 0x8081df7f4 (the conventional "forward direction" setup glibc
+// string/memory routines emit before a REP-prefixed copy/scan). STD
+// is its setter sibling, pre-wired here.
+bool EmitCld(Xbyak::CodeGenerator& c) {
+    // Clear DF: load, BTR bit 10, store. Through a register (same
+    // reason as EmitClc — avoids the `and qword[mem], imm32`
+    // sign-extension foot-gun, and keeps the shape uniform).
+    c.mov(r10, qword[r13 + Offsets::Rflags]);
+    c.btr(r10, 10);
+    c.mov(qword[r13 + Offsets::Rflags], r10);
+    return true;
+}
+
+bool EmitStd(Xbyak::CodeGenerator& c) {
+    // Set DF: load, BTS bit 10, store.
+    c.mov(r10, qword[r13 + Offsets::Rflags]);
+    c.bts(r10, 10);
+    c.mov(qword[r13 + Offsets::Rflags], r10);
+    return true;
+}
+
+// =============================================================================
+// CMPS / REP(E|NE) CMPS — compare string operands.
+//
+// CMPSQ compares qword [RSI] vs qword [RDI] (CMP semantics: sets
+// SF/ZF/CF/OF/PF/AF from [RSI]-[RDI]) and advances BOTH RSI and RDI
+// by the element size, in the direction set by DF (forward +size when
+// DF=0, backward -size when DF=1).
+//
+// With a REPE/REPNE prefix it becomes a counted loop driven by RCX —
+// the building block of memcmp/wmemcmp:
+//   REPE  CMPSQ: repeat while RCX!=0 AND ZF==1  (stop on mismatch or count)
+//   REPNE CMPSQ: repeat while RCX!=0 AND ZF==0  (stop on match or count)
+// Each iteration: compare, advance RSI/RDI by ±size, decrement RCX.
+// If RCX starts at 0, nothing happens (no compare, no flag change).
+// The final flags reflect the LAST comparison actually performed.
+//
+// First seen as `repe cmpsq` at libc 0x8081df7fc — a memcmp inner
+// loop, right after the CLD that set the forward direction.
+//
+// We emit a host loop. Implicit operands map to fixed guest slots:
+// RSI=6, RDI=7, RCX=1. The element size comes from operand_width.
+// Host scratch: r8=RSI, r9=RDI, r10=RCX, r11=step; rax/rdx hold the
+// two loaded elements for the compare; flags captured at the end.
+bool EmitCmps(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
+    using LT = Xbyak::CodeGenerator::LabelType;
+
+    // CRITICAL: ZYDIS_MNEMONIC_CMPSD is shared between the string
+    // "compare dword" and the unrelated SSE2 scalar-double CMPSD
+    // (compare scalar double-precision, e.g. `cmpsd xmm0, xmm1, imm8`).
+    // They are distinguished only by operand visibility: the string
+    // forms (CMPSB/W/D/Q) have ALL operands implicit (RSI/RDI/RCX), so
+    // operand_count_visible == 0; the SSE2 form has 3 visible operands.
+    // Reject anything with visible operands so an SSE2 CMPSD routed
+    // here falls through to its own handler / unsupported path.
+    if (insn.operand_count_visible != 0)
+        return false;
+
+    const unsigned w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64)
+        return false;
+    const int elem = static_cast<int>(w / 8); // 1/2/4/8 bytes
+
+    const bool has_repe = (insn.attributes & ZYDIS_ATTRIB_HAS_REPE) != 0;
+    const bool has_repne = (insn.attributes & ZYDIS_ATTRIB_HAS_REPNE) != 0;
+    const bool is_rep = has_repe || has_repne;
+
+    constexpr int kRsi = 6, kRdi = 7, kRcx = 1;
+
+    // Pointers into r8/r9.
+    c.mov(r8, qword[r13 + GprOffset(kRsi)]);
+    c.mov(r9, qword[r13 + GprOffset(kRdi)]);
+
+    // Step into r11: +elem if DF=0, -elem if DF=1 (DF = rflags bit 10).
+    c.mov(r11, elem);
+    {
+        Xbyak::Label df_clear;
+        c.mov(rax, qword[r13 + Offsets::Rflags]);
+        c.bt(rax, 10);
+        c.jnc(df_clear, LT::T_NEAR);
+        c.neg(r11);
+        c.L(df_clear);
+    }
+
+    // rbx holds the guest rflags we will ultimately write back. Start
+    // it at the current guest rflags so a zero-trip REP (RCX==0) leaves
+    // flags unchanged. Each performed compare overwrites it with that
+    // compare's full flag state (the architectural rule: final flags
+    // reflect the LAST comparison performed). We must preserve rbx
+    // across the host op, so save/restore the host's rbx (it is NOT a
+    // JIT scratch — r13 is pinned; rbx belongs to the host ABI here).
+    c.push(rbx);
+    c.mov(rbx, qword[r13 + Offsets::Rflags]);
+
+    // NOTE: we deliberately do NOT popfq the guest rflags into the host
+    // here. Doing so would also load the guest's DF (bit 10) into the
+    // HOST direction flag, leaving the host in DF=1 mode on return —
+    // a calling-convention violation that corrupts any host memcpy/etc.
+    // run by the dispatcher afterward. We don't need it anyway: each
+    // `cmp` below sets all the arithmetic flags fresh, and rbx already
+    // carries the guest flag bits for the zero-trip case. The host DF
+    // stays at its canonical 0 throughout (we use explicit add/sub for
+    // the pointer stepping, never a host string op).
+
+    // Emits: compare [r8] vs [r9] at width w, then snapshot the host
+    // rflags into rbx (so rbx always holds the most-recent compare's
+    // flags). Uses rax as the load scratch.
+    auto cmp_and_capture = [&]() {
+        switch (w) {
+        case 8:
+            c.mov(al, byte[r8]);
+            c.cmp(al, byte[r9]);
+            break;
+        case 16:
+            c.mov(ax, word[r8]);
+            c.cmp(ax, word[r9]);
+            break;
+        case 32:
+            c.mov(eax, dword[r8]);
+            c.cmp(eax, dword[r9]);
+            break;
+        case 64:
+            c.mov(rax, qword[r8]);
+            c.cmp(rax, qword[r9]);
+            break;
+        }
+        c.pushfq();
+        c.pop(rbx); // rbx = this compare's full rflags
+    };
+
+    if (!is_rep) {
+        // Plain CMPS: one compare, one advance.
+        cmp_and_capture();
+        c.add(r8, r11);
+        c.add(r9, r11);
+    } else {
+        c.mov(r10, qword[r13 + GprOffset(kRcx)]);
+
+        Xbyak::Label l_top, l_done;
+        c.test(r10, r10);
+        c.jz(l_done, LT::T_NEAR); // RCX==0: zero-trip, rbx stays = guest flags
+
+        c.L(l_top);
+        cmp_and_capture(); // rbx = last compare's flags
+        c.add(r8, r11);
+        c.add(r9, r11);
+        c.dec(r10);
+        c.jz(l_done, LT::T_NEAR); // count exhausted
+
+        // Data condition: REPE continues while equal (ZF==1 in rbx),
+        // REPNE continues while not-equal (ZF==0). ZF is rbx bit 6.
+        c.bt(rbx, 6); // CF = ZF-of-last-compare
+        if (has_repe)
+            c.jc(l_top, LT::T_NEAR); // equal -> keep going
+        else
+            c.jnc(l_top, LT::T_NEAR); // not-equal -> keep going
+        c.L(l_done);
+    }
+
+    // Writeback. Store the advanced pointers and residual count FIRST,
+    // while r8/r9/r10 still hold them — then the flag merge is free to
+    // use those registers as scratch.
+    c.mov(qword[r13 + GprOffset(kRsi)], r8);
+    c.mov(qword[r13 + GprOffset(kRdi)], r9);
+    if (is_rep)
+        c.mov(qword[r13 + GprOffset(kRcx)], r10);
+
+    // Flags: arithmetic bits come from the last compare (rbx); the
+    // non-arithmetic bits — crucially DF, which CMPS must NOT modify —
+    // are preserved from the guest's current rflags. On a zero-trip
+    // REP, rbx still equals the full original guest rflags, so this
+    // merge is an exact no-op. Uses rax/r8/r9 as scratch (pointers
+    // already stored above).
+    constexpr u64 kArith = 0x8D5;             // CF|PF|AF|ZF|SF|OF
+    c.mov(rax, qword[r13 + Offsets::Rflags]); // original guest rflags
+    c.mov(r8, ~kArith);
+    c.and_(rax, r8); // guest non-arith bits (incl DF)
+    c.mov(r9, kArith);
+    c.and_(rbx, r9); // compare's arith bits only
+    c.or_(rax, rbx); // merged
+    c.mov(qword[r13 + Offsets::Rflags], rax);
+
+    c.pop(rbx); // restore host rbx
+    return true;
+}
+
 // =============================================================================
 // LEAVE — function epilogue shorthand.
 //
@@ -2858,22 +3291,36 @@ bool EmitAdcSbb64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         return true;
     }
 
-    // 32-bit reg-imm form: `sbb r32, imm8` (sign-extended) or
-    // `sbb r32, imm32`. Observed at libc 0x80001021d inside a
-    // multi-precision subtract chain. The 32-bit-write zero-extends
-    // rax automatically, so qword storeback lands a clean upper half.
+    // 32-bit forms: reg-reg (`sbb r32, r32`) or reg-imm
+    // (`sbb r32, imm8/imm32`). reg-reg first seen at libc 0x808167c40
+    // (a 32-bit borrow-propagating subtract), reg-imm at 0x80001021d.
+    // The 32-bit-write zero-extends rax automatically, so the qword
+    // storeback lands a clean upper half. Flags round-trip through the
+    // host so its ADC/SBB reads the guest CF as borrow/carry-in and
+    // writes the new CF/OF/SF/ZF/PF/AF at the correct 32-bit width.
     if (insn.operand_width == 32) {
-        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-            ops[1].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
             return false;
         const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
         if (dst_idx < 0)
             return false;
-        // Zydis sign-extends imm8/imm32 into a 64-bit s64; mask to
-        // 32-bit since that's the operand width.
-        const u32 imm = static_cast<u32>(ops[1].imm.value.s);
 
         c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+
+        // Load the src into ecx (reg) or use an immediate directly.
+        bool src_is_imm = false;
+        u32 imm = 0;
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+            if (src_idx < 0)
+                return false;
+            c.mov(ecx, dword[r13 + GprOffset(src_idx)]);
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            src_is_imm = true;
+            imm = static_cast<u32>(ops[1].imm.value.s); // sign-extended
+        } else {
+            return false;
+        }
 
         c.mov(r8, qword[r13 + Offsets::Rflags]);
         c.push(r8);
@@ -2881,10 +3328,16 @@ bool EmitAdcSbb64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 
         switch (kind) {
         case AdcSbbKind::Adc:
-            c.adc(eax, imm);
+            if (src_is_imm)
+                c.adc(eax, imm);
+            else
+                c.adc(eax, ecx);
             break;
         case AdcSbbKind::Sbb:
-            c.sbb(eax, imm);
+            if (src_is_imm)
+                c.sbb(eax, imm);
+            else
+                c.sbb(eax, ecx);
             break;
         }
 
@@ -3163,6 +3616,48 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn, const ZydisDecodedOp
                        u64 next_rip, Xbyak::CodeGenerator& c, NarrowArithKind kind) {
     if (insn.operand_width != 16)
         return false;
+
+    const bool is_readonly = (kind == NarrowArithKind::Cmp || kind == NarrowArithKind::Test);
+
+    // ---- Memory-destination/lhs form (e.g. `cmp word [mem], imm`) ----
+    // The lhs is a memory operand. We only support this for the
+    // read-only ops (CMP/TEST) right now — a read-modify-write to
+    // memory (ADD/SUB/AND/... word[mem], x) would need the result
+    // stored back to [mem], which no game has exercised yet. Reject
+    // those rather than silently dropping the writeback.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!is_readonly)
+            return false;
+        // Compute the lhs address (clobbers rax), read the word into
+        // ax, then load the rhs into cx. mem,mem is not a real form.
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+            return false;
+        c.mov(ax, word[rdx]);
+
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+            if (src_idx < 0)
+                return false;
+            c.mov(cx, word[r13 + GprOffset(src_idx)]);
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(cx, static_cast<u16>(ops[1].imm.value.u & 0xFFFF));
+        } else {
+            return false;
+        }
+
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+        if (kind == NarrowArithKind::Cmp)
+            c.cmp(ax, cx);
+        else
+            c.test(ax, cx);
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        return true;
+    }
+
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
         return false;
     const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
@@ -3430,37 +3925,49 @@ bool EmitMov8(const ZydisDecodedInstruction&, const ZydisDecodedOperand* ops, u6
     const auto& dst = ops[0];
     const auto& src = ops[1];
 
-    // Register destination.
+    // Register destination. Each sub-path below computes the precise
+    // byte offset (via ZydisGpr8ToByteOffset) so high-byte destination
+    // registers (AH/CH/DH/BH) are handled — we deliberately do NOT
+    // gate on ZydisGprToIndex here, since it returns -1 for those.
     if (dst.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int dst_idx = ZydisGprToIndex(dst.reg.value);
-        if (dst_idx < 0)
-            return false;
-
         if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
-            // mov r8, r8 — read low byte of src slot, write low byte
-            // of dst slot. Upper bits of dst preserved by `byte` store.
-            const int src_idx = ZydisGprToIndex(src.reg.value);
-            if (src_idx < 0)
+            // mov r8, r8 — read the source byte, write the dest byte.
+            // We must use the 8-bit byte-offset helper, not GprOffset:
+            // high-byte registers (AH/CH/DH/BH) live at parent-slot
+            // offset+1, and ZydisGprToIndex doesn't even recognize them
+            // (it returns -1), so the old GprOffset-based code rejected
+            // any mov involving AH/CH/DH/BH. The byte store/load touches
+            // exactly one byte, preserving the rest of each parent slot.
+            const int dst_off = ZydisGpr8ToByteOffset(dst.reg.value);
+            const int src_off = ZydisGpr8ToByteOffset(src.reg.value);
+            if (dst_off < 0 || src_off < 0)
                 return false;
-            c.mov(al, byte[r13 + GprOffset(src_idx)]);
-            c.mov(byte[r13 + GprOffset(dst_idx)], al);
+            c.mov(al, byte[r13 + src_off]);
+            c.mov(byte[r13 + dst_off], al);
             return true;
         }
         if (src.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-            // mov r8, imm8 — store immediate byte into low byte of slot.
-            c.mov(byte[r13 + GprOffset(dst_idx)], static_cast<u8>(src.imm.value.u & 0xFF));
+            // mov r8, imm8 — store immediate byte into the dest byte
+            // slot (byte-offset helper for high-byte dest regs).
+            const int dst_off = ZydisGpr8ToByteOffset(dst.reg.value);
+            if (dst_off < 0)
+                return false;
+            c.mov(byte[r13 + dst_off], static_cast<u8>(src.imm.value.u & 0xFF));
             return true;
         }
         if (src.type == ZYDIS_OPERAND_TYPE_MEMORY) {
             // mov r8, byte[mem] — compute address (clobbers rax),
-            // then load byte and write low byte of dst slot.
+            // then load byte and write the dest byte slot.
             // We use cl for the loaded byte because rcx is preserved
             // by EmitEffectiveAddress; al would be valid too but is
             // a scratch the helper actively uses.
+            const int dst_off = ZydisGpr8ToByteOffset(dst.reg.value);
+            if (dst_off < 0)
+                return false;
             if (!EmitEffectiveAddress(src.mem, next_rip, c))
                 return false;
             c.mov(cl, byte[rdx]);
-            c.mov(byte[r13 + GprOffset(dst_idx)], cl);
+            c.mov(byte[r13 + dst_off], cl);
             return true;
         }
         return false;
@@ -3470,14 +3977,15 @@ bool EmitMov8(const ZydisDecodedInstruction&, const ZydisDecodedOperand* ops, u6
     if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
             // mov byte[mem], r8 — compute address (rdx), then read
-            // src low byte into cl (rcx preserved through
-            // EmitEffectiveAddress), then store.
-            const int src_idx = ZydisGprToIndex(src.reg.value);
-            if (src_idx < 0)
+            // src byte into cl (rcx preserved through
+            // EmitEffectiveAddress), then store. Byte-offset helper so
+            // a high-byte source register reads the correct byte.
+            const int src_off = ZydisGpr8ToByteOffset(src.reg.value);
+            if (src_off < 0)
                 return false;
             if (!EmitEffectiveAddress(dst.mem, next_rip, c))
                 return false;
-            c.mov(cl, byte[r13 + GprOffset(src_idx)]);
+            c.mov(cl, byte[r13 + src_off]);
             c.mov(byte[rdx], cl);
             return true;
         }
@@ -3999,7 +4507,8 @@ constexpr u32 YmmChunkOffset(int lane_idx, int chunk) {
 bool EmitVmovups(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
                  Xbyak::CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_VMOVUPS && insn.mnemonic != ZYDIS_MNEMONIC_VMOVDQU &&
-        insn.mnemonic != ZYDIS_MNEMONIC_VMOVDQA && insn.mnemonic != ZYDIS_MNEMONIC_VMOVAPS) {
+        insn.mnemonic != ZYDIS_MNEMONIC_VMOVDQA && insn.mnemonic != ZYDIS_MNEMONIC_VMOVAPS &&
+        insn.mnemonic != ZYDIS_MNEMONIC_VMOVNTDQA) {
         // VMOVDQA differs from VMOVDQU only in that it #GPs on
         // misaligned addresses on real hardware. We do all transfers
         // via 64-bit GPR chunks anyway, so alignment is irrelevant
@@ -4012,6 +4521,14 @@ bool EmitVmovups(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
         // VMOVUPS. Float-vs-int operand typing is irrelevant for
         // GPR-relayed bitwise moves, and the alignment requirement
         // doesn't matter for the same reason as VMOVDQA.
+        //
+        // VMOVNTDQA is the *non-temporal* aligned load (the load-side
+        // partner of VMOVNTDQ's store). The "NT" is a cache-locality
+        // hint with no architectural effect — for the data actually
+        // moved it is bitwise identical to VMOVDQA. It is load-only
+        // (reg ← mem); there is no non-temporal-load store direction,
+        // so only the reg←mem path below applies (a mem-dst VMOVNTDQA
+        // isn't a real encoding and would fall through to false).
         return false;
     }
 
@@ -4138,25 +4655,219 @@ bool EmitVmovd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return false;
 }
 
-/// VMOVQ — 64-bit move between an XMM register and either another
-/// XMM register or a GPR. Three reg-reg directions handled here; the
-/// mem-source/dest forms (xmm ↔ m64) can be added when seen.
+/// VPEXTRD — extract one 32-bit dword from an XMM register, selected
+/// by imm8, into a GPR (r32) or memory (m32).
+///
+///   VPEXTRD r/m32, xmm, imm8
+///
+/// imm8[1:0] selects the dword lane (0..3); higher imm8 bits are
+/// ignored (architecturally masked). dword 0 is the low 32 bits.
+///
+/// GPR destination zero-extends to the full 64-bit register (writing
+/// r32 clears bits 63:32), so we store a full qword to the guest GPR
+/// slot with the upper half cleared — same canonical zero-extension
+/// VMOVD uses. Memory destination writes exactly 4 bytes.
+///
+/// Implementation: rather than round-trip through a scratch xmm and
+/// run host VPEXTRD, we read the selected dword straight out of the
+/// GuestState ymm storage. The 4 dwords live at byte offsets 0,4,8,12
+/// within the low 128 bits; we compute the dword's address and load
+/// it directly. (This mirrors the VMOVD GPR←XMM path, just at an
+/// imm-selected offset instead of always dword 0.) For the memory-
+/// destination form we compute the effective address FIRST, because
+/// EmitEffectiveAddress uses rax as scratch — so the extracted dword
+/// is loaded into ecx after the address is settled in rdx.
+///
+/// First instance of the PEXTR family (VPEXTRB/W/D/Q). Kept as a
+/// standalone emitter rather than a parameterised helper for now —
+/// the element widths differ enough (byte/word/dword/qword, with
+/// different GPR write widths and zero-extension rules) that a shared
+/// helper would be mostly branches. Revisit if a second member lands.
+bool EmitVpextrd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
+                 Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPEXTRD)
+        return false;
+    if (insn.operand_count_visible != 3)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        return false;
+
+    const int src_vec = ZydisVecToIndex(ops[1].reg.value);
+    if (src_vec < 0)
+        return false;
+
+    // Lane select: low 2 bits of imm8 (4 dwords in a 128-bit xmm).
+    const unsigned lane = static_cast<unsigned>(ops[2].imm.value.u) & 0x3u;
+    // Byte offset of the selected dword within the ymm storage:
+    // dword `lane` sits at byte (lane*4) from the start of chunk 0.
+    const int dword_off = static_cast<int>(YmmChunkOffset(src_vec, 0)) + static_cast<int>(lane) * 4;
+
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int dst_gpr = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_gpr < 0)
+            return false;
+        // Load the 32-bit dword into eax (zero-extends rax to 64 bits),
+        // then store full qword: a 32-bit GPR write zero-extends, so
+        // the guest slot gets the canonical value with bits 63:32 = 0.
+        c.mov(eax, dword[r13 + dword_off]);
+        c.mov(qword[r13 + GprOffset(dst_gpr)], rax);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute the destination address FIRST: EmitEffectiveAddress
+        // uses rax as scratch (index scaling), so we must not hold the
+        // extracted dword in eax across it. Address lands in rdx.
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+            return false;
+        // Now load the selected dword and write exactly 4 bytes. The
+        // r13-relative load is independent of rdx, and ecx is free
+        // scratch here (not used by EmitEffectiveAddress's result).
+        c.mov(ecx, dword[r13 + dword_off]);
+        c.mov(dword[rdx], ecx);
+    } else {
+        return false;
+    }
+    return true;
+}
+
+/// VPINSRD — insert a 32-bit dword (from a GPR or m32) into an
+/// imm8-selected lane of an XMM. The inverse of VPEXTRD.
+///
+///   VPINSRD xmm1, xmm2, r/m32, imm8
+///
+/// Result: dst = src1, with dword lane (imm8 & 3) replaced by the
+/// 32-bit source value. As a VEX-encoded op, bits 255:128 of the
+/// destination YMM are zeroed.
+///
+/// Implementation: copy src1's low 128 bits into dst (chunks 0,1),
+/// then overwrite the selected dword, then zero the upper YMM. We
+/// must order reads before writes so the dst==src1 in-place form
+/// (vpinsrd xmm0, xmm0, eax, imm) is correct — the chunk copy is a
+/// self-copy in that case, harmless. The 32-bit source is read into
+/// a GPR FIRST when it comes from memory, because EmitEffectiveAddress
+/// uses rax/rdx as scratch (same ordering lesson as VPEXTRD).
+///
+/// First instance of the PINSR family (VPINSRB/W/D/Q). Standalone for
+/// now, mirroring the VPEXTRD decision — the per-width differences
+/// (insert granularity, source register width) make a shared helper
+/// mostly branches. Revisit if a second member lands.
+bool EmitVpinsrd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
+                 Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPINSRD)
+        return false;
+    if (insn.operand_count_visible != 4)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[3].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        return false;
+
+    const int dst_vec = ZydisVecToIndex(ops[0].reg.value);
+    const int src1_vec = ZydisVecToIndex(ops[1].reg.value);
+    if (dst_vec < 0 || src1_vec < 0)
+        return false;
+
+    const unsigned lane = static_cast<unsigned>(ops[3].imm.value.u) & 0x3u;
+
+    // Step 1: get the 32-bit insert value into ecx (a register that
+    // survives the subsequent chunk copies). For a memory source we
+    // must compute the EA and load BEFORE touching dst, and before
+    // anything that uses rax/rdx as scratch.
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src2_gpr = ZydisGprToIndex(ops[2].reg.value);
+        if (src2_gpr < 0)
+            return false;
+        c.mov(ecx, dword[r13 + GprOffset(src2_gpr)]);
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c))
+            return false;
+        c.mov(ecx, dword[rdx]);
+    } else {
+        return false;
+    }
+
+    // Step 2: copy src1's low 128 bits (chunks 0,1) into dst. Reads of
+    // src1 happen before writes of dst; if dst==src1 these are
+    // self-copies (harmless). Use rax as the transfer register.
+    c.mov(rax, qword[r13 + YmmChunkOffset(src1_vec, 0)]);
+    c.mov(qword[r13 + YmmChunkOffset(dst_vec, 0)], rax);
+    c.mov(rax, qword[r13 + YmmChunkOffset(src1_vec, 1)]);
+    c.mov(qword[r13 + YmmChunkOffset(dst_vec, 1)], rax);
+
+    // Step 3: overwrite the selected dword. dword `lane` is at byte
+    // offset lane*4 from chunk 0 of dst.
+    const int dword_off = static_cast<int>(YmmChunkOffset(dst_vec, 0)) + static_cast<int>(lane) * 4;
+    c.mov(dword[r13 + dword_off], ecx);
+
+    // Step 4: VEX zero of bits 255:128 (chunks 2,3).
+    c.xor_(rax, rax);
+    c.mov(qword[r13 + YmmChunkOffset(dst_vec, 2)], rax);
+    c.mov(qword[r13 + YmmChunkOffset(dst_vec, 3)], rax);
+    return true;
+}
+
+/// VMOVQ — 64-bit move involving an XMM register. Handles the three
+/// reg-reg directions plus the two memory forms.
 ///
 ///   xmm ← xmm: copies low 64 of src to low 64 of dst, zeroes the
 ///              rest of the dst YMM (bits 255:64).
 ///   xmm ← r64: copies r64 to dst low 64, zeroes bits 255:64 of YMM.
 ///   r64 ← xmm: copies xmm low 64 to r64 (full 64-bit write, no
 ///              zero-extend needed since it IS the full GPR).
+///   xmm ← m64: loads 64 bits to dst low 64, zeroes bits 255:64.
+///   m64 ← xmm: stores xmm low 64 to memory (8 bytes).
 ///
-/// The user log showed reg,reg with length=5 — that's the 3-byte-
-/// VEX form, used for the GPR↔XMM variants. The xmm←xmm form is 4
-/// bytes (2-byte VEX). All three variants share this emitter and
-/// route by sniffing the operand register classes via the same
-/// trick VMOVD uses.
-bool EmitVmovq(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+/// Forms route by sniffing operand register classes (same trick VMOVD
+/// uses) and operand types. The GPR↔XMM variants are the 3-byte-VEX
+/// reg,reg form (length 5); xmm←xmm is 2-byte VEX (length 4); the
+/// memory forms use a ModRM with addressing bytes (length 8 with
+/// RIP-relative, as first seen at libc 0x800263e4d). The memory paths
+/// compute the effective address before moving data, since
+/// EmitEffectiveAddress scratches rax.
+bool EmitVmovq(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
                Xbyak::CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_VMOVQ)
         return false;
+
+    // ---- Memory forms (added when the reg-mem load was first seen) ----
+    //
+    // VMOVQ xmm, m64  : load 64 bits into dst.low64, zero bits 255:64
+    //                   of the dst YMM (VEX architectural).
+    // VMOVQ m64, xmm  : store xmm.low64 to memory (8 bytes, no other
+    //                   effects).
+    //
+    // EmitEffectiveAddress writes the address into rdx and uses rax as
+    // scratch, so we compute the EA first, then move data through rax.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER && ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        const int dst_vec = ZydisVecToIndex(ops[0].reg.value);
+        if (dst_vec < 0)
+            return false;
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c))
+            return false;
+        c.mov(rax, qword[rdx]);                              // load m64
+        c.mov(qword[r13 + YmmChunkOffset(dst_vec, 0)], rax); // dst.low64
+        c.xor_(rax, rax);                                    // zero 255:64
+        c.mov(qword[r13 + YmmChunkOffset(dst_vec, 1)], rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_vec, 2)], rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_vec, 3)], rax);
+        return true;
+    }
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_vec = ZydisVecToIndex(ops[1].reg.value);
+        if (src_vec < 0)
+            return false;
+        // Load the source quad BEFORE computing the EA (EA clobbers
+        // rax); stash it in rcx, which the EA computation leaves alone.
+        c.mov(rcx, qword[r13 + YmmChunkOffset(src_vec, 0)]);
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+            return false;
+        c.mov(qword[rdx], rcx); // store 8 bytes
+        return true;
+    }
+
+    // ---- Register-register forms ----
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER || ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
         return false;
 
@@ -5381,8 +6092,15 @@ bool EmitVcvttss2si(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
 ///   * reg, reg, reg — dst = src1 OP src2
 ///   * reg, reg, mem — dst = src1 OP [mem]
 ///
+/// VPANDN is the asymmetric member: dst = (NOT src1) AND src2. The
+/// inversion applies ONLY to the first source operand, then ANDs with
+/// the second — NOT a symmetric op. We realize it by inverting the
+/// loaded src1 chunk (`not rax`) before the AND against src2. This is
+/// the standard "clear bits of src2 that are set in src1" / "mask
+/// complement" idiom string code uses to combine match masks.
+///
 /// Vector widths: 128 (VEX-128, zeros upper YMM) and 256 (full YMM).
-enum class VecBitOpKind { Xor, And, Or };
+enum class VecBitOpKind { Xor, And, Or, Andn };
 
 bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
                   Xbyak::CodeGenerator& c, VecBitOpKind kind) {
@@ -5400,6 +6118,10 @@ bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         break;
     case VecBitOpKind::Or:
         if (insn.mnemonic != ZYDIS_MNEMONIC_VORPS && insn.mnemonic != ZYDIS_MNEMONIC_VPOR)
+            return false;
+        break;
+    case VecBitOpKind::Andn:
+        if (insn.mnemonic != ZYDIS_MNEMONIC_VPANDN)
             return false;
         break;
     }
@@ -5421,7 +6143,8 @@ bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 
     // Emit one chunk's worth of {load src1, op against src2-or-mem, store}.
     // src1_chunk and src2_chunk_addr are the per-iteration arguments; the
-    // helper handles the kind dispatch.
+    // helper handles the kind dispatch. For Andn the binary op is AND
+    // (the NOT of src1 is applied separately, right after the load).
     auto emit_op = [&](const Xbyak::Reg64& dst_reg, const Xbyak::Address& src2_mem) {
         switch (kind) {
         case VecBitOpKind::Xor:
@@ -5433,8 +6156,13 @@ bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         case VecBitOpKind::Or:
             c.or_(dst_reg, src2_mem);
             break;
+        case VecBitOpKind::Andn:
+            c.and_(dst_reg, src2_mem);
+            break;
         }
     };
+    // For VPANDN, invert the loaded src1 chunk before the AND.
+    const bool invert_src1 = (kind == VecBitOpKind::Andn);
 
     if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src2_idx = ZydisVecToIndex(ops[2].reg.value);
@@ -5443,6 +6171,8 @@ bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 
         for (int i = 0; i < chunks; ++i) {
             c.mov(rax, qword[r13 + YmmChunkOffset(src1_idx, i)]);
+            if (invert_src1)
+                c.not_(rax);
             emit_op(rax, qword[r13 + YmmChunkOffset(src2_idx, i)]);
             c.mov(qword[r13 + YmmChunkOffset(dst_idx, i)], rax);
         }
@@ -5454,6 +6184,8 @@ bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 
         for (int i = 0; i < chunks; ++i) {
             c.mov(rax, qword[r13 + YmmChunkOffset(src1_idx, i)]);
+            if (invert_src1)
+                c.not_(rax);
             emit_op(rax, qword[rdx + i * 8]);
             c.mov(qword[r13 + YmmChunkOffset(dst_idx, i)], rax);
         }
@@ -6756,6 +7488,84 @@ bool EmitVecShiftImm(const ZydisDecodedInstruction& insn, const ZydisDecodedOper
     return true;
 }
 
+/// VPSLLDQ / VPSRLDQ — shift the WHOLE 128-bit lane left/right by an
+/// imm8 BYTE count, zero-filling. The "DQ" (double-quadword) suffix
+/// distinguishes these from the per-element bit shifts (VPSLLD etc.):
+/// here the entire 128-bit value moves as one unit, in byte steps.
+///
+///   VPSLLDQ xmm1, xmm2, imm8   ; dst = src << (imm8 * 8) bits, per lane
+///   VPSRLDQ xmm1, xmm2, imm8   ; dst = src >> (imm8 * 8) bits, per lane
+///
+/// Byte-shift, not bit-shift: VPSLLDQ by 4 moves byte i to byte i+4,
+/// zero-filling bytes 0..3 and discarding the top 4 bytes. A count
+/// >= 16 zeroes the entire lane (all bytes shifted out).
+///
+/// LANE behavior (same caveat as the pack family): on the 256-bit
+/// form the shift happens INDEPENDENTLY within each 128-bit lane —
+/// bytes never cross the 128-bit boundary. The host op reproduces
+/// this, so we run host VPSLLDQ/VPSRLDQ on xmm0 (128) or ymm0 (256)
+/// rather than reconstructing the byte movement by hand.
+///
+/// Separate from EmitVecShiftImm: that helper is per-ELEMENT bit
+/// shifts (W/D/Q element widths, count in bits); this is a whole-lane
+/// BYTE shift. Different operation, different operand semantics —
+/// hence its own emitter, with VPSRLDQ as the natural pair.
+enum class VecByteShiftKind { Slldq, Srldq };
+
+bool EmitVecByteShift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                      Xbyak::CodeGenerator& c, VecByteShiftKind kind) {
+    const ZydisMnemonic expected =
+        (kind == VecByteShiftKind::Slldq) ? ZYDIS_MNEMONIC_VPSLLDQ : ZYDIS_MNEMONIC_VPSRLDQ;
+    if (insn.mnemonic != expected)
+        return false;
+    if (insn.operand_count_visible != 3)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        return false;
+
+    const int dst_idx = ZydisVecToIndex(ops[0].reg.value);
+    const int src_idx = ZydisVecToIndex(ops[1].reg.value);
+    if (dst_idx < 0 || src_idx < 0)
+        return false;
+
+    const u8 imm = static_cast<u8>(ops[2].imm.value.u & 0xFFu);
+    const int vec_bits = ops[0].size;
+    if (vec_bits != 128 && vec_bits != 256)
+        return false;
+
+    auto emit_op = [&](bool wide) {
+        if (kind == VecByteShiftKind::Slldq) {
+            if (wide)
+                c.vpslldq(ymm0, ymm0, imm);
+            else
+                c.vpslldq(xmm0, xmm0, imm);
+        } else {
+            if (wide)
+                c.vpsrldq(ymm0, ymm0, imm);
+            else
+                c.vpsrldq(xmm0, xmm0, imm);
+        }
+    };
+
+    if (vec_bits == 128) {
+        c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src_idx, 0)]);
+        emit_op(false);
+        c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], xmm0);
+        c.xor_(rax, rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_idx, 2)], rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_idx, 3)], rax);
+    } else {
+        c.vmovdqu(ymm0, ptr[r13 + YmmChunkOffset(src_idx, 0)]);
+        emit_op(true);
+        c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], ymm0);
+    }
+    return true;
+}
+
 /// SFENCE — serialize all prior non-temporal stores. No operands.
 ///
 /// Observed at libc 0x805f2b42d, immediately after the VMOVNTDQ
@@ -6854,6 +7664,107 @@ bool EmitBextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
         c.bextr(eax, r9d, r10d);
     } else {
         c.bextr(rax, r9, r10);
+    }
+
+    c.pushfq();
+    c.pop(r8);
+    c.mov(qword[r13 + Offsets::Rflags], r8);
+
+    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    return true;
+}
+
+/// BLSI / BLSR / BLSMSK — the BMI1 "lowest-set-bit" trio. All are
+/// 2-operand (dst, src), share VEX opcode 0xF3 (distinguished by the
+/// ModRM.reg field), and have closely-related semantics:
+///
+///   BLSI   dst = (-src) & src        ; isolate lowest set bit
+///   BLSR   dst = (src-1) & src       ; reset (clear) lowest set bit
+///   BLSMSK dst = (src-1) ^ src       ; mask up to & incl lowest set bit
+///
+/// Flag semantics (identical Intel/AMD): SF = result MSB, OF = 0,
+/// AF/PF undefined. ZF and CF differ across the three:
+///   BLSI:   ZF = (result==0); CF = (src != 0)
+///   BLSR:   ZF = (result==0); CF = (src == 0)
+///   BLSMSK: ZF = 0;           CF = (src == 0)
+/// We don't compute any of this by hand — the host op sets all the
+/// flags per spec, and the rflags round-trip carries them across,
+/// exactly as BEXTR/ANDN do. BMI1 is advertised in the CPUID spoof
+/// (Jaguar has it), so a guest gating on the bit sees it available.
+///
+/// First instance is BLSI (hit in libc bit-manipulation code).
+/// Parameterised so BLSR/BLSMSK are one-line dispatch additions.
+enum class BlsKind { Blsi, Blsr, Blsmsk };
+
+bool EmitBlsFamily(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                   u64 next_rip, Xbyak::CodeGenerator& c, BlsKind kind) {
+    const ZydisMnemonic expected = (kind == BlsKind::Blsi)   ? ZYDIS_MNEMONIC_BLSI
+                                   : (kind == BlsKind::Blsr) ? ZYDIS_MNEMONIC_BLSR
+                                                             : ZYDIS_MNEMONIC_BLSMSK;
+    if (insn.mnemonic != expected)
+        return false;
+    if (insn.operand_width != 64 && insn.operand_width != 32)
+        return false;
+    if (insn.operand_count_visible != 2)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+
+    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
+    if (dst_idx < 0)
+        return false;
+
+    const bool w32 = (insn.operand_width == 32);
+
+    // Load src into r9 (register or memory). For the 32-bit form we
+    // load 32 bits; the host op only consumes the low 32 anyway.
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+        if (src_idx < 0)
+            return false;
+        if (w32)
+            c.mov(r9d, dword[r13 + GprOffset(src_idx)]);
+        else
+            c.mov(r9, qword[r13 + GprOffset(src_idx)]);
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c))
+            return false;
+        if (w32)
+            c.mov(r9d, dword[rdx]);
+        else
+            c.mov(r9, qword[rdx]);
+    } else {
+        return false;
+    }
+
+    // Round-trip flags through the host so it computes the BMI1
+    // SF/ZF/CF per spec (OF cleared, AF/PF as the host leaves them).
+    c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.push(r8);
+    c.popfq();
+
+    // Run the host op. xbyak's blsi/blsr/blsmsk are (dst, src). A
+    // 32-bit destination write zero-extends bits 63:32, so the qword
+    // storeback lands a clean upper half.
+    switch (kind) {
+    case BlsKind::Blsi:
+        if (w32)
+            c.blsi(eax, r9d);
+        else
+            c.blsi(rax, r9);
+        break;
+    case BlsKind::Blsr:
+        if (w32)
+            c.blsr(eax, r9d);
+        else
+            c.blsr(rax, r9);
+        break;
+    case BlsKind::Blsmsk:
+        if (w32)
+            c.blsmsk(eax, r9d);
+        else
+            c.blsmsk(rax, r9);
+        break;
     }
 
     c.pushfq();
@@ -7449,6 +8360,89 @@ bool EmitVpcmpistri(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
     return true;
 }
 
+/// VPCMPISTRM xmm1, xmm2/m128, imm8 — SSE4.2 "compare implicit-length
+/// strings, return MASK". The sibling of VPCMPISTRI: identical compare
+/// machinery, but the result is a MASK written to the implicit XMM0
+/// rather than an index in ECX. Used by glibc string functions
+/// (strpbrk / strcspn / strspn-style scans) that want the full
+/// match mask rather than just the first index.
+///
+/// Architectural behavior:
+///   XMM0 := result mask. imm8 bit 6 selects the format:
+///            bit6 = 0  → bit-mask: one bit per element in the low
+///                        bits of XMM0, rest zeroed.
+///            bit6 = 1  → byte/word-mask: each element position is
+///                        0x00 or 0xFF (byte mode) / 0x0000 or 0xFFFF
+///                        (word mode), filling the full 128 bits.
+///   CF/ZF/SF/OF := same string-comparison flags as VPCMPISTRI.
+///   AF, PF := 0
+///
+/// CRITICAL: host VPCMPISTRM writes its result to the implicit,
+/// hard-wired physical XMM0. We must therefore NOT use host xmm0 as
+/// an operand-load scratch (as VPCMPISTRI does) — the result would
+/// overwrite an operand before the op even runs. We load the two
+/// operands into host xmm1/xmm2 instead, run the op (which writes
+/// xmm0), then store xmm0 back to the guest XMM0 slot.
+///
+/// imm8 bit 6 (mask format) needs no special handling here: the host
+/// op produces the correctly-formatted XMM0 either way, and we copy
+/// the full 128 bits back verbatim.
+///
+/// Reg-mem second-operand form is deferred (same rationale as
+/// VPCMPISTRI — the string loops use reg-reg after a load).
+bool EmitVpcmpistrm(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                    Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPCMPISTRM)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE)
+        return false;
+
+    const int a_idx = ZydisVecToIndex(ops[0].reg.value);
+    const int b_idx = ZydisVecToIndex(ops[1].reg.value);
+    if (a_idx < 0 || b_idx < 0)
+        return false;
+
+    const u8 imm = static_cast<u8>(ops[2].imm.value.u & 0xFFu);
+
+    // Load operands into xmm1/xmm2 — NOT xmm0, which receives the
+    // implicit mask result.
+    c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(a_idx, 0)]);
+    c.vmovdqu(xmm2, ptr[r13 + YmmChunkOffset(b_idx, 0)]);
+
+    // Run host VPCMPISTRM. Writes the mask to physical xmm0 and sets
+    // CF/ZF/SF/OF per spec (PF/AF cleared).
+    c.vpcmpistrm(xmm1, xmm2, imm);
+
+    // Capture the flags IMMEDIATELY — before any flag-affecting
+    // instruction below. The upper-YMM-zeroing `xor` would otherwise
+    // clobber CF/ZF before we read them. Stash the raw rflags in r8.
+    c.pushfq();
+    c.pop(r8);
+
+    // Store host xmm0 (the mask) into the guest XMM0 slot (vec index
+    // 0, low 128). VEX semantics zero bits 255:128 of that YMM. The
+    // `xor` here trashes host flags, which is why we captured above.
+    c.vmovdqu(ptr[r13 + YmmChunkOffset(0, 0)], xmm0);
+    c.xor_(rax, rax);
+    c.mov(qword[r13 + YmmChunkOffset(0, 2)], rax);
+    c.mov(qword[r13 + YmmChunkOffset(0, 3)], rax);
+
+    // Merge the captured arithmetic flag bits into guest rflags —
+    // identical mask-and-or pattern as VPCMPISTRI / VPTEST.
+    constexpr u64 kArithMask = 0x8D5; // CF|PF|AF|ZF|SF|OF
+    c.and_(r8, kArithMask);
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.mov(rcx, ~kArithMask);
+    c.and_(rdx, rcx);
+    c.or_(rdx, r8);
+    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    return true;
+}
+
 /// VPHADDD — packed horizontal add of 32-bit integers across paired
 /// lanes. For each 128-bit half:
 ///   dst[0] = src1[0] + src1[1]
@@ -7576,6 +8570,151 @@ bool EmitVpunpcklqdq(const ZydisDecodedInstruction& insn, const ZydisDecodedOper
         c.vmovdqu(ymm0, ptr[r13 + YmmChunkOffset(src1_idx, 0)]);
         c.vmovdqu(ymm1, ptr[r13 + YmmChunkOffset(src2_idx, 0)]);
         c.vpunpcklqdq(ymm0, ymm0, ymm1);
+        c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], ymm0);
+    }
+    return true;
+}
+
+/// VPACKSSDW / VPACKSSWB / VPACKUSDW / VPACKUSWB — pack two vectors of
+/// wider integer elements into narrower ones with saturation. The four
+/// members of the pack family share an identical 3-operand shape and
+/// differ only in element widths and signed-vs-unsigned saturation:
+///
+///   VPACKSSDW dst, s1, s2/m  : 32-bit signed   -> 16-bit SIGNED   sat
+///   VPACKSSWB dst, s1, s2/m  : 16-bit signed   -> 8-bit  SIGNED   sat
+///   VPACKUSDW dst, s1, s2/m  : 32-bit signed   -> 16-bit UNSIGNED sat
+///   VPACKUSWB dst, s1, s2/m  : 16-bit signed   -> 8-bit  UNSIGNED sat
+///
+/// Saturation clamps each source element to the destination element's
+/// representable range before narrowing. For the unsigned-dword form
+/// (VPACKUSDW): src < 0 -> 0, src > 0xFFFF -> 0xFFFF, else src.
+///
+/// LAYOUT (the part that's easy to get wrong): pack operates PER
+/// 128-BIT LANE, not across the whole register. Within each 128-bit
+/// lane, the narrowed elements of src1 fill the LOW half of that lane
+/// and the narrowed elements of src2 fill the HIGH half. So for the
+/// 128-bit form: dst.low = saturate(src1), dst.high = saturate(src2).
+/// For the 256-bit form the same low=src1/high=src2 rule applies
+/// INDEPENDENTLY within each of the two 128-bit lanes — it does NOT
+/// concatenate all of src1 then all of src2. We sidestep having to
+/// reproduce that interleave by hand: running the host pack op on
+/// xmm (128) or ymm (256) reproduces the architectural lane behavior
+/// exactly, since the host instruction has the same per-lane semantics.
+///
+/// First instance is VPACKUSDW (hit in pixel/format-conversion code).
+/// Parameterised as EmitVecPack(kind) so the sibling members slot in
+/// as one-line dispatch additions when first seen.
+enum class VecPackKind { Ssdw, Sswb, Usdw, Uswb };
+
+bool EmitVecPack(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
+                 Xbyak::CodeGenerator& c, VecPackKind kind) {
+    // Mnemonic gating — defensive routing check.
+    auto expected = [&]() -> ZydisMnemonic {
+        switch (kind) {
+        case VecPackKind::Ssdw:
+            return ZYDIS_MNEMONIC_VPACKSSDW;
+        case VecPackKind::Sswb:
+            return ZYDIS_MNEMONIC_VPACKSSWB;
+        case VecPackKind::Usdw:
+            return ZYDIS_MNEMONIC_VPACKUSDW;
+        case VecPackKind::Uswb:
+            return ZYDIS_MNEMONIC_VPACKUSWB;
+        }
+        return ZYDIS_MNEMONIC_INVALID;
+    }();
+    if (insn.mnemonic != expected)
+        return false;
+
+    if (insn.operand_count_visible != 3)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+        return false;
+
+    const int dst_idx = ZydisVecToIndex(ops[0].reg.value);
+    const int src1_idx = ZydisVecToIndex(ops[1].reg.value);
+    if (dst_idx < 0 || src1_idx < 0)
+        return false;
+
+    const int vec_bits = ops[0].size;
+    if (vec_bits != 128 && vec_bits != 256)
+        return false;
+
+    // Dispatch the host pack op for the kind (operates on xmm0/xmm1
+    // or ymm0/ymm1; result lands in the first operand).
+    auto emit_pack_128 = [&]() {
+        switch (kind) {
+        case VecPackKind::Ssdw:
+            c.vpackssdw(xmm0, xmm0, xmm1);
+            break;
+        case VecPackKind::Sswb:
+            c.vpacksswb(xmm0, xmm0, xmm1);
+            break;
+        case VecPackKind::Usdw:
+            c.vpackusdw(xmm0, xmm0, xmm1);
+            break;
+        case VecPackKind::Uswb:
+            c.vpackuswb(xmm0, xmm0, xmm1);
+            break;
+        }
+    };
+    auto emit_pack_256 = [&]() {
+        switch (kind) {
+        case VecPackKind::Ssdw:
+            c.vpackssdw(ymm0, ymm0, ymm1);
+            break;
+        case VecPackKind::Sswb:
+            c.vpacksswb(ymm0, ymm0, ymm1);
+            break;
+        case VecPackKind::Usdw:
+            c.vpackusdw(ymm0, ymm0, ymm1);
+            break;
+        case VecPackKind::Uswb:
+            c.vpackuswb(ymm0, ymm0, ymm1);
+            break;
+        }
+    };
+
+    if (vec_bits == 128) {
+        c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src1_idx, 0)]);
+
+        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src2_idx = ZydisVecToIndex(ops[2].reg.value);
+            if (src2_idx < 0)
+                return false;
+            c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(src2_idx, 0)]);
+        } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[2].mem, next_rip, c))
+                return false;
+            c.vmovdqu(xmm1, ptr[rdx]);
+        } else {
+            return false;
+        }
+
+        emit_pack_128();
+
+        c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], xmm0);
+        c.xor_(rax, rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_idx, 2)], rax);
+        c.mov(qword[r13 + YmmChunkOffset(dst_idx, 3)], rax);
+    } else { // 256-bit
+        c.vmovdqu(ymm0, ptr[r13 + YmmChunkOffset(src1_idx, 0)]);
+
+        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src2_idx = ZydisVecToIndex(ops[2].reg.value);
+            if (src2_idx < 0)
+                return false;
+            c.vmovdqu(ymm1, ptr[r13 + YmmChunkOffset(src2_idx, 0)]);
+        } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[2].mem, next_rip, c))
+                return false;
+            c.vmovdqu(ymm1, ptr[rdx]);
+        } else {
+            return false;
+        }
+
+        emit_pack_256();
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], ymm0);
     }
     return true;
@@ -7884,12 +9023,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                                                    : EmitShift64(insn, ops, c, ShiftKind::Sar);
             break;
 
-        // Rotates. Same shape as shifts.
+        // Rotates. Same shape as shifts; width-dispatched like them.
         case ZYDIS_MNEMONIC_ROL:
-            handled = EmitRotate64(insn, ops, c, RotateKind::Rol);
+            handled = (insn.operand_width == 32) ? EmitRotate32(insn, ops, c, RotateKind::Rol)
+                                                 : EmitRotate64(insn, ops, c, RotateKind::Rol);
             break;
         case ZYDIS_MNEMONIC_ROR:
-            handled = EmitRotate64(insn, ops, c, RotateKind::Ror);
+            handled = (insn.operand_width == 32) ? EmitRotate32(insn, ops, c, RotateKind::Ror)
+                                                 : EmitRotate64(insn, ops, c, RotateKind::Ror);
             break;
 
         // Multiplication. EmitImul dispatches by operand_count_visible.
@@ -7924,11 +9065,43 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_CMC:
             handled = EmitCmc(c);
             break;
+        case ZYDIS_MNEMONIC_CLD:
+            handled = EmitCld(c);
+            break;
+        case ZYDIS_MNEMONIC_STD:
+            handled = EmitStd(c);
+            break;
+        case ZYDIS_MNEMONIC_CMPSB:
+        case ZYDIS_MNEMONIC_CMPSW:
+        case ZYDIS_MNEMONIC_CMPSD:
+        case ZYDIS_MNEMONIC_CMPSQ:
+            handled = EmitCmps(insn, c);
+            break;
 
         // NOP — no semantic effect, just consume the bytes.
         // Common forms: 90 (1-byte), 66 90 (2-byte),
         // 0F 1F /0 (multi-byte padding). All decode as NOP.
         case ZYDIS_MNEMONIC_NOP:
+            handled = true;
+            break;
+
+        // PREFETCH* — cache-locality hints with NO architectural
+        // effect. They never modify registers, flags, or memory, and
+        // never fault — a prefetch of an invalid/unmapped address is
+        // silently ignored by the CPU. So the correct lift is to drop
+        // them entirely: we don't even compute the effective address
+        // (nothing is actually accessed, so there's nothing to fault
+        // on and no value to load). Emitting host prefetches would be
+        // pointless — the guest's locality hints don't map meaningfully
+        // onto our JIT's host memory layout. PREFETCHNTA first seen at
+        // libc 0x80817880b (a non-temporal streaming-read hint, likely
+        // a memcpy/scan fast path). PREFETCHT0/T1/T2 and PREFETCHW
+        // share the same no-op treatment.
+        case ZYDIS_MNEMONIC_PREFETCHNTA:
+        case ZYDIS_MNEMONIC_PREFETCHT0:
+        case ZYDIS_MNEMONIC_PREFETCHT1:
+        case ZYDIS_MNEMONIC_PREFETCHT2:
+        case ZYDIS_MNEMONIC_PREFETCHW:
             handled = true;
             break;
 
@@ -8003,6 +9176,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VMOVDQU:
         case ZYDIS_MNEMONIC_VMOVDQA:
         case ZYDIS_MNEMONIC_VMOVAPS:
+        case ZYDIS_MNEMONIC_VMOVNTDQA:
             handled = EmitVmovups(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_VMOVNTDQ:
@@ -8023,11 +9197,20 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPOR:
             handled = EmitVecBitOp(insn, ops, next_rip, c, VecBitOpKind::Or);
             break;
+        case ZYDIS_MNEMONIC_VPANDN:
+            handled = EmitVecBitOp(insn, ops, next_rip, c, VecBitOpKind::Andn);
+            break;
         case ZYDIS_MNEMONIC_VMOVD:
             handled = EmitVmovd(insn, ops, c);
             break;
+        case ZYDIS_MNEMONIC_VPEXTRD:
+            handled = EmitVpextrd(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_VPINSRD:
+            handled = EmitVpinsrd(insn, ops, next_rip, c);
+            break;
         case ZYDIS_MNEMONIC_VMOVQ:
-            handled = EmitVmovq(insn, ops, c);
+            handled = EmitVmovq(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_VMOVSS:
             handled = EmitVmovss(insn, ops, next_rip, c);
@@ -8104,11 +9287,26 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPCMPISTRI:
             handled = EmitVpcmpistri(insn, ops, c);
             break;
+        case ZYDIS_MNEMONIC_VPCMPISTRM:
+            handled = EmitVpcmpistrm(insn, ops, c);
+            break;
         case ZYDIS_MNEMONIC_VPHADDD:
             handled = EmitVphaddd(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_VPUNPCKLQDQ:
             handled = EmitVpunpcklqdq(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_VPACKUSDW:
+            handled = EmitVecPack(insn, ops, next_rip, c, VecPackKind::Usdw);
+            break;
+        case ZYDIS_MNEMONIC_VPACKSSDW:
+            handled = EmitVecPack(insn, ops, next_rip, c, VecPackKind::Ssdw);
+            break;
+        case ZYDIS_MNEMONIC_VPACKSSWB:
+            handled = EmitVecPack(insn, ops, next_rip, c, VecPackKind::Sswb);
+            break;
+        case ZYDIS_MNEMONIC_VPACKUSWB:
+            handled = EmitVecPack(insn, ops, next_rip, c, VecPackKind::Uswb);
             break;
         case ZYDIS_MNEMONIC_VPSHUFD:
             handled = EmitVpshufd(insn, ops, c);
@@ -8194,6 +9392,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPSLLQ:
             handled = EmitVecShiftImm(insn, ops, c, VecShiftImm::SllQ);
             break;
+        case ZYDIS_MNEMONIC_VPSLLDQ:
+            handled = EmitVecByteShift(insn, ops, c, VecByteShiftKind::Slldq);
+            break;
+        case ZYDIS_MNEMONIC_VPSRLDQ:
+            handled = EmitVecByteShift(insn, ops, c, VecByteShiftKind::Srldq);
+            break;
         case ZYDIS_MNEMONIC_VMULPS:
             handled = EmitVecFpArith(insn, ops, next_rip, c, VecFpKind::Mul, VecFpPrec::Single);
             break;
@@ -8238,6 +9442,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_BEXTR:
             handled = EmitBextr(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_BLSI:
+            handled = EmitBlsFamily(insn, ops, next_rip, c, BlsKind::Blsi);
+            break;
+        case ZYDIS_MNEMONIC_BLSR:
+            handled = EmitBlsFamily(insn, ops, next_rip, c, BlsKind::Blsr);
+            break;
+        case ZYDIS_MNEMONIC_BLSMSK:
+            handled = EmitBlsFamily(insn, ops, next_rip, c, BlsKind::Blsmsk);
             break;
         case ZYDIS_MNEMONIC_POPCNT:
             handled = EmitPopcnt(insn, ops, next_rip, c);

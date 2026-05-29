@@ -33,6 +33,7 @@
 #endif
 
 #include "core/cpu_runtime/block_cache.h"
+#include "core/cpu_runtime/code_cache.h"
 #include "core/cpu_runtime/guest_state.h"
 #include "core/cpu_runtime/hle_registry.h"
 #include "core/cpu_runtime/runtime.h"
@@ -8079,6 +8080,2062 @@ TEST_F(CpuRuntimeTest, Vpblendw_DistinctWords_ExactLaneMapping) {
     EXPECT_EQ(st.ymm[0], 0x00A300A200B100B0ULL)
         << "w0=B0 w1=B1 (from src2), w2=A2 w3=A3 (from src1)";
     EXPECT_EQ(st.ymm[1], 0x00A700A600A500A4ULL) << "w4..w7 all from src1 (imm8 high bits 0)";
+}
+
+// ============================================================================
+// VPACKUSDW — pack two vectors of 32-bit signed dwords into 16-bit
+// UNSIGNED words with saturation. Per 128-bit lane: src1's 4 dwords fill
+// the low 4 words, src2's 4 dwords fill the high 4 words; each dword is
+// clamped to [0, 0xFFFF] (negative -> 0, >0xFFFF -> 0xFFFF). Wired via
+// the EmitVecPack family helper (first instance). Expected values below
+// were confirmed against host _mm_packus_epi32.
+// ============================================================================
+
+// Layout: src1 -> low 4 words, src2 -> high 4 words (in-range values).
+TEST_F(CpuRuntimeTest, Vpackusdw_Layout_Src1LowSrc2High) {
+    // vpackusdw xmm0, xmm1, xmm2 — c4 e2 71 2b c2 (5 bytes)
+    const u8 program[] = {
+        0xc4, 0xe2, 0x71, 0x2b, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 = xmm1 (lane 4): dwords 0,1,2,3
+    st.ymm[4] = (1ULL << 32) | 0ULL; // dword0=0, dword1=1
+    st.ymm[5] = (3ULL << 32) | 2ULL; // dword2=2, dword3=3
+    // src2 = xmm2 (lane 8): dwords 0x10,0x11,0x12,0x13
+    st.ymm[8] = (0x11ULL << 32) | 0x10ULL;
+    st.ymm[9] = (0x13ULL << 32) | 0x12ULL;
+    // pre-pollute dst upper YMM
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Result words: low = src1 (0,1,2,3), high = src2 (0x10,0x11,0x12,0x13).
+    // Packed little-endian: chunk0 = words 0..3, chunk1 = words 4..7.
+    // word0=0 word1=1 word2=2 word3=3 -> 0x0003000200010000
+    // word4=0x10 word5=0x11 word6=0x12 word7=0x13 -> 0x0013001200110010
+    EXPECT_EQ(st.ymm[0], 0x0003000200010000ULL) << "low 4 words from src1";
+    EXPECT_EQ(st.ymm[1], 0x0013001200110010ULL) << "high 4 words from src2";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Unsigned saturation: negative -> 0, >0xFFFF -> 0xFFFF, in-range kept.
+TEST_F(CpuRuntimeTest, Vpackusdw_UnsignedSaturation) {
+    // vpackusdw xmm0, xmm1, xmm2
+    const u8 program[] = {
+        0xc4, 0xe2, 0x71, 0x2b, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 dwords: -1, 0x10000, 0xFFFF, 0x8000
+    st.ymm[4] = (static_cast<u64>(0x00010000u) << 32) | static_cast<u32>(-1);
+    st.ymm[5] = (static_cast<u64>(0x00008000u) << 32) | 0x0000FFFFu;
+    // src2 dwords: 0x7FFFFFFF, INT_MIN, 0, 0xFFFE
+    st.ymm[8] = (static_cast<u64>(0x80000000u) << 32) | 0x7FFFFFFFu;
+    st.ymm[9] = (static_cast<u64>(0x0000FFFEu) << 32) | 0x00000000u;
+
+    Runtime rt;
+    rt.Run(st);
+    // Host-confirmed saturation:
+    //   src1: -1->0, 0x10000->ffff, 0xFFFF->ffff, 0x8000->8000
+    //   src2: 0x7FFFFFFF->ffff, INT_MIN->0, 0->0, 0xFFFE->fffe
+    // low chunk words 0..3: 0000 ffff ffff 8000 -> 0x8000ffffffff0000
+    // high chunk words 4..7: ffff 0000 0000 fffe -> 0xfffe00000000ffff
+    EXPECT_EQ(st.ymm[0], 0x8000FFFFFFFF0000ULL)
+        << "src1 sat: -1->0, 0x10000->0xFFFF, 0xFFFF->0xFFFF, 0x8000->0x8000";
+    EXPECT_EQ(st.ymm[1], 0xFFFE00000000FFFFULL)
+        << "src2 sat: INT_MAX->0xFFFF, INT_MIN->0, 0->0, 0xFFFE->0xFFFE";
+}
+
+// ============================================================================
+// VPEXTRD — extract an imm8-selected 32-bit dword from an xmm into a
+// GPR (zero-extended to 64 bits) or memory (exactly 4 bytes). imm8[1:0]
+// picks the lane; dword 0 is the low 32 bits.
+// ============================================================================
+
+// All four lanes -> GPR, verifying lane select + 64-bit zero-extension.
+TEST_F(CpuRuntimeTest, Vpextrd_AllLanes_ToGpr_ZeroExtends) {
+    // Four extracts into rax(0), rcx(1), rdx(2), rbx(3), each a
+    // different lane:
+    //   vpextrd eax, xmm1, 0   c4 e3 79 16 c8 00
+    //   vpextrd ecx, xmm1, 1   c4 e3 79 16 c9 01
+    //   vpextrd edx, xmm1, 2   c4 e3 79 16 ca 02
+    //   vpextrd ebx, xmm1, 3   c4 e3 79 16 cb 03
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x16, 0xc8, 0x00, 0xc4, 0xe3, 0x79, 0x16, 0xc9, 0x01, 0xc4,
+        0xe3, 0x79, 0x16, 0xca, 0x02, 0xc4, 0xe3, 0x79, 0x16, 0xcb, 0x03, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src = xmm1 (lane 4): dwords 0x11111111,0x22222222,0x33333333,0x44444444
+    st.ymm[4] = (0x22222222ULL << 32) | 0x11111111ULL;
+    st.ymm[5] = (0x44444444ULL << 32) | 0x33333333ULL;
+    // pre-load destination GPRs with sentinels in the high 32 bits to
+    // prove zero-extension actually clears them.
+    st.gpr[0] = 0xFFFFFFFF00000000ULL; // rax
+    st.gpr[1] = 0xFFFFFFFF00000000ULL; // rcx
+    st.gpr[2] = 0xFFFFFFFF00000000ULL; // rdx
+    st.gpr[3] = 0xFFFFFFFF00000000ULL; // rbx
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0000000011111111ULL) << "lane0 -> rax, zero-extended";
+    EXPECT_EQ(st.gpr[1], 0x0000000022222222ULL) << "lane1 -> rcx, zero-extended";
+    EXPECT_EQ(st.gpr[2], 0x0000000033333333ULL) << "lane2 -> rdx, zero-extended";
+    EXPECT_EQ(st.gpr[3], 0x0000000044444444ULL) << "lane3 -> rbx, zero-extended";
+}
+
+// Memory destination: exactly 4 bytes written, neighbours untouched.
+TEST_F(CpuRuntimeTest, Vpextrd_MemoryDestination_Writes4Bytes) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0xAAAAAAAAu;
+    scratch[1] = 0xBBBBBBBBu; // sentinel after the 4-byte target
+    // mov rax, scratch ; vpextrd dword[rax], xmm1, 2
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0,
+        0,    0,    0xc4, 0xe3, 0x79, 0x16, 0x08, 0x02, // vpextrd [rax], xmm1, 2
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0x22222222ULL << 32) | 0x11111111ULL;
+    st.ymm[5] = (0x77777777ULL << 32) | 0x33333333ULL; // lane2 = 0x33333333
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0x33333333u) << "lane2 dword written to memory";
+    EXPECT_EQ(scratch[1], 0xBBBBBBBBu) << "next dword untouched (only 4 bytes written)";
+}
+
+// ============================================================================
+// ROL/ROR (32-bit) — rotate left/right by CL or imm8. Rotates set CF
+// (last bit rotated through) and OF (1-bit rotates only) but leave
+// SF/ZF/AF/PF UNAFFECTED — a key difference from shifts. Count masks to
+// 5 bits. The host-rflags round-trip reproduces all of this. Expected
+// values confirmed against host rol/ror.
+// ============================================================================
+
+// ROL by CL: rotate correctness + CF capture + 32-bit zero-extension.
+TEST_F(CpuRuntimeTest, Rol32_ByCl_RotatesAndSetsCarry) {
+    // rol eax, cl  — d3 c0 (length 2)... but log showed length 3 with
+    // ops=reg,reg; that is rol r/m32, cl with a modrm. Use the generic
+    // encoding rol ecx-target. Here: rol eax, cl = d3 c0.
+    const u8 program[] = {
+        0xd3,
+        0xc0, // rol eax, cl
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xFFFFFFFF12345678ULL; // eax = 0x12345678, high junk to test ZE
+    st.gpr[1] = 4;                     // cl = 4
+    st.rflags = 0x202;                 // IF set, arithmetic flags clear
+
+    Runtime rt;
+    rt.Run(st);
+    // rol 0x12345678 by 4 = 0x23456781, zero-extended.
+    EXPECT_EQ(st.gpr[0], 0x0000000023456781ULL) << "rol by 4, zero-extended";
+    // CF = last bit rotated out = bit that wrapped = 1 here.
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF = last bit rotated through";
+}
+
+// Count masks to 5 bits: rol by 36 == rol by 4.
+TEST_F(CpuRuntimeTest, Rol32_CountMasksTo5Bits) {
+    const u8 program[] = {
+        0xd3,
+        0xc0, // rol eax, cl
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x12345678ULL;
+    st.gpr[1] = 36; // 36 & 31 = 4
+    st.rflags = 0x202;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0000000023456781ULL) << "count 36 masks to 4 -> same as rol 4";
+}
+
+// Rotates must NOT disturb SF/ZF/PF (unlike shifts). Pre-set those
+// flags and confirm they survive a rotate.
+TEST_F(CpuRuntimeTest, Rol32_DoesNotDisturbSZP) {
+    const u8 program[] = {
+        0xd3,
+        0xc0, // rol eax, cl
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x00000001ULL;
+    st.gpr[1] = 1;
+    // Pre-set ZF(bit6), SF(bit7), PF(bit2) plus IF(bit9).
+    const u64 ZF = 1ULL << 6, SF = 1ULL << 7, PF = 1ULL << 2, IF = 1ULL << 9;
+    st.rflags = ZF | SF | PF | IF | 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // 0x1 rol 1 = 0x2.
+    EXPECT_EQ(st.gpr[0], 0x2ULL) << "rotate result";
+    // ZF/SF/PF must be UNCHANGED by the rotate.
+    EXPECT_EQ(st.rflags & ZF, ZF) << "ZF preserved across rotate";
+    EXPECT_EQ(st.rflags & SF, SF) << "SF preserved across rotate";
+    EXPECT_EQ(st.rflags & PF, PF) << "PF preserved across rotate";
+}
+
+// ROR by imm8.
+TEST_F(CpuRuntimeTest, Ror32_ByImm) {
+    const u8 program[] = {
+        0xc1,
+        0xc8,
+        0x08, // ror eax, 8
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x12345678ULL;
+    st.rflags = 0x202;
+
+    Runtime rt;
+    rt.Run(st);
+    // ror 0x12345678 by 8 = 0x78123456.
+    EXPECT_EQ(st.gpr[0], 0x0000000078123456ULL) << "ror by 8";
+}
+
+// ============================================================================
+// VPINSRD — insert a 32-bit GPR dword into an imm8-selected lane of an
+// xmm; other lanes copied from src1; upper YMM zeroed (VEX). Inverse of
+// VPEXTRD.
+// ============================================================================
+
+// Insert into lane 2: lane 2 gets the GPR value, lanes 0/1/3 from src1,
+// upper YMM zeroed.
+TEST_F(CpuRuntimeTest, Vpinsrd_Lane2_OtherLanesFromSrc1) {
+    // vpinsrd xmm0, xmm1, eax, 2  — c4 e3 71 22 c0 02 (6 bytes)
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x22, 0xc0, 0x02, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 = xmm1 (lane 4): dwords 0xA0,0xA1,0xA2,0xA3
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.gpr[0] = 0xDEADBEEFULL; // eax (low 32 used)
+    // pre-pollute dst (lane 0) including upper YMM
+    st.ymm[0] = 0x1111111111111111ULL;
+    st.ymm[1] = 0x1111111111111111ULL;
+    st.ymm[2] = 0x2222222222222222ULL;
+    st.ymm[3] = 0x2222222222222222ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // dst lanes: 0=A0, 1=A1, 2=0xDEADBEEF (inserted), 3=A3.
+    // chunk0 (lanes0,1) = 0x000000A1_000000A0
+    EXPECT_EQ(st.ymm[0], 0x000000A1000000A0ULL) << "lanes 0,1 from src1";
+    // chunk1 (lanes2,3) = 0x000000A3_DEADBEEF
+    EXPECT_EQ(st.ymm[1], 0x000000A3DEADBEEFULL) << "lane2 inserted, lane3 from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Insert into lane 0 (the low dword).
+TEST_F(CpuRuntimeTest, Vpinsrd_Lane0) {
+    // vpinsrd xmm0, xmm1, eax, 0
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x22, 0xc0, 0x00, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0xA1ULL << 32) | 0xA0ULL;
+    st.ymm[5] = (0xA3ULL << 32) | 0xA2ULL;
+    st.gpr[0] = 0x12345678ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // lane0=0x12345678, lane1=A1, lane2=A2, lane3=A3.
+    EXPECT_EQ(st.ymm[0], 0x000000A112345678ULL) << "lane0 inserted, lane1 from src1";
+    EXPECT_EQ(st.ymm[1], 0x000000A3000000A2ULL) << "lanes 2,3 from src1";
+}
+
+// In-place form: dst == src1 (vpinsrd xmm1, xmm1, eax, 3). The read-
+// before-write ordering must make this a correct self-copy + patch.
+TEST_F(CpuRuntimeTest, Vpinsrd_InPlace_DstEqualsSrc1) {
+    // vpinsrd xmm1, xmm1, eax, 3  — c4 e3 71 22 c8 03
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x22, 0xc8, 0x03, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 = src1 AND dst (lane 4): dwords 0xB0,0xB1,0xB2,0xB3
+    st.ymm[4] = (0xB1ULL << 32) | 0xB0ULL;
+    st.ymm[5] = (0xB3ULL << 32) | 0xB2ULL;
+    st.gpr[0] = 0xCAFEF00DULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // lane3 replaced; lanes 0,1,2 unchanged.
+    EXPECT_EQ(st.ymm[4], 0x000000B1000000B0ULL) << "lanes 0,1 unchanged in-place";
+    EXPECT_EQ(st.ymm[5], 0xCAFEF00D000000B2ULL) << "lane3 inserted, lane2 unchanged";
+    // VPINSRD is xmm-form: upper YMM of xmm1 (chunks 6,7) zeroed.
+    EXPECT_EQ(st.ymm[6], 0ULL) << "VEX zeros upper YMM of dst";
+    EXPECT_EQ(st.ymm[7], 0ULL);
+}
+
+// ============================================================================
+// VMOVQ memory forms — load (xmm <- m64, zeroes bits 255:64) and store
+// (m64 <- xmm, exactly 8 bytes). Extends the existing reg-reg VMOVQ
+// emitter, which previously rejected memory operands.
+// ============================================================================
+
+// Load: vmovq xmm0, [rax]. Low 64 loaded, upper 192 bits of YMM zeroed.
+TEST_F(CpuRuntimeTest, Vmovq_LoadFromMemory_ZeroesUpper) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x0123456789ABCDEFULL;
+    // mov rax, scratch ; vmovq xmm0, [rax]
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xfa, 0x7e, 0x00, // vmovq xmm0, [rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // pre-pollute xmm0 (lane 0) including upper YMM
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x0123456789ABCDEFULL) << "low 64 loaded from memory";
+    EXPECT_EQ(st.ymm[1], 0ULL) << "bits 127:64 zeroed";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "bits 255:128 zeroed (VEX)";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Store: vmovq [rax], xmm0. Exactly 8 bytes written, neighbour untouched.
+TEST_F(CpuRuntimeTest, Vmovq_StoreToMemory_Writes8Bytes) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x1111111111111111ULL;
+    scratch[1] = 0xBBBBBBBBBBBBBBBBULL; // sentinel after the 8-byte target
+    // mov rax, scratch ; vmovq [rax], xmm0
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc5, 0xf9, 0xd6, 0x00, // vmovq [rax], xmm0
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &scratch_addr, sizeof(scratch_addr));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm0 low 64 = value to store; upper bits must NOT be written.
+    st.ymm[0] = 0xCAFEF00DDEADBEEFULL;
+    st.ymm[1] = 0x9999999999999999ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0xCAFEF00DDEADBEEFULL) << "low 64 stored";
+    EXPECT_EQ(scratch[1], 0xBBBBBBBBBBBBBBBBULL) << "next qword untouched (only 8 bytes written)";
+}
+
+// ============================================================================
+// VPSLLDQ / VPSRLDQ — whole-128-bit-lane BYTE shift (imm8 byte count),
+// zero-filling. Distinct from the per-element bit shifts. count >= 16
+// zeroes the lane. Values confirmed against host _mm_slli_si128.
+// ============================================================================
+
+// VPSLLDQ by 4 bytes: byte i -> byte i+4, low 4 bytes zeroed.
+TEST_F(CpuRuntimeTest, Vpslldq_By4Bytes) {
+    // vpslldq xmm0, xmm1, 4  — c5 f9 73 f9 04 (5 bytes)
+    const u8 program[] = {
+        0xc5, 0xf9, 0x73, 0xf9, 0x04, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src bytes 0x00,0x11,...,0xFF (byte i = i*0x11)
+    st.ymm[4] = 0x7766554433221100ULL;
+    st.ymm[5] = 0xFFEEDDCCBBAA9988ULL;
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x3322110000000000ULL) << "low: bytes 0-3 zero-filled";
+    EXPECT_EQ(st.ymm[1], 0xBBAA998877665544ULL) << "high: shifted up 4 bytes";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// count >= 16 zeroes the entire lane.
+TEST_F(CpuRuntimeTest, Vpslldq_Count16_ZeroesLane) {
+    // vpslldq xmm0, xmm1, 16  — c5 f9 73 f9 10
+    const u8 program[] = {
+        0xc5, 0xf9, 0x73, 0xf9, 0x10, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x7766554433221100ULL;
+    st.ymm[5] = 0xFFEEDDCCBBAA9988ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0ULL) << "shift by 16 bytes -> all zero";
+    EXPECT_EQ(st.ymm[1], 0ULL);
+}
+
+// VPSRLDQ by 3 bytes: byte i -> byte i-3, high 3 bytes zeroed.
+TEST_F(CpuRuntimeTest, Vpsrldq_By3Bytes) {
+    // vpsrldq xmm0, xmm1, 3  — c5 f9 73 d9 03
+    const u8 program[] = {
+        0xc5, 0xf9, 0x73, 0xd9, 0x03, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x7766554433221100ULL;
+    st.ymm[5] = 0xFFEEDDCCBBAA9988ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // Right shift by 3 bytes: new lo = bytes 3..10, new hi = bytes 11..15 + 3 zero bytes.
+    // orig bytes (LE): [00 11 22 33 44 55 66 77][88 99 aa bb cc dd ee ff]
+    // >>3 bytes: lo = 33 44 55 66 77 88 99 aa -> 0xaa99887766554433
+    //            hi = bb cc dd ee ff 00 00 00 -> 0x000000ffeeddccbb
+    EXPECT_EQ(st.ymm[0], 0xAA99887766554433ULL) << "low shifted down 3 bytes";
+    EXPECT_EQ(st.ymm[1], 0x000000FFEEDDCCBBULL) << "high: top 3 bytes zeroed";
+}
+
+// ============================================================================
+// VPCMPISTRM — SSE4.2 packed compare implicit-length strings, return
+// MASK to the implicit XMM0. Sibling of VPCMPISTRI (which returns an
+// index in ECX). imm8 bit6 picks bit-mask (0) vs byte-mask (1). Values
+// confirmed against host _mm_cmpistrm. Operands are loaded into host
+// xmm1/xmm2 (not xmm0, which receives the result).
+//
+// Test data: needle a="ABCDEFGHIJKLMNOP", haystack b="XBXDXFXHX...".
+// Under equal-any (imm bits 2-3 = 00), b matches the needle set at the
+// odd positions 1,3,5,7 (B,D,F,H) -> match bitmask 0b10101010 = 0xAA.
+// ============================================================================
+
+// Bit-mask form (imm 0x00): low bits of XMM0 hold one bit per element.
+TEST_F(CpuRuntimeTest, Vpcmpistrm_BitMask_EqualAny) {
+    // vpcmpistrm xmm1, xmm2, 0x00  — c4 e3 79 62 ca 00 (6 bytes)
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x00, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // a = xmm1 (lane 4) = "ABCDEFGHIJKLMNOP"
+    st.ymm[4] = 0x4847464544434241ULL; // "ABCDEFGH"
+    st.ymm[5] = 0x504F4E4D4C4B4A49ULL; // "IJKLMNOP"
+    // b = xmm2 (lane 8) = "XBXDXFXHXXXXXXXX"
+    st.ymm[8] = 0x4858465844584258ULL; // "XBXDXFXH"
+    st.ymm[9] = 0x5858585858585858ULL; // "XXXXXXXX"
+    // pre-pollute guest XMM0 (the implicit dest, vec index 0) entirely
+    st.ymm[0] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[1] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // bit-mask: matches at positions 1,3,5,7 -> 0b10101010 = 0xAA.
+    EXPECT_EQ(st.ymm[0], 0x00000000000000AAULL) << "bit-mask of matches";
+    EXPECT_EQ(st.ymm[1], 0ULL) << "rest of low 128 zero (bit-mask)";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM of XMM0";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+    // CF = mask not all zero = 1; ZF/SF = 0 (no nulls); OF = 0.
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF: matches exist";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF: b has no null";
+    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF: a has no null";
+}
+
+// Byte-mask form (imm 0x40, bit6=1): each element 0x00 or 0xFF.
+TEST_F(CpuRuntimeTest, Vpcmpistrm_ByteMask_EqualAny) {
+    // vpcmpistrm xmm1, xmm2, 0x40  — c4 e3 79 62 ca 40
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x40, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x4847464544434241ULL;
+    st.ymm[5] = 0x504F4E4D4C4B4A49ULL;
+    st.ymm[8] = 0x4858465844584258ULL;
+    st.ymm[9] = 0x5858585858585858ULL;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // byte-mask: matching byte positions -> 0xFF, others 0x00.
+    // positions 1,3,5,7 match -> 0xff00ff00ff00ff00 ; positions 8-15 no match.
+    EXPECT_EQ(st.ymm[0], 0xFF00FF00FF00FF00ULL) << "byte-mask low: 0xFF at matches";
+    EXPECT_EQ(st.ymm[1], 0x0000000000000000ULL) << "byte-mask high: no matches in 8-15";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ZF reflects a null terminator in the second operand (b).
+TEST_F(CpuRuntimeTest, Vpcmpistrm_ZFOnNullInB) {
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x62, 0xca, 0x00, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x4847464544434241ULL; // a "ABCDEFGH"
+    st.ymm[5] = 0x504F4E4D4C4B4A49ULL; // a "IJKLMNOP"
+    // b = "XBX\0XF\0\0" then zeros -> contains nulls (terminator)
+    st.ymm[8] = 0x0000460058044258ULL; // bytes: 58 42 04 00 58 46 00 00
+    st.ymm[9] = 0x0000000000000000ULL;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // ZF set because b contains a null terminator.
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF: b has a null terminator";
+}
+
+// ============================================================================
+// VPANDN — bitwise AND-NOT: dst = (NOT src1) AND src2. The NOT applies
+// only to the FIRST source (asymmetric). Routed through EmitVecBitOp
+// with the Andn kind. Values confirmed against host _mm_andnot_si128.
+// ============================================================================
+
+// dst = (~src1) & src2, 128-bit. Also confirms upper-YMM zeroing.
+TEST_F(CpuRuntimeTest, Vpandn_AndNot_128) {
+    // vpandn xmm0, xmm1, xmm2  — c5 f1 df c2 (4 bytes)
+    const u8 program[] = {
+        0xc5, 0xf1, 0xdf, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 = xmm1 (lane 4)
+    st.ymm[4] = 0x00FF00FF00FF00FFULL;
+    st.ymm[5] = 0x0F0F0F0F0F0F0F0FULL;
+    // src2 = xmm2 (lane 8)
+    st.ymm[8] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[9] = 0xAAAAAAAAAAAAAAAAULL;
+    // pre-pollute dst upper YMM
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // (~src1) & src2
+    EXPECT_EQ(st.ymm[0], 0xFF00FF00FF00FF00ULL) << "(~0x00FF..) & 0xFFFF.. ";
+    EXPECT_EQ(st.ymm[1], 0xA0A0A0A0A0A0A0A0ULL) << "(~0x0F0F..) & 0xAAAA.. ";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// Asymmetry guard: VPANDN is NOT commutative. With these operands,
+// (~src1)&src2 != (~src2)&src1, so swapping would give a different
+// (wrong) result. This catches any accidental symmetric-AND or
+// wrong-operand-inverted implementation.
+TEST_F(CpuRuntimeTest, Vpandn_IsAsymmetric) {
+    // vpandn xmm0, xmm1, xmm2
+    const u8 program[] = {
+        0xc5, 0xf1, 0xdf, 0xc2, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 has bits set where src2 does NOT, and vice versa, so the
+    // result distinguishes (~src1)&src2 from (~src2)&src1.
+    st.ymm[4] = 0xF0F0F0F0F0F0F0F0ULL; // src1
+    st.ymm[5] = 0x0ULL;
+    st.ymm[8] = 0xFF00FF00FF00FF00ULL; // src2
+    st.ymm[9] = 0x0ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // (~src1) & src2 = (~0xF0F0..) & 0xFF00.. = 0x0F0F.. & 0xFF00.. = 0x0F000F000F000F00
+    EXPECT_EQ(st.ymm[0], 0x0F000F000F000F00ULL) << "(~src1)&src2, not the swapped form";
+    EXPECT_EQ(st.ymm[1], 0ULL);
+    // Sanity: the swapped form (~src2)&src1 would be 0x00F000F000F000F0 — different.
+}
+
+// ============================================================================
+// CMP (16-bit) — narrow-width compare via host-rflags round-trip so the
+// host computes width-correct CF/OF/SF/ZF/PF. The game hit the
+// `cmp word [mem], imm` form. Flag values confirmed against host cmpw.
+// ============================================================================
+
+// cmp word [mem], imm — the exact form the game emitted. Equal -> ZF=1.
+TEST_F(CpuRuntimeTest, Cmp16_MemImm_Equal) {
+    u16* scratch = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x1234;
+    // mov rax, scratch ; cmp word [rax], 0x1234
+    // cmp word [rax], imm16 = 66 81 38 34 12 (5 bytes); the game's was
+    // length 4 (likely imm8-sign-extended form 66 83 38 imm8), but we
+    // test the imm16 form here which exercises the same path.
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x66, 0x81, 0x38, 0x34, 0x12, // cmp word [rax], 0x1234
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: equal";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no borrow";
+}
+
+// cmp word [mem], imm where mem < imm unsigned -> CF=1, SF=1.
+TEST_F(CpuRuntimeTest, Cmp16_MemImm_Borrow) {
+    u16* scratch = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x0010;
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x66, 0x81, 0x38, 0x20, 0x00, // cmp word [rax], 0x0020
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // 0x10 - 0x20 borrows: CF=1, result 0xFFF0 -> SF=1, ZF=0.
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: 0x10 < 0x20";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result 0xFFF0";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+}
+
+// The 16-bit-specific case: cmp 0x8000, 0x7FFF sets OF=1 at 16-bit
+// width (signed overflow) but would NOT at 64-bit width. This proves
+// the flags are computed at the correct narrow width.
+TEST_F(CpuRuntimeTest, Cmp16_RegImm_WidthSpecificOverflow) {
+    // cmp ax, 0x7FFF  =  66 3d ff 7f (4 bytes) — cmp AX, imm16
+    const u8 program[] = {
+        0x66, 0x3d, 0xff, 0x7f, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // ax = 0x8000, upper bits of rax set to prove width isolation.
+    st.gpr[0] = 0xFFFFFFFFFFFF8000ULL;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // 0x8000 - 0x7FFF = 1: CF=0, ZF=0, SF=0, OF=1 (signed overflow at 16-bit).
+    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: 16-bit signed overflow";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no unsigned borrow";
+    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF clear: result positive (0x0001)";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+}
+
+// ============================================================================
+// BLSI — BMI1 "extract lowest set isolated bit": dst = (-src) & src.
+// Isolates the lowest set bit; zeroes the rest. Flags: CF = (src != 0)
+// [note: opposite polarity from BLSR/BLSMSK], ZF = (result==0),
+// SF = result MSB, OF = 0. Values confirmed against host blsi.
+// ============================================================================
+
+// Isolate lowest set bit of 0x16 (0b10110) -> 0x02. CF set (src != 0).
+TEST_F(CpuRuntimeTest, Blsi_IsolatesLowestBit) {
+    // blsi eax, ecx  — c4 e2 78 f3 d9 (5 bytes)
+    const u8 program[] = {
+        0xc4, 0xe2, 0x78, 0xf3, 0xd9, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0xFFFFFFFF00000016ULL; // ecx = 0x16, high junk for ZE check
+    st.gpr[0] = 0xDEADBEEFDEADBEEFULL; // eax pre-poisoned
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0000000000000002ULL) << "lowest set bit isolated, zero-extended";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: src != 0";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear: result nonzero";
+    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF clear: bit1 result";
+}
+
+// Zero source: result 0, CF=0, ZF=1 (the polarity that distinguishes
+// BLSI from BLSR/BLSMSK, which set CF when src==0).
+TEST_F(CpuRuntimeTest, Blsi_ZeroSource_ClearsCFSetsZF) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x78, 0xf3, 0xd9, // blsi eax, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0; // ecx = 0
+    st.gpr[0] = 0xDEADBEEFDEADBEEFULL;
+    // Pre-set CF so we can confirm it is CLEARED (not left set).
+    st.rflags = 0x2 | 0x1;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0ULL) << "zero source -> zero result";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF cleared: src == 0 (BLSI polarity)";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+}
+
+// SF reflects the result MSB: blsi 0x80000000 = 0x80000000 -> SF=1.
+TEST_F(CpuRuntimeTest, Blsi_HighBit_SetsSF) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x78, 0xf3, 0xd9, // blsi eax, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0x80000000ULL; // ecx
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0000000080000000ULL) << "only bit 31 set";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB (bit31)";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: src != 0";
+}
+
+// ============================================================================
+// INC dword [mem] — 32-bit in-memory increment. The defining INC quirk:
+// it sets ZF/SF/OF/PF/AF but does NOT affect CF (unlike ADD). The
+// mem-dst path lets the host INC produce the flags via the rflags
+// round-trip, so CF-preservation comes for free. Confirmed vs host.
+// ============================================================================
+
+// Basic increment of a 32-bit memory counter; CF pre-set must survive.
+TEST_F(CpuRuntimeTest, Inc32_Mem_PreservesCF) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x41;
+    scratch[1] = 0x99999999u; // sentinel after the 4-byte target
+    // mov rax, scratch ; inc dword [rax]
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x00, // inc dword [rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2 | 0x1; // CF pre-set
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0x42u) << "memory incremented";
+    EXPECT_EQ(scratch[1], 0x99999999u) << "next dword untouched (only 4 bytes written)";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not affect CF)";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+}
+
+// Wraparound 0xFFFFFFFF -> 0: ZF=1, and CF stays clear (INC never
+// sets CF, even on overflow-to-zero — distinct from ADD).
+TEST_F(CpuRuntimeTest, Inc32_Mem_WrapSetsZFNotCF) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0xFFFFFFFFu;
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x00, // inc dword [rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2; // CF clear going in
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0x0u) << "wrapped to zero";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear (INC never sets CF on wrap)";
+}
+
+// Signed overflow edge: 0x7FFFFFFF -> 0x80000000 sets OF and SF.
+TEST_F(CpuRuntimeTest, Inc32_Mem_SignedOverflow) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x7FFFFFFFu;
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0x00, // inc dword [rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0x80000000u) << "incremented past INT_MAX";
+    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+}
+
+// ============================================================================
+// PREFETCHNTA / PREFETCHT0/1/2 / PREFETCHW — cache hints with NO
+// architectural effect. Lifted as no-ops: bytes consumed, no register/
+// flag/memory change, no fault, execution continues. We verify the
+// hint is skipped cleanly and a following instruction still runs.
+// ============================================================================
+
+// prefetchnta [rax+rcx*4+0x100] (the 7-byte SIB+disp form the game hit)
+// followed by a mov that proves execution continued past the hint.
+TEST_F(CpuRuntimeTest, Prefetchnta_IsNoOp_ExecutionContinues) {
+    u32* scratch = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x12345678u;
+    // mov rax, scratch        (48 b8 ...)
+    // xor rcx, rcx            (48 31 c9)
+    // prefetchnta [rax+rcx*4+0x100]  (0f 18 84 88 00 01 00 00) -- 8 bytes:
+    //   the SIB byte 0x88 selects a disp32, so the full displacement is
+    //   00 01 00 00 (= 0x100). Easy to under-count by one byte.
+    // mov edx, 0xCAFE         (ba fe ca 00 00) -- proves we continued
+    // ret
+    const u8 program[] = {
+        0x48, 0xb8, 0,    0,    0,    0,    0,    0,    0,    0,    0x48, 0x31, 0xc9, 0x0f,
+        0x18, 0x84, 0x88, 0x00, 0x01, 0x00, 0x00, 0xba, 0xfe, 0xca, 0x00, 0x00, 0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Pre-set registers and flags to known values; the prefetch must
+    // leave everything except what the surrounding movs touch.
+    st.gpr[2] = 0xAAAAAAAAAAAAAAAAULL;   // rdx (will be set by the trailing mov edx)
+    st.gpr[6] = 0x1234567812345678ULL;   // rsi: must be untouched
+    st.rflags = 0x2 | 0x1 | (1ULL << 6); // CF + ZF pre-set
+
+    Runtime rt;
+    rt.Run(st);
+    // The trailing `mov edx, 0xCAFE` proves we executed past the hint.
+    EXPECT_EQ(st.gpr[2], 0x000000000000CAFEULL) << "execution continued past prefetch";
+    // The hint touched no other state.
+    EXPECT_EQ(st.gpr[6], 0x1234567812345678ULL) << "unrelated reg untouched";
+    EXPECT_EQ(scratch[0], 0x12345678u) << "prefetched memory unchanged";
+    // Flags unchanged by the prefetch (the movs here don't touch flags
+    // either: mov and xor-zero... actually xor clears flags, so only
+    // assert the prefetch itself is inert by checking memory/regs).
+}
+
+// A prefetch whose computed address would be wild must still not fault
+// — we don't even compute the EA. Use a base register holding a
+// bogus value; the no-op lift never dereferences it.
+TEST_F(CpuRuntimeTest, Prefetchnta_BogusAddress_DoesNotFault) {
+    // mov rax, 0xDEAD0000DEAD0000 ; prefetchnta [rax] ; mov ecx, 7 ; ret
+    const u8 program[] = {
+        0x48, 0xb8, 0x00, 0x00, 0xad, 0xde, 0x00,
+        0x00, 0xad, 0xde, 0x0f, 0x18, 0x00, // prefetchnta [rax]
+        0xb9, 0x07, 0x00, 0x00, 0x00,       // mov ecx, 7
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(st);
+    // If the prefetch had dereferenced rax, this would have crashed.
+    // Reaching here with ecx=7 proves it was a true no-op.
+    EXPECT_EQ(st.gpr[1], 0x0000000000000007ULL) << "no fault; execution continued";
+}
+
+// ============================================================================
+// VMOVNTDQA — non-temporal aligned vector load (xmm/ymm <- [mem]). The
+// load-side partner of VMOVNTDQ's store. The "NT" is a cache hint with
+// no architectural effect; for the data moved it is identical to
+// VMOVDQA. Load-only. Routed through EmitVmovups (the aligned-move
+// family). We verify the full 128/256-bit payload lands and that the
+// 128-bit form zeroes the upper YMM (VEX semantics).
+// ============================================================================
+
+// 128-bit load: all 16 bytes land; upper YMM (255:128) zeroed.
+TEST_F(CpuRuntimeTest, Vmovntdqa_Load128_ZeroesUpper) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x1122334455667788ULL;
+    scratch[1] = 0x99AABBCCDDEEFF00ULL;
+    // mov rax, scratch ; vmovntdqa xmm1, [rax]  (c4 e2 79 2a 08)
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xe2, 0x79, 0x2a, 0x08, // vmovntdqa xmm1, [rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 = vec index 1 -> ymm[4..7]. Pre-poison upper lanes.
+    st.ymm[6] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[7] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[4], 0x1122334455667788ULL) << "low qword loaded";
+    EXPECT_EQ(st.ymm[5], 0x99AABBCCDDEEFF00ULL) << "high qword loaded";
+    EXPECT_EQ(st.ymm[6], 0ULL) << "VEX zeroes bits 255:128";
+    EXPECT_EQ(st.ymm[7], 0ULL);
+}
+
+// 256-bit load: all 32 bytes land across the full YMM.
+TEST_F(CpuRuntimeTest, Vmovntdqa_Load256) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x0001020304050607ULL;
+    scratch[1] = 0x08090A0B0C0D0E0FULL;
+    scratch[2] = 0x1011121314151617ULL;
+    scratch[3] = 0x18191A1B1C1D1E1FULL;
+    // mov rax, scratch ; vmovntdqa ymm0, [rax]  (c4 e2 7d 2a 00)
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0xc4, 0xe2, 0x7d, 0x2a, 0x00, // vmovntdqa ymm0, [rax]
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(st);
+    // ymm0 = vec index 0 -> ymm[0..3].
+    EXPECT_EQ(st.ymm[0], 0x0001020304050607ULL);
+    EXPECT_EQ(st.ymm[1], 0x08090A0B0C0D0E0FULL);
+    EXPECT_EQ(st.ymm[2], 0x1011121314151617ULL);
+    EXPECT_EQ(st.ymm[3], 0x18191A1B1C1D1E1FULL);
+}
+
+// ============================================================================
+// XOR r64, imm — 64-bit register XOR with a (sign-extended) immediate.
+// The imm8/imm32 forms sign-extend to 64 bits, so an imm32 with its
+// top bit set flips the upper 32 bits too. XOR clears CF/OF and sets
+// ZF/SF/PF from the result. Values confirmed against host xorq.
+// ============================================================================
+
+// xor r64, imm32 where the immediate's high bit is set: the
+// sign-extension must reach the upper 32 bits. Result 0xFFFFFFFF00000000.
+TEST_F(CpuRuntimeTest, Xor64_Imm_SignExtends) {
+    // mov rax, 0xDEADBEEF ; xor rax, 0xDEADBEEF
+    // xor rax, imm32 = 48 35 ef be ad de (6 bytes); to match length-7
+    // forms we could use a ModRM imm, but 48 35 (XOR RAX, imm32) is the
+    // canonical RAX form. We assert behavior, not encoding length.
+    const u8 program[] = {
+        0x48, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0x00, 0x00, 0x00, 0x00, // mov rax, 0xDEADBEEF
+        0x48, 0x35, 0xef, 0xbe, 0xad, 0xde,                         // xor rax, 0xDEADBEEF (sx)
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // 0x00000000DEADBEEF ^ 0xFFFFFFFFDEADBEEF = 0xFFFFFFFF00000000.
+    EXPECT_EQ(st.gpr[0], 0xFFFFFFFF00000000ULL) << "imm sign-extended to 64 bits";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF cleared by XOR";
+    EXPECT_EQ(st.rflags & (1ULL << 11), 0ULL) << "OF cleared by XOR";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB set";
+}
+
+// xor r64, imm with a register other than RAX (uses the ModRM imm32
+// form, 7 bytes — matching the game's reported length). Full flip.
+TEST_F(CpuRuntimeTest, Xor64_Imm_NonRax) {
+    // mov rcx, 0x0123456789ABCDEF ; xor rcx, 0xFFFFFFFF (= -1 sx)
+    // xor rcx, imm32 = 48 81 f1 ff ff ff ff (7 bytes)
+    const u8 program[] = {
+        0x48, 0xb9, 0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, // mov rcx, 0x0123456789ABCDEF
+        0x48, 0x81, 0xf1, 0xff, 0xff, 0xff, 0xff, // xor rcx, 0xFFFFFFFF (sx -> -1)
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // ^ all-ones = bitwise NOT: 0x0123456789ABCDEF -> 0xFEDCBA9876543210.
+    EXPECT_EQ(st.gpr[1], 0xFEDCBA9876543210ULL) << "xor with -1 flips all bits";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB set";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear: result nonzero";
+}
+
+// xor r64, imm producing zero -> ZF set (value XOR itself).
+TEST_F(CpuRuntimeTest, Xor64_Imm_ToZeroSetsZF) {
+    // mov eax, 0x7F ; xor rax, 0x7F  -> 0, ZF=1
+    const u8 program[] = {
+        0xb8, 0x7f, 0x00, 0x00, 0x00, // mov eax, 0x7F (zero-extends rax)
+        0x48, 0x83, 0xf0, 0x7f,       // xor rax, 0x7F (imm8 sx)
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2 | 0x1; // CF pre-set; XOR must clear it
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0ULL) << "x ^ x = 0";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF cleared by XOR";
+}
+
+// ============================================================================
+// ADD qword [mem], imm — 64-bit read-modify-write add of an immediate
+// to a memory location (the RMW counterpart of `add r64, imm`). Full
+// ADD flags: CF on unsigned carry, OF on signed overflow, ZF/SF/PF
+// from the result; imm8/imm32 sign-extended. Confirmed vs host addq.
+// ============================================================================
+
+// Basic in-memory accumulator bump; only the 8 target bytes change.
+TEST_F(CpuRuntimeTest, Add64_MemImm_Basic) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x100;
+    scratch[1] = 0xBBBBBBBBBBBBBBBBULL; // sentinel after the 8-byte target
+    // mov rax, scratch ; add qword [rax], 0x10
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0,    0,    0,    0,
+        0,    0,    0, 0x48, 0x83, 0x00, 0x10, // add qword [rax], 0x10 (imm8 sx)
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0x110ULL) << "memory accumulator incremented";
+    EXPECT_EQ(scratch[1], 0xBBBBBBBBBBBBBBBBULL) << "next qword untouched";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no carry";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+}
+
+// Unsigned carry + wrap to zero: add 1 to 0xFFFF...FF -> 0, CF=1, ZF=1.
+TEST_F(CpuRuntimeTest, Add64_MemImm_CarryWrap) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0xFFFFFFFFFFFFFFFFULL;
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x83, 0x00, 0x01, // add qword [rax], 1
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0ULL) << "wrapped to zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: unsigned carry out";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+}
+
+// Signed overflow: add 1 to INT64_MAX -> 0x8000.., OF=1, SF=1.
+TEST_F(CpuRuntimeTest, Add64_MemImm_SignedOverflow) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x7FFFFFFFFFFFFFFFULL;
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x83, 0x00, 0x01, // add qword [rax], 1
+        0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(scratch[0], 0x8000000000000000ULL);
+    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+}
+
+// Negative immediate via sign-extended imm32: add -1 (0xFFFFFFFF sx).
+TEST_F(CpuRuntimeTest, Add64_MemImm_NegativeSignExtended) {
+    u64* scratch = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    scratch[0] = 0x100;
+    // mov rax, scratch ; add qword [rax], 0xFFFFFFFF (imm32, sx -> -1)
+    // 48 81 00 ff ff ff ff (7 bytes)
+    const u8 program[] = {
+        0x48, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0x48, 0x81, 0x00, 0xff, 0xff, 0xff, 0xff, 0xc3,
+    };
+    u8 prog[sizeof(program)];
+    std::memcpy(prog, program, sizeof(program));
+    const u64 a = reinterpret_cast<u64>(scratch);
+    std::memcpy(prog + 2, &a, sizeof(a));
+    std::memcpy(mem.CodePtr(), prog, sizeof(prog));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // 0x100 + (-1) = 0xFF; CF set (carry-out of the add-of-all-ones).
+    EXPECT_EQ(scratch[0], 0xFFULL) << "imm sign-extended to -1, subtracted 1";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set per add-of-negative semantics";
+}
+
+// ============================================================================
+// SBB r32, r32 — 32-bit subtract with borrow: dst = dst - src - CF.
+// The defining trait: it consumes the incoming CF as a borrow, so the
+// SAME operands give different results depending on CF. Routed through
+// EmitAdcSbb64 (which round-trips flags so host CF == guest CF).
+// Values confirmed against host sbb.
+// ============================================================================
+
+// CF=0: behaves like plain SUB. 0x100 - 0x10 - 0 = 0xF0.
+TEST_F(CpuRuntimeTest, Sbb32_RegReg_NoBorrowIn) {
+    // sbb eax, ecx  — 19 c8 (2 bytes... but Zydis reports len 3 for the
+    // game's encoding; the operation is identical). We use 19 c8.
+    const u8 program[] = {
+        0x19,
+        0xc8, // sbb eax, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x100; // eax
+    st.gpr[1] = 0x10;  // ecx
+    st.rflags = 0x2;   // CF = 0
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xF0ULL) << "0x100 - 0x10 - 0 = 0xF0";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no borrow out";
+}
+
+// CF=1: subtracts an extra 1. Same operands as above -> 0xEF, not 0xF0.
+// This is the test that proves the borrow-in is honored.
+TEST_F(CpuRuntimeTest, Sbb32_RegReg_BorrowIn) {
+    const u8 program[] = {
+        0x19,
+        0xc8, // sbb eax, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x100;
+    st.gpr[1] = 0x10;
+    st.rflags = 0x2 | 0x1; // CF = 1
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xEFULL) << "0x100 - 0x10 - 1 = 0xEF (borrow-in honored)";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear: no borrow out";
+}
+
+// Underflow with borrow-in: 5 - 5 - 1 = 0xFFFFFFFF, CF=1 (borrow out),
+// SF=1, and the result zero-extends into the full 64-bit slot.
+TEST_F(CpuRuntimeTest, Sbb32_RegReg_BorrowOut_ZeroExtends) {
+    const u8 program[] = {
+        0x19,
+        0xc8, // sbb eax, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xFFFFFFFF00000005ULL; // eax=5, high junk -> must be zero-extended
+    st.gpr[1] = 0x5;                   // ecx
+    st.rflags = 0x2 | 0x1;             // CF=1
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x00000000FFFFFFFFULL) << "5-5-1 wraps; upper 32 zero-extended";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF set: borrow out";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result MSB (bit31) set";
+}
+
+// Result zero -> ZF. 0x10 - 0x10 - 0 = 0.
+TEST_F(CpuRuntimeTest, Sbb32_RegReg_ToZero) {
+    const u8 program[] = {
+        0x19,
+        0xc8, // sbb eax, ecx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x10;
+    st.gpr[1] = 0x10;
+    st.rflags = 0x2; // CF=0
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0ULL);
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear";
+}
+
+// ============================================================================
+// INC r8 — 8-bit register increment. Preserves CF (the INC quirk),
+// sets ZF/SF/OF/PF/AF, preserves the upper 56 bits of the parent
+// register, and addresses the correct byte for high-byte regs (AH/etc).
+// Confirmed vs host incb.
+// ============================================================================
+
+// inc al: byte increments, upper 56 bits of rax preserved, CF preserved.
+TEST_F(CpuRuntimeTest, Inc8_AL_PreservesUpperAndCF) {
+    // inc al  — fe c0 (2 bytes)
+    const u8 program[] = {
+        0xfe,
+        0xc0,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEADBEEFDEAD0041ULL; // al = 0x41, upper must survive
+    st.rflags = 0x2 | 0x1;             // CF pre-set
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xDEADBEEFDEAD0042ULL) << "al incremented, upper 56 bits preserved";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not affect CF)";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+}
+
+// inc ah: the high-byte register increments byte 1 of rax, leaving
+// al (byte 0) and the rest untouched. Proves the +1 byte offset.
+TEST_F(CpuRuntimeTest, Inc8_AH_HighByte) {
+    // inc ah  — fe c4 (2 bytes)
+    const u8 program[] = {
+        0xfe,
+        0xc4,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x00000000000012FFULL; // ah=0x12, al=0xFF
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // ah: 0x12 -> 0x13; al (0xFF) and all other bytes unchanged.
+    EXPECT_EQ(st.gpr[0], 0x00000000000013FFULL) << "ah incremented, al untouched";
+}
+
+// Wrap 0xFF -> 0: ZF set, CF stays clear (INC never sets CF on wrap).
+TEST_F(CpuRuntimeTest, Inc8_AL_WrapSetsZF) {
+    const u8 program[] = {
+        0xfe,
+        0xc0, // inc al
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAAAAAAAAAAAAAAFFULL; // al = 0xFF
+    st.rflags = 0x2;                   // CF clear
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFULL, 0ULL) << "al wrapped to 0";
+    EXPECT_EQ(st.gpr[0] & ~0xFFULL, 0xAAAAAAAAAAAAAA00ULL) << "upper bytes preserved";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: byte result zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear on wrap";
+}
+
+// Signed overflow at 8-bit boundary: 0x7F -> 0x80 sets OF and SF.
+TEST_F(CpuRuntimeTest, Inc8_AL_SignedOverflow) {
+    const u8 program[] = {
+        0xfe,
+        0xc0, // inc al
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x7F;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFULL, 0x80ULL);
+    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: 8-bit signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+}
+
+// ============================================================================
+// DIV r8 — 8-bit unsigned divide. Distinct implicit-operand layout from
+// the wider forms: dividend is the full 16-bit AX (not a DX:AX pair),
+// quotient -> AL, remainder -> AH. The upper 48 bits of RAX are
+// preserved. DIV's flags are architecturally undefined, so not
+// asserted. Values confirmed against host divb.
+// ============================================================================
+
+// 100 / 7 = q14 r2. Dividend fits in AL but uses the AX layout.
+TEST_F(CpuRuntimeTest, Div8_Basic) {
+    // div cl  — f6 f1 (2 bytes)
+    const u8 program[] = {
+        0xf6,
+        0xf1,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // ax = 100 (dividend), upper bits poisoned to verify preservation.
+    st.gpr[0] = 0xDEADBEEFDEAD0064ULL; // ax = 0x0064 = 100
+    st.gpr[1] = 0x7;                   // cl = 7 (divisor)
+
+    Runtime rt;
+    rt.Run(st);
+    // AL = quotient = 14 (0x0E), AH = remainder = 2 -> AX = 0x020E.
+    EXPECT_EQ(st.gpr[0] & 0xFFFFULL, 0x020EULL) << "AL=quotient 14, AH=remainder 2";
+    EXPECT_EQ(st.gpr[0] & ~0xFFFFULL, 0xDEADBEEFDEAD0000ULL) << "upper 48 bits preserved";
+}
+
+// 0x1234 / 0x77: dividend > 255, proving the full 16-bit AX is the
+// dividend (not just AL). q=39 (0x27), r=19 (0x13) -> AX = 0x1327.
+TEST_F(CpuRuntimeTest, Div8_FullAxDividend) {
+    const u8 program[] = {
+        0xf6,
+        0xf1, // div cl
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x0000000000001234ULL; // ax = 0x1234 = 4660
+    st.gpr[1] = 0x77;                  // cl = 0x77 = 119
+
+    Runtime rt;
+    rt.Run(st);
+    // 4660 / 119 = 39 rem 19 -> AL=0x27, AH=0x13 -> AX=0x1327.
+    EXPECT_EQ(st.gpr[0] & 0xFFFFULL, 0x1327ULL) << "16-bit AX dividend: q=39, r=19";
+}
+
+// Divisor in a different register (bl), exact division -> remainder 0.
+TEST_F(CpuRuntimeTest, Div8_ExactDivision_NonClDivisor) {
+    // div bl  — f6 f3 (2 bytes)
+    const u8 program[] = {
+        0xf6,
+        0xf3,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xF0; // ax = 240
+    st.gpr[3] = 0x10; // bl = 16 (divisor; RBX = gpr index 3)
+
+    Runtime rt;
+    rt.Run(st);
+    // 240 / 16 = 15 rem 0 -> AL=0x0F, AH=0x00 -> AX=0x000F.
+    EXPECT_EQ(st.gpr[0] & 0xFFFFULL, 0x000FULL) << "q=15, r=0 (exact)";
+}
+
+// ============================================================================
+// DEC r8 — 8-bit register decrement (symmetric companion of INC r8).
+// Preserves CF (the DEC quirk), sets ZF/SF/OF/PF/AF, preserves the
+// upper 56 bits of the parent register, and addresses the correct byte
+// for high-byte regs (AH/etc). Confirmed vs host decb.
+// ============================================================================
+
+// dec al: byte decrements, upper 56 bits preserved, CF preserved.
+TEST_F(CpuRuntimeTest, Dec8_AL_PreservesUpperAndCF) {
+    // dec al  — fe c8 (2 bytes)
+    const u8 program[] = {
+        0xfe,
+        0xc8,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEADBEEFDEAD0042ULL; // al = 0x42, upper must survive
+    st.rflags = 0x2 | 0x1;             // CF pre-set
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xDEADBEEFDEAD0041ULL) << "al decremented, upper 56 bits preserved";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (DEC does not affect CF)";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF clear";
+}
+
+// dec to zero: 0x01 -> 0x00 sets ZF.
+TEST_F(CpuRuntimeTest, Dec8_AL_ToZeroSetsZF) {
+    const u8 program[] = {
+        0xfe,
+        0xc8, // dec al
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x01;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFULL, 0ULL);
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF set: result zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF clear";
+}
+
+// Underflow 0x00 -> 0xFF: SF set (result negative), CF stays clear.
+TEST_F(CpuRuntimeTest, Dec8_AL_UnderflowSetsSFNotCF) {
+    const u8 program[] = {
+        0xfe,
+        0xc8, // dec al
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAAAAAAAAAAAAAA00ULL; // al = 0x00
+    st.rflags = 0x2;                   // CF clear
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFULL, 0xFFULL) << "al underflowed to 0xFF";
+    EXPECT_EQ(st.gpr[0] & ~0xFFULL, 0xAAAAAAAAAAAAAA00ULL) << "upper bytes preserved";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF set: result negative";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear on underflow";
+}
+
+// Signed overflow: 0x80 (INT8_MIN) -> 0x7F sets OF.
+TEST_F(CpuRuntimeTest, Dec8_AL_SignedOverflow) {
+    const u8 program[] = {
+        0xfe,
+        0xc8, // dec al
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x80;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFULL, 0x7FULL);
+    EXPECT_EQ(st.rflags & (1ULL << 11), (1ULL << 11)) << "OF set: 0x80 - 1 signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL << 7), 0ULL) << "SF clear: result 0x7F positive";
+}
+
+// High-byte register: dec ah decrements byte 1 of rax, al untouched.
+TEST_F(CpuRuntimeTest, Dec8_AH_HighByte) {
+    // dec ah  — fe cc (2 bytes)
+    const u8 program[] = {
+        0xfe,
+        0xcc,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x0000000000001200ULL; // ah=0x12, al=0x00
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    // ah: 0x12 -> 0x11; al (0x00) untouched.
+    EXPECT_EQ(st.gpr[0], 0x0000000000001100ULL) << "ah decremented, al untouched";
+}
+
+// ============================================================================
+// MOV r8, r8 — 8-bit register-to-register move. Must touch exactly one
+// byte of each parent register (preserving the other 56 bits) and
+// correctly address high-byte registers (AH/CH/DH/BH), which live at
+// parent-slot offset+1. The previous code used GprOffset/ZydisGprToIndex,
+// which only reach the low byte and reject high-byte regs outright.
+// ============================================================================
+
+// Low-byte reg-reg (regression guard): mov cl, al. Only CL changes.
+TEST_F(CpuRuntimeTest, Mov8_RegReg_LowBytes) {
+    // mov cl, al  — 88 c1 (2 bytes)
+    const u8 program[] = {
+        0x88,
+        0xc1,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x11111111111111AAULL; // al = 0xAA
+    st.gpr[1] = 0x2222222222222233ULL; // cl = 0x33 -> becomes 0xAA
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0x22222222222222AAULL) << "cl = al, upper bits of rcx preserved";
+    EXPECT_EQ(st.gpr[0], 0x11111111111111AAULL) << "rax untouched";
+}
+
+// High-byte DESTINATION: mov ah, bl. Writes byte 1 of rax (AH),
+// leaving al and the upper bytes untouched. Previously rejected.
+TEST_F(CpuRuntimeTest, Mov8_RegReg_HighByteDest) {
+    // mov ah, bl  — 88 dc (2 bytes)
+    const u8 program[] = {
+        0x88,
+        0xdc,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x00000000000000CCULL; // ah=0x00, al=0xCC
+    st.gpr[3] = 0x000000000000007BULL; // bl=0x7B (RBX=index 3)
+
+    Runtime rt;
+    rt.Run(st);
+    // ah := bl (0x7B) -> rax low 16 = 0x7BCC; al unchanged.
+    EXPECT_EQ(st.gpr[0], 0x0000000000007BCCULL) << "ah=bl, al preserved";
+}
+
+// High-byte SOURCE: mov bl, ah. Reads byte 1 of rax (AH) into bl.
+// Previously the source read would have grabbed AL instead of AH.
+TEST_F(CpuRuntimeTest, Mov8_RegReg_HighByteSource) {
+    // mov bl, ah  — 88 e3 (2 bytes)
+    const u8 program[] = {
+        0x88,
+        0xe3,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x0000000000005678ULL; // ah=0x56, al=0x78
+    st.gpr[3] = 0xFFFFFFFFFFFFFF00ULL; // bl=0x00 -> becomes 0x56
+
+    Runtime rt;
+    rt.Run(st);
+    // bl := ah (0x56); upper bits of rbx preserved.
+    EXPECT_EQ(st.gpr[3], 0xFFFFFFFFFFFFFF56ULL) << "bl=ah (0x56, not al 0x78)";
+    EXPECT_EQ(st.gpr[0], 0x0000000000005678ULL) << "rax untouched";
+}
+
+// Both operands high-byte-ish: mov al, ah copies byte1 into byte0.
+TEST_F(CpuRuntimeTest, Mov8_RegReg_AhToAl) {
+    // mov al, ah  — 88 e0 (2 bytes)
+    const u8 program[] = {
+        0x88,
+        0xe0,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEADBEEF0000AB12ULL; // ah=0xAB, al=0x12
+
+    Runtime rt;
+    rt.Run(st);
+    // al := ah (0xAB); ah and upper bits unchanged -> low16 = 0xABAB.
+    EXPECT_EQ(st.gpr[0], 0xDEADBEEF0000ABABULL) << "al=ah; ah and upper preserved";
+}
+
+// ============================================================================
+// Code-cache flush/recycle invariant — the mechanism behind the
+// dispatcher's "flush and retry on full cache" path. When the bump
+// allocator is exhausted (Allocate returns nullptr), flushing the code
+// cache (reset bump pointer) together with clearing the block cache
+// (drop all host pointers, which would otherwise dangle into recycled
+// memory) must make allocation succeed again. This is what lets the
+// game keep running once it has compiled more code than the cache
+// holds at once — instead of dying at "code cache full".
+// ============================================================================
+
+TEST(CodeCacheFlush, RecycleAfterFull) {
+    // Small cache so we can exhaust it quickly. 64 KB.
+    CodeCache cache(64 * 1024);
+    BlockCache blocks;
+
+    // Allocate fixed-size chunks until the cache is full, recording a
+    // fake block-cache mapping for each (as the dispatcher would).
+    const u64 chunk = 4096;
+    u64 fake_rip = 0x40000;
+    int allocated = 0;
+    for (;;) {
+        u8* p = cache.Allocate(chunk);
+        if (p == nullptr)
+            break;
+        blocks.Insert(fake_rip, p);
+        fake_rip += 0x100;
+        ++allocated;
+        ASSERT_LT(allocated, 100000) << "cache never filled (unexpected)";
+    }
+    EXPECT_GT(allocated, 0) << "should have fit at least one chunk";
+    EXPECT_GT(cache.Used(), 0u) << "cache shows usage before flush";
+    // Confirm it is genuinely full: another allocation fails.
+    EXPECT_EQ(cache.Allocate(chunk), nullptr) << "cache is full";
+
+    // The recycle: clear the block cache, flush the code cache.
+    blocks.Clear();
+    cache.Flush();
+
+    // After flush, allocation succeeds again — this is the retry the
+    // dispatcher performs to keep executing.
+    u8* after = cache.Allocate(chunk);
+    EXPECT_NE(after, nullptr) << "allocation succeeds after flush+clear";
+    EXPECT_LE(cache.Used(), cache.Capacity()) << "usage sane after recycle";
+
+    // The block cache is empty after the clear: the old (now-dangling)
+    // mappings are gone, so a lookup of a previously-inserted rip misses.
+    EXPECT_EQ(blocks.Lookup(0x40000), nullptr)
+        << "stale block-cache entry must not survive a flush";
+}
+
+// A single allocation larger than the whole cache fails even when the
+// cache is empty — this is the genuine-failure case the dispatcher
+// distinguishes from a capacity recycle (it does NOT loop on it).
+TEST(CodeCacheFlush, OversizeAllocationFailsEvenWhenEmpty) {
+    CodeCache cache(64 * 1024);
+    EXPECT_EQ(cache.Used(), 0u) << "fresh cache is empty";
+    // Request more than the entire capacity.
+    u8* p = cache.Allocate(128 * 1024);
+    EXPECT_EQ(p, nullptr) << "an over-capacity block cannot be allocated";
+    // Used() is still ~0, which is exactly the signal the dispatcher
+    // uses to decline flushing (flushing an empty cache won't help).
+    EXPECT_EQ(cache.Used(), 0u) << "failed oversize alloc left cache empty";
+}
+
+// ============================================================================
+// CLD / STD — clear / set the direction flag (DF, rflags bit 10).
+// Controls string-op direction (auto-inc when DF=0, auto-dec when
+// DF=1). Touch no other flag and no register. CLD seen at libc
+// 0x8081df7f4 before a REP string op.
+// ============================================================================
+
+// CLD clears DF (bit 10) while leaving the surrounding flags intact.
+TEST_F(CpuRuntimeTest, Cld_ClearsDirectionFlag) {
+    // cld  — fc (1 byte)
+    const u8 program[] = {
+        0xfc,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // DF set, plus CF and ZF set, to confirm only DF is cleared.
+    st.rflags = 0x2 | (1ULL << 10) | 0x1 | (1ULL << 6);
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.rflags & (1ULL << 10), 0ULL) << "DF cleared";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF preserved";
+}
+
+// CLD when DF already clear is a no-op (idempotent), other flags intact.
+TEST_F(CpuRuntimeTest, Cld_AlreadyClear_Idempotent) {
+    const u8 program[] = {
+        0xfc, // cld
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = 0x2 | (1ULL << 7); // DF clear, SF set
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.rflags & (1ULL << 10), 0ULL) << "DF stays clear";
+    EXPECT_EQ(st.rflags & (1ULL << 7), (1ULL << 7)) << "SF preserved";
+}
+
+// STD sets DF (bit 10) while leaving the surrounding flags intact.
+TEST_F(CpuRuntimeTest, Std_SetsDirectionFlag) {
+    // std  — fd (1 byte)
+    const u8 program[] = {
+        0xfd,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // DF clear, CF set; confirm DF goes on and CF survives.
+    st.rflags = 0x2 | 0x1;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.rflags & (1ULL << 10), (1ULL << 10)) << "DF set";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved";
+}
+
+// ============================================================================
+// REPE CMPSQ — compare-string quadword, repeat-while-equal. The memcmp
+// inner loop: compare [RSI] vs [RDI] (CMP flags), advance both by ±8
+// (per DF), decrement RCX; continue while RCX!=0 AND ZF==1. Final
+// flags reflect the last compare; RSI/RDI/RCX hold their residual
+// loop values. Confirmed against host `repe cmpsq`.
+// ============================================================================
+
+// Equal arrays: runs to count exhaustion. RCX->0, ZF=1, both pointers
+// advanced by count*8.
+TEST_F(CpuRuntimeTest, RepeCmpsq_EqualArrays_RunsToCount) {
+    u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
+    for (int i = 0; i < 4; ++i) {
+        a[i] = 100 + i;
+        b[i] = 100 + i;
+    }
+    // repe cmpsq  — f3 48 a7 (3 bytes)
+    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(a); // RSI
+    st.gpr[7] = reinterpret_cast<u64>(b); // RDI
+    st.gpr[1] = 4;                        // RCX = element count
+    st.rflags = 0x2;                      // DF=0 (forward)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0ULL) << "RCX exhausted";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF=1: last compare equal";
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a) + 32) << "RSI += 4*8";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b) + 32) << "RDI += 4*8";
+}
+
+// Mismatch at index 2: stops after comparing the 3rd element. RCX=1,
+// ZF=0, RSI/RDI advanced by 3*8 (point past the mismatching element).
+TEST_F(CpuRuntimeTest, RepeCmpsq_StopsOnMismatch) {
+    u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
+    a[0] = 1;
+    a[1] = 2;
+    a[2] = 9;
+    a[3] = 4;
+    b[0] = 1;
+    b[1] = 2;
+    b[2] = 3;
+    b[3] = 4; // differ at index 2
+    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(a);
+    st.gpr[7] = reinterpret_cast<u64>(b);
+    st.gpr[1] = 4;
+    st.rflags = 0x2;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 1ULL) << "RCX = 1 (3 compares done)";
+    EXPECT_EQ(st.rflags & (1ULL << 6), 0ULL) << "ZF=0: mismatch found";
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a) + 24) << "RSI past mismatch (3*8)";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b) + 24) << "RDI past mismatch (3*8)";
+    // 9 > 3 unsigned -> last compare (a-b) had no borrow: CF=0.
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF reflects last compare (9-3, no borrow)";
+}
+
+// Zero count: RCX==0 -> no compare, no pointer movement, flags
+// unchanged.
+TEST_F(CpuRuntimeTest, RepeCmpsq_ZeroCount_NoOp) {
+    u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
+    a[0] = 0xAAAA;
+    b[0] = 0xBBBB; // would mismatch if compared
+    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(a);
+    st.gpr[7] = reinterpret_cast<u64>(b);
+    st.gpr[1] = 0;                 // RCX = 0
+    st.rflags = 0x2 | (1ULL << 6); // ZF pre-set; must survive untouched
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0ULL) << "RCX stays 0";
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a)) << "RSI unmoved (no compare)";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b)) << "RDI unmoved";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "flags unchanged on zero-trip";
+}
+
+// DF=1 (backward): pointers DECREMENT. Compare a single pair then step
+// back by 8. Use count=1 so we isolate the direction behavior.
+TEST_F(CpuRuntimeTest, RepeCmpsq_BackwardDirection) {
+    u64* a = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    u64* b = reinterpret_cast<u64*>(mem.CodePtr() + 0x200);
+    a[0] = 0x55;
+    b[0] = 0x55; // equal
+    const u8 program[] = {0xf3, 0x48, 0xa7, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(a);
+    st.gpr[7] = reinterpret_cast<u64>(b);
+    st.gpr[1] = 1;
+    st.rflags = 0x2 | (1ULL << 10); // DF=1 (backward)
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0ULL) << "one compare done";
+    EXPECT_EQ(st.rflags & (1ULL << 6), (1ULL << 6)) << "ZF=1: equal";
+    EXPECT_EQ(st.gpr[6], reinterpret_cast<u64>(a) - 8) << "RSI -= 8 (backward)";
+    EXPECT_EQ(st.gpr[7], reinterpret_cast<u64>(b) - 8) << "RDI -= 8 (backward)";
 }
 
 } // namespace
