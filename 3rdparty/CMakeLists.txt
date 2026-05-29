@@ -23,3 +23,16 @@ if (NOT TARGET Zydis::Zydis)
     add_subdirectory(zydis)
 endif()
 
+# x86 xbyak
+if (NOT TARGET xbyak::xbyak)
+    add_subdirectory(xbyak)
+endif()
+
+# xbyak_aarch64
+if (ARCHITECTURE STREQUAL "arm64")
+    if (NOT TARGET xbyak_aarch64)
+        set(XBYAK_AARCH64_BUILD_TEST OFF CACHE BOOL "" FORCE)
+        add_subdirectory(xbyak_aarch64)
+    endif()
+endif()
+

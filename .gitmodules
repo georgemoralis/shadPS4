@@ -22,10 +22,6 @@
 	path = externals/robin-map
 	url = https://github.com/Tessil/robin-map.git
 	shallow = true
-[submodule "externals/xbyak"]
-	path = externals/xbyak
-	url = https://github.com/herumi/xbyak.git
-	shallow = true
 [submodule "externals/magic_enum"]
 	path = externals/magic_enum
 	url = https://github.com/Neargye/magic_enum.git
@@ -144,3 +140,11 @@
 	path = 3rdparty/zydis
 	url = https://github.com/shadexternals/zydis.git
 	branch = master
+[submodule "3rdparty/xbyak"]
+	path = 3rdparty/xbyak
+	url = https://github.com/shadexternals/xbyak.git
+	branch = master
+[submodule "3rdparty/xbyak_aarch64"]
+	path = 3rdparty/xbyak_aarch64
+	url = https://github.com/shadexternals/xbyak_aarch64.git
+	branch = main

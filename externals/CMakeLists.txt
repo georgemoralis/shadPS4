@@ -109,11 +109,6 @@ if (NOT TARGET tsl::robin_map)
     add_subdirectory(robin-map)
 endif()
 
-# Xbyak
-if (NOT TARGET xbyak::xbyak)
-    add_subdirectory(xbyak)
-endif()
-
 # MagicEnum
 if (NOT TARGET magic_enum::magic_enum)
     add_subdirectory(magic_enum)
