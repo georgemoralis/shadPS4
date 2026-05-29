@@ -1838,9 +1838,34 @@ bool EmitInc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         return true;
     }
 
-    // Register-dst path below handles only 32/64-bit. 16-bit register
-    // INC hasn't been observed; the 16-bit form above is mem-dst only.
-    if (insn.operand_width == 16) return false;
+    // 16-bit register form: `inc r16` (AX/CX/.../R15W). Modeled on the
+    // 8-bit register path above: load the low 16 bits of the parent slot,
+    // round-trip guest rflags through the host so `inc ax` produces correct
+    // 16-bit-width flags (host INC preserves CF, so CF-preservation is
+    // automatic — no manual save/restore), then store back only the low 16
+    // bits. A 16-bit register write preserves the upper 48 bits of the
+    // parent register (unlike a 32-bit write, which zero-extends), so we use
+    // a word-sized store into the slot rather than a full-qword writeback.
+    if (insn.operand_width == 16) {
+        const int idx = ZydisGprToIndex(ops[0].reg.value);
+        if (idx < 0) return false;
+
+        c.mov(ax, word[r13 + GprOffset(idx)]);
+
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        c.inc(ax);
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        c.mov(word[r13 + GprOffset(idx)], ax); // preserve parent bits 63:16
+        return true;
+    }
+
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0)
         return false;
@@ -1984,6 +2009,33 @@ bool EmitDec(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         c.mov(qword[r13 + Offsets::Rflags], rdx);
 
         c.mov(byte[r13 + byte_off], al);
+        return true;
+    }
+
+    // 16-bit register form: `dec r16` (AX/CX/.../R15W). Symmetric companion
+    // of `inc r16`. Load the low 16 bits of the parent slot, round-trip
+    // guest rflags through the host so `dec ax` produces correct 16-bit
+    // flags (host DEC preserves CF — automatic, no manual save/restore),
+    // then store back only the low 16 bits. A 16-bit register write
+    // preserves the parent's upper 48 bits (unlike a 32-bit write, which
+    // zero-extends), so we use a word-sized store into the slot.
+    if (insn.operand_width == 16) {
+        const int idx = ZydisGprToIndex(ops[0].reg.value);
+        if (idx < 0) return false;
+
+        c.mov(ax, word[r13 + GprOffset(idx)]);
+
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+
+        c.dec(ax);
+
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+
+        c.mov(word[r13 + GprOffset(idx)], ax); // preserve parent bits 63:16
         return true;
     }
 

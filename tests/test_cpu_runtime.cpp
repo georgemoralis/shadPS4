@@ -14309,5 +14309,142 @@ TEST_F(CpuRuntimeTest, Mfence_PreservesSurroundingEffects) {
     EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
 }
 
+
+// ============================================================================
+// 16-bit register INC/DEC (`inc r16` / `dec r16`, 66-prefixed). Like the
+// 8-bit register forms, these preserve CF and the parent register's upper
+// bits — a 16-bit write touches only bits 15:0, leaving 63:16 intact (in
+// contrast to a 32-bit write, which zero-extends). Flags ZF/SF/OF/PF are
+// computed at 16-bit width via the host round-trip.
+// ============================================================================
+
+// inc ax: low 16 bits increment, upper 48 bits and CF preserved.
+TEST_F(CpuRuntimeTest, Inc16_AX_PreservesUpperAndCF) {
+    const u8 program[] = {
+        0x66, 0xff, 0xc0, // inc ax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEADBEEF12340041ULL; // ax = 0x0041, upper 48 must survive
+    st.rflags = 0x2 | 0x1; // CF pre-set
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xDEADBEEF12340042ULL) << "ax incremented, upper 48 bits preserved";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not affect CF)";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
+}
+
+// inc cx on 0xFFFF: wraps to 0, ZF set, CF stays clear, upper preserved.
+// Uses cx (not ax) to prove the slot index isn't hardcoded.
+TEST_F(CpuRuntimeTest, Inc16_CX_WrapSetsZF) {
+    const u8 program[] = {
+        0x66, 0xff, 0xc1, // inc cx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0xAAAAAAAAAAAAFFFFULL; // cx = 0xFFFF
+    st.rflags = 0x2; // CF clear
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1] & 0xFFFFULL, 0ULL) << "cx wrapped to 0";
+    EXPECT_EQ(st.gpr[1] & ~0xFFFFULL, 0xAAAAAAAAAAAA0000ULL) << "upper 48 bits preserved";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: 16-bit result zero";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0ULL) << "CF still clear on wrap";
+}
+
+// inc ax at 0x7FFF: signed 16-bit overflow sets OF and SF.
+TEST_F(CpuRuntimeTest, Inc16_AX_SignedOverflow) {
+    const u8 program[] = {
+        0x66, 0xff, 0xc0, // inc ax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x7FFFULL; // ax = 0x7FFF
+    st.rflags = 0x2;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFFFULL, 0x8000ULL);
+    EXPECT_EQ(st.rflags & (1ULL<<11), (1ULL<<11)) << "OF set: 16-bit signed overflow";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result negative";
+}
+
+// dec ax: low 16 bits decrement, upper 48 bits and CF preserved.
+TEST_F(CpuRuntimeTest, Dec16_AX_PreservesUpperAndCF) {
+    const u8 program[] = {
+        0x66, 0xff, 0xc8, // dec ax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEADBEEF12340042ULL; // ax = 0x0042
+    st.rflags = 0x2 | 0x1; // CF pre-set
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xDEADBEEF12340041ULL) << "ax decremented, upper 48 bits preserved";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (DEC does not affect CF)";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
+}
+
+// dec cx from 1: result 0 sets ZF, CF preserved, upper bits intact.
+TEST_F(CpuRuntimeTest, Dec16_CX_ToZero_SetsZf) {
+    const u8 program[] = {
+        0x66, 0xff, 0xc9, // dec cx
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0x1234567800000001ULL; // cx = 0x0001
+    st.rflags = 0x2; // CF clear
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1] & 0xFFFFULL, 0ULL) << "cx decremented to 0";
+    EXPECT_EQ(st.gpr[1] & ~0xFFFFULL, 0x1234567800000000ULL) << "upper 48 bits preserved";
+    EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF set: 16-bit result zero";
+}
+
+// dec ax from 0: underflow wraps to 0xFFFF, SF set (negative), CF preserved.
+TEST_F(CpuRuntimeTest, Dec16_AX_UnderflowWraps) {
+    const u8 program[] = {
+        0x66, 0xff, 0xc8, // dec ax
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x0000000000000000ULL; // ax = 0
+    st.rflags = 0x2;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0] & 0xFFFFULL, 0xFFFFULL) << "ax underflowed to 0xFFFF";
+    EXPECT_EQ(st.rflags & (1ULL<<7), (1ULL<<7)) << "SF set: result has high bit";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
+}
+
 } // namespace
 } // namespace Core::Runtime
