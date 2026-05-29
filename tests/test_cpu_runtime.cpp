@@ -97,13 +97,20 @@ public:
     static constexpr u64 BRIDGE_HEADROOM = 128;
 
     GuestMemory() {
+        // This region holds GUEST memory: the guest program bytes (which the
+        // lifter only ever READS, via the decoder) and the guest stack. The
+        // JIT emits HOST code into the separate CodeCache, never here — so
+        // this mapping needs READ+WRITE only, never EXECUTE. Requesting EXEC
+        // is not just unnecessary, it's actively harmful on Apple Silicon:
+        // the hardened runtime rejects a simultaneously writable+executable
+        // anonymous mapping (W^X) unless it carries MAP_JIT, so the old
+        // PROT_EXEC form returned MAP_FAILED there and every test died in
+        // SetUp() before a single guest instruction was lifted.
 #ifdef _WIN32
-        void* p =
-            ::VirtualAlloc(nullptr, TOTAL_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+        void* p = ::VirtualAlloc(nullptr, TOTAL_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         base_ = static_cast<u8*>(p);
 #else
-        void* p = ::mmap(nullptr, TOTAL_SIZE, PROT_READ | PROT_WRITE | PROT_EXEC,
-                         MAP_PRIVATE | MAP_ANON, -1, 0);
+        void* p = ::mmap(nullptr, TOTAL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
         base_ = (p == MAP_FAILED) ? nullptr : static_cast<u8*>(p);
 #endif
     }
