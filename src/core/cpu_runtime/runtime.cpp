@@ -720,6 +720,7 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
     const u64 used_before = code_cache_->Used();
     void* host_ptr = lifter_->CompileBlock(guest_rip);
     if (host_ptr != nullptr) {
+#ifdef ARCH_X86_64
         // Optional: disassemble EVERY compiled block straight into the log,
         // once per guest RIP, so blocks are human-readable without any offline
         // tool. Off by default (this floods the log); enable by setting the
@@ -731,6 +732,10 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
         //     ...
         // The r13-relative annotation maps the access back to the guest
         // register / state field, since r13 is pinned to the GuestState base.
+        // x86-only: it decodes the emitted HOST instructions with Zydis, whose
+        // formatter is x86. On the arm64 host the emitted code is AArch64, which
+        // Zydis can't format, so the feature is compiled out there (the Zydis
+        // include itself is also gated to ARCH_X86_64).
         static const bool dump_all_blocks = [] {
             const char* e = std::getenv("SHADPS4_DUMP_BLOCKS");
             return e != nullptr && e[0] != '\0' && e[0] != '0';
@@ -836,6 +841,7 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
                 }
             }
         }
+#endif // ARCH_X86_64
         // [RAXTRACE] Dump emitted host bytes for the loop blocks involved
         // in the bit-33 corruption (0x800274c00 / ...c09 / ...cae), so the
         // exact lifted sequence can be disassembled. Computed from the
