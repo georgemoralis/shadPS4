@@ -85,10 +85,22 @@ constexpr u64 BLOCK_GUEST_SIZE_CAP = 1024;
 // Host SIMD scratch (NEON): v0/v1 are the per-lane vector scratch
 // (mirror of x86 xmm0/xmm1); v0..v7 are caller-saved.
 // ============================================================================
-constexpr XReg kState = x28;
-constexpr XReg kScratch0 = x9;
-constexpr XReg kScratch1 = x10;
-constexpr XReg kAddr = x11;
+// xbyak_aarch64 does not expose the pre-instantiated register objects
+// (x0, w0, sp, xzr, ...) at namespace scope, so `using namespace
+// Xbyak_aarch64` does NOT bring `x28` etc. into scope here. Construct the
+// registers explicitly by index instead: XReg(i) is the 64-bit register i,
+// WReg(i) the 32-bit view. This is the scope-independent, API-guaranteed
+// form (the README shows WReg(i) in a loop). Also note XReg is a runtime
+// class with no constexpr constructor, so these are `const`, not constexpr.
+const XReg kState = XReg(28);     // GuestState* (x86 r13 analog)
+const XReg kScratch0 = XReg(9);   // primary scratch (rax analog)
+const XReg kScratch1 = XReg(10);  // secondary scratch (rcx analog)
+const XReg kAddr = XReg(11);      // address scratch (rdx analog)
+const XReg kScratch2 = XReg(12);  // additional transient
+const XReg kExitStub = XReg(25);  // fatal-exit stub (x86 r15 analog)
+const XReg kDispatchTop = XReg(26); // dispatcher-loop top (x86 r14 analog)
+const WReg kWScratch0 = WReg(9);  // 32-bit view of x9
+const WReg kWScratch3 = WReg(13); // 32-bit transient (flag_op write)
 
 constexpr u32 GprOffset(int idx) {
     return static_cast<u32>(Offsets::Gpr + idx * 8);
@@ -153,15 +165,15 @@ bool EmitAdd64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
     c.ldr(kScratch0, ptr(kState, GprOffset(dst))); // lhs (== src1)
     c.ldr(kScratch1, ptr(kState, GprOffset(src))); // rhs
-    c.add(x12, kScratch0, kScratch1);              // result
-    c.str(x12, ptr(kState, GprOffset(dst)));
+    c.add(kScratch2, kScratch0, kScratch1);        // result
+    c.str(kScratch2, ptr(kState, GprOffset(dst)));
 
     // Lazy-flag side-band.
-    c.mov(w13, FLAG_OP_ADD);
-    c.str(w13, ptr(kState, offsetof(GuestState, flag_op)));
+    c.mov(kWScratch3, FLAG_OP_ADD);
+    c.str(kWScratch3, ptr(kState, offsetof(GuestState, flag_op)));
     c.str(kScratch0, ptr(kState, offsetof(GuestState, flag_lhs)));
     c.str(kScratch1, ptr(kState, offsetof(GuestState, flag_rhs)));
-    c.str(x12, ptr(kState, offsetof(GuestState, flag_result)));
+    c.str(kScratch2, ptr(kState, offsetof(GuestState, flag_result)));
     return true;
 }
 
@@ -197,9 +209,13 @@ bool EmitVpaddd128(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
     c.add(VReg4S(0), VReg4S(0), VReg4S(1)); // per-lane 32-bit add
     c.add(kAddr, kState, YmmChunkOffset(dst, 0));
     c.st1(VReg4S(0), ptr(kAddr));   // store result low-128
-    // VEX-128: zero upper 128 bits (chunks 2,3).
+    // VEX-128: zero upper 128 bits (chunks 2,3). Use a zeroed GPR pair
+    // rather than xzr — xbyak_aarch64's register-31 spelling (xzr vs sp) is
+    // type-disambiguated and not reachable here as a bare instance, so we
+    // materialize zero in a scratch and store the pair.
+    c.mov(kScratch0, 0);
     c.add(kAddr, kState, YmmChunkOffset(dst, 2));
-    c.stp(xzr, xzr, ptr(kAddr));
+    c.stp(kScratch0, kScratch0, ptr(kAddr));
     return true;
 }
 
@@ -210,9 +226,9 @@ bool EmitVpaddd128(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
 void EmitUnsupportedExit(u64 rip, CodeGenerator& c) {
     c.mov(kScratch0, rip); // mov pseudo-op -> movz/movk sequence for 64-bit imm
     c.str(kScratch0, ptr(kState, Offsets::Rip));
-    c.mov(w9, static_cast<u32>(ExitReason::UnsupportedInstruction));
-    c.str(w9, ptr(kState, offsetof(GuestState, exit_reason)));
-    c.br(x25); // fatal exit (do not re-dispatch the bad address)
+    c.mov(kWScratch0, static_cast<u32>(ExitReason::UnsupportedInstruction));
+    c.str(kWScratch0, ptr(kState, offsetof(GuestState, exit_reason)));
+    c.br(kExitStub); // fatal exit (do not re-dispatch the bad address)
 }
 
 } // namespace
@@ -308,9 +324,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     if (!emitted_terminator) {
         c.mov(kScratch0, rip);
         c.str(kScratch0, ptr(kState, Offsets::Rip));
-        c.mov(w9, static_cast<u32>(ExitReason::BlockEnd));
-        c.str(w9, ptr(kState, offsetof(GuestState, exit_reason)));
-        c.br(x26); // normal dispatcher re-entry
+        c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
+        c.str(kWScratch0, ptr(kState, offsetof(GuestState, exit_reason)));
+        c.br(kDispatchTop); // normal dispatcher re-entry
     }
 
     // Lay out labels in the buffer (no protect — we own W^X here).
@@ -327,7 +343,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     // (CodeCache::WriteEnd currently can't know the range; do it here
     // where we have [code_buf, code_buf+emitted). If WriteEnd is later
     // extended to take a range, fold this into it.)
-    sys_icache_invalidate(code_buf, emitted);
+    // Qualify ::sys_icache_invalidate explicitly: `using namespace
+    // Xbyak_aarch64` brings in that library's own same-named declaration,
+    // which would otherwise shadow libkern's and fail to resolve.
+    ::sys_icache_invalidate(code_buf, emitted);
 
     bytes_emitted_ += emitted;
     ++blocks_compiled_;

@@ -87,50 +87,69 @@ void FreeGatewayRegion(u8* p) {
 /// thread's MAP_JIT pages to WRITABLE before calling, and MUST switch
 /// back to EXECUTABLE + invalidate the icache AFTER. See the Gateway
 /// constructor.
+/// Gateway code generator. xbyak_aarch64's pre-instantiated register
+/// instances (x0, x29, sp, ...) and mnemonic functions are MEMBERS of
+/// CodeGenerator — they are not reachable through a file-scope
+/// `using namespace`, only from within a CodeGenerator-derived class. So we
+/// follow the library's documented pattern (see its sample/add.cpp) and
+/// emit from a subclass constructor, where `x0`, `sp`, `stp(...)`, etc. all
+/// resolve as inherited members. The pinned registers are built by index
+/// with XReg(i), which is valid in any scope.
+class GatewayGenerator : public Xbyak_aarch64::CodeGenerator {
+public:
+    GatewayGenerator(u8* code_buf, u64 code_size)
+        : Xbyak_aarch64::CodeGenerator(code_size, code_buf) {
+        using Xbyak_aarch64::Label;
+        using Xbyak_aarch64::XReg;
+
+        const XReg rGuestState = XReg(kRegGuestState);
+        const XReg rDispatcher = XReg(kRegDispatcher);
+        const XReg rDispatchTop = XReg(kRegDispatchTop);
+        const XReg rExitStub = XReg(kRegExitStub);
+
+        // ---- PROLOGUE ----
+        // STP pre-indexed = push-pair; each pair is 16 bytes so the stack
+        // stays 16-aligned (a hard AArch64 requirement at all times).
+        stp(x29, x30, pre_ptr(sp, -16));            // FP, LR
+        stp(rGuestState, rDispatcher, pre_ptr(sp, -16));
+        stp(rDispatchTop, rExitStub, pre_ptr(sp, -16));
+        mov(x29, sp); // frame pointer
+
+        // Normalize args into pinned registers.
+        mov(rGuestState, x0); // state
+        mov(rDispatcher, x1); // dispatcher
+
+        // Pre-compute exit-path addresses. ADR is PC-relative (+/-1 MiB),
+        // far more than the gateway's size.
+        Label dispatch_loop_top;
+        Label exit_stub;
+        adr(rDispatchTop, dispatch_loop_top);
+        adr(rExitStub, exit_stub);
+
+        // ---- DISPATCH LOOP ----
+        L(dispatch_loop_top);
+        mov(x0, rGuestState); // dispatcher(state): arg0 = x0
+        blr(rDispatcher);     // branch-with-link to register
+        cbz(x0, exit_stub);   // null result -> exit (no flags needed)
+        br(x0);               // else branch into JIT block
+
+        // ---- EXIT STUB ----
+        L(exit_stub);
+        // Pop pairs in reverse order (post-indexed = pop-pair).
+        ldp(rDispatchTop, rExitStub, post_ptr(sp, 16));
+        ldp(rGuestState, rDispatcher, post_ptr(sp, 16));
+        ldp(x29, x30, post_ptr(sp, 16));
+        ret();
+
+        // Finalize the xbyak_aarch64 buffer (lays out labels). We manage
+        // MAP_JIT write-protect + sys_icache_invalidate ourselves in the
+        // Gateway constructor.
+        ready();
+    }
+};
+
 void GenerateGateway(u8* code_buf, u64 code_size) {
-    using namespace Xbyak_aarch64;
-
-    CodeGenerator c{code_size, code_buf};
-
-    // ---- PROLOGUE ----
-    // STP pre-indexed = push-pair; each pair is 16 bytes so the stack
-    // stays 16-aligned (a hard AArch64 requirement at all times).
-    c.stp(x29, x30, pre_ptr(sp, -16));                              // FP, LR
-    c.stp(XReg(kRegGuestState), XReg(kRegDispatcher), pre_ptr(sp, -16));
-    c.stp(XReg(kRegDispatchTop), XReg(kRegExitStub), pre_ptr(sp, -16));
-    c.mov(x29, sp); // frame pointer
-
-    // Normalize args into pinned registers.
-    c.mov(XReg(kRegGuestState), x0); // state
-    c.mov(XReg(kRegDispatcher), x1); // dispatcher
-
-    // Pre-compute exit-path addresses. ADR is PC-relative (+/-1 MiB),
-    // far more than the gateway's size.
-    Label dispatch_loop_top;
-    Label exit_stub;
-    c.adr(XReg(kRegDispatchTop), dispatch_loop_top);
-    c.adr(XReg(kRegExitStub), exit_stub);
-
-    // ---- DISPATCH LOOP ----
-    c.L(dispatch_loop_top);
-    c.mov(x0, XReg(kRegGuestState)); // dispatcher(state): arg0 = x0
-    c.blr(XReg(kRegDispatcher));     // branch-with-link to register
-    c.cbz(x0, exit_stub);            // null result -> exit (no flags needed)
-    c.br(x0);                        // else branch into JIT block
-
-    // ---- EXIT STUB ----
-    c.L(exit_stub);
-    // Pop pairs in reverse order (post-indexed = pop-pair).
-    c.ldp(XReg(kRegDispatchTop), XReg(kRegExitStub), post_ptr(sp, 16));
-    c.ldp(XReg(kRegGuestState), XReg(kRegDispatcher), post_ptr(sp, 16));
-    c.ldp(x29, x30, post_ptr(sp, 16));
-    c.ret();
-
-    // Finalize the xbyak_aarch64 buffer (lays out labels). We manage
-    // MAP_JIT write-protect + sys_icache_invalidate ourselves in the
-    // constructor; prefer the no-protect finalize variant if the real
-    // header offers one. Resolve on first build.
-    c.ready();
+    GatewayGenerator{code_buf, code_size};
 }
 
 } // namespace
@@ -150,7 +169,10 @@ Gateway::Gateway() {
     // Invalidate the instruction cache over the gateway range. On
     // AArch64 the I/D caches are not coherent for freshly-written code;
     // without this the CPU may execute stale bytes.
-    sys_icache_invalidate(gateway_code_, gateway_size_);
+    // Qualify ::sys_icache_invalidate explicitly: xbyak_aarch64 declares its
+    // own same-named symbol, which can shadow libkern's via ADL/namespace
+    // lookup and fail to resolve. The global libkern one is what we want.
+    ::sys_icache_invalidate(gateway_code_, gateway_size_);
 
     entry_ = reinterpret_cast<EntryFn>(gateway_code_);
 
