@@ -139,13 +139,6 @@ if (NOT TARGET xxHash::xxhash)
     add_library(xxHash::xxhash ALIAS xxhash)
 endif()
 
-# Zydis
-if (NOT TARGET Zydis::Zydis)
-    option(ZYDIS_BUILD_TOOLS "" OFF)
-    option(ZYDIS_BUILD_EXAMPLES "" OFF)
-    add_subdirectory(zydis)
-endif()
-
 # sirit
 add_subdirectory(sirit)
 if (WIN32)
