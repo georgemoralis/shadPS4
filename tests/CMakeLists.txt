@@ -325,6 +325,16 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         list(APPEND CPU_RUNTIME_TEST_SOURCES
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/gateway/gateway_x86.cpp
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_x86_host.cpp)
+    elseif (ARCHITECTURE STREQUAL "arm64")
+        # arm64 host backend. NOTE: the arm64 lifter is currently a skeleton
+        # (a few representative emitters), so most tests in test_cpu_runtime.cpp
+        # — which assert x86-lifter behavior by running emitted code — will FAIL
+        # here until the full emitter port lands. The arm64 CI test job is
+        # allowed to fail for exactly this reason; building the target gives
+        # compile/link coverage of the arm64 backend in the meantime.
+        list(APPEND CPU_RUNTIME_TEST_SOURCES
+            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/gateway/gateway_arm64.cpp
+            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_arm64_host.cpp)
     endif()
 
     add_executable(shadps4_cpu_runtime_test ${CPU_RUNTIME_TEST_SOURCES})
@@ -346,11 +356,18 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         nlohmann_json::nlohmann_json
         toml11::toml11
         tsl::robin_map
-        xbyak::xbyak
         Zydis::Zydis
         SDL3::SDL3
         spdlog::spdlog
     )
+
+    # Code generator for the runtime lifter: x86 xbyak on x86_64,
+    # xbyak_aarch64 on arm64 — matching the backend sources added above.
+    if (ARCHITECTURE STREQUAL "x86_64")
+        target_link_libraries(shadps4_cpu_runtime_test PRIVATE xbyak::xbyak)
+    elseif (ARCHITECTURE STREQUAL "arm64")
+        target_link_libraries(shadps4_cpu_runtime_test PRIVATE xbyak_aarch64)
+    endif()
 
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
         CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
