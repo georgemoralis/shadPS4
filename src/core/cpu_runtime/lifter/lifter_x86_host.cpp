@@ -7161,49 +7161,71 @@ bool EmitVecBitOp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 /// 2-operand syntax (`vpshufb xmm5, xmm6`) and Zydis will report
 /// 2 visible ops. We handle both shapes: 3 visible → ops[0,1,2]
 /// = dst, src1, mask; 2 visible → ops[0,1] = dst(=src1), mask.
+///
+/// The mask (last operand) may be a register OR a memory operand
+/// (`vpshufb xmm, xmm, [mem]`). dst and src1 are always registers.
+/// For a memory mask we compute the effective address once into
+/// rdx and load each 128-bit lane from [rdx + lane*16]; VPSHUFB
+/// never crosses a 128-bit lane boundary, so the per-lane loads are
+/// independent and need no reordering.
 bool EmitVpshufb(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-                 Xbyak::CodeGenerator& c) {
+                 u64 next_rip, Xbyak::CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_VPSHUFB)
         return false;
 
-    int dst_idx, src_idx, mask_idx;
+    int dst_idx, src_idx;
+    const ZydisDecodedOperand* mask_op;
     if (insn.operand_count_visible == 3) {
-        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-            ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-            ops[2].type != ZYDIS_OPERAND_TYPE_REGISTER)
-            return false;
-        dst_idx = ZydisVecToIndex(ops[0].reg.value);
-        src_idx = ZydisVecToIndex(ops[1].reg.value);
-        mask_idx = ZydisVecToIndex(ops[2].reg.value);
-    } else if (insn.operand_count_visible == 2) {
         if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
             ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
             return false;
         dst_idx = ZydisVecToIndex(ops[0].reg.value);
+        src_idx = ZydisVecToIndex(ops[1].reg.value);
+        mask_op = &ops[2];
+    } else if (insn.operand_count_visible == 2) {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
+            return false;
+        dst_idx = ZydisVecToIndex(ops[0].reg.value);
         src_idx = dst_idx;
-        mask_idx = ZydisVecToIndex(ops[1].reg.value);
+        mask_op = &ops[1];
     } else {
         return false;
     }
-    if (dst_idx < 0 || src_idx < 0 || mask_idx < 0)
+    if (dst_idx < 0 || src_idx < 0)
         return false;
 
     const int vec_bits = ops[0].size;
     if (vec_bits != 128 && vec_bits != 256)
         return false;
+    const int lanes = vec_bits / 128;
 
     // Process each 128-bit lane. For the 128-bit form there's only
     // one lane (chunks 0..1); for the 256-bit AVX2 form there's a
     // second lane (chunks 2..3) handled identically — VPSHUFB does
     // not cross 128-bit boundaries.
-    for (int lane = 0; lane < vec_bits / 128; ++lane) {
-        const u32 src_off = YmmChunkOffset(src_idx, lane * 2);
-        const u32 mask_off = YmmChunkOffset(mask_idx, lane * 2);
-        const u32 dst_off = YmmChunkOffset(dst_idx, lane * 2);
-        c.vmovdqu(xmm0, ptr[r13 + src_off]);
-        c.vmovdqu(xmm1, ptr[r13 + mask_off]);
-        c.vpshufb(xmm0, xmm0, xmm1);
-        c.vmovdqu(ptr[r13 + dst_off], xmm0);
+    if (mask_op->type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int mask_idx = ZydisVecToIndex(mask_op->reg.value);
+        if (mask_idx < 0)
+            return false;
+        for (int lane = 0; lane < lanes; ++lane) {
+            c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src_idx, lane * 2)]);
+            c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(mask_idx, lane * 2)]);
+            c.vpshufb(xmm0, xmm0, xmm1);
+            c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, lane * 2)], xmm0);
+        }
+    } else if (mask_op->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // mem-mask: EA → rdx (computed once); each lane loads its
+        // 16-byte control vector from [rdx + lane*16].
+        if (!EmitEffectiveAddress(mask_op->mem, next_rip, c))
+            return false;
+        for (int lane = 0; lane < lanes; ++lane) {
+            c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src_idx, lane * 2)]);
+            c.vmovdqu(xmm1, ptr[rdx + lane * 16]);
+            c.vpshufb(xmm0, xmm0, xmm1);
+            c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, lane * 2)], xmm0);
+        }
+    } else {
+        return false;
     }
     // 128-bit VEX form zeros bits 255:128 of the destination YMM.
     if (vec_bits == 128) {
@@ -10691,7 +10713,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitVcvttsd2si(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_VPSHUFB:
-            handled = EmitVpshufb(insn, ops, c);
+            handled = EmitVpshufb(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_VPTEST:
             handled = EmitVptest(insn, ops, c);

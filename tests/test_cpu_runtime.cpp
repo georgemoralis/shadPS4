@@ -14446,5 +14446,77 @@ TEST_F(CpuRuntimeTest, Dec16_AX_UnderflowWraps) {
     EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
 }
 
+
+// ============================================================================
+// VPSHUFB — byte shuffle, register and memory mask forms. dst = xmm0 (ymm[0]),
+// src1 = xmm1 (ymm[4..5]). The control vector selects src bytes per output
+// byte; a control byte with bit 7 set zeroes that output byte. The 128-bit
+// VEX form zeros bits 255:128 of the destination. Test vector hand-computed:
+//   src  = 0x10..0x1f (byte j = 0x10+j)
+//   mask = reverse (15..0) with byte0's high bit set (-> output byte0 = 0)
+//   out.q0 = 0x18191a1b1c1d1e00  out.q1 = 0x1011121314151617
+// ============================================================================
+
+// Register-mask form: vpshufb xmm0, xmm1, xmm2.
+TEST_F(CpuRuntimeTest, Vpshufb_Xmm_RegMask_Shuffles) {
+    const u8 program[] = {
+        0xc4, 0xe2, 0x71, 0x00, 0xc2, // vpshufb xmm0, xmm1, xmm2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 (src1) = ymm[4],ymm[5]; xmm2 (mask) = ymm[8],ymm[9].
+    st.ymm[4] = 0x1716151413121110ULL; st.ymm[5] = 0x1f1e1d1c1b1a1918ULL;
+    st.ymm[8] = 0x08090a0b0c0d0e8fULL; st.ymm[9] = 0x0001020304050607ULL;
+    // Pre-dirty dst (xmm0) upper lane to prove it gets zeroed.
+    st.ymm[0] = 0xDEADBEEFULL; st.ymm[1] = 0xCAFEBABEULL;
+    st.ymm[2] = 0x1111111111111111ULL; st.ymm[3] = 0x2222222222222222ULL;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x18191a1b1c1d1e00ULL) << "dst low qword shuffled";
+    EXPECT_EQ(st.ymm[1], 0x1011121314151617ULL) << "dst high qword shuffled";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "128-bit VEX zeros bits 191:128";
+    EXPECT_EQ(st.ymm[3], 0ULL) << "128-bit VEX zeros bits 255:192";
+}
+
+// Memory-mask form: vpshufb xmm0, xmm1, [rax]. The control vector lives in
+// guest memory pointed to by rax; same expected result as the reg form.
+TEST_F(CpuRuntimeTest, Vpshufb_Xmm_MemMask_Shuffles) {
+    // 16-byte control vector in a scratch buffer one page past the code.
+    u8* scratch = mem.CodePtr() + 0x100;
+    const u8 mask_bytes[16] = {
+        0x8f,0x0e,0x0d,0x0c,0x0b,0x0a,0x09,0x08,
+        0x07,0x06,0x05,0x04,0x03,0x02,0x01,0x00,
+    };
+    std::memcpy(scratch, mask_bytes, sizeof(mask_bytes));
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, <scratch addr>  (imm @2..9)
+        0xc4, 0xe2, 0x71, 0x00, 0x00,  // vpshufb xmm0, xmm1, [rax]
+        0xc3,
+    };
+    const u64 scratch_addr = reinterpret_cast<u64>(scratch);
+    std::memcpy(&program[2], &scratch_addr, sizeof(scratch_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x1716151413121110ULL; st.ymm[5] = 0x1f1e1d1c1b1a1918ULL;
+    st.ymm[2] = 0x3333333333333333ULL; st.ymm[3] = 0x4444444444444444ULL;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x18191a1b1c1d1e00ULL) << "dst low qword shuffled (mem mask)";
+    EXPECT_EQ(st.ymm[1], 0x1011121314151617ULL) << "dst high qword shuffled (mem mask)";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "128-bit VEX zeros upper lane (mem mask)";
+    EXPECT_EQ(st.ymm[3], 0ULL) << "128-bit VEX zeros upper lane (mem mask)";
+}
+
 } // namespace
 } // namespace Core::Runtime
