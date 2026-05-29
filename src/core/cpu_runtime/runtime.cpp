@@ -463,8 +463,30 @@ void* DispatcherTrampoline(GuestState* state) {
             // the per-call path never invokes spdlog/fmt there, and on
             // the macOS/arm64 target there is no SEH walker to trip.
             const u64 guest_rsp = state->gpr[kGuestRsp];
-            const u64 guest_return_addr =
-                *reinterpret_cast<const u64*>(guest_rsp);
+
+            // Reading the guest stack (return address + spilled args) can
+            // fault if guest_rsp sits near the top of a mapped page and the
+            // next page is unmapped — the bridge would then crash inside the
+            // marshalling reads rather than in the called function. Guard the
+            // reads with a page bound: a qword is only dereferenced if its
+            // full 8 bytes lie within the same page as guest_rsp; otherwise it
+            // defaults to 0. The return address and SysV stack args are pushed
+            // immediately below RSP, so in practice they're always in-page and
+            // this never trips — it only protects the pathological boundary
+            // case. We use a page bound rather than a VMA query because the
+            // bridge runs from a JIT gateway frame where taking the memory
+            // manager's mutex is unsafe (same reason this path avoids spdlog).
+            constexpr u64 kPageSize = 0x1000;
+            const u64 rsp_page_end = (guest_rsp & ~(kPageSize - 1)) + kPageSize;
+            const auto safe_read_qword = [&](u64 addr) -> u64 {
+                if (addr < guest_rsp || addr + sizeof(u64) > rsp_page_end) {
+                    // Below RSP or crossing the page boundary: don't touch it.
+                    return 0;
+                }
+                return *reinterpret_cast<const u64*>(addr);
+            };
+
+            const u64 guest_return_addr = safe_read_qword(guest_rsp);
 
             // Look up the resolved HLE function name. If the
             // address isn't registered, that's either a JIT bug
@@ -500,17 +522,17 @@ void* DispatcherTrampoline(GuestState* state) {
             // If the guest's actual stack-arg count is < 8, the
             // extra reads pull whatever lives beyond the args. The
             // called HLE function ignores them per its declared
-            // signature.
-            const u64* guest_stack_args =
-                reinterpret_cast<const u64*>(guest_rsp) + 1;
-            const u64 s0 = guest_stack_args[0];
-            const u64 s1 = guest_stack_args[1];
-            const u64 s2 = guest_stack_args[2];
-            const u64 s3 = guest_stack_args[3];
-            const u64 s4 = guest_stack_args[4];
-            const u64 s5 = guest_stack_args[5];
-            const u64 s6 = guest_stack_args[6];
-            const u64 s7 = guest_stack_args[7];
+            // signature. Each read is page-bounded (see safe_read_qword
+            // above): args past the end of guest_rsp's page default to 0
+            // rather than faulting the bridge.
+            const u64 s0 = safe_read_qword(guest_rsp + 1 * sizeof(u64));
+            const u64 s1 = safe_read_qword(guest_rsp + 2 * sizeof(u64));
+            const u64 s2 = safe_read_qword(guest_rsp + 3 * sizeof(u64));
+            const u64 s3 = safe_read_qword(guest_rsp + 4 * sizeof(u64));
+            const u64 s4 = safe_read_qword(guest_rsp + 5 * sizeof(u64));
+            const u64 s5 = safe_read_qword(guest_rsp + 6 * sizeof(u64));
+            const u64 s6 = safe_read_qword(guest_rsp + 7 * sizeof(u64));
+            const u64 s7 = safe_read_qword(guest_rsp + 8 * sizeof(u64));
 
             if (name.empty()) {
                 LOG_WARNING(Core,
