@@ -140,8 +140,45 @@ constexpr u32 YmmChunkOffset(int lane, int chunk) {
     return static_cast<u32>(offsetof(GuestState, ymm) + (lane * 4 + chunk) * 8);
 }
 
-int ZydisGprToIndex(ZydisRegister reg); // shared util (RAX..R15 -> 0..15)
-int ZydisVecToIndex(ZydisRegister reg); // shared util (XMM/YMM0.. -> 0..31)
+// Register-name -> canonical AMD64 index. These mirror the x86 host
+// lifter's helpers exactly; both live in their TU's anonymous namespace,
+// so the arm64 lifter needs its own copy (the x86 definitions are not
+// linked into an arm64 build).
+int ZydisGprToIndex(ZydisRegister r) {
+    if (r >= ZYDIS_REGISTER_RAX && r <= ZYDIS_REGISTER_R15) {
+        return r - ZYDIS_REGISTER_RAX;
+    }
+    if (r >= ZYDIS_REGISTER_EAX && r <= ZYDIS_REGISTER_R15D) {
+        return r - ZYDIS_REGISTER_EAX;
+    }
+    if (r >= ZYDIS_REGISTER_AX && r <= ZYDIS_REGISTER_R15W) {
+        return r - ZYDIS_REGISTER_AX;
+    }
+    // 8-bit low: AL, CL, DL, BL = indices 0..3.
+    if (r >= ZYDIS_REGISTER_AL && r <= ZYDIS_REGISTER_BL) {
+        return r - ZYDIS_REGISTER_AL;
+    }
+    // 8-bit "extended" low: SPL, BPL, SIL, DIL = indices 4..7.
+    if (r >= ZYDIS_REGISTER_SPL && r <= ZYDIS_REGISTER_DIL) {
+        return (r - ZYDIS_REGISTER_SPL) + 4;
+    }
+    // 8-bit REX-prefixed: R8B..R15B = indices 8..15.
+    if (r >= ZYDIS_REGISTER_R8B && r <= ZYDIS_REGISTER_R15B) {
+        return (r - ZYDIS_REGISTER_R8B) + 8;
+    }
+    // AH/CH/DH/BH and non-GPR registers fall through to "unsupported".
+    return -1;
+}
+
+int ZydisVecToIndex(ZydisRegister reg) {
+    if (reg >= ZYDIS_REGISTER_XMM0 && reg <= ZYDIS_REGISTER_XMM31) {
+        return static_cast<int>(reg) - static_cast<int>(ZYDIS_REGISTER_XMM0);
+    }
+    if (reg >= ZYDIS_REGISTER_YMM0 && reg <= ZYDIS_REGISTER_YMM31) {
+        return static_cast<int>(reg) - static_cast<int>(ZYDIS_REGISTER_YMM0);
+    }
+    return -1;
+}
 
 // Shared lazy-flag op enum value (matches the x86 lifter + the
 // host-agnostic materializer in runtime.cpp).
