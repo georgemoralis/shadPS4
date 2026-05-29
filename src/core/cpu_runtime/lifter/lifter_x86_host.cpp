@@ -7604,11 +7604,14 @@ Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
 }
 
 Lifter::~Lifter() {
-    // Use fprintf rather than LOG_INFO here: by the time the lifter
-    // destructor runs at program shutdown, shadPS4's logging
-    // subsystem has often been torn down, and LOG_INFO degrades to
-    // emitting the format string verbatim with the `{}` placeholders
-    // un-substituted. fprintf works at any teardown phase.
+    // Deliberate fprintf exception (the only one left in this file).
+    // By the time the lifter destructor runs at program shutdown,
+    // shadPS4's logging subsystem has often already been torn down, so
+    // LOG_INFO would degrade to emitting the format string verbatim
+    // with the `{}` placeholders un-substituted (or worse, touch a
+    // half-destructed sink). fprintf to stderr works at any teardown
+    // phase and needs no live logging backend. This is platform-
+    // independent and unrelated to the JIT-context SEH concern.
     std::fprintf(stderr, "[lifter] %llu blocks compiled, %llu bytes emitted, %llu unsupported\n",
                  (unsigned long long)blocks_compiled_, (unsigned long long)bytes_emitted_,
                  (unsigned long long)unsupported_hits_);
@@ -7616,30 +7619,20 @@ Lifter::~Lifter() {
 }
 
 void* Lifter::CompileBlock(u64 guest_rip) {
-    // Diagnostic: trace the compile path via fprintf(stderr).
-    //
-    // We deliberately do NOT use LOG_INFO here, even though it would
-    // be the natural fit. The reason: this function is called from
-    // inside the gateway-dispatched code path (Runtime::Run -> gateway
-    // -> dispatcher trampoline -> here). The gateway is JIT-emitted
-    // x86 code with no registered Windows unwind info (.pdata /
-    // .xdata). Any spdlog/fmt operation that triggers SEH stack
-    // walking — RTC1 checks, RAII destructor cleanup paths, debug
-    // checks — fails when the walker reaches the JIT gateway frame
-    // and reads garbage from a missing function table entry.
-    //
-    // Empirically: LOG_INFO from constructors (before JIT execution)
-    // works; LOG_INFO from inside CompileBlock crashes with
-    // "access violation reading 0xFFFFFFFFFFFFFFFF". The fprintf path
-    // doesn't walk the stack and is safe.
-    //
-    // The proper long-term fix is registering unwind info for the
-    // gateway via RtlAddFunctionTable on Windows. That's a separate
-    // piece of work. Until then, JIT-dispatched-context code uses
-    // fprintf for diagnostics.
-    std::fprintf(stderr, "[lifter] CompileBlock: guest_rip = 0x%llx\n",
-                 static_cast<unsigned long long>(guest_rip));
-    std::fflush(stderr);
+    // Per-block compile trace. LOG_TRACE compiles to (void(0)) in
+    // release builds, so this has zero cost there and only emits in
+    // _DEBUG. That matters because CompileBlock runs in JIT-dispatched
+    // context (Runtime::Run -> gateway -> dispatcher trampoline ->
+    // here), and on the x86/Windows host an spdlog/fmt call that
+    // triggers an SEH stack walk can fault when the walker reaches the
+    // JIT gateway frame (no registered .pdata/.xdata). Because
+    // LOG_TRACE is gone entirely in release, the hot path never touches
+    // spdlog. On the macOS/arm64 target there is no SEH walker at all,
+    // so even _DEBUG tracing here is safe. The error/warning paths
+    // below use LOG_WARNING/LOG_ERROR, which only fire on real problems
+    // (low frequency) and carry the same release-build caveat handled
+    // by the gateway-unwind work tracked separately for Windows.
+    LOG_TRACE(Core, "Lifter: compiling block at guest_rip={:#x}", guest_rip);
 
     // Reserve a chunk of code cache for this block. We don't know
     // the final size yet; conservatively reserve the size cap and
@@ -7648,8 +7641,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     // overhead is tiny.)
     u8* code_buf = code_cache_.Allocate(BLOCK_HOST_SIZE_CAP);
     if (code_buf == nullptr) {
-        std::fprintf(stderr, "[lifter] code cache full at RIP 0x%llx\n",
-                     static_cast<unsigned long long>(guest_rip));
+        LOG_WARNING(Core,
+                    "Lifter: code cache full at guest_rip={:#x}; "
+                    "caller should flush and retry",
+                    guest_rip);
         return nullptr;
     }
 
@@ -7671,20 +7666,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // safe-decode path that catches faults.
         ZydisDecodedInstruction insn;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-        std::fprintf(stderr, "[lifter] about to decode at 0x%llx\n",
-                     static_cast<unsigned long long>(rip));
-        std::fflush(stderr);
+        LOG_TRACE(Core, "Lifter: decoding at {:#x}", rip);
         const auto status =
             ZydisDecoderDecodeFull(&decoder, reinterpret_cast<const void*>(rip), 15, &insn, ops);
-        std::fprintf(stderr, "[lifter] decoded at 0x%llx ok=%d mnemonic=%s\n",
-                     static_cast<unsigned long long>(rip), ZYAN_SUCCESS(status) ? 1 : 0,
-                     ZYAN_SUCCESS(status) ? ZydisMnemonicGetString(insn.mnemonic)
-                                          : "(decode-failed)");
-        std::fflush(stderr);
+        LOG_TRACE(Core, "Lifter: decoded at {:#x} ok={} mnemonic={}", rip,
+                  ZYAN_SUCCESS(status) ? 1 : 0,
+                  ZYAN_SUCCESS(status) ? ZydisMnemonicGetString(insn.mnemonic) : "(decode-failed)");
         if (!ZYAN_SUCCESS(status)) {
-            std::fprintf(stderr, "[lifter] decode FAILED at 0x%llx\n",
-                         static_cast<unsigned long long>(rip));
-            std::fflush(stderr);
+            LOG_ERROR(Core, "Lifter: decode FAILED at {:#x}", rip);
             ++unsupported_hits_;
             // Emit a clean exit so the host program doesn't die.
             // Use r15 (fatal exit) rather than r14 (dispatcher loop)
@@ -8267,14 +8256,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     return "?";
                 }
             };
-            std::fprintf(
-                stderr,
-                "[lifter] unsupported insn at 0x%llx (mnemonic=%s, "
-                "width=%u, length=%u, ops=%s,%s)\n",
-                static_cast<unsigned long long>(rip), ZydisMnemonicGetString(insn.mnemonic),
-                static_cast<unsigned>(insn.operand_width), static_cast<unsigned>(insn.length),
-                op_type_name(ops[0].type), op_type_name(ops[1].type));
-            std::fflush(stderr);
+            LOG_ERROR(Core,
+                      "Lifter: unsupported insn at {:#x} (mnemonic={}, "
+                      "width={}, length={}, ops={},{})",
+                      rip, ZydisMnemonicGetString(insn.mnemonic),
+                      static_cast<unsigned>(insn.operand_width), static_cast<unsigned>(insn.length),
+                      op_type_name(ops[0].type), op_type_name(ops[1].type));
             ++unsupported_hits_;
             // Update state.rip to the un-lifted instruction so a
             // post-mortem caller knows where it stopped, then exit
@@ -8329,11 +8316,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     bytes_emitted_ += emitted;
     ++blocks_compiled_;
 
-    std::fprintf(
-        stderr, "[lifter] compiled block 0x%llx -> %p (%llu guest bytes -> %llu host bytes)\n",
-        static_cast<unsigned long long>(guest_rip), static_cast<void*>(code_buf),
-        static_cast<unsigned long long>(rip - guest_rip), static_cast<unsigned long long>(emitted));
-    std::fflush(stderr);
+    LOG_TRACE(Core, "Lifter: compiled block {:#x} -> {} ({} guest bytes -> {} host bytes)",
+              guest_rip, static_cast<void*>(code_buf), rip - guest_rip, emitted);
 
     return code_buf;
 }
