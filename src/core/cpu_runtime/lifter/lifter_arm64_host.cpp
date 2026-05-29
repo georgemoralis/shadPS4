@@ -40,6 +40,34 @@
 //     instructions ran near-verbatim), the ARM64 host must TRANSLATE every
 //     guest x86 instruction into one-or-more AArch64 instructions. There is
 //     no "just run the host op" shortcut for scalar integer work.
+//
+// MEMORY MODEL / ATOMICITY (known follow-up, NOT handled by this skeleton):
+//
+//   GuestState is a per-thread execution context, so the plain ldr/str this
+//   lifter emits for ordinary guest loads/stores are correct: a naturally
+//   aligned <=64-bit GPR access IS single-copy atomic on ARMv8 (no LDAR/LDXR
+//   needed), and with no second observer of a thread-local field there is
+//   nothing to tear against or to order. The GPR slots are 8-byte aligned and
+//   GuestState is alignas(64), so that precondition holds.
+//
+//   What does NOT carry over from the x86 host is GUEST-VISIBLE concurrency.
+//   The x86 host got correct behavior for free from x86's strong (TSO) memory
+//   model and its genuinely-atomic LOCK-prefixed ops. AArch64 is a WEAK model,
+//   so when the emitter port reaches instructions whose guest semantics imply
+//   atomicity or ordering across guest threads / shared memory, a plain
+//   ldr/str lowering is WRONG. Specifically, these will each need real ARM
+//   primitives rather than the x86 host's plain accesses:
+//     - LOCK-prefixed RMW (xchg, cmpxchg, xadd, lock add/or/...) -> LSE atomics
+//       (ldadd/swp/cas...) or an ldxr/stxr retry loop; NOT load-then-store.
+//     - MFENCE / LFENCE / SFENCE                                 -> dmb ish*.
+//     - Acquire/release-ordered guest accesses                   -> ldar/stlr.
+//     - 128-bit accesses are NOT single-copy atomic before v8.4/LSE2: a 128-bit
+//       guest atomic cannot be a single ldp/stp pre-v8.4 (each 64-bit half is
+//       atomic, but the pair can tear). Vector (NEON) loads are not guaranteed
+//       atomic at all — fine for thread-local YMM state, wrong if ever shared.
+//   None of the above is implemented here; the current emitters assume the
+//   thread-local case. Guest atomics/fences must be added before this backend
+//   can run real multithreaded guest code correctly.
 // ============================================================================
 
 #include "core/cpu_runtime/lifter/lifter.h"
@@ -170,10 +198,10 @@ bool EmitAdd64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
     // Lazy-flag side-band.
     c.mov(kWScratch3, FLAG_OP_ADD);
-    c.str(kWScratch3, ptr(kState, offsetof(GuestState, flag_op)));
-    c.str(kScratch0, ptr(kState, offsetof(GuestState, flag_lhs)));
-    c.str(kScratch1, ptr(kState, offsetof(GuestState, flag_rhs)));
-    c.str(kScratch2, ptr(kState, offsetof(GuestState, flag_result)));
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
     return true;
 }
 
@@ -227,7 +255,7 @@ void EmitUnsupportedExit(u64 rip, CodeGenerator& c) {
     c.mov(kScratch0, rip); // mov pseudo-op -> movz/movk sequence for 64-bit imm
     c.str(kScratch0, ptr(kState, Offsets::Rip));
     c.mov(kWScratch0, static_cast<u32>(ExitReason::UnsupportedInstruction));
-    c.str(kWScratch0, ptr(kState, offsetof(GuestState, exit_reason)));
+    c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
     c.br(kExitStub); // fatal exit (do not re-dispatch the bad address)
 }
 
@@ -325,7 +353,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         c.mov(kScratch0, rip);
         c.str(kScratch0, ptr(kState, Offsets::Rip));
         c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
-        c.str(kWScratch0, ptr(kState, offsetof(GuestState, exit_reason)));
+        c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
         c.br(kDispatchTop); // normal dispatcher re-entry
     }
 
@@ -343,10 +371,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     // (CodeCache::WriteEnd currently can't know the range; do it here
     // where we have [code_buf, code_buf+emitted). If WriteEnd is later
     // extended to take a range, fold this into it.)
-    // Qualify ::sys_icache_invalidate explicitly: `using namespace
-    // Xbyak_aarch64` brings in that library's own same-named declaration,
-    // which would otherwise shadow libkern's and fail to resolve.
-    ::sys_icache_invalidate(code_buf, emitted);
+    // xbyak_aarch64 declares sys_icache_invalidate in its own namespace (not
+    // the global one), so qualify it explicitly. (`::` does NOT work here.)
+    Xbyak_aarch64::sys_icache_invalidate(code_buf, emitted);
 
     bytes_emitted_ += emitted;
     ++blocks_compiled_;

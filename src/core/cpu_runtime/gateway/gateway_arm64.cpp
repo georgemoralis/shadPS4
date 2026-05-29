@@ -99,8 +99,13 @@ class GatewayGenerator : public Xbyak_aarch64::CodeGenerator {
 public:
     GatewayGenerator(u8* code_buf, u64 code_size)
         : Xbyak_aarch64::CodeGenerator(code_size, code_buf) {
-        using Xbyak_aarch64::Label;
-        using Xbyak_aarch64::XReg;
+        // xbyak_aarch64 splits its symbols: the register CLASSES (XReg, ...)
+        // and Label are in the GLOBAL namespace, while the address-helper free
+        // functions (pre_ptr/post_ptr/ptr) live in namespace Xbyak_aarch64. A
+        // single using-directive makes both reachable here (and the bare
+        // register instances x0/sp/x29 resolve as inherited CodeGenerator
+        // members).
+        using namespace Xbyak_aarch64;
 
         const XReg rGuestState = XReg(kRegGuestState);
         const XReg rDispatcher = XReg(kRegDispatcher);
@@ -169,10 +174,10 @@ Gateway::Gateway() {
     // Invalidate the instruction cache over the gateway range. On
     // AArch64 the I/D caches are not coherent for freshly-written code;
     // without this the CPU may execute stale bytes.
-    // Qualify ::sys_icache_invalidate explicitly: xbyak_aarch64 declares its
-    // own same-named symbol, which can shadow libkern's via ADL/namespace
-    // lookup and fail to resolve. The global libkern one is what we want.
-    ::sys_icache_invalidate(gateway_code_, gateway_size_);
+    // In this TU the libkern declaration is visible via the Xbyak_aarch64
+    // namespace (the library includes OSCacheControl.h within its own
+    // namespace), so qualify it accordingly.
+    Xbyak_aarch64::sys_icache_invalidate(gateway_code_, gateway_size_);
 
     entry_ = reinterpret_cast<EntryFn>(gateway_code_);
 
