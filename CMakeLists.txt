@@ -306,7 +306,17 @@ find_package(toml11 4.2.0 CONFIG)
 find_package(tsl-robin-map 1.3.0 CONFIG)
 find_package(VulkanHeaders 1.4.329 CONFIG)
 find_package(VulkanMemoryAllocator 3.1.0 CONFIG)
-find_package(xbyak 7.07 CONFIG)
+# x86 xbyak is required on every x86_64 build: cpu_patches.cpp uses it
+# unconditionally (see the ARCHITECTURE x86_64 block in the source list), and
+# the x86 runtime-backend lifter uses it too. On arm64 the only xbyak consumer
+# is the arm64 runtime lifter, which needs xbyak_aarch64 instead — and only
+# when the 'runtime' backend is actually built.
+if (ARCHITECTURE STREQUAL "x86_64")
+    find_package(xbyak 7.07 CONFIG)
+elseif (ARCHITECTURE STREQUAL "arm64" AND
+        SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
+    find_package(xbyak_aarch64 CONFIG)
+endif()
 find_package(xxHash 0.8.2 MODULE)
 find_package(ZLIB 1.3 MODULE)
 find_package(Zydis 5.0.0 MODULE)
@@ -1002,11 +1012,15 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
                  src/core/cpu_runtime/gateway/gateway_x86.cpp
                  src/core/cpu_runtime/lifter/lifter_x86_host.cpp)
     elseif (ARCHITECTURE STREQUAL "arm64")
-        # ARM64 backend lands in a follow-up PR.
-        message(FATAL_ERROR
-            "SHADPS4_CPU_BACKEND=runtime on arm64 not yet implemented; "
-            "the gateway_arm64.cpp and lifter_arm64_host.cpp files are "
-            "deferred to a follow-up PR.")
+        # ARM64 (AArch64) host backend — macOS / Apple Silicon only.
+        # The lifter is currently a structural skeleton (a few
+        # representative emitters; most guest instructions take the
+        # unsupported-exit path). It compiles and links so the runtime
+        # can be exercised on real hardware; the full emitter port is
+        # follow-up work.
+        set(CORE ${CORE}
+                 src/core/cpu_runtime/gateway/gateway_arm64.cpp
+                 src/core/cpu_runtime/lifter/lifter_arm64_host.cpp)
     endif()
 endif()
 # ============================================================================
@@ -1274,9 +1288,22 @@ add_executable(shadps4
 create_target_directory_groups(shadps4)
 
 target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
-target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map xbyak::xbyak Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
+target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 pugixml::pugixml)
 target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib)
+
+# xbyak code generator linkage. On x86_64, cpu_patches.cpp always needs x86
+# xbyak (and so does the x86 runtime lifter), so link it for the whole
+# architecture. On arm64, only the runtime-backend lifter needs a code
+# generator, and it's xbyak_aarch64. Kept separate from the link lines above
+# (which previously hard-coded xbyak::xbyak unconditionally) so an arm64 build
+# doesn't drag in the x86 assembler.
+if (ARCHITECTURE STREQUAL "x86_64")
+    target_link_libraries(shadps4 PRIVATE xbyak::xbyak)
+elseif (ARCHITECTURE STREQUAL "arm64" AND
+        SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
+    target_link_libraries(shadps4 PRIVATE xbyak_aarch64)
+endif()
 
 if (${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     target_link_libraries(shadps4 PRIVATE "/usr/lib/libusb.so")
