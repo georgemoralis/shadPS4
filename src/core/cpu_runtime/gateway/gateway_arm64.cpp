@@ -52,6 +52,21 @@ constexpr u64 GATEWAY_SIZE = 4096;
 // x25..x28 are callee-saved (AAPCS64 x19..x28), so they survive the
 // dispatcher call without per-call spilling. We avoid x16/x17 (veneer
 // scratch) and x18 (platform register; reserved on Darwin).
+//
+// CALLEE-SAVED PRESERVATION POLICY:
+// The gateway is called from C++ and must honor AAPCS64 — it must leave every
+// callee-saved register as it found it. Crucially, the lifted JIT blocks run
+// "inside" this gateway frame (the dispatch loop branches into them and they
+// branch back), so ANY callee-saved register a lifted block clobbers would
+// leak out to the C++ caller unless the gateway saved it. Rather than impose a
+// "lifter may only touch caller-saved regs" contract on every future emitter
+// (easy to violate silently), the gateway saves the FULL callee-saved set up
+// front, exactly like the x86 gateway pushes rbx/rbp/r12-r15:
+//   GPRs:    x19..x28 (10) + x29(FP) + x30(LR)      = 12 regs, 6 STP pairs
+//   FP/SIMD: d8..d15 (low 64 bits of v8..v15 only)  =  8 regs, 4 STP pairs
+// Total 160 bytes, 16-byte aligned (a hard AArch64 SP requirement). This makes
+// the gateway correct for any emitter the lifter port adds, with no per-block
+// spill cost (saved once on entry, restored once on exit).
 // ============================================================================
 constexpr int kRegGuestState = 28;
 constexpr int kRegDispatcher = 27;
@@ -113,12 +128,24 @@ public:
         const XReg rExitStub = XReg(kRegExitStub);
 
         // ---- PROLOGUE ----
-        // STP pre-indexed = push-pair; each pair is 16 bytes so the stack
-        // stays 16-aligned (a hard AArch64 requirement at all times).
+        // Save the full AAPCS64 callee-saved set (see policy note above).
+        // STP pre-indexed = push-pair; each pair is 16 bytes so SP stays
+        // 16-aligned at every step (a hard AArch64 requirement).
+        //
+        // GPRs x19..x28 + FP(x29)/LR(x30): 6 pairs, 96 bytes.
+        stp(x19, x20, pre_ptr(sp, -16));
+        stp(x21, x22, pre_ptr(sp, -16));
+        stp(x23, x24, pre_ptr(sp, -16));
+        stp(x25, x26, pre_ptr(sp, -16));
+        stp(x27, x28, pre_ptr(sp, -16));
         stp(x29, x30, pre_ptr(sp, -16));            // FP, LR
-        stp(rGuestState, rDispatcher, pre_ptr(sp, -16));
-        stp(rDispatchTop, rExitStub, pre_ptr(sp, -16));
-        mov(x29, sp); // frame pointer
+        // Callee-saved FP/SIMD: only the low 64 bits of v8..v15 (the d-regs)
+        // are callee-saved. 4 pairs, 64 bytes.
+        stp(d8, d9, pre_ptr(sp, -16));
+        stp(d10, d11, pre_ptr(sp, -16));
+        stp(d12, d13, pre_ptr(sp, -16));
+        stp(d14, d15, pre_ptr(sp, -16));
+        mov(x29, sp); // frame pointer (points at the saved d14/d15 pair)
 
         // Normalize args into pinned registers.
         mov(rGuestState, x0); // state
@@ -140,10 +167,18 @@ public:
 
         // ---- EXIT STUB ----
         L(exit_stub);
-        // Pop pairs in reverse order (post-indexed = pop-pair).
-        ldp(rDispatchTop, rExitStub, post_ptr(sp, 16));
-        ldp(rGuestState, rDispatcher, post_ptr(sp, 16));
-        ldp(x29, x30, post_ptr(sp, 16));
+        // Pop in EXACT reverse order of the prologue pushes (post-indexed =
+        // pop-pair). FP/SIMD first (they were pushed last), then GPRs.
+        ldp(d14, d15, post_ptr(sp, 16));
+        ldp(d12, d13, post_ptr(sp, 16));
+        ldp(d10, d11, post_ptr(sp, 16));
+        ldp(d8, d9, post_ptr(sp, 16));
+        ldp(x29, x30, post_ptr(sp, 16));            // FP, LR
+        ldp(x27, x28, post_ptr(sp, 16));
+        ldp(x25, x26, post_ptr(sp, 16));
+        ldp(x23, x24, post_ptr(sp, 16));
+        ldp(x21, x22, post_ptr(sp, 16));
+        ldp(x19, x20, post_ptr(sp, 16));
         ret();
 
         // Finalize the xbyak_aarch64 buffer (lays out labels). We manage
