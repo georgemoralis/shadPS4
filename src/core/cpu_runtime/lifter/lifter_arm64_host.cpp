@@ -4,22 +4,27 @@
 // ============================================================================
 // ARM64 (AArch64) lifter — macOS / Apple Silicon ONLY.
 //
-// STATUS: structural skeleton. This compiles and links into an arm64 build,
-// but implements only THREE representative emitters, one per distinct
-// translation shape:
+// STATUS: verified infrastructure baseline, NO instruction emitters.
+// This compiles and links into an arm64 build and exercises the full runtime
+// path — gateway prologue/epilogue, dispatch loop, MAP_JIT W^X bracketing,
+// icache invalidation, block compilation, and the unsupported-exit terminator
+// — all of which are confirmed to execute on real Apple Silicon. What it does
+// NOT do is translate any guest instruction: every decoded instruction routes
+// to EmitUnsupportedExit, so a real workload bails on its first instruction.
 //
-//   1. GPR move            (GuestState<->host reg data movement)
-//   2. 64-bit ADD          (arithmetic + lazy-flag side-band write-back)
-//   3. vector op via NEON   (validates the YMM-in-memory + per-lane model)
-//   plus the block terminator (br x26 normal / br x25 fatal)
+// This is deliberate. Earlier drafts carried a few representative emitters
+// (GPR move, 64-bit ADD, NEON vpaddd) as pattern demonstrations, but none had
+// been confirmed correct by a passing test on arm64 hardware. An emitter that
+// is subtly wrong is worse than none — it silently corrupts guest state rather
+// than taking the clean, diagnosable unsupported-exit. So the lifter is held
+// to "verified only": emitters are (re)introduced one at a time, each landing
+// only after a green arm64 test proves it. The x86 host lifter remains the
+// reference for the translation shapes (GPR load-op-store, lazy-flag side-band,
+// NEON 128-bit lane ops); the helpers and scratch-register conventions below
+// are kept ready for that work.
 //
-// Every other guest instruction falls through to EmitUnsupportedExit, so a
-// real workload will bail almost immediately. The remaining ~hundred x86
-// emitters port mechanically by matching each to one of the shapes above;
-// that port is the follow-up work. This file exists so the arm64 build
-// configures/compiles/links and the runtime can be exercised end-to-end on
-// real hardware (the CI macos-arm64 job is the first compile-check — the
-// x86_64 dev sandbox has no xbyak_aarch64).
+// The CI macos-arm64 job is the only compile/run check — the x86_64 dev
+// sandbox has no xbyak_aarch64.
 //
 // Two macOS/Apple-Silicon facts drive the structure:
 //
@@ -122,21 +127,21 @@ constexpr u64 BLOCK_GUEST_SIZE_CAP = 1024;
 // class with no constexpr constructor, so these are `const`, not constexpr.
 const XReg kState = XReg(28);     // GuestState* (x86 r13 analog)
 const XReg kScratch0 = XReg(9);   // primary scratch (rax analog)
-const XReg kScratch1 = XReg(10);  // secondary scratch (rcx analog)
-const XReg kAddr = XReg(11);      // address scratch (rdx analog)
-const XReg kScratch2 = XReg(12);  // additional transient
+[[maybe_unused]] const XReg kScratch1 = XReg(10);  // secondary scratch (rcx analog)
+[[maybe_unused]] const XReg kAddr = XReg(11);      // address scratch (rdx analog)
+[[maybe_unused]] const XReg kScratch2 = XReg(12);  // additional transient
 const XReg kExitStub = XReg(25);  // fatal-exit stub (x86 r15 analog)
 const XReg kDispatchTop = XReg(26); // dispatcher-loop top (x86 r14 analog)
 const WReg kWScratch0 = WReg(9);  // 32-bit view of x9
-const WReg kWScratch3 = WReg(13); // 32-bit transient (flag_op write)
+[[maybe_unused]] const WReg kWScratch3 = WReg(13); // 32-bit transient (flag_op write)
 
-constexpr u32 GprOffset(int idx) {
+[[maybe_unused]] constexpr u32 GprOffset(int idx) {
     return static_cast<u32>(Offsets::Gpr + idx * 8);
 }
 
 // YMM lane chunk offset — identical layout to x86. lane 0..31,
 // chunk 0..3 (each chunk is a u64). Stride 4 u64 = 32 bytes/lane.
-constexpr u32 YmmChunkOffset(int lane, int chunk) {
+[[maybe_unused]] constexpr u32 YmmChunkOffset(int lane, int chunk) {
     return static_cast<u32>(offsetof(GuestState, ymm) + (lane * 4 + chunk) * 8);
 }
 
@@ -144,7 +149,7 @@ constexpr u32 YmmChunkOffset(int lane, int chunk) {
 // lifter's helpers exactly; both live in their TU's anonymous namespace,
 // so the arm64 lifter needs its own copy (the x86 definitions are not
 // linked into an arm64 build).
-int ZydisGprToIndex(ZydisRegister r) {
+[[maybe_unused]] int ZydisGprToIndex(ZydisRegister r) {
     if (r >= ZYDIS_REGISTER_RAX && r <= ZYDIS_REGISTER_R15) {
         return r - ZYDIS_REGISTER_RAX;
     }
@@ -170,7 +175,7 @@ int ZydisGprToIndex(ZydisRegister r) {
     return -1;
 }
 
-int ZydisVecToIndex(ZydisRegister reg) {
+[[maybe_unused]] int ZydisVecToIndex(ZydisRegister reg) {
     if (reg >= ZYDIS_REGISTER_XMM0 && reg <= ZYDIS_REGISTER_XMM31) {
         return static_cast<int>(reg) - static_cast<int>(ZYDIS_REGISTER_XMM0);
     }
@@ -182,110 +187,30 @@ int ZydisVecToIndex(ZydisRegister reg) {
 
 // Shared lazy-flag op enum value (matches the x86 lifter + the
 // host-agnostic materializer in runtime.cpp).
-constexpr u32 FLAG_OP_ADD = 1;
+[[maybe_unused]] constexpr u32 FLAG_OP_ADD = 1;
 
 // ----------------------------------------------------------------------------
-// PATTERN 1 — GPR MOVE.  guest: mov r64, r64
-//   x86:   mov rax,[r13+src]; mov [r13+dst],rax
-//   arm64: ldr x9,[x28,#src]; str x9,[x28,#dst]
-// ----------------------------------------------------------------------------
-bool EmitMov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-             u64 next_rip, CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_MOV) return false;
-    if (insn.operand_count_visible != 2) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) {
-        return false; // draft: reg-reg only
-    }
-    const int dst = ZydisGprToIndex(ops[0].reg.value);
-    const int src = ZydisGprToIndex(ops[1].reg.value);
-    if (dst < 0 || src < 0) return false;
-
-    c.ldr(kScratch0, ptr(kState, GprOffset(src)));
-    c.str(kScratch0, ptr(kState, GprOffset(dst)));
-    return true;
-}
-
-// ----------------------------------------------------------------------------
-// PATTERN 2 — 64-bit ADD with lazy flags.  guest: add r64, r64
+// INSTRUCTION EMITTERS — intentionally empty.
 //
-// The lazy-flag side-band model is HOST-AGNOSTIC: it decides WHEN to
-// materialize guest RFLAGS, not how host flags map. We do the host
-// arithmetic, write the result, and stash (op, lhs, rhs, result) for the
-// runtime's materializer — identical strategy to x86. We deliberately do
-// NOT map host NZCV onto guest RFLAGS (different bit layout, AF/PF have
-// no NZCV equivalent).
-// ----------------------------------------------------------------------------
-bool EmitAdd64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-               u64 next_rip, CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_ADD) return false;
-    if (insn.operand_width != 64) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) {
-        return false;
-    }
-    const int dst = ZydisGprToIndex(ops[0].reg.value);
-    const int src = ZydisGprToIndex(ops[1].reg.value);
-    if (dst < 0 || src < 0) return false;
-
-    c.ldr(kScratch0, ptr(kState, GprOffset(dst))); // lhs (== src1)
-    c.ldr(kScratch1, ptr(kState, GprOffset(src))); // rhs
-    c.add(kScratch2, kScratch0, kScratch1);        // result
-    c.str(kScratch2, ptr(kState, GprOffset(dst)));
-
-    // Lazy-flag side-band.
-    c.mov(kWScratch3, FLAG_OP_ADD);
-    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
-    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
-    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
-    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
-    return true;
-}
-
-// ----------------------------------------------------------------------------
-// PATTERN 3 — vector op via NEON.  guest: vpaddd xmm, xmm, xmm (128-bit)
+// This lifter currently implements NO guest-instruction emitters. Every
+// decoded instruction routes to the fatal unsupported-exit below. That is
+// deliberate: the gateway, dispatch loop, W^X bracketing, icache flush,
+// block compilation, and the unsupported-exit path are all verified to
+// execute correctly on Apple Silicon, but no instruction emitter has yet
+// been confirmed correct by a passing test on real hardware. An emitter
+// that is subtly wrong is worse than none — it silently corrupts guest
+// state instead of taking this clean, diagnosable exit.
 //
-// YMM-in-memory model identical to x86. NEON is 128-bit only, so the
-// 256-bit form (deferred in this draft) becomes TWO of these — which maps
-// onto the x86 lifter's existing "per-128-bit-lane loop". We materialize
-// the chunk base into kAddr and use register addressing, since high-lane
-// YmmChunkOffsets exceed the q-register ldr/str immediate range.
+// Emitters are added back one at a time, each only after a green test on
+// arm64 confirms it. The patterns to follow when porting (GPR load-op-store,
+// lazy-flag side-band, NEON 128-bit lane ops) live in the x86 host lifter
+// and the project notes; the helpers above (ZydisGprToIndex / ZydisVecToIndex
+// / GprOffset / YmmChunkOffset / FLAG_OP_ADD) are the scaffolding they need
+// and are kept here ready for that work.
 // ----------------------------------------------------------------------------
-bool EmitVpaddd128(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-                   u64 next_rip, CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_VPADDD) return false;
-    if (insn.operand_count_visible != 3) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[2].type != ZYDIS_OPERAND_TYPE_REGISTER) {
-        return false; // draft: reg-reg-reg only
-    }
-    if (ops[0].size != 128) return false; // draft: skip 256 for now
-
-    const int dst = ZydisVecToIndex(ops[0].reg.value);
-    const int s1 = ZydisVecToIndex(ops[1].reg.value);
-    const int s2 = ZydisVecToIndex(ops[2].reg.value);
-    if (dst < 0 || s1 < 0 || s2 < 0) return false;
-
-    c.add(kAddr, kState, YmmChunkOffset(s1, 0));
-    c.ld1(VReg4S(0), ptr(kAddr));   // v0.4s = src1 low-128
-    c.add(kAddr, kState, YmmChunkOffset(s2, 0));
-    c.ld1(VReg4S(1), ptr(kAddr));   // v1.4s = src2 low-128
-    c.add(VReg4S(0), VReg4S(0), VReg4S(1)); // per-lane 32-bit add
-    c.add(kAddr, kState, YmmChunkOffset(dst, 0));
-    c.st1(VReg4S(0), ptr(kAddr));   // store result low-128
-    // VEX-128: zero upper 128 bits (chunks 2,3). Use a zeroed GPR pair
-    // rather than xzr — xbyak_aarch64's register-31 spelling (xzr vs sp) is
-    // type-disambiguated and not reachable here as a bare instance, so we
-    // materialize zero in a scratch and store the pair.
-    c.mov(kScratch0, 0);
-    c.add(kAddr, kState, YmmChunkOffset(dst, 2));
-    c.stp(kScratch0, kScratch0, ptr(kAddr));
-    return true;
-}
 
 // ----------------------------------------------------------------------------
-// PATTERN 4 — fatal-exit tail (unsupported instruction).
+// Fatal-exit tail (unsupported instruction).
 //   set state.rip, set exit_reason, br x25.
 // ----------------------------------------------------------------------------
 void EmitUnsupportedExit(u64 rip, CodeGenerator& c) {
@@ -357,20 +282,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
 
         const u64 next_rip = rip + insn.length;
         bool handled = false;
-        switch (insn.mnemonic) {
-        case ZYDIS_MNEMONIC_MOV:
-            if (insn.operand_width == 64) handled = EmitMov(insn, ops, next_rip, c);
-            break;
-        case ZYDIS_MNEMONIC_ADD:
-            if (insn.operand_width == 64) handled = EmitAdd64(insn, ops, next_rip, c);
-            break;
-        case ZYDIS_MNEMONIC_VPADDD:
-            handled = EmitVpaddd128(insn, ops, next_rip, c);
-            break;
-        // ... ~hundred more emitters port here following patterns 1-4 ...
-        default:
-            break;
-        }
+        // No instruction emitters yet — every mnemonic falls through to the
+        // unsupported-exit below. Emitters are added back here one at a time,
+        // each gated behind a passing arm64 test. See the note above the
+        // (currently empty) emitter section.
+        (void)next_rip;
+        (void)ops;
 
         if (!handled) {
             ++unsupported_hits_;
