@@ -10973,7 +10973,9 @@ TEST_F(CpuRuntimeTest, Addr32_BaseUpperBitsIgnored) {
     rt.Run(st);
     EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x12345678u)
         << "store landed at the 32-bit-truncated address";
+#if !defined(_WIN32)
     ::munmap(low, 4096);
+#endif
 }
 
 // mov [ebx + ecx*4], eax with BOTH base and index carrying garbage
@@ -11003,7 +11005,9 @@ TEST_F(CpuRuntimeTest, Addr32_BasePlusIndexTruncated) {
     rt.Run(st);
     EXPECT_EQ(*reinterpret_cast<u32*>(target), 0xABCDEF01u)
         << "base+index*scale truncated to 32 bits before access";
+#if !defined(_WIN32)
     ::munmap(low, 4096);
+#endif
 }
 
 // Regression guard: a NORMAL 64-bit-mode access (no 0x67 prefix) must
