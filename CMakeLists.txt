@@ -326,6 +326,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_CXX_COMPILER_ID STREQUAL "Ap
     endif()
 endif()
 
+add_subdirectory(3rdparty)
 add_subdirectory(externals)
 include_directories(src)
 
