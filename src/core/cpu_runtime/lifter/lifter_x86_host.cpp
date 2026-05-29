@@ -4703,33 +4703,56 @@ bool EmitVsqrtss(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     return EmitScalarFp(insn, ops, next_rip, c, ScalarFpKind::Sqrt, ScalarFpPrec::Single);
 }
 
-/// VBLENDPS — packed single-precision blend, controlled by imm8 mask.
+/// VBLENDPS / VPBLENDW — packed blend controlled by an imm8 mask.
+/// Both are 4-operand (dst, src1, src2/mem, imm8) immediate-mask
+/// blends; they differ only in element granularity and the host
+/// mnemonic. Parameterised here at the second instance (VPBLENDW).
 ///
-///   VBLENDPS xmm1, xmm2, xmm3/m128, imm8     ; 4 elements (128-bit)
-///   VBLENDPS ymm1, ymm2, ymm3/m256, imm8     ; 8 elements (256-bit)
+///   VBLENDPS xmm/ymm, src1, src2/m, imm8   ; 32-bit float-word lanes
+///   VPBLENDW xmm/ymm, src1, src2/m, imm8   ; 16-bit integer-word lanes
 ///
-/// For each 32-bit single-precision lane i:
-///   if imm8[i] == 0 → dst[i] = src1[i]
-///   if imm8[i] == 1 → dst[i] = src2[i]
+/// Per lane i (of the element width for the kind):
+///   imm8 bit for lane i == 0 → dst[i] = src1[i]
+///   imm8 bit for lane i == 1 → dst[i] = src2[i]
 ///
-/// For 128-bit (4 elements): imm8 low nibble selects; high nibble reserved.
-/// For 256-bit (8 elements): all 8 bits of imm8 are used.
-/// 128-bit form additionally zeros bits 255:128 of YMM (VEX architectural).
+/// imm8 BIT-SEMANTICS differ between the two, and this matters for
+/// the 256-bit forms — but in both cases the HOST op interprets imm8,
+/// so we pass the raw byte straight through and never decode it
+/// ourselves:
+///   * VBLENDPS: 1 bit per 32-bit element. 128-bit uses imm8[3:0]
+///     (high nibble reserved); 256-bit uses all 8 bits (one per
+///     element across both lanes).
+///   * VPBLENDW: 1 bit per 16-bit word, covering the 8 words of ONE
+///     128-bit lane (imm8[7:0]). For the 256-bit form the SAME imm8
+///     pattern is replicated to the upper 128-bit lane — imm8 does
+///     NOT widen to 16 bits. The host vpblendw ymm does this
+///     replication internally, so passing imm8 unchanged is correct.
 ///
-/// Implementation: the imm8 control byte logic is non-trivial to lift
-/// directly (would require per-element conditional moves with the
-/// imm8 bits as constant predicates). Much simpler to run host
-/// VBLENDPS — the imm8 is encoded in the guest instruction stream
-/// so we have it at lift time and just pass it through to xbyak's
-/// 4-operand form.
+/// Implementation: the imm8 control logic is non-trivial to lift
+/// directly (per-element conditional moves keyed on constant imm8
+/// bits). Much simpler to run the host blend — the imm8 is in the
+/// guest instruction stream so we have it at lift time. 128-bit form
+/// additionally zeros bits 255:128 of the dst YMM (VEX architectural).
 ///
-/// Compilers emit VBLENDPS for branchless selection — e.g. picking
-/// between two computed alternatives based on a fixed condition
-/// pattern that the compiler proved at compile time.
-bool EmitVblendps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops, u64 next_rip,
-                  Xbyak::CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_VBLENDPS)
+/// Compilers emit these for branchless selection — picking between
+/// two computed alternatives on a fixed compile-time-proven pattern.
+enum class VecBlendImm { Ps, W };
+
+bool EmitVecBlendImm(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                     u64 next_rip, Xbyak::CodeGenerator& c, VecBlendImm kind) {
+    // Mnemonic gating — defensive routing check.
+    auto expected = [&]() -> ZydisMnemonic {
+        switch (kind) {
+        case VecBlendImm::Ps:
+            return ZYDIS_MNEMONIC_VBLENDPS;
+        case VecBlendImm::W:
+            return ZYDIS_MNEMONIC_VPBLENDW;
+        }
+        return ZYDIS_MNEMONIC_INVALID;
+    }();
+    if (insn.mnemonic != expected)
         return false;
+
     if (insn.operand_count_visible != 4)
         return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER)
@@ -4750,13 +4773,33 @@ bool EmitVblendps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 
     const u8 imm = static_cast<u8>(ops[3].imm.value.u);
 
+    // Dispatch the host blend op for the kind, at the given width.
+    auto emit_blend_128 = [&]() {
+        switch (kind) {
+        case VecBlendImm::Ps:
+            c.vblendps(xmm0, xmm0, xmm1, imm);
+            break;
+        case VecBlendImm::W:
+            c.vpblendw(xmm0, xmm0, xmm1, imm);
+            break;
+        }
+    };
+    auto emit_blend_256 = [&]() {
+        switch (kind) {
+        case VecBlendImm::Ps:
+            c.vblendps(ymm0, ymm0, ymm1, imm);
+            break;
+        case VecBlendImm::W:
+            c.vpblendw(ymm0, ymm0, ymm1, imm);
+            break;
+        }
+    };
+
     // Branch on vector width — different host registers (xmm vs ymm)
     // and different storeback chunk counts.
     if (vec_bits == 128) {
-        // Load src1 full xmm into xmm0.
         c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src1_vec, 0)]);
 
-        // Load src2 into xmm1.
         if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int src2_vec = ZydisVecToIndex(ops[2].reg.value);
             if (src2_vec < 0)
@@ -4770,10 +4813,8 @@ bool EmitVblendps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
             return false;
         }
 
-        // Run host blend with the imm8 control byte.
-        c.vblendps(xmm0, xmm0, xmm1, imm);
+        emit_blend_128();
 
-        // Storeback + zero upper YMM.
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_vec, 0)], xmm0);
         c.xor_(rax, rax);
         c.mov(qword[r13 + YmmChunkOffset(dst_vec, 2)], rax);
@@ -4794,7 +4835,7 @@ bool EmitVblendps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
             return false;
         }
 
-        c.vblendps(ymm0, ymm0, ymm1, imm);
+        emit_blend_256();
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_vec, 0)], ymm0);
     }
     return true;
@@ -8028,7 +8069,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitVsqrtss(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_VBLENDPS:
-            handled = EmitVblendps(insn, ops, next_rip, c);
+            handled = EmitVecBlendImm(insn, ops, next_rip, c, VecBlendImm::Ps);
+            break;
+        case ZYDIS_MNEMONIC_VPBLENDW:
+            handled = EmitVecBlendImm(insn, ops, next_rip, c, VecBlendImm::W);
             break;
         case ZYDIS_MNEMONIC_VBLENDVPS:
             handled = EmitVblendvps(insn, ops, next_rip, c);

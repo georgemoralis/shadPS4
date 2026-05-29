@@ -7980,5 +7980,106 @@ TEST_F(CpuRuntimeTest, Vpsrld_LargeShiftCount_ClampsToZero) {
     EXPECT_EQ(static_cast<u32>(st.ymm[1] >> 32), 0u);
 }
 
+// ============================================================================
+// VPBLENDW — per-16-bit-word immediate-mask blend. Routed through
+// EmitVecBlendImm alongside VBLENDPS via the second-instance refactor.
+// Each of imm8's 8 bits selects word i: bit==0 -> src1 word, bit==1 ->
+// src2 word. For the 256-bit form the same imm8 byte is replicated to
+// both 128-bit lanes (imm8 does not widen). These tests pin the word
+// granularity and the per-bit select direction.
+// ============================================================================
+
+// imm8 = 0xAA = 1010 1010: odd-indexed words from src2, even from src1.
+TEST_F(CpuRuntimeTest, Vpblendw_AlternatingMask_SelectsWords) {
+    // vpblendw xmm0, xmm1, xmm2, 0xAA — c4 e3 71 0e c2 aa (6 bytes)
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0xaa, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 = xmm1 (lane 4): all words = 0x1111
+    st.ymm[4] = 0x1111111111111111ULL;
+    st.ymm[5] = 0x1111111111111111ULL;
+    // src2 = xmm2 (lane 8): all words = 0x2222
+    st.ymm[8] = 0x2222222222222222ULL;
+    st.ymm[9] = 0x2222222222222222ULL;
+    // pre-pollute dst upper YMM
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // imm8=0xAA: words 0,2,4,6 from src1 (0x1111); words 1,3,5,7 from
+    // src2 (0x2222). Each 64-bit chunk holds 4 words; pattern per chunk
+    // (little-endian, word0 in low bits): 0x2222 1111 2222 1111.
+    EXPECT_EQ(st.ymm[0], 0x2222111122221111ULL) << "low chunk: w0=src1 w1=src2 w2=src1 w3=src2";
+    EXPECT_EQ(st.ymm[1], 0x2222111122221111ULL) << "high chunk: w4=src1 w5=src2 w6=src1 w7=src2";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// imm8 = 0x00: all words from src1. imm8 = 0xFF: all words from src2.
+TEST_F(CpuRuntimeTest, Vpblendw_AllZeroAllOne_PickPureSource) {
+    // Two instructions: blend with 0x00 into xmm0, then 0xFF into xmm3.
+    // vpblendw xmm0, xmm1, xmm2, 0x00
+    // vpblendw xmm3, xmm1, xmm2, 0xFF
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0x00, // -> xmm0 = src1
+        0xc4, 0xe3, 0x71, 0x0e, 0xda, 0xff, // -> xmm3 = src2
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x1111111111111111ULL; // src1 lo
+    st.ymm[5] = 0x1111111111111111ULL; // src1 hi
+    st.ymm[8] = 0x2222222222222222ULL; // src2 lo
+    st.ymm[9] = 0x2222222222222222ULL; // src2 hi
+
+    Runtime rt;
+    rt.Run(st);
+    // xmm0 (dst lane 0): imm8=0x00 -> all src1
+    EXPECT_EQ(st.ymm[0], 0x1111111111111111ULL) << "imm8=0 -> pure src1";
+    EXPECT_EQ(st.ymm[1], 0x1111111111111111ULL);
+    // xmm3 (dst lane 12 -> chunks 12,13): imm8=0xFF -> all src2
+    EXPECT_EQ(st.ymm[12], 0x2222222222222222ULL) << "imm8=0xFF -> pure src2";
+    EXPECT_EQ(st.ymm[13], 0x2222222222222222ULL);
+}
+
+// Distinct per-word values verify the exact word lane mapping (not just
+// uniform fills). imm8 = 0x03 = 0000 0011: words 0,1 from src2; 2..7 src1.
+TEST_F(CpuRuntimeTest, Vpblendw_DistinctWords_ExactLaneMapping) {
+    // vpblendw xmm0, xmm1, xmm2, 0x03
+    const u8 program[] = {
+        0xc4, 0xe3, 0x71, 0x0e, 0xc2, 0x03, 0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // src1 words 0..7 = 0xA0..0xA7 (in each 16-bit slot)
+    st.ymm[4] = 0x00A300A200A100A0ULL; // words 0,1,2,3
+    st.ymm[5] = 0x00A700A600A500A4ULL; // words 4,5,6,7
+    // src2 words 0..7 = 0xB0..0xB7
+    st.ymm[8] = 0x00B300B200B100B0ULL;
+    st.ymm[9] = 0x00B700B600B500B4ULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // imm8=0x03: word0=src2(B0), word1=src2(B1), word2..7=src1(A2..A7).
+    EXPECT_EQ(st.ymm[0], 0x00A300A200B100B0ULL)
+        << "w0=B0 w1=B1 (from src2), w2=A2 w3=A3 (from src1)";
+    EXPECT_EQ(st.ymm[1], 0x00A700A600A500A4ULL) << "w4..w7 all from src1 (imm8 high bits 0)";
+}
+
 } // namespace
 } // namespace Core::Runtime

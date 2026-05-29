@@ -5,7 +5,6 @@
 
 #include <array>
 #include <bit>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -203,30 +202,28 @@ HostReturn CallHostFromGuest(VAddr host_fn, u64 a0, u64 a1, u64 a2, u64 a3, u64 
 void* DispatcherTrampoline(GuestState* state) {
     // Hot path: the dispatcher trampoline is called once per JIT block
     // exit, which in tight loops (memset/memcpy/scan) is once per loop
-    // iteration. Calling fprintf+fflush on every entry is fine for
-    // initial bring-up but masks forward progress in real workloads —
-    // a 3.4 MB memset that takes 217k iterations becomes 30+ seconds
-    // of printf and looks identical to a stuck dispatcher.
+    // iteration. The per-entry diagnostics use LOG_TRACE, which expands
+    // to (void(0)) outside _DEBUG — so in release builds this hot path
+    // touches no logging machinery at all (important: the dispatcher is
+    // reached from a JIT-emitted gateway frame; on the x86/Windows host
+    // an spdlog/fmt SEH stack walk could fault there, and on macOS/arm64
+    // there is no SEH walker but we still want zero hot-path cost).
     //
-    // Gate the per-entry diagnostics behind a "RIP changed since last
-    // entry" check. New RIPs (control transfers, fresh blocks) still
-    // get the full A/B/C dump; repeat entries to the same RIP (back-
-    // edge loops) stay silent. This keeps the diagnostics useful for
-    // catching where execution actually goes wrong without slowing
-    // tight loops to a crawl.
+    // In _DEBUG, gate the per-entry trace behind a "RIP changed since
+    // last entry" check so back-edge loops stay quiet: new RIPs get the
+    // full A/B/C dump; repeat entries to the same RIP are silent. This
+    // keeps debug tracing useful without drowning tight loops.
     static thread_local u64 prev_logged_rip = 0;
     const u64 cur_rip = state->rip;
     const bool rip_changed = (cur_rip != prev_logged_rip);
     if (rip_changed) {
         prev_logged_rip = cur_rip;
-        std::fprintf(stderr, "[disp] A: enter state=%p\n", (void*)state);
-        std::fprintf(stderr, "[disp] B: state->rip=0x%llx\n", (unsigned long long)cur_rip);
+        LOG_TRACE(Core, "Dispatcher: enter state={} rip={:#x}", static_cast<void*>(state), cur_rip);
     }
 
     Runtime* rt = tl_active_runtime;
     if (rip_changed) {
-        std::fprintf(stderr, "[disp] C: rt=%p\n", (void*)rt);
-        std::fflush(stderr);
+        LOG_TRACE(Core, "Dispatcher: active runtime={}", static_cast<void*>(rt));
     }
 
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
@@ -239,9 +236,10 @@ void* DispatcherTrampoline(GuestState* state) {
     // at 10 M to catch only true infinite loops (no forward progress
     // at all) rather than slow ones.
     //
-    // The watchdog still fires on the same-RIP re-entry pattern; what
-    // we lost was the printf-bound slowdown that was making every
-    // real workload look like an infinite loop.
+    // The watchdog fires regardless of build flavor (it's a real fault
+    // condition, not a trace), so it uses LOG_ERROR. It runs at most
+    // once per stuck site (the == comparison, not >=), so the logging
+    // cost is a non-issue.
     {
         static thread_local u64 last_rip = 0;
         static thread_local u64 same_rip_hits = 0;
@@ -253,20 +251,18 @@ void* DispatcherTrampoline(GuestState* state) {
         }
         constexpr u64 kStuckThreshold = 10'000'000;
         if (same_rip_hits == kStuckThreshold) {
-            std::fprintf(stderr,
-                         "[disp] STUCK at 0x%llx after %llu re-entries; "
-                         "dumping guest GPRs and exiting fatally:\n",
-                         (unsigned long long)cur_rip, (unsigned long long)same_rip_hits);
+            LOG_ERROR(Core,
+                      "Dispatcher: STUCK at {:#x} after {} re-entries; "
+                      "dumping guest GPRs and exiting fatally",
+                      cur_rip, same_rip_hits);
             static const char* const kGprNames[16] = {
                 "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
                 "r8",  "r9",  "r10", "r11", "r12", "r13", "r14", "r15",
             };
             for (int i = 0; i < 16; ++i) {
-                std::fprintf(stderr, "  %s = 0x%llx\n", kGprNames[i],
-                             (unsigned long long)state->gpr[i]);
+                LOG_ERROR(Core, "  {} = {:#x}", kGprNames[i], state->gpr[i]);
             }
-            std::fprintf(stderr, "  rflags = 0x%llx\n", (unsigned long long)state->rflags);
-            std::fflush(stderr);
+            LOG_ERROR(Core, "  rflags = {:#x}", state->rflags);
             state->exit_reason = static_cast<u32>(ExitReason::UnsupportedInstruction);
             return nullptr;
         }
@@ -297,16 +293,19 @@ void* DispatcherTrampoline(GuestState* state) {
             const VAddr host_fn = state->rip;
 
             // Read the guest return address now (before the call)
-            // so we can log it. If the host fn crashes, this log
+            // so we can log it. If the host fn crashes, this trace
             // line will be the last thing emitted — telling us
             // *which* host fn crashed and *which* guest block
             // called it.
             //
-            // We use fprintf+fflush rather than LOG_* because the
-            // dispatcher is reached from a JIT-emitted gateway
-            // frame that doesn't have Windows unwind info
-            // registered; spdlog/fmt internal SEH walks would
-            // fault. The same workaround is used in CompileBlock.
+            // Logging here uses LOG_TRACE for the per-call dump (the
+            // common case, compiled out in release so the bridge hot
+            // path is free) and LOG_WARNING only for the unregistered-
+            // target case (rare, a real diagnostic worth keeping in
+            // release). The dispatcher is reached from a JIT-emitted
+            // gateway frame; LOG_TRACE being (void(0)) in release means
+            // the per-call path never invokes spdlog/fmt there, and on
+            // the macOS/arm64 target there is no SEH walker to trip.
             const u64 guest_rsp = state->gpr[kGuestRsp];
             const u64 guest_return_addr = *reinterpret_cast<const u64*>(guest_rsp);
 
@@ -355,49 +354,33 @@ void* DispatcherTrampoline(GuestState* state) {
             const u64 s7 = guest_stack_args[7];
 
             if (name.empty()) {
-                std::fprintf(stderr,
-                             "[bridge] WARNING unregistered host=0x%llx ret=0x%llx | "
-                             "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                             "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
-                             (unsigned long long)host_fn, (unsigned long long)guest_return_addr,
-                             (unsigned long long)state->gpr[7], (unsigned long long)state->gpr[6],
-                             (unsigned long long)state->gpr[2], (unsigned long long)state->gpr[1],
-                             (unsigned long long)state->gpr[8], (unsigned long long)state->gpr[9]);
+                LOG_WARNING(Core,
+                            "Bridge: unregistered host={:#x} ret={:#x} | "
+                            "rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x}",
+                            host_fn, guest_return_addr, state->gpr[7], state->gpr[6], state->gpr[2],
+                            state->gpr[1], state->gpr[8], state->gpr[9]);
             } else {
-                // %.*s lets us print a non-null-terminated
-                // string_view without copying it. The cast to int
-                // is required because precision uses int width.
-                std::fprintf(stderr,
-                             "[bridge] call %.*s host=0x%llx ret=0x%llx | "
-                             "rdi=0x%llx rsi=0x%llx rdx=0x%llx "
-                             "rcx=0x%llx r8=0x%llx r9=0x%llx\n",
-                             static_cast<int>(name.size()), name.data(),
-                             (unsigned long long)host_fn, (unsigned long long)guest_return_addr,
-                             (unsigned long long)state->gpr[7], (unsigned long long)state->gpr[6],
-                             (unsigned long long)state->gpr[2], (unsigned long long)state->gpr[1],
-                             (unsigned long long)state->gpr[8], (unsigned long long)state->gpr[9]);
+                // fmt prints a std::string_view natively via {} — no
+                // null terminator or %.*s width dance needed.
+                LOG_TRACE(Core,
+                          "Bridge: call {} host={:#x} ret={:#x} | "
+                          "rdi={:#x} rsi={:#x} rdx={:#x} rcx={:#x} r8={:#x} r9={:#x}",
+                          name, host_fn, guest_return_addr, state->gpr[7], state->gpr[6],
+                          state->gpr[2], state->gpr[1], state->gpr[8], state->gpr[9]);
             }
-            // Log XMM args on a continuation line. Print as hex bit
-            // patterns rather than decimals — they're easier to
-            // recognize as "this is 1.0" vs "this is garbage" by eye.
-            std::fprintf(stderr,
-                         "[bridge]   xmm0=0x%llx xmm1=0x%llx xmm2=0x%llx xmm3=0x%llx "
-                         "xmm4=0x%llx xmm5=0x%llx xmm6=0x%llx xmm7=0x%llx\n",
-                         (unsigned long long)state->ymm[0], (unsigned long long)state->ymm[4],
-                         (unsigned long long)state->ymm[8], (unsigned long long)state->ymm[12],
-                         (unsigned long long)state->ymm[16], (unsigned long long)state->ymm[20],
-                         (unsigned long long)state->ymm[24], (unsigned long long)state->ymm[28]);
-            // Log stack-spilled args on a third continuation line.
-            // Same caveats as XMM line: if the function takes few
-            // stack args, the latter slots are whatever the guest
-            // happened to leave there. Still useful for diagnosis.
-            std::fprintf(stderr,
-                         "[bridge]   stk0=0x%llx stk1=0x%llx stk2=0x%llx stk3=0x%llx "
-                         "stk4=0x%llx stk5=0x%llx stk6=0x%llx stk7=0x%llx\n",
-                         (unsigned long long)s0, (unsigned long long)s1, (unsigned long long)s2,
-                         (unsigned long long)s3, (unsigned long long)s4, (unsigned long long)s5,
-                         (unsigned long long)s6, (unsigned long long)s7);
-            std::fflush(stderr);
+            // XMM and stack args as TRACE-level detail (hex bit patterns
+            // — easier to eyeball "this is 1.0" vs "this is garbage").
+            // These are pure diagnostics, dropped in release; the
+            // actionable unregistered-target signal above is WARNING.
+            LOG_TRACE(Core,
+                      "Bridge:   xmm0={:#x} xmm1={:#x} xmm2={:#x} xmm3={:#x} "
+                      "xmm4={:#x} xmm5={:#x} xmm6={:#x} xmm7={:#x}",
+                      state->ymm[0], state->ymm[4], state->ymm[8], state->ymm[12], state->ymm[16],
+                      state->ymm[20], state->ymm[24], state->ymm[28]);
+            LOG_TRACE(Core,
+                      "Bridge:   stk0={:#x} stk1={:#x} stk2={:#x} stk3={:#x} "
+                      "stk4={:#x} stk5={:#x} stk6={:#x} stk7={:#x}",
+                      s0, s1, s2, s3, s4, s5, s6, s7);
 
             // Unregistered host addresses get a loud WARNING from
             // the log block above, but the call still proceeds. The
@@ -407,11 +390,11 @@ void* DispatcherTrampoline(GuestState* state) {
             // a gating one. (An earlier revision short-circuited
             // unregistered targets to rax=0 as a defense against an
             // unrelated spdlog/fmt SEH-walk crash in LOG_ERROR; that
-            // crash is moot now that the bridge logs via
-            // fprintf+fflush, and the short-circuit made it
-            // impossible for guest code to call any host function
-            // that wasn't pre-registered — which is the wrong
-            // contract for a JIT bridge.)
+            // crash is handled now — the hot-path logging here is
+            // LOG_TRACE which is absent in release, and the one
+            // release-visible call is the LOG_WARNING above — so the
+            // short-circuit was removed. Gating host calls on prior
+            // registration is the wrong contract for a JIT bridge.)
             HostReturn ret =
                 CallHostFromGuest(host_fn,
                                   state->gpr[kSysvArg0], // RDI
@@ -431,18 +414,16 @@ void* DispatcherTrampoline(GuestState* state) {
             const u64 xmm0_bits = std::bit_cast<u64>(ret.xmm0);
             std::memcpy(&state->ymm[0], &xmm0_bits, sizeof(u64));
 
-            // Print the post-return rax/xmm0. If we never see this
-            // line for a given host_fn, that function crashed.
+            // Post-return rax/xmm0 as TRACE detail. If a debug trace
+            // shows the "call" line for a host_fn but never this "ret"
+            // line, that function crashed inside the call.
             if (name.empty()) {
-                std::fprintf(stderr, "[bridge] ret  host=0x%llx -> rax=0x%llx xmm0=0x%llx\n",
-                             (unsigned long long)host_fn, (unsigned long long)ret.rax,
-                             (unsigned long long)xmm0_bits);
+                LOG_TRACE(Core, "Bridge: ret  host={:#x} -> rax={:#x} xmm0={:#x}", host_fn, ret.rax,
+                          xmm0_bits);
             } else {
-                std::fprintf(stderr, "[bridge] ret  %.*s -> rax=0x%llx xmm0=0x%llx\n",
-                             static_cast<int>(name.size()), name.data(),
-                             (unsigned long long)ret.rax, (unsigned long long)xmm0_bits);
+                LOG_TRACE(Core, "Bridge: ret  {} -> rax={:#x} xmm0={:#x}", name, ret.rax,
+                          xmm0_bits);
             }
-            std::fflush(stderr);
 
             // Pop guest return address.
             state->rip = guest_return_addr;
@@ -481,20 +462,21 @@ void Runtime::Run(GuestState& state) {
     // this thread. Setting these is per-Run nesting, not a global
     // lock: nested Run() calls (typical for HLE → guest callback →
     // HLE → guest pattern) restore the outer Run's pointers on exit.
-    std::fprintf(stderr, "[run] R0: enter, state.rip=0x%llx state.gpr[4]=0x%llx\n",
-                 (unsigned long long)state.rip, (unsigned long long)state.gpr[4]);
-    std::fflush(stderr);
+    //
+    // These R0–R3 checkpoints are bring-up trace granularity
+    // (LOG_TRACE: absent in release). Run() is the OUTER entry — it is
+    // not itself in JIT-dispatched context — so logging here is safe
+    // at any level; TRACE is chosen purely because this is checkpoint
+    // detail, not something a release build needs.
+    LOG_TRACE(Core, "Run: R0 enter, state.rip={:#x} state.gpr[4]={:#x}", state.rip, state.gpr[4]);
     Runtime* const saved_rt = tl_active_runtime;
     GuestState* const saved_state = tl_current_guest_state;
-    std::fprintf(stderr, "[run] R1: tls read ok, saved_rt=%p\n", (void*)saved_rt);
-    std::fflush(stderr);
+    LOG_TRACE(Core, "Run: R1 tls read ok, saved_rt={}", static_cast<void*>(saved_rt));
     tl_active_runtime = this;
     tl_current_guest_state = &state;
-    std::fprintf(stderr, "[run] R2: tls write ok\n");
-    std::fflush(stderr);
+    LOG_TRACE(Core, "Run: R2 tls write ok");
     gateway_->Enter(state, &DispatcherTrampoline);
-    std::fprintf(stderr, "[run] R3: gateway returned\n");
-    std::fflush(stderr);
+    LOG_TRACE(Core, "Run: R3 gateway returned");
     tl_current_guest_state = saved_state;
     tl_active_runtime = saved_rt;
 }
