@@ -7,9 +7,9 @@
 // STATUS: minimal emitter set targeting the simplest runtime tests.
 // Beyond the verified infrastructure (gateway, dispatch loop, MAP_JIT W^X
 // bracketing, icache invalidation, block compilation, unsupported-exit), this
-// implements exactly three GPR emitters — MOV (reg/imm), ADD r64 (reg/imm with
-// lazy-flag side-band), and RET — which together make MovAddRet_ProducesCorrectRax
-// and MultipleRegistersAndOpcodes_ProduceCorrectValues executable end-to-end.
+// implements GPR emitters — MOV (reg/imm), ADD r64 (reg/imm), SUB r64 (reg/imm),
+// both with the lazy-flag side-band, and RET — which make the simplest runtime
+// tests (MovAddRet, MultipleRegisters, SubImm) executable end-to-end.
 // Every other instruction form routes to EmitUnsupportedExit. Emitters are
 // added one at a time, each landing only after a green arm64 test confirms it,
 // because an emitter that is subtly wrong silently corrupts guest state rather
@@ -181,6 +181,7 @@ int ZydisGprToIndex(ZydisRegister r) {
 // Shared lazy-flag op enum value (matches the x86 lifter + the
 // host-agnostic materializer in runtime.cpp).
 constexpr u32 FLAG_OP_ADD = 1;
+constexpr u32 FLAG_OP_SUB = 2;
 
 // ----------------------------------------------------------------------------
 // INSTRUCTION EMITTERS.
@@ -258,7 +259,42 @@ bool EmitAdd64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
-// guest: ret (no-immediate form only).
+// guest: sub r64, r64  /  sub r64, imm   (with lazy-flag side-band)
+//   identical shape to EmitAdd64; result = lhs - rhs, op tag = FLAG_OP_SUB.
+// NOTE: like ADD, the side-band (op/lhs/rhs/result) is written for a future
+// runtime materializer; flags are NOT yet derived on arm64 (see header note).
+// Tests that only check the GPR result (e.g. SubImm_DecrementsCorrectly) pass;
+// flag-checking SUB/CMP tests await the materializer.
+bool EmitSub64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_SUB) return false;
+    if (insn.operand_width != 64) return false;
+    if (insn.operand_count_visible != 2) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisGprToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    c.ldr(kScratch0, ptr(kState, GprOffset(dst))); // lhs (== dst current)
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisGprToIndex(ops[1].reg.value);
+        if (src < 0) return false;
+        c.ldr(kScratch1, ptr(kState, GprOffset(src))); // rhs
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(kScratch1, static_cast<u64>(ops[1].imm.value.s)); // rhs (sign-ext imm)
+    } else {
+        return false; // mem forms deferred
+    }
+    c.sub(kScratch2, kScratch0, kScratch1);        // result = lhs - rhs
+    c.str(kScratch2, ptr(kState, GprOffset(dst)));
+
+    // Lazy-flag side-band (host-agnostic; runtime materializes RFLAGS).
+    c.mov(kWScratch3, FLAG_OP_SUB);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    return true;
+}
 //   rip = [rsp]; rsp += 8; exit_reason = BlockEnd; br dispatch-top (normal).
 // Mirrors x86 EmitRet exactly. This is the NORMAL block terminator — it sets
 // emitted_terminator so CompileBlock does not append a fallthrough exit.
@@ -359,6 +395,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_ADD:
             handled = EmitAdd64(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_SUB:
+            handled = EmitSub64(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_RET:
             handled = EmitRet(insn, c);
