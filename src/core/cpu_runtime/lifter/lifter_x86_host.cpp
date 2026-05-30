@@ -749,11 +749,16 @@ bool EmitMovsx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 namespace RflagsBits {
 constexpr u64 CF = 1ULL << 0;
 constexpr u64 PF = 1ULL << 2;
+constexpr u64 AF = 1ULL << 4; // auxiliary carry (carry/borrow out of bit 3)
 constexpr u64 ZF = 1ULL << 6;
 constexpr u64 SF = 1ULL << 7;
 constexpr u64 DF = 1ULL << 10; // direction flag (string-op direction)
 constexpr u64 OF = 1ULL << 11;
-constexpr u64 AllArith = CF | PF | ZF | SF | OF;
+// AF is included so EmitClearArithFlags wipes any stale AF before the per-op
+// helpers OR in the freshly-computed value. ADD/SUB compute AF exactly
+// (carry/borrow out of bit 3); bitwise ops leave it 0 (x86 marks AF undefined
+// after AND/OR/XOR/TEST — 0 is a deterministic, conventional choice).
+constexpr u64 AllArith = CF | PF | AF | ZF | SF | OF;
 } // namespace RflagsBits
 
 /// Emit code that computes PF (parity of the low byte of rax) and
@@ -822,6 +827,16 @@ void EmitFlagsFromSubtract(Xbyak::CodeGenerator& c) {
     c.shl(r8, 11); // OF at bit 11
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
+    // AF for subtract: borrow out of bit 3 = (lhs ^ rhs ^ result) bit 4.
+    // Identical formula for add and subtract, vendor-independent.
+    c.mov(r8, rcx);
+    c.xor_(r8, rdx);
+    c.xor_(r8, rax); // r8 = lhs ^ rhs ^ result
+    c.shr(r8, 4);    // bring bit 4 down to bit 0
+    c.and_(r8, 1);
+    c.shl(r8, 4);    // AF at bit 4
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
     // PF: parity of low byte of result.
     EmitWritePF(c);
 }
@@ -861,6 +876,15 @@ void EmitFlagsFromAdd(Xbyak::CodeGenerator& c) {
     c.and_(r8, r9);
     c.shr(r8, 63);
     c.shl(r8, 11);
+    c.or_(qword[r13 + Offsets::Rflags], r8);
+
+    // AF for add: carry out of bit 3 = (lhs ^ rhs ^ result) bit 4.
+    c.mov(r8, rcx);
+    c.xor_(r8, rdx);
+    c.xor_(r8, rax); // r8 = lhs ^ rhs ^ result
+    c.shr(r8, 4);
+    c.and_(r8, 1);
+    c.shl(r8, 4);    // AF at bit 4
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
     // PF: parity of low byte of result.
