@@ -8,8 +8,9 @@
 // Beyond the verified infrastructure (gateway, dispatch loop, MAP_JIT W^X
 // bracketing, icache invalidation, block compilation, unsupported-exit), this
 // implements GPR emitters — MOV (reg/imm), ADD r64 (reg/imm), SUB r64 (reg/imm),
-// both with the lazy-flag side-band, and RET — which make the simplest runtime
-// tests (MovAddRet, MultipleRegisters, SubImm) executable end-to-end.
+// both arith with the lazy-flag side-band, PUSH (reg/imm), POP (reg), and RET —
+// which make the simplest runtime tests (MovAddRet, MultipleRegisters, SubImm,
+// PushPop) executable end-to-end.
 // Every other instruction form routes to EmitUnsupportedExit. Emitters are
 // added one at a time, each landing only after a green arm64 test confirms it,
 // because an emitter that is subtly wrong silently corrupts guest state rather
@@ -295,6 +296,52 @@ bool EmitSub64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
     return true;
 }
+
+// guest: push r64 / push imm.   value = src; rsp -= 8; [rsp] = value.
+// (mem source deferred — needs effective-address emitter.) No flags affected.
+bool EmitPush(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_PUSH) return false;
+    if (insn.operand_width != 64) return false;
+    if (insn.operand_count_visible != 1) return false;
+
+    constexpr int RSP_IDX = 4;
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisGprToIndex(ops[0].reg.value);
+        if (src < 0) return false;
+        c.ldr(kScratch0, ptr(kState, GprOffset(src)));
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(kScratch0, static_cast<u64>(ops[0].imm.value.s)); // sign-extended
+    } else {
+        return false; // mem source deferred
+    }
+    c.ldr(kScratch1, ptr(kState, GprOffset(RSP_IDX))); // x10 = guest RSP
+    c.sub(kScratch1, kScratch1, 8);
+    c.str(kScratch0, ptr(kScratch1));                  // write to guest stack
+    c.str(kScratch1, ptr(kState, GprOffset(RSP_IDX))); // update RSP
+    return true;
+}
+
+// guest: pop r64.   reg = [rsp]; rsp += 8.   No flags affected.
+bool EmitPop(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_POP) return false;
+    if (insn.operand_width != 64) return false;
+    if (insn.operand_count_visible != 1) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisGprToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    constexpr int RSP_IDX = 4;
+    c.ldr(kScratch1, ptr(kState, GprOffset(RSP_IDX))); // x10 = guest RSP
+    c.ldr(kScratch0, ptr(kScratch1));                  // x9 = [rsp]
+    c.add(kScratch1, kScratch1, 8);                    // rsp += 8
+    c.str(kScratch1, ptr(kState, GprOffset(RSP_IDX))); // update RSP
+    c.str(kScratch0, ptr(kState, GprOffset(dst)));     // dst = popped value
+    return true;
+}
+
+// guest: ret (no-immediate form only).
 //   rip = [rsp]; rsp += 8; exit_reason = BlockEnd; br dispatch-top (normal).
 // Mirrors x86 EmitRet exactly. This is the NORMAL block terminator — it sets
 // emitted_terminator so CompileBlock does not append a fallthrough exit.
@@ -398,6 +445,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_SUB:
             handled = EmitSub64(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_PUSH:
+            handled = EmitPush(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_POP:
+            handled = EmitPop(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_RET:
             handled = EmitRet(insn, c);
