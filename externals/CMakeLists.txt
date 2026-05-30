@@ -109,11 +109,6 @@ if (NOT TARGET tsl::robin_map)
     add_subdirectory(robin-map)
 endif()
 
-# Xbyak
-if (NOT TARGET xbyak::xbyak)
-    add_subdirectory(xbyak)
-endif()
-
 # MagicEnum
 if (NOT TARGET magic_enum::magic_enum)
     add_subdirectory(magic_enum)
@@ -137,13 +132,6 @@ if (NOT TARGET xxHash::xxhash)
     add_library(xxhash xxhash/xxhash.h xxhash/xxhash.c)
     target_include_directories(xxhash PUBLIC xxhash)
     add_library(xxHash::xxhash ALIAS xxhash)
-endif()
-
-# Zydis
-if (NOT TARGET Zydis::Zydis)
-    option(ZYDIS_BUILD_TOOLS "" OFF)
-    option(ZYDIS_BUILD_EXAMPLES "" OFF)
-    add_subdirectory(zydis)
 endif()
 
 # sirit

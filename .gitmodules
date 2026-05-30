@@ -144,3 +144,15 @@
 [submodule "externals/libressl"]
 	path = externals/libressl
 	url = https://github.com/shadexternals/libressl
+[submodule "3rdparty/zydis"]
+	path = 3rdparty/zydis
+	url = https://github.com/shadexternals/zydis.git
+	branch = master
+[submodule "3rdparty/xbyak"]
+	path = 3rdparty/xbyak
+	url = https://github.com/shadexternals/xbyak.git
+	branch = master
+[submodule "3rdparty/xbyak_aarch64"]
+	path = 3rdparty/xbyak_aarch64
+	url = https://github.com/shadexternals/xbyak_aarch64.git
+	branch = main
