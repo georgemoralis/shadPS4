@@ -90,6 +90,54 @@ struct alignas(64) GuestState {
     // Backends MUST NOT assume any specific value is preserved across
     // dispatcher invocations.
     std::array<u64, 4> scratch;
+
+    // ---- x87 FPU state ----
+    // The x87 register file is a stack of 8 registers accessed relative
+    // to a top-of-stack pointer (fpu_top): ST(i) lives in
+    // st[(fpu_top + i) & 7]. A push (fld) does fpu_top = (fpu_top-1)&7
+    // then writes st[fpu_top]; a pop (fstp) reads st[fpu_top] then does
+    // fpu_top = (fpu_top+1)&7.
+    //
+    // PRECISION NOTE: real x87 registers are 80-bit extended precision.
+    // We store each as a 64-bit double bit-pattern instead. This is
+    // bit-exact for float/double load, store, convert, compare, and
+    // ordinary arithmetic on values that fit in a double — which covers
+    // essentially all PS4 guest x87 use (compilers emit SSE for real
+    // FP work and only fall back to x87 for occasional conversions and
+    // legacy routines). Code that depends on the extra 11 mantissa bits
+    // or the wider exponent of true 80-bit intermediates will differ.
+    // 80-bit storage was rejected because the host long double is only
+    // 64-bit on the Windows target, so it cannot represent the format.
+    alignas(16) std::array<u64, 8> st;
+
+    // Top-of-stack pointer, 0..7. Authoritative; the x87 status-word TOP
+    // field (bits 11..13) is composed from this on demand by fstsw/fnstsw.
+    u32 fpu_top;
+
+    // Tag word, 2 bits per PHYSICAL register st[i] (not ST(i)):
+    //   0b00 valid, 0b01 zero, 0b10 special (NaN/Inf/denormal),
+    //   0b11 empty. Needed so fld can detect stack overflow (push onto a
+    //   non-empty slot) and fstp/arith can detect underflow (access of an
+    //   empty slot). v1 tracks empty vs valid precisely; the
+    //   zero/special distinction is computed only where an instruction
+    //   actually observes it.
+    u16 fpu_tag;
+
+    // Control word (rounding mode, precision control, exception masks).
+    // Read/written by fldcw/fnstcw. Initialized to 0x037F (the x87
+    // default: round-to-nearest, 64-bit precision, all exceptions
+    // masked) when the FPU is reset (finit).
+    u16 fpu_cw;
+
+    // Cached condition codes C0/C1/C2/C3 from the last compare-class
+    // instruction (fcom/fucom/fxam/...), in their status-word bit
+    // positions (C0=bit8, C1=bit9, C2=bit10, C3=bit14). fstsw/fnstsw
+    // ORs these together with the TOP field to build the full status
+    // word. Kept separate from fpu_top so a compare doesn't have to
+    // read-modify-write a packed status word.
+    u16 fpu_sw_cc;
+
+    u16 _pad_fpu;
 };
 
 /// Reason the JIT exited and returned control to the dispatcher / host.

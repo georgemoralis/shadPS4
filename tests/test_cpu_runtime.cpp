@@ -1811,6 +1811,128 @@ TEST_F(CpuRuntimeTest, CmovL_NotTakenWhenSourceIsGreater) {
 // =============================================================================
 
 // SHL rax, 4 — left shift by immediate. Multiplies by 16.
+// SHR ax, imm — 16-bit logical right shift. Must shift only the low
+// word and PRESERVE the upper 48 bits of rax (16-bit register writes do
+// not zero-extend). Regression test for EmitShift16 (eboot 0x80000378f
+// `shr r/m16, imm`, which previously fell through to EmitShift64 and was
+// rejected as unsupported).
+// VROUNDSS xmm0, xmm0, xmm1, 1 — round-down (floor) the scalar single in
+// xmm1's low lane into xmm0's low lane, preserving xmm0's upper bits.
+// Regression for EmitVroundss (eboot 0x8000382fa). imm=1 selects floor.
+// VMOVSLDUP xmm0, xmm1 — duplicate even-indexed single floats:
+// dst[0]=dst[1]=src[0], dst[2]=dst[3]=src[2]. Regression for EmitMovDup
+// (eboot 0x800038388). VEX-128 zeros the upper YMM half of dst.
+TEST_F(CpuRuntimeTest, Vmovsldup_DuplicatesEvenLanes) {
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    const u8 program[] = {
+        0xc5, 0xfa, 0x12, 0xc1, // vmovsldup xmm0, xmm1
+        0xc3,                   // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // xmm1 lanes: [0]=1.0, [1]=2.0, [2]=3.0, [3]=4.0.
+    // ymm[4] = low 64 (lanes 0,1), ymm[5] = high 64 (lanes 2,3).
+    const auto pack = [](float lo, float hi) {
+        return static_cast<u64>(std::bit_cast<u32>(lo)) |
+               (static_cast<u64>(std::bit_cast<u32>(hi)) << 32);
+    };
+    state.ymm[4] = pack(1.0f, 2.0f); // xmm1 lanes 0,1
+    state.ymm[5] = pack(3.0f, 4.0f); // xmm1 lanes 2,3
+    // Dirty xmm0 upper YMM half to confirm it gets zeroed.
+    state.ymm[2] = 0xFFFFFFFFFFFFFFFFull;
+    state.ymm[3] = 0xFFFFFFFFFFFFFFFFull;
+
+    Runtime rt;
+    rt.Run(state);
+
+    // Expect xmm0 lanes = [1.0, 1.0, 3.0, 3.0].
+    EXPECT_EQ(state.ymm[0], pack(1.0f, 1.0f)) << "xmm0 lanes 0,1 should both be src[0]=1.0";
+    EXPECT_EQ(state.ymm[1], pack(3.0f, 3.0f)) << "xmm0 lanes 2,3 should both be src[2]=3.0";
+    // VEX-128 zeroed the upper half.
+    EXPECT_EQ(state.ymm[2], 0u);
+    EXPECT_EQ(state.ymm[3], 0u);
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+TEST_F(CpuRuntimeTest, Vroundss_FloorScalarSingle) {
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    const u8 program[] = {
+        0xc4, 0xe3, 0x79, 0x0a, 0xc1, 0x01, // vroundss xmm0, xmm0, xmm1, 1
+        0xc3,                               // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 low float = 3.7; xmm0 low float = some sentinel we expect replaced,
+    // xmm0 upper 96 bits = a marker we expect PRESERVED.
+    const float in = 3.7f;
+    state.ymm[4] = static_cast<u64>(std::bit_cast<u32>(in)); // xmm1 low 32
+    // xmm0: low32 = 0 (will be overwritten), bits 32..127 = marker.
+    state.ymm[0] = 0xDEADBEEF00000000ull; // low32=0, next32=0xDEADBEEF
+    state.ymm[1] = 0xCAFEF00DCAFEBABEull; // bits 64..127 (preserved)
+
+    Runtime rt;
+    rt.Run(state);
+
+    // Low 32 of xmm0 = floor(3.7) = 3.0.
+    const auto low = static_cast<u32>(state.ymm[0] & 0xFFFFFFFFu);
+    EXPECT_EQ(std::bit_cast<float>(low), 3.0f);
+    // Upper 96 bits of xmm0 preserved from src1 (=xmm0 input).
+    EXPECT_EQ(state.ymm[0] >> 32, 0xDEADBEEFu);
+    EXPECT_EQ(state.ymm[1], 0xCAFEF00DCAFEBABEull);
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+TEST_F(CpuRuntimeTest, Shr_Imm16_PreservesUpperBits) {
+    const u8 program[] = {
+        // mov rax, 0xAAAABBBB0000F000 — upper 48 bits nonzero, low word 0xF000
+        0x48, 0xb8, 0x00, 0xf0, 0x00, 0x00, 0xbb, 0xbb, 0xaa, 0xaa,
+        0x66, 0xc1, 0xe8, 0x04,                   // shr ax, 4
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // Low word: 0xF000 >> 4 = 0x0F00. Upper 48 bits unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0xAAAABBBB00000F00ull);
+}
+
+// SHL ax, imm — 16-bit left shift, also preserving upper bits, and the
+// 16-bit result must wrap within the word (no carry into bits 16+).
+TEST_F(CpuRuntimeTest, Shl_Imm16_WrapsWithinWordAndPreservesUpper) {
+    const u8 program[] = {
+        // mov rax, 0x1111222200001234
+        0x48, 0xb8, 0x34, 0x12, 0x00, 0x00, 0x22, 0x22, 0x11, 0x11,
+        0x66, 0xc1, 0xe0, 0x08,                   // shl ax, 8
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // 0x1234 << 8 = 0x123400, truncated to 16 bits = 0x3400. Upper kept.
+    EXPECT_EQ(r.state.gpr[0], 0x1111222200003400ull);
+}
+
+// SAR ax, imm — 16-bit arithmetic right shift sign-extends within the
+// word (0x8000-set value stays negative), upper 48 bits preserved.
+TEST_F(CpuRuntimeTest, Sar_Imm16_SignExtendsWithinWord) {
+    const u8 program[] = {
+        // mov rax, 0x000000000000FF00 (low word 0xFF00, high bit set)
+        0x48, 0xb8, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x66, 0xc1, 0xf8, 0x04,                   // sar ax, 4
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // 0xFF00 as s16 = -256; >>4 arithmetic = -16 = 0xFFF0 in the low word.
+    EXPECT_EQ(r.state.gpr[0], 0x000000000000FFF0ull);
+}
+
 TEST_F(CpuRuntimeTest, Shl_Imm8_LeftShifts) {
     const u8 program[] = {
         0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3
@@ -3725,7 +3847,7 @@ TEST_F(CpuRuntimeTest, Cmov32_ConditionTrue_ZeroExtendsSrc) {
 // bits 63:32 of the slot. This is the regression catcher. If the lifter
 // blindly applied the "32-bit op zero-extends" rule, the upper junk
 // (0xDEADBEEF) would be wiped here, breaking guest semantics.
-TEST_F(CpuRuntimeTest, Cmov32_ConditionFalse_LeavesUpper32Untouched) {
+TEST_F(CpuRuntimeTest, Cmov32_ConditionFalse_ZeroExtendsDst) {
     const u8 program[] = {
         // mov rax, 0xDEADBEEFCAFEBABE — junk dst (upper 32 = 0xDEADBEEF)
         0x48, 0xb8, 0xbe, 0xba, 0xfe, 0xca, 0xef, 0xbe, 0xad, 0xde,
@@ -3734,14 +3856,17 @@ TEST_F(CpuRuntimeTest, Cmov32_ConditionFalse_LeavesUpper32Untouched) {
         // mov rdx, 1; test rdx, rdx → ZF=0
         0x48, 0xc7, 0xc2, 0x01, 0x00, 0x00, 0x00,
         0x48, 0x85, 0xd2,
-        // cmovz eax, ecx — cond FALSE (ZF=0) → no write to rax at all
+        // cmovz eax, ecx — cond FALSE (ZF=0); the move is NOT performed,
+        // but a 32-bit CMOV still issues a 32-bit write to the destination
+        // register, which zero-extends bits 63:32 per x86-64.
         0x0f, 0x44, 0xc1,
         0xc3,                                     // ret
     };
     const auto r = RunProgram(program, sizeof(program), mem);
-    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEFCAFEBABEULL)
-        << "CMOVZ 32-bit cond FALSE must leave the WHOLE qword unchanged, "
-           "including bits 63:32 — different from ordinary 32-bit ops";
+    EXPECT_EQ(r.state.gpr[0], 0x00000000CAFEBABEULL)
+        << "CMOVZ 32-bit cond FALSE keeps the low 32 bits but ZERO-EXTENDS "
+           "bits 63:32 — verified against real hardware (an untaken 32-bit "
+           "CMOV still performs a 32-bit register write)";
 }
 
 // ============================================================================
@@ -14527,6 +14652,828 @@ TEST_F(CpuRuntimeTest, Vpshufb_Xmm_MemMask_Shuffles) {
     EXPECT_EQ(st.ymm[1], 0x1011121314151617ULL) << "dst high qword shuffled (mem mask)";
     EXPECT_EQ(st.ymm[2], 0ULL) << "128-bit VEX zeros upper lane (mem mask)";
     EXPECT_EQ(st.ymm[3], 0ULL) << "128-bit VEX zeros upper lane (mem mask)";
+}
+
+// ============================================================================
+// x87 FPU — Group 1: load/store (fld, fst, fstp, fild, fistp)
+// ============================================================================
+//
+// Harness note: these tests place a small scratch data area inside the
+// guest memory region (well clear of the code at the base and the stack
+// at the top) and point RDI at it. The guest program loads/stores via
+// [rdi+disp]. We read back the stored bytes and the resulting fpu_top /
+// fpu_tag to verify both the value path and the stack bookkeeping.
+
+namespace {
+// A fixed offset into guest memory for x87 scratch data: past the code,
+// far below the stack. 1 KiB in is plenty for these short programs.
+constexpr u64 kX87ScratchOff = 1024;
+} // namespace
+
+// fld dword [rdi]; fstp dword [rdi+16]; ret
+// Load a float, push, store-and-pop to a different slot. Expect the
+// round-tripped float to match, fpu_top back to 0, tag empty again.
+TEST_F(CpuRuntimeTest, X87_FldFstp_Float32RoundTrip) {
+    u8* data = mem.CodePtr() + kX87ScratchOff;
+    const float in = 3.5f;
+    std::memcpy(data, &in, sizeof(in));
+    std::memset(data + 16, 0, sizeof(float));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr>  (imm @2..9)
+        0xd9, 0x07,                     // fld  dword [rdi]
+        0xd9, 0x5f, 0x10,               // fstp dword [rdi+0x10]
+        0xc3,                           // ret
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    float out = 0;
+    std::memcpy(&out, data + 16, sizeof(out));
+
+    EXPECT_EQ(out, 3.5f) << "float round-trips through the x87 stack";
+    EXPECT_EQ(r.state.fpu_top, 0u) << "push then pop returns top to 0";
+    EXPECT_EQ(r.state.fpu_tag & 0x1u, 0u) << "slot 0 marked empty after pop";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// fld qword [rdi]; fstp qword [rdi+16]; ret  — double round-trip.
+TEST_F(CpuRuntimeTest, X87_FldFstp_Float64RoundTrip) {
+    u8* data = mem.CodePtr() + kX87ScratchOff;
+    const double in = 1.0e300; // large value: would lose to float, exact as double
+    std::memcpy(data, &in, sizeof(in));
+    std::memset(data + 16, 0, sizeof(double));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr>
+        0xdd, 0x07,                     // fld  qword [rdi]
+        0xdd, 0x5f, 0x10,               // fstp qword [rdi+0x10]
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double out = 0;
+    std::memcpy(&out, data + 16, sizeof(out));
+
+    EXPECT_EQ(out, 1.0e300) << "double round-trips bit-exact";
+    EXPECT_EQ(r.state.fpu_top, 0u);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// fld dword [rdi]; fst dword [rdi+32]; fstp dword [rdi+16]; ret
+// fst stores WITHOUT popping; the following fstp then stores the SAME
+// value (still ST(0)) and pops. Both destinations must equal the input.
+TEST_F(CpuRuntimeTest, X87_Fst_NoPop_LeavesValueOnStack) {
+    u8* data = mem.CodePtr() + kX87ScratchOff;
+    const float in = -2.25f;
+    std::memcpy(data, &in, sizeof(in));
+    std::memset(data + 16, 0, sizeof(float));
+    std::memset(data + 32, 0, sizeof(float));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr>
+        0xd9, 0x07,                     // fld  dword [rdi]
+        0xd9, 0x57, 0x20,               // fst  dword [rdi+0x20]   (no pop)
+        0xd9, 0x5f, 0x10,               // fstp dword [rdi+0x10]   (pop)
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    float out_fst = 0, out_fstp = 0;
+    std::memcpy(&out_fst, data + 32, sizeof(out_fst));
+    std::memcpy(&out_fstp, data + 16, sizeof(out_fstp));
+
+    EXPECT_EQ(out_fst, -2.25f) << "fst stored ST(0) without popping";
+    EXPECT_EQ(out_fstp, -2.25f) << "fstp stored the same ST(0) then popped";
+    EXPECT_EQ(r.state.fpu_top, 0u) << "exactly one net pop";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// fild dword [rdi]; fistp dword [rdi+16]; ret — integer load/store round trip.
+TEST_F(CpuRuntimeTest, X87_FildFistp_Int32RoundTrip) {
+    u8* data = mem.CodePtr() + kX87ScratchOff;
+    const int32_t in = -12345;
+    std::memcpy(data, &in, sizeof(in));
+    std::memset(data + 16, 0, sizeof(int32_t));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr>
+        0xdb, 0x07,                     // fild  dword [rdi]
+        0xdb, 0x5f, 0x10,               // fistp dword [rdi+0x10]
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    int32_t out = 0;
+    std::memcpy(&out, data + 16, sizeof(out));
+
+    EXPECT_EQ(out, -12345) << "int32 round-trips through fild/fistp";
+    EXPECT_EQ(r.state.fpu_top, 0u);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// fild qword [rdi]; fistp qword [rdi+16]; ret — 64-bit integer round trip.
+TEST_F(CpuRuntimeTest, X87_FildFistp_Int64RoundTrip) {
+    u8* data = mem.CodePtr() + kX87ScratchOff;
+    const int64_t in = -1234567890123LL;
+    std::memcpy(data, &in, sizeof(in));
+    std::memset(data + 16, 0, sizeof(int64_t));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr>
+        0xdf, 0x2f,                     // fild  qword [rdi]
+        0xdf, 0x7f, 0x10,               // fistp qword [rdi+0x10]
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    int64_t out = 0;
+    std::memcpy(&out, data + 16, sizeof(out));
+
+    EXPECT_EQ(out, -1234567890123LL) << "int64 round-trips through fild/fistp";
+    EXPECT_EQ(r.state.fpu_top, 0u);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// Two pushes then two pops: verify the stack is LIFO and top wraps
+// correctly. fld A; fld B; fstp -> B; fstp -> A.
+TEST_F(CpuRuntimeTest, X87_TwoLevel_StackIsLIFO) {
+    u8* data = mem.CodePtr() + kX87ScratchOff;
+    const float a = 10.0f, b = 20.0f;
+    std::memcpy(data + 0, &a, sizeof(a));   // [rdi+0]  = A
+    std::memcpy(data + 4, &b, sizeof(b));   // [rdi+4]  = B
+    std::memset(data + 16, 0, sizeof(float));
+    std::memset(data + 20, 0, sizeof(float));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr>
+        0xd9, 0x07,                     // fld  dword [rdi]       push A  -> ST0=A
+        0xd9, 0x47, 0x04,               // fld  dword [rdi+4]     push B  -> ST0=B,ST1=A
+        0xd9, 0x5f, 0x10,               // fstp dword [rdi+0x10]  pop->B
+        0xd9, 0x5f, 0x14,               // fstp dword [rdi+0x14]  pop->A
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    float first = 0, second = 0;
+    std::memcpy(&first, data + 16, sizeof(first));   // first pop == B (LIFO)
+    std::memcpy(&second, data + 20, sizeof(second)); // second pop == A
+
+    EXPECT_EQ(first, 20.0f) << "first pop returns most-recently pushed (B)";
+    EXPECT_EQ(second, 10.0f) << "second pop returns A";
+    EXPECT_EQ(r.state.fpu_top, 0u) << "two pushes + two pops nets to 0";
+    EXPECT_EQ(r.state.fpu_tag & 0x3u, 0u) << "both used slots empty again";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// and rsi, qword [rdi]; ret
+// 64-bit AND with a memory source (reg destination). This is the form
+// that blocked the game's main entry path. Verify the mask is applied
+// and the upper bits clear correctly.
+TEST_F(CpuRuntimeTest, And64_RegMemSource_MasksCorrectly) {
+    u8* data = mem.CodePtr() + 1024;
+    const u64 mask = 0x00000000FFFF0000ULL;
+    std::memcpy(data, &mask, sizeof(mask));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data addr> (imm @2..9)
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,   // mov rsi, 0x123456789ABCDEF0 (imm @12..19)
+        0x48, 0x23, 0x37,              // and rsi, qword [rdi]
+        0xc3,                          // ret
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    const u64 rsi_init  = 0x123456789ABCDEF0ULL;
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+    std::memcpy(&program[12], &rsi_init, sizeof(rsi_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[6], rsi_init & mask) << "rsi = rsi & [rdi]";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// cmovz ecx, edx with ZF=1 (so move happens): set ZF via xor eax,eax.
+// 32-bit cmov zero-extends. Verify ecx takes edx and upper bits clear.
+TEST_F(CpuRuntimeTest, Cmovz32_TakesSource_WhenZeroFlagSet) {
+    u8 program[] = {
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx, 0xAAAAAAAABBBBBBBB (imm @2)
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, 0x1111111122222222 (imm @12)
+        0x31, 0xc0,                    // xor eax, eax  (sets ZF=1)
+        0x0f, 0x44, 0xca,              // cmovz ecx, edx
+        0xc3,                          // ret
+    };
+    const u64 rdx_init = 0xAAAAAAAABBBBBBBBULL;
+    const u64 rcx_init = 0x1111111122222222ULL;
+    std::memcpy(&program[2],  &rdx_init, sizeof(rdx_init));
+    std::memcpy(&program[12], &rcx_init, sizeof(rcx_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    // Move taken; 32-bit op zero-extends, so ecx = 0xBBBBBBBB, upper = 0.
+    EXPECT_EQ(r.state.gpr[1], 0x00000000BBBBBBBBULL) << "ecx = edx, zero-extended";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// imul esi, edi, 0x1234 — 3-operand 32-bit immediate multiply.
+TEST_F(CpuRuntimeTest, Imul3Op32_MultipliesByImmediate) {
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, 0x10 (imm @2)
+        0x69, 0xf7, 0x34, 0x12, 0x00, 0x00,  // imul esi, edi, 0x1234
+        0xc3,                          // ret
+    };
+    const u64 rdi_init = 0x10ULL;
+    std::memcpy(&program[2], &rdi_init, sizeof(rdi_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[6], static_cast<u64>(0x10u * 0x1234u))
+        << "esi = edi * 0x1234, zero-extended";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// movsx eax, cl (8->32) with a negative byte: 0xFF -> 0xFFFFFFFF,
+// then zero-extended into rax => 0x00000000FFFFFFFF.
+TEST_F(CpuRuntimeTest, Movsx_Byte8ToReg32_SignExtends) {
+    u8 program[] = {
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, 0x...FF (imm @2)
+        0x0f, 0xbe, 0xc1,              // movsx eax, cl
+        0xc3,                          // ret
+    };
+    const u64 rcx_init = 0x12345678000000FFULL;  // cl = 0xFF
+    std::memcpy(&program[2], &rcx_init, sizeof(rcx_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    // cl=0xFF sign-extends to 0xFFFFFFFF in eax; 32-bit write zero-extends.
+    EXPECT_EQ(r.state.gpr[0], 0x00000000FFFFFFFFULL) << "eax = sext(cl)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// movsx rax, cl (8->64) with negative byte: 0xFF -> full 0xFFFF...FF.
+TEST_F(CpuRuntimeTest, Movsx_Byte8ToReg64_SignExtends) {
+    u8 program[] = {
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, 0x...80 (imm @2)
+        0x48, 0x0f, 0xbe, 0xc1,        // movsx rax, cl
+        0xc3,                          // ret
+    };
+    const u64 rcx_init = 0x0000000000000080ULL;  // cl = 0x80 (negative)
+    std::memcpy(&program[2], &rcx_init, sizeof(rcx_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFF80ULL) << "rax = sext64(cl)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// andn rax, rbx, rcx — dst = (~rbx) & rcx (BMI1).
+TEST_F(CpuRuntimeTest, Andn64_ComputesNotSrc1AndSrc2) {
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // mov rbx, src1 (imm @2)
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, src2 (imm @12)
+        0xc4, 0xe2, 0xe0, 0xf2, 0xc1,  // andn rax, rbx, rcx
+        0xc3,                          // ret
+    };
+    const u64 src1 = 0x00000000FFFF0000ULL;
+    const u64 src2 = 0xFFFFFFFFFFFFFFFFULL;
+    std::memcpy(&program[2],  &src1, sizeof(src1));
+    std::memcpy(&program[12], &src2, sizeof(src2));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[0], (~src1) & src2) << "rax = (~rbx) & rcx";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// add rsi, qword [rdi] — 64-bit ADD with a memory source.
+TEST_F(CpuRuntimeTest, Add64_RegMemSource_AddsAndStores) {
+    u8* data = mem.CodePtr() + 1024;
+    const u64 addend = 0x0000000000001000ULL;
+    std::memcpy(data, &addend, sizeof(addend));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,   // mov rsi, 0x40 (imm @12)
+        0x48, 0x03, 0x37,              // add rsi, qword [rdi]
+        0xc3,                          // ret
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    const u64 rsi_init  = 0x40ULL;
+    std::memcpy(&program[2],  &data_addr, sizeof(data_addr));
+    std::memcpy(&program[12], &rsi_init,  sizeof(rsi_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[6], rsi_init + addend) << "rsi = rsi + [rdi]";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// lea eax, [rdi+0x10] — 32-bit LEA: full-width address arithmetic,
+// result truncated to 32 bits and zero-extended into rax.
+TEST_F(CpuRuntimeTest, Lea32_ComputesAddrZeroExtended) {
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, 0x1_2345_6000 (imm @2)
+        0x8d, 0x47, 0x10,              // lea eax, [rdi+0x10]
+        0xc3,                          // ret
+    };
+    // Pick a base whose +0x10 has a nonzero bit above 32 to prove truncation.
+    const u64 rdi_init = 0x0000000123456000ULL;
+    std::memcpy(&program[2], &rdi_init, sizeof(rdi_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    const u64 full = rdi_init + 0x10;             // 0x123456010
+    EXPECT_EQ(r.state.gpr[0], full & 0xFFFFFFFFULL)
+        << "eax = low 32 of (rdi+0x10), upper 32 zeroed";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// vmovdqa xmm0, [rdi] — aligned 128-bit load. Treated identically to
+// vmovdqu in the JIT (the host load handles addressing). Verify the
+// 128 bits land in xmm0 (ymm[0]/ymm[1]) and the upper YMM half zeroes.
+TEST_F(CpuRuntimeTest, Vmovdqa_LoadsXmmFromMemory) {
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    // 16-byte aligned data region.
+    u8* data = mem.CodePtr() + 2048;
+    const u64 lo = 0x1122334455667788ULL;
+    const u64 hi = 0x99AABBCCDDEEFF00ULL;
+    std::memcpy(data,     &lo, sizeof(lo));
+    std::memcpy(data + 8, &hi, sizeof(hi));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0xc5, 0xf9, 0x6f, 0x07,        // vmovdqa xmm0, [rdi]
+        0xc3,                          // ret
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Dirty xmm0's upper YMM half to confirm VEX-128 zeroes it.
+    state.ymm[2] = 0xFFFFFFFFFFFFFFFFull;
+    state.ymm[3] = 0xFFFFFFFFFFFFFFFFull;
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.ymm[0], lo) << "xmm0 low 64";
+    EXPECT_EQ(state.ymm[1], hi) << "xmm0 high 64";
+    EXPECT_EQ(state.ymm[2], 0u) << "VEX-128 zeroes bits 255:128";
+    EXPECT_EQ(state.ymm[3], 0u);
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// bextr rax, rcx, rdx — BMI1 bit-field extract.
+// control rdx = start | (len << 8). Extract len bits of rcx starting
+// at bit `start`. Here start=4, len=8 → bits [11:4] of src.
+TEST_F(CpuRuntimeTest, Bextr64_ExtractsBitField) {
+    u8 program[] = {
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, src     (imm @2)
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx, control (imm @12)
+        0xc4, 0xe2, 0xe8, 0xf7, 0xc1,  // bextr rax, rcx, rdx
+        0xc3,                          // ret
+    };
+    const u64 src     = 0xFFFFFFFFFFFFFABCULL;  // bits [11:4] = 0xAB
+    const u64 control = 4 | (8u << 8);          // start=4, len=8
+    std::memcpy(&program[2],  &src,     sizeof(src));
+    std::memcpy(&program[12], &control, sizeof(control));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    const u64 expected = (src >> 4) & ((1ULL << 8) - 1);  // = 0xAB
+    EXPECT_EQ(r.state.gpr[0], expected) << "rax = bextr(rcx, start=4, len=8)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// xor rax, 0x1234 — 64-bit XOR with an immediate source.
+TEST_F(CpuRuntimeTest, Xor64_Imm_FlipsBits) {
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, init (imm @2)
+        0x48, 0x35, 0x34, 0x12, 0x00, 0x00,  // xor rax, 0x1234
+        0xc3,                          // ret
+    };
+    const u64 init = 0x00000000000000FFULL;
+    std::memcpy(&program[2], &init, sizeof(init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[0], init ^ 0x1234ULL) << "rax ^= 0x1234";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// shr cl, 3 — 8-bit shift by immediate. Upper 56 bits of rcx must be
+// preserved (8-bit writes don't zero-extend).
+TEST_F(CpuRuntimeTest, Shr8_Imm_PreservesUpperBits) {
+    u8 program[] = {
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, init (imm @2)
+        0xc0, 0xe9, 0x03,              // shr cl, 3
+        0xc3,                          // ret
+    };
+    const u64 init = 0xAABBCCDDEEFF0080ULL;  // cl = 0x80
+    std::memcpy(&program[2], &init, sizeof(init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    const u8 shifted = static_cast<u8>(0x80u >> 3);   // = 0x10
+    const u64 expected = (init & ~0xFFULL) | shifted; // upper 56 preserved
+    EXPECT_EQ(r.state.gpr[1], expected) << "cl >>= 3, upper bits intact";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// vpcmpeqb xmm0, xmm1, xmm2 — packed byte-equality compare. Each byte
+// equal → 0xFF, else 0x00; VEX-128 zeroes the upper YMM half.
+TEST_F(CpuRuntimeTest, Vpcmpeqb_ComparesBytesPerLane) {
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    const u8 program[] = {
+        0xc5, 0xf1, 0x74, 0xc2,  // vpcmpeqb xmm0, xmm1, xmm2
+        0xc3,                    // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    // Each XMM occupies 4 u64 slots (32 bytes): xmm_n low/high =
+    // ymm[n*4 + 0]/[n*4 + 1], with [n*4 + 2]/[+3] the upper 128.
+    // xmm1 = ymm[4]/[5], xmm2 = ymm[8]/[9], dst xmm0 = ymm[0]/[1].
+    // byte lanes of xmm1 low: 00 11 22 33 44 55 66 77
+    state.ymm[4] = 0x7766554433221100ULL;  // xmm1 low
+    state.ymm[5] = 0x0000000000000000ULL;  // xmm1 high
+    // xmm2 low: match even byte indices, differ on odd ones.
+    {
+        auto byte_of = [](u64 v, int i){ return static_cast<u8>((v >> (i*8)) & 0xFF); };
+        u64 a = state.ymm[4];
+        u64 b = 0;
+        for (int i = 0; i < 8; ++i) {
+            u8 ba = byte_of(a, i);
+            u8 bb = (i % 2 == 0) ? ba : static_cast<u8>(ba ^ 0xFF);
+            b |= static_cast<u64>(bb) << (i*8);
+        }
+        state.ymm[8] = b;
+    }
+    state.ymm[9] = 0x0000000000000000ULL;  // xmm2 high
+    // Dirty xmm0 (dst) low and its upper-128 half to confirm overwrite
+    // and VEX-128 zeroing.
+    state.ymm[0] = 0xDEADBEEFDEADBEEFULL;
+    state.ymm[1] = 0xCAFEBABECAFEBABEULL;
+    state.ymm[2] = 0xFFFFFFFFFFFFFFFFULL;
+    state.ymm[3] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(state);
+
+    // Expected low 64: even byte lanes equal → 0xFF, odd → 0x00.
+    u64 expected_lo = 0;
+    for (int i = 0; i < 8; ++i)
+        if (i % 2 == 0) expected_lo |= static_cast<u64>(0xFF) << (i*8);
+    EXPECT_EQ(state.ymm[0], expected_lo) << "byte-equal lanes -> 0xFF";
+    // xmm1 high (ymm[5]) and xmm2 high (ymm[9]) are both 0 → every byte
+    // equal → 0xFF across the whole high 64.
+    EXPECT_EQ(state.ymm[1], 0xFFFFFFFFFFFFFFFFULL) << "equal zero bytes -> 0xFF";
+    // VEX-128 zeroes bits 255:128 of xmm0.
+    EXPECT_EQ(state.ymm[2], 0ULL) << "upper 128 zeroed";
+    EXPECT_EQ(state.ymm[3], 0ULL);
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// setnz dl with ZF=0 → dl=1; upper 56 bits of rdx preserved.
+// Drive ZF=0 via `test eax,eax` on a non-zero eax.
+TEST_F(CpuRuntimeTest, Setnz_RegDst_ConditionTrue_PreservesUpper) {
+    u8 program[] = {
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx, poison (imm @2)
+        0x48, 0xb8, 0x01, 0,0,0,0,0,0,0, // mov rax, 1 (imm @12) -> eax nonzero
+        0x85, 0xc0,                    // test eax, eax  (ZF=0)
+        0x0f, 0x95, 0xc2,              // setnz dl
+        0xc3,                          // ret
+    };
+    const u64 poison = 0xDEADBEEFCAFE0000ULL;  // dl currently 0
+    const u64 raxval = 0x0000000000000001ULL;
+    std::memcpy(&program[2],  &poison, sizeof(poison));
+    std::memcpy(&program[12], &raxval, sizeof(raxval));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[2] & 0xFFULL, 0x01ULL) << "dl = 1 (ZF was 0)";
+    EXPECT_EQ(r.state.gpr[2] & ~0xFFULL, 0xDEADBEEFCAFE0000ULL)
+        << "upper 56 bits preserved";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// cmpxchg [rdi], ecx — MATCH case. EAX == [rdi] → ZF=1, [rdi] = ecx,
+// EAX unchanged.
+TEST_F(CpuRuntimeTest, Cmpxchg32_MemDst_Match_StoresSrcSetsZf) {
+    u8* data = mem.CodePtr() + 1024;
+    const u32 mem_init = 0x11112222u;
+    std::memcpy(data, &mem_init, sizeof(mem_init));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x48, 0xb8, 0x22, 0x22, 0x11, 0x11, 0,0,0,0, // mov rax, 0x11112222 (eax == mem)
+        0x48, 0xb9, 0x99, 0x88, 0x77, 0x66, 0,0,0,0, // mov rcx, 0x66778899 (src)
+        0x0f, 0xb1, 0x0f,              // cmpxchg [rdi], ecx
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 mem_after; std::memcpy(&mem_after, data, sizeof(mem_after));
+    EXPECT_EQ(mem_after, 0x66778899u) << "match → [rdi] = ecx";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF=1 on match";
+    EXPECT_EQ(r.state.gpr[0] & 0xFFFFFFFFULL, 0x11112222u) << "eax unchanged on match";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// cmpxchg [rdi], ecx — MISMATCH case. EAX != [rdi] → ZF=0, EAX = [rdi],
+// memory unchanged.
+TEST_F(CpuRuntimeTest, Cmpxchg32_MemDst_Mismatch_LoadsAccSetsNoZf) {
+    u8* data = mem.CodePtr() + 1024;
+    const u32 mem_init = 0x11112222u;
+    std::memcpy(data, &mem_init, sizeof(mem_init));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x48, 0xb8, 0x00, 0x00, 0x00, 0x00, 0,0,0,0, // mov rax, 0 (eax != mem)
+        0x48, 0xb9, 0x99, 0x88, 0x77, 0x66, 0,0,0,0, // mov rcx, 0x66778899 (src)
+        0x0f, 0xb1, 0x0f,              // cmpxchg [rdi], ecx
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 mem_after; std::memcpy(&mem_after, data, sizeof(mem_after));
+    EXPECT_EQ(mem_after, 0x11112222u) << "mismatch → memory unchanged";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF=0 on mismatch";
+    EXPECT_EQ(r.state.gpr[0] & 0xFFFFFFFFULL, 0x11112222u) << "eax = [rdi] on mismatch";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// cmp byte [rdi], cl — 8-bit compare with memory lhs, register rhs.
+// Equal bytes → ZF=1; memory is not modified.
+TEST_F(CpuRuntimeTest, Cmp8_MemDst_RegSrc_EqualSetsZf) {
+    u8* data = mem.CodePtr() + 1024;
+    *data = 0x42;
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x48, 0xb9, 0x42, 0,0,0, 0,0,0,0, // mov rcx, 0x42 (cl = 0x42)
+        0x38, 0x0f,                    // cmp byte [rdi], cl
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF=1 (bytes equal)";
+    EXPECT_EQ(*data, 0x42) << "memory unchanged by cmp";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// cmp byte [rdi], cl — unequal: [mem]=0x42, cl=0x40 → [mem] > rhs,
+// ZF=0, CF=0 (0x42 - 0x40 = 2, no borrow).
+TEST_F(CpuRuntimeTest, Cmp8_MemDst_RegSrc_UnequalClearsZf) {
+    u8* data = mem.CodePtr() + 1024;
+    *data = 0x42;
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data>
+        0x48, 0xb9, 0x40, 0,0,0, 0,0,0,0, // mov rcx, 0x40 (cl=0x40)
+        0x38, 0x0f,                    // cmp byte [rdi], cl
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF=0 (bytes differ)";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "CF=0 (0x42 >= 0x40)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// or byte [rdi], 0x80 — 8-bit OR with memory destination + immediate,
+// the bitfield-set idiom. Result written back; CF/OF cleared.
+TEST_F(CpuRuntimeTest, Or8_MemDst_Imm_SetsBitAndWritesBack) {
+    u8* data = mem.CodePtr() + 1024;
+    *data = 0x01;
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x80, 0x0f, 0x80,              // or byte [rdi], 0x80
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    std::memcpy(&program[2], &data_addr, sizeof(data_addr));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(*data, 0x81) << "0x01 | 0x80 = 0x81 written to [rdi]";
+    EXPECT_FALSE(r.state.rflags & 1ULL)        << "CF cleared by OR";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 11)) << "OF cleared by OR";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// cmp byte [rdi], ah — high-byte register as rhs. AH is bits 15:8 of
+// RAX, which ZydisGprToIndex rejects; the byte-offset path handles it.
+// This is the exact form that kept exiting the JIT at guest 0x806043525.
+TEST_F(CpuRuntimeTest, Cmp8_MemDst_HighByteReg_EqualSetsZf) {
+    u8* data = mem.CodePtr() + 1024;
+    *data = 0x42;
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x48, 0xb8, 0x00, 0x42, 0,0,0,0,0,0,  // mov rax, 0x4200 → AH=0x42
+        0x38, 0x27,                    // cmp byte [rdi], ah
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    const u64 raxval = 0x0000000000004200ULL;
+    std::memcpy(&program[2],  &data_addr, sizeof(data_addr));
+    std::memcpy(&program[12], &raxval,    sizeof(raxval));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF=1 ([mem]==AH)";
+    EXPECT_EQ(*data, 0x42) << "memory unchanged by cmp";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// Same form, unequal: [mem]=0x42, AH=0x40 → ZF=0, CF=0.
+TEST_F(CpuRuntimeTest, Cmp8_MemDst_HighByteReg_UnequalClearsZf) {
+    u8* data = mem.CodePtr() + 1024;
+    *data = 0x42;
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data>
+        0x48, 0xb8, 0x00, 0x40, 0,0,0,0,0,0,  // mov rax, 0x4000 → AH=0x40
+        0x38, 0x27,                    // cmp byte [rdi], ah
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    const u64 raxval = 0x0000000000004000ULL;
+    std::memcpy(&program[2],  &data_addr, sizeof(data_addr));
+    std::memcpy(&program[12], &raxval,    sizeof(raxval));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF=0 (0x42 != 0x40)";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "CF=0 (0x42 >= 0x40)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// sub rsi, qword [rdi] — 64-bit SUB with a memory source.
+TEST_F(CpuRuntimeTest, Sub64_RegMemSource_SubtractsAndStores) {
+    u8* data = mem.CodePtr() + 1024;
+    const u64 subtrahend = 0x0000000000000300ULL;
+    std::memcpy(data, &subtrahend, sizeof(subtrahend));
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data> (imm @2)
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,   // mov rsi, 0x1000 (imm @12)
+        0x48, 0x2b, 0x37,              // sub rsi, qword [rdi]
+        0xc3,
+    };
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    const u64 rsi_init  = 0x1000ULL;
+    std::memcpy(&program[2],  &data_addr, sizeof(data_addr));
+    std::memcpy(&program[12], &rsi_init,  sizeof(rsi_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[6], rsi_init - subtrahend) << "rsi = rsi - [rdi]";
+    EXPECT_FALSE(r.state.rflags & 1ULL) << "CF=0 (0x1000 >= 0x300)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// or r64, imm — 64-bit register OR with a sign-extended immediate.
+// Encoding `49 83 c9 01` (or r9, 1) is the exact length-4 form the
+// game emitted. OR clears CF/OF and sets ZF/SF/PF from the result.
+TEST_F(CpuRuntimeTest, Or64_RegImm_SetsBitsAndClearsCf) {
+    u8 program[] = {
+        // mov r9, 0x1000_0000_0000_0000
+        0x49, 0xb9, 0,0,0,0,0,0,0,0x10,
+        0x49, 0x83, 0xc9, 0x01,   // or r9, 1
+        0xc3,
+    };
+    const u64 r9_init = 0x1000000000000000ULL;
+    std::memcpy(&program[2], &r9_init, sizeof(r9_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[9], 0x1000000000000001ULL) << "bit 0 set, others preserved";
+    EXPECT_FALSE(r.state.rflags & 1ULL)         << "CF cleared by OR";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 11)) << "OF cleared by OR";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6))  << "ZF clear (result != 0)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// or r64, imm32 with the immediate's high bit set — sign-extends to
+// flip the entire upper 32 bits as well.
+TEST_F(CpuRuntimeTest, Or64_RegImm32_SignExtends) {
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, 0
+        0x48, 0x0d, 0x00, 0x00, 0x00, 0x80,  // or rax, 0xFFFFFFFF80000000 (imm32 sx)
+        0xc3,
+    };
+    const u64 rax_init = 0;
+    std::memcpy(&program[2], &rax_init, sizeof(rax_init));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFF80000000ULL)
+        << "imm32 0x80000000 sign-extends to set the upper 32 bits too";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 7)) << "SF set (bit 63 = 1)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// Exact length-2 no-displacement form `fstp dword [rdi]` = D9 1F, the
+// form observed at guest 0x80734d21e. Proves the memory-store path is
+// reached for the bare [reg] addressing mode (not just disp8 forms).
+TEST_F(CpuRuntimeTest, X87_Fstp_NoDisp_DwordStore) {
+    u8* data = mem.CodePtr() + 0x300;
+    *reinterpret_cast<float*>(data) = 0.0f;
+
+    u8 program[] = {
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <data>
+        0xd9, 0x07,                     // fld   dword [rdi]  (load 0.0)
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, <src float>
+        0xc5, 0xfa, 0x10, 0x00,         // vmovss xmm0, [rax]
+        // store the loaded ST0 elsewhere; but simplest: overwrite [rdi]
+        // with a known value via the x87 stack. Reload then fstp.
+        0xd9, 0x1f,                     // fstp dword [rdi]   (store ST0=0.0, pop)
+        0xc3,
+    };
+    // Put 0.0 at data so fld pushes 0.0, then fstp writes it back.
+    const u64 data_addr = reinterpret_cast<u64>(data);
+    const u64 srcf = data_addr;  // reuse; not strictly needed
+    std::memcpy(&program[2],  &data_addr, sizeof(data_addr));
+    std::memcpy(&program[14], &srcf,      sizeof(srcf));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd))
+        << "fstp dword [rdi] (D9 1F) is handled, block reaches ret";
+}
+
+// x87 80-bit extended-precision (`fstp tbyte` = DB 3A, `fld tbyte` =
+// DB 2A) — the form observed at guest 0x80734d21e. Zydis reports
+// operand_width=32 and op0.type=mem for it (identical to fstp dword in
+// the trace), but op0.size==80, which the dword/qword path rejected.
+// Round-trip: fld qword [src] (push double) ; fstp tbyte [scratch]
+// (store 80-bit, pop) ; fld tbyte [scratch] (load 80-bit, push) ;
+// fstp qword [dst] (store double, pop). The double must survive intact.
+TEST_F(CpuRuntimeTest, X87_Fstp_Fld_Tbyte_RoundTrip) {
+    u8* src     = mem.CodePtr() + 0x300;
+    u8* scratch = mem.CodePtr() + 0x320;  // 10 bytes for the m80
+    u8* dst     = mem.CodePtr() + 0x340;
+    const double value = 3.14159265358979;
+    std::memcpy(src, &value, sizeof(value));
+    std::memset(dst, 0, sizeof(double));
+
+    u8 program[] = {
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,   // mov rsi, <src>
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,   // mov rdi, <scratch>
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx_via_rbx? -> use rbx for dst
+        0xdd, 0x06,                     // fld  qword [rsi]      (push double)
+        0xdb, 0x3f,                     // fstp tbyte [rdi]      (store m80, pop)
+        0xdb, 0x2f,                     // fld  tbyte [rdi]      (load m80, push)
+        0xdd, 0x1a,                     // fstp qword [rdx]      (store double, pop)
+        0xc3,
+    };
+    const u64 src_a = reinterpret_cast<u64>(src);
+    const u64 scr_a = reinterpret_cast<u64>(scratch);
+    const u64 dst_a = reinterpret_cast<u64>(dst);
+    std::memcpy(&program[2],  &src_a, sizeof(src_a));
+    std::memcpy(&program[12], &scr_a, sizeof(scr_a));
+    std::memcpy(&program[22], &dst_a, sizeof(dst_a));
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    double out;
+    std::memcpy(&out, dst, sizeof(out));
+    EXPECT_EQ(out, value) << "double survives the 80-bit extended round-trip";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
 }
 
 } // namespace

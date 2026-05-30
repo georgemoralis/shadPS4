@@ -60,7 +60,17 @@ std::filesystem::path MntPoints::GetHostPath(std::string_view path, bool* is_rea
     }
 
     if (is_read_only) {
-        *is_read_only = mount->read_only;
+        // Normally a mount's read-only flag is honored verbatim. We make one
+        // exception: the application image (/app0, /hostapp) is mounted
+        // read-only to mirror real hardware, but some titles probe it with
+        // O_CREAT/O_TRUNC (e.g. writing a debug "/app0/log.pm4" capture) and
+        // expect the open to succeed rather than return EROFS. Report these
+        // mounts as writable so those opens proceed. Reads are unaffected.
+        if (corrected_path.starts_with("/app0") || corrected_path.starts_with("/hostapp")) {
+            *is_read_only = false;
+        } else {
+            *is_read_only = mount->read_only;
+        }
     }
 
     const auto corrected_path_sanitized = RemoveTrailingSlashes(corrected_path);

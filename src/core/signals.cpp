@@ -87,6 +87,7 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
             pExp->ExceptionRecord->ExceptionInformation[1]);
     }
 
+#ifdef SHADPS4_USES_RUNTIME
     const auto fctx = Core::Runtime::DescribeFaultContext(address);
     if (fctx.in_runtime) {
         const char* mnem =
@@ -162,6 +163,9 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {} | not in CPU runtime",
                      code, address);
     }
+#else
+    LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+#endif
     Common::Log::Flush();
 
     return EXCEPTION_CONTINUE_SEARCH;
@@ -206,6 +210,7 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                                                     reinterpret_cast<ucontext_t*>(raw_context));
                 return;
             }
+#ifdef SHADPS4_USES_RUNTIME
             const auto fctx = Core::Runtime::DescribeFaultContext(code_address);
             UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {} | "
                             "CPU-runtime: {} guest_rip={:#x} site={}",
@@ -213,6 +218,11 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                             fmt::ptr(info->si_addr),
                             fctx.in_runtime ? "yes" : "no", fctx.guest_rip,
                             fctx.in_jit_code ? "in-JIT-code" : "not-in-JIT-code");
+#else
+            UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
+                            fmt::ptr(code_address), is_write ? "Write to" : "Read from",
+                            fmt::ptr(info->si_addr));
+#endif
         }
         break;
     }
@@ -223,12 +233,17 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
                                                     reinterpret_cast<ucontext_t*>(raw_context));
                 return;
             }
+#ifdef SHADPS4_USES_RUNTIME
             const auto fctx = Core::Runtime::DescribeFaultContext(code_address);
             UNREACHABLE_MSG("Unhandled illegal instruction at code address {}: {} | "
                             "CPU-runtime: {} guest_rip={:#x} site={}",
                             fmt::ptr(code_address), DisassembleInstruction(code_address),
                             fctx.in_runtime ? "yes" : "no", fctx.guest_rip,
                             fctx.in_jit_code ? "in-JIT-code" : "not-in-JIT-code");
+#else
+            UNREACHABLE_MSG("Unhandled illegal instruction at code address {}: {}",
+                            fmt::ptr(code_address), DisassembleInstruction(code_address));
+#endif
         }
         break;
     default:

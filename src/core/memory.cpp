@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -14,6 +15,44 @@
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
+
+// [DIAG] Watched-address mapping probe.
+//
+// Resolves the open question for faults like CUSA07010's 0x414c40040: was the
+// faulting address EVER backed by a mapping? Every VA-establishing call site
+// (MapMemory / PoolCommit / MapFile) calls DiagWatchRange with its final
+// range. If the watched address falls inside, we emit a LOG_CRITICAL line that
+// no log-level filter suppresses — so the ABSENCE of a hit in the log is then
+// meaningful ("never mapped"), not just "maybe filtered out".
+//
+// The watched address defaults to 0x414c40040 and is overridable via
+// SHADPS4_WATCH_ADDR (hex, e.g. 0x414c40040) so the same probe serves the next
+// fault without a recompile. Set to 0 to disable.
+namespace {
+u64 DiagWatchAddr() {
+    static const u64 addr = [] {
+        if (const char* e = std::getenv("SHADPS4_WATCH_ADDR")) {
+            return static_cast<u64>(std::strtoull(e, nullptr, 0));
+        }
+        return static_cast<u64>(0x414c40040ull); // default: the CUSA07010 fault addr
+    }();
+    return addr;
+}
+
+void DiagWatchRange(const char* site, VAddr base, u64 size, u32 type, u32 prot) {
+    const u64 w = DiagWatchAddr();
+    if (w == 0) {
+        return;
+    }
+    if (w >= base && w < base + size) {
+        LOG_CRITICAL(Kernel_Vmm,
+                     "[DIAG-WATCH] *** watched addr {:#x} IS BACKED by {} range "
+                     "{:#x}..{:#x} (size={:#x}) type={} prot={:#x}. Fault on it => "
+                     "protection/fault-handler issue, NOT an unmapped-address bug.",
+                     w, site, base, base + size, size, type, prot);
+    }
+}
+} // namespace
 
 MemoryManager::MemoryManager() {
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
@@ -454,6 +493,8 @@ s32 MemoryManager::PoolCommit(VAddr virtual_addr, u64 size, MemoryProt prot, s32
     LOG_INFO(Kernel_Vmm,
              "[DIAG] PoolCommit range {:#x}..{:#x} (size={:#x}) type=Pooled prot={:#x}",
              mapped_addr, mapped_addr + size, size, static_cast<u32>(prot));
+    DiagWatchRange("PoolCommit", mapped_addr, size,
+                   static_cast<u32>(VMAType::Pooled), static_cast<u32>(prot));
 
     lk2.unlock();
     if (IsValidGpuMapping(mapped_addr, size)) {
@@ -673,6 +714,8 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
              "[DIAG] MapMemory range {:#x}..{:#x} (size={:#x}) type={} prot={:#x} name='{}'",
              mapped_addr, mapped_addr + size, size, static_cast<u32>(type),
              static_cast<u32>(prot), name);
+    DiagWatchRange("MapMemory", mapped_addr, size, static_cast<u32>(type),
+                   static_cast<u32>(prot));
 
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
         // Flexible address space mappings were performed while finding direct memory areas.
@@ -773,6 +816,13 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     impl.MapFile(mapped_addr, size, phys_addr, std::bit_cast<u32>(prot), handle);
 
     *out_addr = std::bit_cast<void*>(mapped_addr);
+
+    // [DIAG] Log the final mapped file VA range (see MapMemory diag note).
+    LOG_INFO(Kernel_Vmm,
+             "[DIAG] MapFile range {:#x}..{:#x} (size={:#x}) type=File prot={:#x} fd={}",
+             mapped_addr, mapped_addr + size, size, static_cast<u32>(prot), fd);
+    DiagWatchRange("MapFile", mapped_addr, size, static_cast<u32>(VMAType::File),
+                   static_cast<u32>(prot));
     return ORBIS_OK;
 }
 

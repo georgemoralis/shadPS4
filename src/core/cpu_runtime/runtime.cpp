@@ -360,44 +360,132 @@ void* DispatcherTrampoline(GuestState* state) {
         }
         last_block_rip = cur_rip;
 
-        // [RAXTRACE] R8 sign-extension probe. Reports only a GENUINE
-        // transition into 0xfffffe70 (R8 changing from some other value to
-        // the bad value), not the first observation — the producer runs
-        // very early and R8 is a stable invariant by the time the tracer is
-        // active, so a first-observation match is meaningless. `seen_first`
-        // primes prev_r8 from the first block so only a real change reports.
+        // [GPRSNAP] Per-block full-GPR snapshot ring + value-origin walk.
+        //
+        // The gap detector above names the block AFTER which a register was
+        // first seen holding a bad value, but it cannot say where that value
+        // was actually WRITTEN — the bad register often persists unchanged
+        // across many blocks before the gap detector first inspects it, and
+        // the block-RIP ring records only RIPs, never values. This snapshot
+        // ring records ALL 16 GPRs at every block boundary. When a register
+        // first enters the unmapped gap, we walk the ring backward to find
+        // the FIRST boundary where that register's value differs from the
+        // boundary before it — i.e. the block that actually produced the
+        // bad value — and report old->new with the producing block's RIP.
+        //
+        // This is the decisive attribution the prior tracers could not give:
+        // it converts "corruption happened somewhere in the last N blocks"
+        // into "block X wrote <bad> into <reg> (was <good>)".
         {
-            static thread_local u64 prev_r8 = 0;
-            static thread_local bool seen_first = false;
-            static thread_local bool r8_reported = false;
-            const u64 r8 = state->gpr[8];
-            if (seen_first && !r8_reported && r8 == 0xfffffe70ull &&
-                prev_r8 != 0xfffffe70ull) {
-                r8_reported = true;
-                LOG_ERROR(Core,
-                          "[RAXTRACE] guest R8 transitioned {:#x} -> 0xfffffe70 (should be "
-                          "0xfffffffffffffe70 sign-extended) at block rip={:#x}",
-                          prev_r8, last_block_rip);
-                if (rt != nullptr && last_block_rip != 0) {
-                    BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
-                    if (void* hp = bc.Lookup(last_block_rip)) {
-                        const u8* p = reinterpret_cast<const u8*>(hp);
-                        const char* digits = "0123456789abcdef";
-                        char hex[256 * 3 + 1];
-                        for (int k = 0; k < 256; ++k) {
-                            hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
-                            hex[k * 3 + 1] = digits[p[k] & 0xF];
-                            hex[k * 3 + 2] = ' ';
-                        }
-                        hex[256 * 3] = '\0';
-                        LOG_ERROR(Core,
-                                  "[RAXTRACE] R8-producer block {:#x} host code (256 bytes): {}",
-                                  last_block_rip, hex);
+            constexpr int kSnapDepth = 64;
+            struct GprSnap {
+                u64 rip;            // block RIP recorded at this boundary
+                u64 gpr[16];        // full GPR file at this boundary
+                bool valid;
+            };
+            static thread_local GprSnap snaps[kSnapDepth] = {};
+            static thread_local u32 snap_pos = 0;
+            static thread_local u64 origin_reported = 0;  // bitset per gpr idx
+
+            // Record this boundary's snapshot.
+            const u32 cur_slot = snap_pos % kSnapDepth;
+            snaps[cur_slot].rip = cur_rip;
+            for (int i = 0; i < 16; ++i) snaps[cur_slot].gpr[i] = state->gpr[i];
+            snaps[cur_slot].valid = true;
+            snap_pos++;
+
+            // For each GPR now sitting in the unmapped gap that we haven't
+            // already attributed, walk the ring backward to find where it
+            // first took on its current (bad) value.
+            for (int i = 0; i < 16; ++i) {
+                if (i == 4 || i == 5) continue;  // rsp/rbp: stack-ish, skip
+                const u64 bad = state->gpr[i];
+                const u64 top = bad >> 32;
+                const bool in_anon_stack =
+                    (bad >= 0x7ef000000ull && bad < 0x800000000ull);
+                const bool is_bad = (top >= 0x3 && top <= 0x7 && !in_anon_stack);
+                if (!is_bad) continue;
+                if (origin_reported & (1ull << i)) continue;
+
+                // Walk backward over recorded snapshots (newest first).
+                // We have snap_pos total writes; only the last min(snap_pos,
+                // kSnapDepth) are live. Find the oldest CONTIGUOUS run in
+                // which gpr[i] == bad, then the snapshot just before that run
+                // holds the prior (good) value and its RIP is the producer.
+                const u32 live = (snap_pos < (u32)kSnapDepth) ? snap_pos
+                                                              : (u32)kSnapDepth;
+                if (live < 2) continue;
+
+                // newest live snapshot is at (snap_pos-1).
+                u64 prev_val = 0;
+                u64 producer_rip = 0;
+                bool found = false;
+                bool seen_bad_run = false;
+                for (u32 k = 1; k <= live; ++k) {
+                    const u32 slot = (snap_pos - k) % kSnapDepth;
+                    if (!snaps[slot].valid) break;
+                    const u64 v = snaps[slot].gpr[i];
+                    if (v == bad) {
+                        seen_bad_run = true;
+                        // keep walking back; this boundary still had the bad value
+                        continue;
                     }
+                    // First boundary (going back) where the value was NOT bad.
+                    if (seen_bad_run) {
+                        // Snapshot timing: snaps[].rip labels the block ABOUT
+                        // TO RUN at that boundary, while snaps[].gpr is the
+                        // state the PREVIOUS block produced. So the block that
+                        // actually produced the good->bad transition is the one
+                        // about-to-run at THIS (last-good) boundary — i.e.
+                        // snaps[slot].rip, not the next-newer slot. (The newer
+                        // slot's value is already bad, so its about-to-run block
+                        // merely inherited the bad value.)
+                        prev_val = v;
+                        producer_rip = snaps[slot].rip;
+                        found = true;
+                    }
+                    break;
+                }
+
+                if (found) {
+                    origin_reported |= (1ull << i);
+                    LOG_ERROR(Core,
+                              "[GPRSNAP] {} VALUE-ORIGIN: block {:#x} changed it "
+                              "from {:#x} -> {:#x} (bad now persists into rip={:#x})",
+                              kGprNames[i], producer_rip, prev_val, bad, cur_rip);
+                    // Dump the producing block's emitted host code for offline
+                    // disassembly, same format as the gap detector above.
+                    if (rt != nullptr && producer_rip != 0) {
+                        BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
+                        if (void* hp = bc.Lookup(producer_rip)) {
+                            const u8* p = reinterpret_cast<const u8*>(hp);
+                            const char* digits = "0123456789abcdef";
+                            char hex[256 * 3 + 1];
+                            for (int k = 0; k < 256; ++k) {
+                                hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
+                                hex[k * 3 + 1] = digits[p[k] & 0xF];
+                                hex[k * 3 + 2] = ' ';
+                            }
+                            hex[256 * 3] = '\0';
+                            LOG_ERROR(Core,
+                                      "[GPRSNAP] producer block {:#x} host code "
+                                      "(256 bytes): {}",
+                                      producer_rip, hex);
+                        }
+                    }
+                } else if (seen_bad_run) {
+                    // The bad value was already present at the oldest live
+                    // snapshot — the producer is older than our ring depth.
+                    // Report that so we know to deepen the ring if needed.
+                    origin_reported |= (1ull << i);
+                    LOG_ERROR(Core,
+                              "[GPRSNAP] {} VALUE-ORIGIN: bad value {:#x} predates "
+                              "the {}-deep snapshot ring (producer older than "
+                              "rip={:#x}); increase kSnapDepth to catch it",
+                              kGprNames[i], bad, kSnapDepth,
+                              snaps[(snap_pos - live) % kSnapDepth].rip);
                 }
             }
-            prev_r8 = r8;
-            seen_first = true;
         }
 
         // [RAXTRACE] Block-RIP ring buffer. Records the last 32 block

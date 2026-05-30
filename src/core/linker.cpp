@@ -99,20 +99,22 @@ static PS4_SYSV_ABI void RunMainEntryRuntime [[noreturn]] (EntryParams* params) 
     // deeply.
     constexpr u64 kGuestStackSize = 8 * 1024 * 1024;
     u8* guest_stack = static_cast<u8*>(std::malloc(kGuestStackSize));
-    ASSERT_MSG(guest_stack != nullptr, "RunMainEntryRuntime: failed to allocate guest stack");
+    ASSERT_MSG(guest_stack != nullptr,
+               "RunMainEntryRuntime: failed to allocate guest stack");
 
     // Set up the guest stack to match what the inline-asm in
     // RunMainEntry would have produced:
     //   align to 16, misalign by 8, push high half of params,
     //   push low half of params.
     u64 rsp = reinterpret_cast<u64>(guest_stack + kGuestStackSize);
-    rsp &= ~static_cast<u64>(0xF); // andq $-16, %rsp
-    rsp -= 8;                      // subq $8, %rsp
+    rsp &= ~static_cast<u64>(0xF);  // andq $-16, %rsp
+    rsp -= 8;                        // subq $8, %rsp
     // pushq 8(%1) / pushq 0(%1): push the two qwords of params.
     // We're pushing pointers worth of bytes; the native asm does
     // 8 bytes each, regardless of architecture-pointer-width.
     rsp -= 8;
-    *reinterpret_cast<u64*>(rsp) = *reinterpret_cast<u64*>(reinterpret_cast<u8*>(params) + 8);
+    *reinterpret_cast<u64*>(rsp) = *reinterpret_cast<u64*>(
+        reinterpret_cast<u8*>(params) + 8);
     rsp -= 8;
     *reinterpret_cast<u64*>(rsp) = *reinterpret_cast<u64*>(params);
 
@@ -120,28 +122,31 @@ static PS4_SYSV_ABI void RunMainEntryRuntime [[noreturn]] (EntryParams* params) 
     // fields the entry contract uses (RIP, RDI, RSI), plus RSP.
     Runtime::GuestState state{};
     state.rip = params->entry_addr;
-    state.gpr[4] = rsp;                                     // RSP
-    state.gpr[7] = reinterpret_cast<u64>(params);           // RDI = params
-    state.gpr[6] = reinterpret_cast<u64>(&ProgramExitFunc); // RSI = exit_fn
+    state.gpr[4] = rsp;                                      // RSP
+    state.gpr[7] = reinterpret_cast<u64>(params);            // RDI = params
+    state.gpr[6] = reinterpret_cast<u64>(&ProgramExitFunc);  // RSI = exit_fn
 
-    LOG_INFO(Core_Linker, "RunMainEntryRuntime: entering JIT at RIP={:#x}, RSP={:#x}", state.rip,
-             state.gpr[4]);
+    LOG_INFO(Core_Linker,
+             "RunMainEntryRuntime: entering JIT at RIP={:#x}, RSP={:#x}",
+             state.rip, state.gpr[4]);
 
     // Run through the JIT singleton, shared with module init and
     // other guest-entry sites.
     Runtime::Runtime::Instance().Run(state);
 
-    LOG_INFO(Core_Linker, "RunMainEntryRuntime: JIT exited (RIP={:#x}, exit_reason={})", state.rip,
-             state.exit_reason);
+    LOG_INFO(Core_Linker,
+             "RunMainEntryRuntime: JIT exited (RIP={:#x}, exit_reason={})",
+             state.rip, state.exit_reason);
 
     // Mirror native path's "no coming back" semantics. The native
     // path never returns because the guest jumps to ProgramExitFunc
     // which logs an error and falls through to process termination.
     // We do it explicitly.
     std::free(guest_stack);
-    std::exit(state.exit_reason == static_cast<u32>(Runtime::ExitReason::BlockEnd) ? 0 : 1);
+    std::exit(state.exit_reason == static_cast<u32>(
+                  Runtime::ExitReason::BlockEnd) ? 0 : 1);
 }
-#endif // SHADPS4_USES_RUNTIME
+#endif  // SHADPS4_USES_RUNTIME
 
 Linker::Linker() : memory{Memory::Instance()} {}
 
@@ -392,8 +397,7 @@ void Linker::Relocate(Module* module) {
             case STB_GLOBAL:
             case STB_WEAK: {
                 rel_name = names_tlb + sym.st_name;
-                const bool truly_resolved = Resolve(rel_name, rel_sym_type, module, &symrec);
-                if (truly_resolved) {
+                if (Resolve(rel_name, rel_sym_type, module, &symrec)) {
                     // Only set the rela bit if the symbol was actually resolved and not stubbed.
                     module->SetRelaBit(bit_idx);
                 }
@@ -405,23 +409,11 @@ void Linker::Relocate(Module* module) {
                 // attempts to call host code at addresses the linker
                 // never registered (a strong signal of a JIT bug or
                 // a corrupted guest pointer).
-                //
-                // IMPORTANT: only register when Resolve() returned
-                // true — i.e. this is a REAL HLE function whose host
-                // implementation exists. When Resolve falls through
-                // to AeroLib::GetStub, it returns false; those stub
-                // host pointers MUST NOT be registered. Stubs all
-                // funnel into CommonStubTemplate<I> whose body
-                // LOG_ERRORs through a thread_local that's broken on
-                // raw-CreateThread threads on Windows debug builds
-                // (reads 0xFFFFFFFFFFFFFFFF and crashes). Leaving
-                // stubs unregistered means the bridge sees an empty
-                // name on lookup and short-circuits the call to a
-                // clean return-zero, mirroring what the stub would
-                // have returned anyway.
-                if (truly_resolved && symbol_virtual_addr != 0) {
-                    Core::Runtime::HleRegistry::Instance().Register(symbol_virtual_addr,
-                                                                    symrec.name);
+                if (symbol_virtual_addr != 0) {
+#ifdef SHADPS4_USES_RUNTIME
+                    Core::Runtime::HleRegistry::Instance().Register(
+                        symbol_virtual_addr, symrec.name);
+#endif
                 }
                 break;
             }
