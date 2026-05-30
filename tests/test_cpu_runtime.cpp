@@ -15476,5 +15476,136 @@ TEST_F(CpuRuntimeTest, X87_Fstp_Fld_Tbyte_RoundTrip) {
     EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
 }
 
+// x87 register-form `fld st(i)` (D9 C0+i) — push a copy of ST(i). The
+// form observed at guest 0x80736d6e8 (op0=reg, hence "reg,reg" in the
+// trace). Load 10.0 then 20.0 (so ST0=20, ST1=10); `fld st(1)` copies
+// the value 10.0 to a new ST0. We then store the three live stack
+// slots and confirm ST0=10 (the copy), ST1=20, ST2=10.
+TEST_F(CpuRuntimeTest, X87_Fld_RegisterForm_DuplicatesStI) {
+    u8* d0 = mem.CodePtr() + 0x300;
+    u8* d1 = mem.CodePtr() + 0x310;
+    u8* d2 = mem.CodePtr() + 0x320;
+    u8* a  = mem.CodePtr() + 0x330;
+    u8* b  = mem.CodePtr() + 0x340;
+    const double va = 10.0, vb = 20.0;
+    std::memcpy(a, &va, sizeof(va));
+    std::memcpy(b, &vb, sizeof(vb));
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,    // mov rax, a
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,    // mov rcx, b
+        0x48, 0xba, 0,0,0,0,0,0,0,0,    // mov rdx, d0
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,    // mov rsi, d1
+        0x48, 0xbf, 0,0,0,0,0,0,0,0,    // mov rdi, d2
+        0xdd, 0x00,                      // fld qword [rax]   (push 10 -> ST0=10)
+        0xdd, 0x01,                      // fld qword [rcx]   (push 20 -> ST0=20,ST1=10)
+        0xd9, 0xc1,                      // fld st(1)         (copy ST1=10 -> new ST0)
+        // now ST0=10, ST1=20, ST2=10. Store and pop each:
+        0xdd, 0x1a,                      // fstp qword [rdx]  (ST0=10 -> d0)
+        0xdd, 0x1e,                      // fstp qword [rsi]  (ST0=20 -> d1)
+        0xdd, 0x1f,                      // fstp qword [rdi]  (ST0=10 -> d2)
+        0xc3,
+    };
+    const u64 aa=reinterpret_cast<u64>(a), ba=reinterpret_cast<u64>(b),
+              d0a=reinterpret_cast<u64>(d0), d1a=reinterpret_cast<u64>(d1),
+              d2a=reinterpret_cast<u64>(d2);
+    std::memcpy(&program[2],  &aa,  8);
+    std::memcpy(&program[12], &ba,  8);
+    std::memcpy(&program[22], &d0a, 8);
+    std::memcpy(&program[32], &d1a, 8);
+    std::memcpy(&program[42], &d2a, 8);
+
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    double o0, o1, o2;
+    std::memcpy(&o0, d0, 8);
+    std::memcpy(&o1, d1, 8);
+    std::memcpy(&o2, d2, 8);
+    EXPECT_EQ(o0, 10.0) << "fld st(1) copied ST1 (=10) to new ST0";
+    EXPECT_EQ(o1, 20.0) << "old ST0 (=20) is now ST1";
+    EXPECT_EQ(o2, 10.0) << "original ST1 (=10) still present as ST2";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// x87 arithmetic-with-pop family (DE xx). Focus on the reversed forms
+// (FSUBRP/FDIVRP), which are the easiest to get backwards, plus FADDP.
+// Setup pushes A then B so ST0=B, ST1=A; the op writes ST1 and pops, so
+// afterward ST0 holds the result. FSUBRP at guest 0x80736d769 motivated
+// this; verify st(i)=st(0)-st(i), i.e. B-A reversed = ST0-ST1.
+TEST_F(CpuRuntimeTest, X87_Fsubrp_ReverseSubtractAndPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 10.0, B = 20.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,    // mov rax, pa
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,    // mov rcx, pb
+        0x48, 0xba, 0,0,0,0,0,0,0,0,    // mov rdx, out
+        0xdd, 0x00,                      // fld qword [rax]  (ST0=A=10)
+        0xdd, 0x01,                      // fld qword [rcx]  (ST0=B=20, ST1=A=10)
+        0xde, 0xe1,                      // fsubrp st1,st0   (ST1 = ST0-ST1 = 20-10=10; pop)
+        0xdd, 0x1a,                      // fstp qword [rdx] (store result, pop)
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 10.0) << "fsubrp: st(0)-st(i) = 20-10 = 10 (not -10)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+TEST_F(CpuRuntimeTest, X87_Fdivrp_ReverseDivideAndPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 10.0, B = 20.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00,                      // ST0=A=10
+        0xdd, 0x01,                      // ST0=B=20, ST1=A=10
+        0xde, 0xf1,                      // fdivrp st1,st0 (ST1 = ST0/ST1 = 20/10=2; pop)
+        0xdd, 0x1a,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 2.0) << "fdivrp: st(0)/st(i) = 20/10 = 2 (not 0.5)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+TEST_F(CpuRuntimeTest, X87_Faddp_AddAndPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 10.0, B = 20.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00,
+        0xdd, 0x01,
+        0xde, 0xc1,                      // faddp st1,st0 (ST1 = 10+20 = 30; pop)
+        0xdd, 0x1a,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 30.0) << "faddp: 10+20 = 30";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
 } // namespace
 } // namespace Core::Runtime

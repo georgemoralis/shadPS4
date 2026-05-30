@@ -4052,8 +4052,20 @@ bool EmitFld(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              u64 next_rip,
              Xbyak::CodeGenerator& c) {
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) {
-        return false;  // register form deferred to Group 2
+    // Register form: `fld st(i)` (D9 C0+i) — push a copy of ST(i) onto
+    // the stack. The index i is relative to the CURRENT top, evaluated
+    // BEFORE the push, so we read st[(top+i)&7] into xmm0 first, then
+    // push (which decrements top and stores xmm0 into the new ST(0)).
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (ops[0].reg.value < ZYDIS_REGISTER_ST0 ||
+            ops[0].reg.value > ZYDIS_REGISTER_ST7) {
+            return false;
+        }
+        const int i = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+        EmitX87RegAddr(c, r8, i);          // r8 = &st[(top+i)&7]
+        c.movsd(xmm0, ptr[r8]);
+        EmitX87Push(c);                    // top--, st[top] = xmm0
+        return true;
     }
     // operand width: 32 = m32fp (float), 64 = m64fp (double).
     // NOTE: Zydis reports operand_width==32 for ALL x87 memory operands
@@ -4206,6 +4218,69 @@ bool EmitFistp(const ZydisDecodedInstruction& insn,
         c.mov(qword[rdx], rax);
     }
 
+    EmitX87PopDiscardValue(c);
+    return true;
+}
+
+/// FADDP / FMULP / FSUBP / FSUBRP / FDIVP / FDIVRP st(i), st(0) —
+/// x87 arithmetic with pop (DE xx). The operation writes ST(i), then
+/// ST(0) is popped. Operand order (Intel):
+///   FADDP : st(i) = st(i) + st(0)
+///   FMULP : st(i) = st(i) * st(0)
+///   FSUBP : st(i) = st(i) - st(0)
+///   FSUBRP: st(i) = st(0) - st(i)   (reversed)
+///   FDIVP : st(i) = st(i) / st(0)
+///   FDIVRP: st(i) = st(0) / st(i)   (reversed)
+/// i is relative to the CURRENT top (before the pop). We load st(0)
+/// into xmm0 and st(i) into xmm1, compute on host SSE2 doubles, write
+/// the result back to st(i)'s slot, then pop. Addresses are captured in
+/// callee-stable regs (r8 = &st(0), r10 = &st(i)) so EmitX87RegAddr's
+/// rcx/lea scratch use doesn't clobber them between the two lookups.
+bool EmitFpuArithPop(const ZydisDecodedInstruction& insn,
+                     const ZydisDecodedOperand* ops,
+                     Xbyak::CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    switch (m) {
+        case ZYDIS_MNEMONIC_FADDP:  case ZYDIS_MNEMONIC_FMULP:
+        case ZYDIS_MNEMONIC_FSUBP:  case ZYDIS_MNEMONIC_FSUBRP:
+        case ZYDIS_MNEMONIC_FDIVP:  case ZYDIS_MNEMONIC_FDIVRP:
+            break;
+        default: return false;
+    }
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[0].reg.value < ZYDIS_REGISTER_ST0 ||
+        ops[0].reg.value > ZYDIS_REGISTER_ST7) {
+        return false;
+    }
+    const int i = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+    if (i == 0) return false;  // st(0),st(0) — not a meaningful pop form
+
+    // r8 = &st(0); load into xmm0. r10 = &st(i); load into xmm1.
+    EmitX87RegAddr(c, r8, 0);
+    c.movsd(xmm0, ptr[r8]);          // xmm0 = st(0)
+    EmitX87RegAddr(c, r10, i);
+    c.movsd(xmm1, ptr[r10]);         // xmm1 = st(i)
+
+    // Compute into xmm1 (= the st(i) result). Non-reversed ops are
+    // st(i) <op> st(0); reversed subtract/divide swap the operands.
+    switch (m) {
+        case ZYDIS_MNEMONIC_FADDP:  c.addsd(xmm1, xmm0); break;  // i + 0
+        case ZYDIS_MNEMONIC_FMULP:  c.mulsd(xmm1, xmm0); break;  // i * 0
+        case ZYDIS_MNEMONIC_FSUBP:  c.subsd(xmm1, xmm0); break;  // i - 0
+        case ZYDIS_MNEMONIC_FDIVP:  c.divsd(xmm1, xmm0); break;  // i / 0
+        case ZYDIS_MNEMONIC_FSUBRP:                              // 0 - i
+            c.subsd(xmm0, xmm1);     // xmm0 = st(0) - st(i)
+            c.movsd(xmm1, xmm0);
+            break;
+        case ZYDIS_MNEMONIC_FDIVRP:                             // 0 / i
+            c.divsd(xmm0, xmm1);     // xmm0 = st(0) / st(i)
+            c.movsd(xmm1, xmm0);
+            break;
+        default: return false;
+    }
+    c.movsd(ptr[r10], xmm1);         // st(i) = result
+
+    // Pop st(0).
     EmitX87PopDiscardValue(c);
     return true;
 }
@@ -6403,6 +6478,11 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_FST:
             case ZYDIS_MNEMONIC_FSTP:
                 handled = EmitFstOrFstp(insn, ops, next_rip, c);
+                break;
+            case ZYDIS_MNEMONIC_FADDP:  case ZYDIS_MNEMONIC_FMULP:
+            case ZYDIS_MNEMONIC_FSUBP:  case ZYDIS_MNEMONIC_FSUBRP:
+            case ZYDIS_MNEMONIC_FDIVP:  case ZYDIS_MNEMONIC_FDIVRP:
+                handled = EmitFpuArithPop(insn, ops, c);
                 break;
             case ZYDIS_MNEMONIC_FLDCW:
                 handled = EmitFldcw(insn, ops, next_rip, c);
