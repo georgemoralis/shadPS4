@@ -16633,5 +16633,220 @@ TEST_F(CpuRuntimeTest, PackedFp_Vminps_NanTakesSecondOperand) {
     EXPECT_EQ(XmmLaneF(st, 1), 5.0f);
 }
 
+// ============================================================================
+// EXTENDED EMITTER COVERAGE, BATCH 4 -- ADDRESSING MODES
+//
+// The earlier batches covered opcodes; this batch exercises the *address
+// computation* (EmitEffectiveAddress) across the SIB and displacement forms
+// that the per-opcode tests didn't reach: base+index*scale, scaled indices,
+// disp8 / disp32 / negative displacement, and the memory-destination /
+// memory-source ALU forms layered on top. A scratch qword is staged in a
+// known slot of the guest code page and addressed via a base register so the
+// effective-address math is what's under test, not the opcode.
+//
+// All encodings byte-verified. Scratch convention: we place data at
+// CodePtr()+0x200 (well past the few program bytes at CodePtr()) and load a
+// base register with that address.
+// ============================================================================
+
+namespace {
+// Common setup: program at CodePtr(), a base pointer in a chosen GPR, run.
+GuestState RunAddrTest(const u8* program, size_t n, GuestMemory& mem,
+                       std::function<void(GuestState&, u8* scratch)> setup) {
+    std::memcpy(mem.CodePtr(), program, n);
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    setup(st, mem.CodePtr() + 0x200);
+    Runtime rt;
+    rt.Run(st);
+    return st;
+}
+} // namespace
+
+// ----------------------------------------------------------------------------
+// SIB: base + index*scale load. mov rax, [rcx + rdx*4]  (48 8b 04 91).
+// Place a marker qword at base + idx*4 and confirm it is loaded.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_SibBaseIndexScale4_Loads) {
+    const u8 program[] = {0x48, 0x8b, 0x04, 0x91, 0xc3}; // mov rax,[rcx+rdx*4]
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            // base=rcx=scratch, index=rdx=3, scale=4 -> scratch+12
+            *reinterpret_cast<u64*>(scratch + 12) = 0xCAFEF00DBAADF00DULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch); // rcx
+            s.gpr[2] = 3;                               // rdx
+            s.gpr[0] = 0;                               // rax poison
+        });
+    EXPECT_EQ(st.gpr[0], 0xCAFEF00DBAADF00DULL)
+        << "loaded from base + index*4";
+}
+
+// SIB with scale 8 and disp8. mov rax, [rcx + rdx*8 + 0x10] (48 8b 44 d1 10).
+TEST_F(CpuRuntimeTest, Addr_SibScale8Disp8_Loads) {
+    const u8 program[] = {0x48, 0x8b, 0x44, 0xd1, 0x10, 0xc3};
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            // scratch + rdx*8 + 0x10; rdx=2 -> scratch + 16 + 16 = scratch+32
+            *reinterpret_cast<u64*>(scratch + 32) = 0x1122334455667788ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[2] = 2;
+        });
+    EXPECT_EQ(st.gpr[0], 0x1122334455667788ULL)
+        << "base + index*8 + disp8";
+}
+
+// SIB store: mov [rcx + rdx*2], rax  (48 89 04 51).
+TEST_F(CpuRuntimeTest, Addr_SibScale2Store_Writes) {
+    const u8 program[] = {0x48, 0x89, 0x04, 0x51, 0xc3};
+    u8* scratch_captured = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            scratch_captured = scratch;
+            *reinterpret_cast<u64*>(scratch + 10) = 0; // base + rdx*2 (rdx=5) -> +10
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[2] = 5;
+            s.gpr[0] = 0xABCDEF0123456789ULL; // rax = value to store
+        });
+    ASSERT_NE(scratch_captured, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(scratch_captured + 10), 0xABCDEF0123456789ULL)
+        << "stored at base + index*2";
+}
+
+// ----------------------------------------------------------------------------
+// Displacement forms: disp8 positive, disp32, negative disp8.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_Disp8Positive_Loads) {
+    const u8 program[] = {0x48, 0x8b, 0x41, 0x7f, 0xc3}; // mov rax,[rcx+0x7f]
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            *reinterpret_cast<u64*>(scratch + 0x7f) = 0xDEADBEEF00000001ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+        });
+    EXPECT_EQ(st.gpr[0], 0xDEADBEEF00000001ULL) << "base + disp8";
+}
+
+TEST_F(CpuRuntimeTest, Addr_Disp32_Loads) {
+    const u8 program[] = {0x48, 0x8b, 0x81, 0x00,0x01,0x00,0x00, 0xc3}; // [rcx+0x100]
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            *reinterpret_cast<u64*>(scratch + 0x100) = 0x0123456789ABCDEFULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+        });
+    EXPECT_EQ(st.gpr[0], 0x0123456789ABCDEFULL) << "base + disp32";
+}
+
+TEST_F(CpuRuntimeTest, Addr_NegativeDisp8_Loads) {
+    const u8 program[] = {0x48, 0x8b, 0x41, 0x80, 0xc3}; // mov rax,[rcx-0x80]
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            // base = scratch + 0x80, disp = -0x80 -> scratch
+            *reinterpret_cast<u64*>(scratch) = 0xFEEDFACECAFEBEEFULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch) + 0x80;
+        });
+    EXPECT_EQ(st.gpr[0], 0xFEEDFACECAFEBEEFULL) << "base + negative disp8";
+}
+
+// ----------------------------------------------------------------------------
+// LEA with full SIB+disp: lea rax, [rcx + rdx*4 + 0x20]  (48 8d 44 91 20).
+// LEA computes the address without dereferencing; the result is pure
+// arithmetic, so we can check it exactly without staging memory.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_LeaSibDisp_ComputesAddress) {
+    const u8 program[] = {0x48, 0x8d, 0x44, 0x91, 0x20, 0xc3};
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* /*scratch*/) {
+            s.gpr[1] = 0x100000;  // rcx (base)
+            s.gpr[2] = 0x10;      // rdx (index)
+        });
+    // 0x100000 + 0x10*4 + 0x20 = 0x100000 + 0x40 + 0x20 = 0x100060
+    EXPECT_EQ(st.gpr[0], 0x100060ULL) << "base + index*4 + disp";
+}
+
+// ----------------------------------------------------------------------------
+// Memory-destination ALU: ADD / SUB write back to [mem] and set flags.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_AddMemDest_WritesBackAndFlags) {
+    const u8 program[] = {0x48, 0x01, 0x01, 0xc3}; // add [rcx], rax
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            *reinterpret_cast<u64*>(scratch) = 0x1000;
+            s.gpr[1] = reinterpret_cast<u64>(scratch); // rcx
+            s.gpr[0] = 0x0234;                          // rax
+        });
+    ASSERT_NE(cap, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0x1234ULL) << "[mem] += rax";
+    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear (nonzero result)";
+}
+
+TEST_F(CpuRuntimeTest, Addr_SubMemDest_ToZero_SetsZf) {
+    const u8 program[] = {0x48, 0x29, 0x01, 0xc3}; // sub [rcx], rax
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            *reinterpret_cast<u64*>(scratch) = 0x5555;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0x5555; // equal -> result 0
+        });
+    ASSERT_NE(cap, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0ULL) << "[mem] -= rax -> 0";
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set on zero result";
+}
+
+// ----------------------------------------------------------------------------
+// CMP in both memory directions -- it sets flags without writing memory.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_CmpRegMem_Equal_SetsZf) {
+    const u8 program[] = {0x48, 0x3b, 0x01, 0xc3}; // cmp rax, [rcx]
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            *reinterpret_cast<u64*>(scratch) = 0xABCD;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0xABCD; // equal
+        });
+    ASSERT_NE(cap, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0xABCDULL) << "cmp must not write memory";
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: rax == [mem]";
+    EXPECT_FALSE(st.rflags & (1ULL << 0)) << "CF clear on equal";
+}
+
+TEST_F(CpuRuntimeTest, Addr_CmpMemReg_Smaller_SetsCf) {
+    const u8 program[] = {0x48, 0x39, 0x01, 0xc3}; // cmp [rcx], rax
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            *reinterpret_cast<u64*>(scratch) = 0x10; // [mem]
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0x100;                         // rax (bigger)
+        });
+    // [mem] - rax = 0x10 - 0x100 -> borrow -> CF=1, ZF=0
+    EXPECT_TRUE(st.rflags & (1ULL << 0)) << "CF set: [mem] < rax";
+    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear";
+}
+
+// ----------------------------------------------------------------------------
+// 32-bit load from a SIB address zero-extends into the 64-bit register.
+// mov eax, [rcx + rdx*4]  (8b 04 91, no REX.W).
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_Sib32BitLoad_ZeroExtends) {
+    const u8 program[] = {0x8b, 0x04, 0x91, 0xc3}; // mov eax,[rcx+rdx*4]
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            // store a full 64-bit pattern; the 32-bit load takes only low 32
+            *reinterpret_cast<u64*>(scratch + 16) = 0xFFFFFFFF89ABCDEFULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[2] = 4; // rdx*4 = 16
+            s.gpr[0] = 0xDEADBEEFDEADBEEFULL; // rax poison
+        });
+    EXPECT_EQ(st.gpr[0], 0x0000000089ABCDEFULL)
+        << "32-bit load takes low dword and zero-extends bits 63:32";
+}
+
 } // namespace
 } // namespace Core::Runtime
