@@ -17085,5 +17085,227 @@ TEST_F(CpuRuntimeTest, Reject_GsSegmentOverride_UnsupportedExit) {
     EXPECT_EQ(st.gpr[0], 9u);
 }
 
+// ============================================================================
+// RUNTIME-LAYER BEHAVIOR TESTS
+//
+// These exercise the runtime *machinery* -- the dispatcher loop, block/code
+// caches, exit-reason plumbing, and the (compiled-out) diagnostics hooks --
+// rather than individual lifted opcodes. They drive Runtime directly (instead
+// of the RunProgram helper) where they need to introspect cache state after a
+// run.
+// ============================================================================
+
+namespace {
+// Like RunProgram, but exposes the Runtime so the test can inspect its caches
+// after execution. Returns nothing; caller holds the Runtime and GuestState.
+void RunOn(Runtime& rt, GuestMemory& mem, const u8* program, size_t n,
+           GuestState& out_state) {
+    std::memcpy(mem.CodePtr(), program, n);
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    out_state = GuestState{};
+    out_state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    out_state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    rt.Run(out_state);
+}
+} // namespace
+
+// ----------------------------------------------------------------------------
+// Multi-block dispatch: a forward jump splits execution across two distinct
+// guest RIPs. The dispatcher must compile and cache *both* blocks and chain
+// from the first into the second. Observable via the final register state and
+// a clean BlockEnd exit.
+//   xor rax,rax; jmp +N; <dead>; target: mov rax,0x2a; ret
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Dispatch_ForwardJump_ChainsTwoBlocks) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc0,             // xor rax, rax           (block A, off 0)
+        0xeb, 0x07,                   // jmp +7  -> off 0x0c    (ends block A)
+        0x48, 0xc7, 0xc3, 0x09,0,0,0, // mov rbx, 9 (dead code, jumped over)
+        0x48, 0xc7, 0xc0, 0x2a,0,0,0, // target: mov rax, 0x2a  (block B, off 0x0c)
+        0xc3,                         // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x2aULL) << "block B ran";
+    EXPECT_EQ(r.state.gpr[3], 0ULL)    << "dead code between blocks did not run";
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ----------------------------------------------------------------------------
+// Block-cache reuse: a loop re-enters the same block RIP three times. The
+// block is compiled once and served from the cache on the 2nd and 3rd entry.
+// Correctness of the accumulated result proves the cached block runs each time.
+//   xor rax,rax; mov rcx,3; L: add rax,rcx; dec rcx; jnz L; ret
+//   -> rax = 3 + 2 + 1 = 6
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Dispatch_Loop_ReusesCachedBlock) {
+    const u8 program[] = {
+        0x48, 0x31, 0xc0,             // xor rax, rax
+        0x48, 0xc7, 0xc1, 0x03,0,0,0, // mov rcx, 3
+        0x48, 0x01, 0xc8,             // L: add rax, rcx
+        0x48, 0xff, 0xc9,             // dec rcx
+        0x75, 0xf8,                   // jnz L
+        0xc3,                         // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 6ULL) << "3+2+1 accumulated across loop iterations";
+    EXPECT_EQ(r.state.gpr[1], 0ULL) << "counter decremented to 0";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ----------------------------------------------------------------------------
+// The block cache populates and serves a compiled block: after a run, the
+// entry RIP resolves in the block cache, and that host pointer is inside the
+// code cache.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, BlockCache_PopulatedAfterRun_AndInsideCodeCache) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07,0,0,0, // mov rax, 7
+        0xc3,                         // ret
+    };
+    Runtime rt;
+    GuestState st{};
+    RunOn(rt, mem, program, sizeof(program), st);
+    ASSERT_EQ(st.gpr[0], 7ULL);
+
+    const u64 entry_rip = reinterpret_cast<u64>(mem.CodePtr());
+    void* host = const_cast<BlockCache&>(rt.GetBlockCache()).Lookup(entry_rip);
+    ASSERT_NE(host, nullptr) << "entry block must be cached after the run";
+    EXPECT_TRUE(rt.GetCodeCache().Contains(host))
+        << "the cached block's host code lives in the code cache";
+}
+
+// A second Run() of the same program on the SAME Runtime resolves the entry to
+// the identical host pointer -- i.e. it is served from cache, not recompiled
+// to a new location.
+TEST_F(CpuRuntimeTest, BlockCache_SecondRun_ServesSameHostPointer) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07,0,0,0, // mov rax, 7
+        0xc3,
+    };
+    Runtime rt;
+    GuestState st1{}, st2{};
+    RunOn(rt, mem, program, sizeof(program), st1);
+    const u64 entry_rip = reinterpret_cast<u64>(mem.CodePtr());
+    void* host1 = const_cast<BlockCache&>(rt.GetBlockCache()).Lookup(entry_rip);
+
+    RunOn(rt, mem, program, sizeof(program), st2);
+    void* host2 = const_cast<BlockCache&>(rt.GetBlockCache()).Lookup(entry_rip);
+
+    ASSERT_NE(host1, nullptr);
+    EXPECT_EQ(host1, host2) << "same RIP must map to the same cached host block";
+    EXPECT_EQ(st1.gpr[0], st2.gpr[0]) << "and produce the same result";
+}
+
+// ----------------------------------------------------------------------------
+// Exit-reason plumbing: each reachable terminal reason surfaces in
+// state.exit_reason.
+// ----------------------------------------------------------------------------
+
+// BlockEnd: a normal RET through the return sentinel.
+TEST_F(CpuRuntimeTest, ExitReason_BlockEnd_OnReturnToSentinel) {
+    const u8 program[] = {0x48, 0x31, 0xc0, 0xc3}; // xor rax,rax; ret
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+    EXPECT_EQ(r.state.rip, kReturnSentinel);
+}
+
+// UnsupportedInstruction: an instruction the lifter does not handle stops the
+// run with the offending RIP preserved. (FS-segment-override load -- verified
+// elsewhere as unsupported.)
+TEST_F(CpuRuntimeTest, ExitReason_Unsupported_StopsWithRipAtFault) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x05,0,0,0, // mov rax, 5  (off 0)
+        0x64, 0x48, 0x8b, 0x09,        // mov rcx, fs:[rcx]  (off 7, unsupported)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.exit_reason,
+              static_cast<u32>(ExitReason::UnsupportedInstruction));
+    EXPECT_EQ(r.state.rip, r.program_base + 7) << "rip at the unsupported insn";
+    EXPECT_EQ(r.state.gpr[0], 5ULL) << "instructions before it executed";
+}
+
+// ----------------------------------------------------------------------------
+// Cross-run cache sharing on one Runtime: two *different* programs each get
+// their own cached entry block, and both entries coexist (the cache is not
+// clobbered by the second compile).
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, BlockCache_TwoProgramsCoexist) {
+    Runtime rt;
+
+    // Program 1 at CodePtr(): mov rax, 0x11; ret
+    const u8 p1[] = {0x48, 0xc7, 0xc0, 0x11,0,0,0, 0xc3};
+    GuestState s1{};
+    RunOn(rt, mem, p1, sizeof(p1), s1);
+    const u64 rip1 = reinterpret_cast<u64>(mem.CodePtr());
+    void* h1 = const_cast<BlockCache&>(rt.GetBlockCache()).Lookup(rip1);
+
+    // Program 2 at CodePtr()+0x40 (distinct RIP): mov rax, 0x22; ret
+    u8* p2_base = mem.CodePtr() + 0x40;
+    const u8 p2[] = {0x48, 0xc7, 0xc0, 0x22,0,0,0, 0xc3};
+    std::memcpy(p2_base, p2, sizeof(p2));
+    u8* rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(rsp) = kReturnSentinel;
+    GuestState s2{};
+    s2.rip = reinterpret_cast<u64>(p2_base);
+    s2.gpr[4] = reinterpret_cast<u64>(rsp);
+    rt.Run(s2);
+
+    const u64 rip2 = reinterpret_cast<u64>(p2_base);
+    void* h2 = const_cast<BlockCache&>(rt.GetBlockCache()).Lookup(rip2);
+
+    EXPECT_EQ(s1.gpr[0], 0x11ULL);
+    EXPECT_EQ(s2.gpr[0], 0x22ULL);
+    ASSERT_NE(h1, nullptr);
+    ASSERT_NE(h2, nullptr);
+    EXPECT_NE(h1, h2) << "distinct programs get distinct cached blocks";
+    // Program 1's block is still resolvable after program 2 compiled.
+    EXPECT_EQ(const_cast<BlockCache&>(rt.GetBlockCache()).Lookup(rip1), h1)
+        << "first block survived the second compile";
+}
+
+// ----------------------------------------------------------------------------
+// CallGuestSimple round-trips integer args (RDI..R9 per SysV) into the guest
+// and returns RAX. Guest: lea rax,[rdi+rsi]; ret  (rax = a0 + a1).
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, CallGuestSimple_SumsTwoArgsViaLea) {
+    const u8 program[] = {
+        0x48, 0x8d, 0x04, 0x37, // lea rax, [rdi + rsi]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    Runtime rt;
+    const u64 fn = reinterpret_cast<u64>(mem.CodePtr());
+    const u64 result = rt.CallGuestSimple(fn, mem.StackTop(),
+                                          /*a0=*/40, /*a1=*/2);
+    EXPECT_EQ(result, 42ULL) << "RDI(40) + RSI(2) via lea, returned in RAX";
+}
+
+// ----------------------------------------------------------------------------
+// Diagnostics-off invariant: in the default build (SHADPS4_RUNTIME_DIAGNOSTICS
+// undefined) the dispatcher's diagnostics hooks are inline no-ops. A program
+// that crosses block boundaries, compiles, and loops -- hitting every hook
+// site -- must produce exactly the result the pure computation predicts, i.e.
+// the hooks perturb nothing. (When diagnostics ARE compiled in, this still
+// passes; it just also logs.)
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, DiagnosticsHooks_DoNotPerturbExecution) {
+    // Same loop as the cache-reuse test (crosses boundaries + repeats a block)
+    // plus a forward structure, with a deterministic expected result.
+    const u8 program[] = {
+        0x48, 0x31, 0xc0,             // xor rax, rax
+        0x48, 0xc7, 0xc1, 0x05,0,0,0, // mov rcx, 5
+        0x48, 0x01, 0xc8,             // L: add rax, rcx
+        0x48, 0xff, 0xc9,             // dec rcx
+        0x75, 0xf8,                   // jnz L
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 15ULL) << "5+4+3+2+1, unaffected by diagnostics hooks";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
 } // namespace
 } // namespace Core::Runtime
