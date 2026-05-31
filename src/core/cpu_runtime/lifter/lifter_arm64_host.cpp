@@ -822,7 +822,20 @@ bool EmitAlu(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         default: return false;
     }
 
-    // ---- Write back at width. ----
+    // ---- Lazy-flag side-band (width-tagged), stashed BEFORE write-back.
+    //      The narrow merge path below reuses vLhs/vRhs as scratch, so the
+    //      operands must be committed to the side-band first. The materializer
+    //      reads these from memory and masks to flag_width. ----
+    c.mov(kWScratch3, flag_op);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(kWScratch3, w);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+    c.str(vLhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(vRhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(vRes, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+
+    // ---- Write back at width. (May clobber vLhs/vRhs in the narrow path;
+    //      safe now that the side-band is already committed.) ----
     if (dst_mem) {
         switch (w) {
             case 8:  c.strb(WReg(vRes.getIdx()), ptr(vAddr)); break;
@@ -848,15 +861,6 @@ bool EmitAlu(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         }
     }
 
-    // ---- Lazy-flag side-band (width-tagged). lhs/rhs/result stashed raw; the
-    //      materializer masks to flag_width. ----
-    c.mov(kWScratch3, flag_op);
-    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
-    c.mov(kWScratch3, w);
-    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
-    c.str(vLhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
-    c.str(vRhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
-    c.str(vRes, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
     EmitMaterializeFlags(c);
     return true;
 }
