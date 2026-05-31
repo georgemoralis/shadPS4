@@ -183,6 +183,11 @@ int ZydisGprToIndex(ZydisRegister r) {
 // host-agnostic materializer in runtime.cpp).
 constexpr u32 FLAG_OP_ADD = 1;
 constexpr u32 FLAG_OP_SUB = 2;
+// Logical ops (AND/OR/XOR/TEST): x86 clears CF and OF and sets ZF/SF/PF
+// from the result. The runtime materializer reads (op, result) for this
+// tag; lhs/rhs are still stashed for uniformity but are not needed to
+// derive the logical flags.
+constexpr u32 FLAG_OP_LOGIC = 3;
 
 // ----------------------------------------------------------------------------
 // INSTRUCTION EMITTERS.
@@ -290,6 +295,57 @@ bool EmitSub64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
     // Lazy-flag side-band (host-agnostic; runtime materializes RFLAGS).
     c.mov(kWScratch3, FLAG_OP_SUB);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    return true;
+}
+
+// guest: and/or/xor r64, r64  /  r64, imm   (with lazy-flag side-band)
+//   Bitwise logic. Same load/op/store/side-band shape as ADD/SUB, but
+//   the host op is the AArch64 logical instruction and the flag tag is
+//   FLAG_OP_LOGIC (x86 logicals clear CF/OF, set ZF/SF/PF from result).
+//   AArch64 register-form logicals: and_(Xd,Xn,Xm) / orr / eor.
+//   Memory operand forms are deferred (need the effective-address
+//   emitter), mirroring the current ADD/SUB scope.
+bool EmitLogic64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 CodeGenerator& c) {
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_AND:
+    case ZYDIS_MNEMONIC_OR:
+    case ZYDIS_MNEMONIC_XOR:
+        break;
+    default:
+        return false;
+    }
+    if (insn.operand_width != 64) return false;
+    if (insn.operand_count_visible != 2) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisGprToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    c.ldr(kScratch0, ptr(kState, GprOffset(dst))); // lhs (== dst current)
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisGprToIndex(ops[1].reg.value);
+        if (src < 0) return false;
+        c.ldr(kScratch1, ptr(kState, GprOffset(src))); // rhs
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(kScratch1, static_cast<u64>(ops[1].imm.value.s)); // rhs (sign-ext imm)
+    } else {
+        return false; // mem forms deferred
+    }
+
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_AND: c.and_(kScratch2, kScratch0, kScratch1); break;
+    case ZYDIS_MNEMONIC_OR:  c.orr(kScratch2, kScratch0, kScratch1);  break;
+    case ZYDIS_MNEMONIC_XOR: c.eor(kScratch2, kScratch0, kScratch1);  break;
+    default: return false;
+    }
+    c.str(kScratch2, ptr(kState, GprOffset(dst)));
+
+    // Lazy-flag side-band (host-agnostic; runtime materializes RFLAGS).
+    c.mov(kWScratch3, FLAG_OP_LOGIC);
     c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
     c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
     c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
@@ -445,6 +501,11 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_SUB:
             handled = EmitSub64(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_AND:
+        case ZYDIS_MNEMONIC_OR:
+        case ZYDIS_MNEMONIC_XOR:
+            handled = EmitLogic64(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_PUSH:
             handled = EmitPush(insn, ops, c);
