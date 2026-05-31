@@ -23,6 +23,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <functional>
 
 #include <gtest/gtest.h>
 
@@ -15605,6 +15606,441 @@ TEST_F(CpuRuntimeTest, X87_Faddp_AddAndPop) {
     double res; std::memcpy(&res, out, 8);
     EXPECT_EQ(res, 30.0) << "faddp: 10+20 = 30";
     EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ============================================================================
+// EXTENDED EMITTER COVERAGE
+//
+// The tests below broaden coverage of instruction families that the lifter
+// fully supports but that the original suite only sampled: the complete
+// SETcc / CMOVcc / Jcc condition matrices, plus flag-precision and width
+// edge cases for the integer ALU. Each test drives a single condition or
+// edge case in isolation so a failure pinpoints exactly which predicate or
+// width is wrong.
+//
+// Convention: where a test needs a specific RFLAGS bit pattern, it sets
+// state.rflags directly (bit 1 is the reserved-1 bit; we always keep it).
+// SETcc/CMOVcc read flags from state.rflags, so this is a direct probe of
+// the condition-decode logic without depending on a preceding compare.
+// ============================================================================
+
+namespace {
+// RFLAGS arithmetic bits, mirroring the constants used earlier in the file
+// but re-expressed locally for readability in the condition tables.
+constexpr u64 kFlagReserved1 = 1ULL << 1;  // always set in real RFLAGS
+constexpr u64 FCF = 1ULL << 0;
+constexpr u64 FPF = 1ULL << 2;
+constexpr u64 FZF = 1ULL << 6;
+constexpr u64 FSF = 1ULL << 7;
+constexpr u64 FOF = 1ULL << 11;
+
+// Run a single-instruction-plus-RET program with a caller-controlled
+// initial register/flag state, returning the post-run state.
+GuestState RunWithState(const u8* program, size_t n, GuestMemory& mem,
+                        std::function<void(GuestState&)> setup) {
+    std::memcpy(mem.CodePtr(), program, n);
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.rflags = kFlagReserved1;
+    setup(st);
+    Runtime rt;
+    rt.Run(st);
+    return st;
+}
+} // namespace
+
+// ----------------------------------------------------------------------------
+// SETcc -- the full 16-condition matrix. Each setcc writes 0/1 into AL's low
+// byte based on the flag predicate. We poison RAX's upper bits and verify
+// only the low byte is touched and that it matches the expected boolean.
+// Encoding: 0F 9x C0  (setcc al). Followed by RET.
+// ----------------------------------------------------------------------------
+
+// Helper macro: emit `setcc al; ret`, set rflags, expect al == want.
+#define SETCC_TEST(NAME, OPC2, FLAGS, WANT)                                  \
+    TEST_F(CpuRuntimeTest, SetccMatrix_##NAME) {                            \
+        const u8 program[] = {0x0f, OPC2, 0xc0, 0xc3};                      \
+        const auto st = RunWithState(program, sizeof(program), mem,         \
+            [](GuestState& s) {                                             \
+                s.gpr[0] = 0xDEADBEEFCAFE0042ULL; /* poison; al=0x42 */     \
+                s.rflags |= (FLAGS);                                        \
+            });                                                             \
+        EXPECT_EQ(st.gpr[0] & 0xFFULL, static_cast<u64>(WANT))              \
+            << #NAME " low byte";                                           \
+        EXPECT_EQ(st.gpr[0] & ~0xFFULL, 0xDEADBEEFCAFE0000ULL)              \
+            << #NAME " preserves upper 56 bits";                           \
+        EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));  \
+    }
+
+// OF set / clear.
+SETCC_TEST(Seto_True,   0x90, FOF, 1)
+SETCC_TEST(Seto_False,  0x90, 0,   0)
+SETCC_TEST(Setno_True,  0x91, 0,   1)
+SETCC_TEST(Setno_False, 0x91, FOF, 0)
+// CF (below / above-equal).
+SETCC_TEST(Setb_True,   0x92, FCF, 1)
+SETCC_TEST(Setb_False,  0x92, 0,   0)
+SETCC_TEST(Setae_True,  0x93, 0,   1)
+SETCC_TEST(Setae_False, 0x93, FCF, 0)
+// ZF (equal / not-equal).
+SETCC_TEST(Sete_True,   0x94, FZF, 1)
+SETCC_TEST(Sete_False,  0x94, 0,   0)
+SETCC_TEST(Setne_True,  0x95, 0,   1)
+SETCC_TEST(Setne_False, 0x95, FZF, 0)
+// CF|ZF (below-equal / above).
+SETCC_TEST(Setbe_CF,    0x96, FCF, 1)
+SETCC_TEST(Setbe_ZF,    0x96, FZF, 1)
+SETCC_TEST(Setbe_False, 0x96, 0,   0)
+SETCC_TEST(Seta_True,   0x97, 0,   1)
+SETCC_TEST(Seta_CF,     0x97, FCF, 0)
+SETCC_TEST(Seta_ZF,     0x97, FZF, 0)
+// SF.
+SETCC_TEST(Sets_True,   0x98, FSF, 1)
+SETCC_TEST(Sets_False,  0x98, 0,   0)
+SETCC_TEST(Setns_True,  0x99, 0,   1)
+SETCC_TEST(Setns_False, 0x99, FSF, 0)
+// PF.
+SETCC_TEST(Setp_True,   0x9a, FPF, 1)
+SETCC_TEST(Setp_False,  0x9a, 0,   0)
+SETCC_TEST(Setnp_True,  0x9b, 0,   1)
+SETCC_TEST(Setnp_False, 0x9b, FPF, 0)
+// SF!=OF (less / greater-equal).
+SETCC_TEST(Setl_SF,     0x9c, FSF, 1)         // SF=1,OF=0 -> SF!=OF -> less
+SETCC_TEST(Setl_OF,     0x9c, FOF, 1)         // SF=0,OF=1 -> less
+SETCC_TEST(Setl_Equal,  0x9c, FSF | FOF, 0)   // SF==OF -> not less
+SETCC_TEST(Setge_Equal, 0x9d, FSF | FOF, 1)   // SF==OF -> ge
+SETCC_TEST(Setge_Diff,  0x9d, FSF, 0)         // SF!=OF -> not ge
+// ZF | (SF!=OF) (less-equal / greater).
+SETCC_TEST(Setle_ZF,    0x9e, FZF, 1)
+SETCC_TEST(Setle_SF,    0x9e, FSF, 1)
+SETCC_TEST(Setle_False, 0x9e, 0,   0)
+SETCC_TEST(Setg_True,   0x9f, 0,   1)
+SETCC_TEST(Setg_ZF,     0x9f, FZF, 0)
+SETCC_TEST(Setg_SF,     0x9f, FSF, 0)
+
+#undef SETCC_TEST
+
+// ----------------------------------------------------------------------------
+// CMOVcc -- the full condition matrix. cmovcc rax, rbx (48 0F 4x C3).
+// RAX starts at a sentinel "old" value, RBX holds the "new" value. When the
+// condition holds, RAX must become RBX; otherwise RAX is unchanged.
+// ----------------------------------------------------------------------------
+
+#define CMOV_TEST(NAME, OPC2, FLAGS, TAKEN)                                  \
+    TEST_F(CpuRuntimeTest, CmovMatrix_##NAME) {                             \
+        const u8 program[] = {0x48, 0x0f, OPC2, 0xc3, 0xc3};               \
+        const u64 OLD = 0x1111111111111111ULL;                             \
+        const u64 NEW = 0x2222222222222222ULL;                             \
+        const auto st = RunWithState(program, sizeof(program), mem,         \
+            [&](GuestState& s) {                                           \
+                s.gpr[0] = OLD; s.gpr[3] = NEW;                            \
+                s.rflags |= (FLAGS);                                       \
+            });                                                            \
+        EXPECT_EQ(st.gpr[0], (TAKEN) ? NEW : OLD) << #NAME;                 \
+        EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));  \
+    }
+
+CMOV_TEST(Cmovo_T,   0x40, FOF, true)
+CMOV_TEST(Cmovo_F,   0x40, 0,   false)
+CMOV_TEST(Cmovno_T,  0x41, 0,   true)
+CMOV_TEST(Cmovno_F,  0x41, FOF, false)
+CMOV_TEST(Cmovb_T,   0x42, FCF, true)
+CMOV_TEST(Cmovb_F,   0x42, 0,   false)
+CMOV_TEST(Cmovae_T,  0x43, 0,   true)
+CMOV_TEST(Cmovae_F,  0x43, FCF, false)
+CMOV_TEST(Cmove_T,   0x44, FZF, true)
+CMOV_TEST(Cmove_F,   0x44, 0,   false)
+CMOV_TEST(Cmovne_T,  0x45, 0,   true)
+CMOV_TEST(Cmovne_F,  0x45, FZF, false)
+CMOV_TEST(Cmovbe_CF, 0x46, FCF, true)
+CMOV_TEST(Cmovbe_ZF, 0x46, FZF, true)
+CMOV_TEST(Cmovbe_F,  0x46, 0,   false)
+CMOV_TEST(Cmova_T,   0x47, 0,   true)
+CMOV_TEST(Cmova_CF,  0x47, FCF, false)
+CMOV_TEST(Cmovs_T,   0x48, FSF, true)
+CMOV_TEST(Cmovs_F,   0x48, 0,   false)
+CMOV_TEST(Cmovns_T,  0x49, 0,   true)
+CMOV_TEST(Cmovns_F,  0x49, FSF, false)
+CMOV_TEST(Cmovp_T,   0x4a, FPF, true)
+CMOV_TEST(Cmovp_F,   0x4a, 0,   false)
+CMOV_TEST(Cmovnp_T,  0x4b, 0,   true)
+CMOV_TEST(Cmovnp_F,  0x4b, FPF, false)
+CMOV_TEST(Cmovl_SF,  0x4c, FSF, true)
+CMOV_TEST(Cmovl_Eq,  0x4c, FSF | FOF, false)
+CMOV_TEST(Cmovge_Eq, 0x4d, FSF | FOF, true)
+CMOV_TEST(Cmovge_D,  0x4d, FSF, false)
+CMOV_TEST(Cmovle_ZF, 0x4e, FZF, true)
+CMOV_TEST(Cmovle_SF, 0x4e, FSF, true)
+CMOV_TEST(Cmovle_F,  0x4e, 0,   false)
+CMOV_TEST(Cmovg_T,   0x4f, 0,   true)
+CMOV_TEST(Cmovg_ZF,  0x4f, FZF, false)
+
+#undef CMOV_TEST
+
+// ----------------------------------------------------------------------------
+// Jcc -- the full short-form condition matrix (opcode 7x rel8). Each test lays
+// out: `jcc +N ; <BSR unsupported> ; <padding> ; <BSR unsupported>` so that a
+// TAKEN branch lands on the second BSR (clean UnsupportedInstruction at a
+// known RIP) and a NOT-TAKEN branch hits the first BSR right after the Jcc.
+// We distinguish taken/not-taken by which RIP the unsupported-exit reports.
+// ----------------------------------------------------------------------------
+
+#define JCC_TEST(NAME, OPC, FLAGS, EXPECT_TAKEN)                             \
+    TEST_F(CpuRuntimeTest, JccMatrix_##NAME) {                             \
+        /* layout:                                                          \
+           0: jcc +6           (2 bytes)                                    \
+           2: bsr rbx,rax      (4 bytes)  <- not-taken lands here           \
+           6: nop nop          (2 bytes)                                    \
+           8: bsr rbx,rax      (4 bytes)  <- taken lands here (2+4=6 disp)  \
+        */                                                                  \
+        const u8 program[] = {                                              \
+            OPC, 0x06,                                                      \
+            0x48, 0x0f, 0xbd, 0xd8,                                         \
+            0x90, 0x90,                                                     \
+            0x48, 0x0f, 0xbd, 0xd8,                                         \
+        };                                                                  \
+        std::memcpy(mem.CodePtr(), program, sizeof(program));              \
+        u8* guest_rsp = mem.StackTop() - 8;                                 \
+        *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;               \
+        GuestState st{};                                                    \
+        const u64 base = reinterpret_cast<u64>(mem.CodePtr());             \
+        st.rip = base; st.gpr[4] = reinterpret_cast<u64>(guest_rsp);       \
+        st.rflags = kFlagReserved1 | (FLAGS);                              \
+        Runtime rt; rt.Run(st);                                             \
+        EXPECT_EQ(st.exit_reason,                                          \
+                  static_cast<u32>(ExitReason::UnsupportedInstruction));   \
+        EXPECT_EQ(st.rip, base + ((EXPECT_TAKEN) ? 8u : 2u)) << #NAME;      \
+    }
+
+JCC_TEST(Jo_T,   0x70, FOF, true)
+JCC_TEST(Jo_F,   0x70, 0,   false)
+JCC_TEST(Jno_T,  0x71, 0,   true)
+JCC_TEST(Jno_F,  0x71, FOF, false)
+JCC_TEST(Jb_T,   0x72, FCF, true)
+JCC_TEST(Jb_F,   0x72, 0,   false)
+JCC_TEST(Jae_T,  0x73, 0,   true)
+JCC_TEST(Jae_F,  0x73, FCF, false)
+JCC_TEST(Je_T,   0x74, FZF, true)
+JCC_TEST(Je_F,   0x74, 0,   false)
+JCC_TEST(Jne_T,  0x75, 0,   true)
+JCC_TEST(Jne_F,  0x75, FZF, false)
+JCC_TEST(Jbe_CF, 0x76, FCF, true)
+JCC_TEST(Jbe_ZF, 0x76, FZF, true)
+JCC_TEST(Jbe_F,  0x76, 0,   false)
+JCC_TEST(Ja_T,   0x77, 0,   true)
+JCC_TEST(Ja_CF,  0x77, FCF, false)
+JCC_TEST(Js_T,   0x78, FSF, true)
+JCC_TEST(Js_F,   0x78, 0,   false)
+JCC_TEST(Jns_T,  0x79, 0,   true)
+JCC_TEST(Jns_F,  0x79, FSF, false)
+JCC_TEST(Jp_T,   0x7a, FPF, true)
+JCC_TEST(Jp_F,   0x7a, 0,   false)
+JCC_TEST(Jnp_T,  0x7b, 0,   true)
+JCC_TEST(Jnp_F,  0x7b, FPF, false)
+JCC_TEST(Jl_SF,  0x7c, FSF, true)
+JCC_TEST(Jl_Eq,  0x7c, FSF | FOF, false)
+JCC_TEST(Jge_Eq, 0x7d, FSF | FOF, true)
+JCC_TEST(Jge_D,  0x7d, FSF, false)
+JCC_TEST(Jle_ZF, 0x7e, FZF, true)
+JCC_TEST(Jle_F,  0x7e, 0,   false)
+JCC_TEST(Jg_T,   0x7f, 0,   true)
+JCC_TEST(Jg_ZF,  0x7f, FZF, false)
+
+#undef JCC_TEST
+
+// ----------------------------------------------------------------------------
+// Flag-precision tests: verify that ADD/SUB set each arithmetic flag exactly,
+// including the signed-overflow and carry corner cases that simpler tests miss.
+// ----------------------------------------------------------------------------
+
+// ADD that overflows signed (0x7FFF...FF + 1): OF=1, SF=1, CF=0, ZF=0.
+TEST_F(CpuRuntimeTest, AddFlags_SignedOverflow_SetsOfSf) {
+    const u8 program[] = {
+        0x48, 0xb8, 0xff,0xff,0xff,0xff,0xff,0xff,0xff,0x7f, // mov rax, INT64_MAX
+        0x48, 0x83, 0xc0, 0x01,                              // add rax, 1
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x8000000000000000ULL);
+    EXPECT_TRUE(r.state.rflags & FOF)  << "signed overflow";
+    EXPECT_TRUE(r.state.rflags & FSF)  << "result negative";
+    EXPECT_FALSE(r.state.rflags & FCF) << "no unsigned carry";
+    EXPECT_FALSE(r.state.rflags & FZF);
+}
+
+// ADD that carries unsigned (0xFFFF...FF + 1 = 0): CF=1, ZF=1, OF=0, SF=0.
+TEST_F(CpuRuntimeTest, AddFlags_UnsignedCarryToZero_SetsCfZf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0xff,0xff,0xff,0xff, // mov rax, -1 (sign-extended 0xFFFF..FF)
+        0x48, 0x83, 0xc0, 0x01,                // add rax, 1 -> 0
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);
+    EXPECT_TRUE(r.state.rflags & FCF)  << "carry out of bit 63";
+    EXPECT_TRUE(r.state.rflags & FZF)  << "result zero";
+    EXPECT_FALSE(r.state.rflags & FOF) << "no signed overflow (-1 + 1)";
+    EXPECT_FALSE(r.state.rflags & FSF);
+}
+
+// SUB producing signed overflow (INT64_MIN - 1): OF=1, CF=0 (no borrow),
+// SF=0 (result wraps to positive 0x7FFF...FF).
+TEST_F(CpuRuntimeTest, SubFlags_SignedOverflow_SetsOf) {
+    const u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0x80, // mov rax, INT64_MIN (0x8000..00)
+        0x48, 0x83, 0xe8, 0x01,         // sub rax, 1
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x7FFFFFFFFFFFFFFFULL);
+    EXPECT_TRUE(r.state.rflags & FOF)  << "signed overflow on INT64_MIN - 1";
+    EXPECT_FALSE(r.state.rflags & FSF) << "wrapped to positive";
+    EXPECT_FALSE(r.state.rflags & FCF) << "0x8000..00 >= 1, no borrow";
+}
+
+// Parity flag: a result with an even number of set bits in the low byte sets
+// PF; an odd count clears it. (0x03 has two bits -> PF=1; 0x07 has three ->
+// PF=0.) We use AND to land an exact low byte.
+TEST_F(CpuRuntimeTest, ParityFlag_EvenBitsSetsPf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x03, 0x00, 0x00, 0x00, // mov rax, 3 (0b11, even parity)
+        0x48, 0x25, 0xff, 0x00, 0x00, 0x00,       // and rax, 0xFF
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 3u);
+    EXPECT_TRUE(r.state.rflags & FPF) << "two set bits -> even parity -> PF=1";
+}
+TEST_F(CpuRuntimeTest, ParityFlag_OddBitsClearsPf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7 (0b111, odd parity)
+        0x48, 0x25, 0xff, 0x00, 0x00, 0x00,       // and rax, 0xFF
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 7u);
+    EXPECT_FALSE(r.state.rflags & FPF) << "three set bits -> odd parity -> PF=0";
+}
+
+// ----------------------------------------------------------------------------
+// ADC / SBB carry-propagation, exercised through a real 128-bit add and sub
+// (two 64-bit halves chained via CF). These complement the existing
+// Adc_128BitAddChain test with explicit edge values.
+// ----------------------------------------------------------------------------
+
+// 0xFFFF...FF + 1 across two limbs: low = 0 (CF=1), high += carry.
+TEST_F(CpuRuntimeTest, Adc_CarryPropagatesIntoHighLimb) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0xff,0xff,0xff,0xff, // mov rax, -1   (low limb a)
+        0x48, 0xc7, 0xc3, 0x00,0x00,0x00,0x00, // mov rbx, 0    (high limb a)
+        0x48, 0x83, 0xc0, 0x01,                // add rax, 1    -> 0, CF=1
+        0x48, 0x83, 0xd3, 0x00,                // adc rbx, 0    -> 0 + 0 + CF = 1
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u)  << "low limb wrapped to 0";
+    EXPECT_EQ(r.state.gpr[3], 1u)  << "high limb picked up the carry";
+}
+
+// SBB borrow: 0 - 1 with no prior borrow sets CF; then sbb high - 0 - CF.
+TEST_F(CpuRuntimeTest, Sbb_BorrowPropagatesIntoHighLimb) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x00,0x00,0x00,0x00, // mov rax, 0  (low limb)
+        0x48, 0xc7, 0xc3, 0x05,0x00,0x00,0x00, // mov rbx, 5  (high limb)
+        0x48, 0x83, 0xe8, 0x01,                // sub rax, 1  -> -1, CF=1 (borrow)
+        0x48, 0x83, 0xdb, 0x00,                // sbb rbx, 0  -> 5 - 0 - 1 = 4
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFFFFULL) << "low limb underflowed";
+    EXPECT_EQ(r.state.gpr[3], 4u) << "high limb lost one to the borrow";
+}
+
+// ----------------------------------------------------------------------------
+// NEG / NOT at 32-bit width: NEG must set flags and the 32-bit form must
+// zero-extend the upper 32. NOT never touches flags.
+// ----------------------------------------------------------------------------
+
+// NEG eax of a nonzero value: result is two's complement, CF set, upper32=0.
+TEST_F(CpuRuntimeTest, Neg32_NonZero_SetsCfAndZeroExtends) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x05,0,0,0, 0xEF,0xBE,0xAD,0xDE, // mov rax, 0xDEADBEEF00000005
+        0xf7, 0xd8,                                   // neg eax
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x00000000FFFFFFFBULL)
+        << "neg of 5 in 32 bits is 0xFFFFFFFB, upper 32 zeroed";
+    EXPECT_TRUE(r.state.rflags & FCF) << "NEG of nonzero sets CF";
+}
+
+// NEG eax of zero: result 0, CF clear, ZF set.
+TEST_F(CpuRuntimeTest, Neg32_Zero_ClearsCf) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0,0,0,0, // mov rax, 0
+        0xf7, 0xd8,                // neg eax
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0u);
+    EXPECT_FALSE(r.state.rflags & FCF) << "NEG of zero clears CF";
+    EXPECT_TRUE(r.state.rflags & FZF);
+}
+
+// ----------------------------------------------------------------------------
+// MOVSX width coverage: sign-extend an 8-bit and a 16-bit source to 64 bits.
+// ----------------------------------------------------------------------------
+
+TEST_F(CpuRuntimeTest, Movsx_Byte_NegativeSignExtendsTo64) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc3, 0x80,0xff,0xff,0xff, // mov rbx, 0xFFFFFFFFFFFFFF80 (bl=0x80)
+        0x48, 0x0f, 0xbe, 0xc3,                // movsx rax, bl
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFFFF80ULL)
+        << "0x80 as signed byte is -128, sign-extended";
+}
+TEST_F(CpuRuntimeTest, Movsx_Word_NegativeSignExtendsTo64) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc3, 0x00,0x80,0xff,0xff, // mov rbx, ...0xFFFF8000 (bx=0x8000)
+        0x48, 0x0f, 0xbf, 0xc3,                // movsx rax, bx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFFFFFFFFFFF8000ULL)
+        << "0x8000 as signed word sign-extends to 64";
+}
+
+// ----------------------------------------------------------------------------
+// Shift edge cases: SHR/SAR/SHL by a count that the hardware masks to 6 bits
+// (64-bit) or 5 bits (32-bit). Verify masking and the sign behavior of SAR.
+// ----------------------------------------------------------------------------
+
+// SAR rax (arithmetic) of a negative value fills with sign bits.
+TEST_F(CpuRuntimeTest, Sar64_Negative_SignFills) {
+    const u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0x80, // mov rax, INT64_MIN
+        0x48, 0xc1, 0xf8, 0x04,         // sar rax, 4
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xF800000000000000ULL)
+        << "arithmetic shift fills the top 4 bits with the sign";
+}
+
+// SHL eax by a count masked to 5 bits: shl eax, 33 == shl eax, 1.
+TEST_F(CpuRuntimeTest, Shl32_CountMaskedTo5Bits) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x01,0x00,0x00,0x00, // mov rax, 1
+        0xc1, 0xe0, 0x21,                       // shl eax, 33  (33 & 31 = 1)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 2u) << "33 masks to 1: 1<<1 = 2, upper32 zeroed";
 }
 
 } // namespace

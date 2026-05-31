@@ -3997,33 +3997,36 @@ bool EmitJccCondition(ZydisMnemonic mnemonic, Xbyak::CodeGenerator& c) {
             break;
         }
         case ZYDIS_MNEMONIC_JLE: {                       // JLE / JNG: ZF=1 OR SF != OF
-            // First (SF != OF) into r8.
-            c.mov(r8, rax);
-            c.shr(r8, 7);
+            // (SF != OF) into rdx. NOTE: must not use r8 here — EmitCmov
+            // stashes the CMOV source operand in r8 across this call, so
+            // clobbering r8 corrupted CMOVLE/CMOVG. rdx is free scratch.
+            c.mov(rdx, rax);
+            c.shr(rdx, 7);
             c.mov(rcx, rax);
             c.shr(rcx, 11);
-            c.xor_(r8, rcx);
-            c.and_(r8, 1);
+            c.xor_(rdx, rcx);
+            c.and_(rdx, 1);
             // Then ZF into rcx.
             c.mov(rcx, rax);
             c.shr(rcx, 6);
             c.and_(rcx, 1);
             // OR them.
-            c.or_(rcx, r8);
+            c.or_(rcx, rdx);
             break;
         }
         case ZYDIS_MNEMONIC_JNLE: {                      // JNLE / JG: ZF=0 AND SF == OF
-            c.mov(r8, rax);
-            c.shr(r8, 7);
+            // (SF != OF) into rdx (see JLE note: avoid r8).
+            c.mov(rdx, rax);
+            c.shr(rdx, 7);
             c.mov(rcx, rax);
             c.shr(rcx, 11);
-            c.xor_(r8, rcx);
-            c.and_(r8, 1);
-            // r8 = (SF != OF). We want NOT(ZF=1 OR (SF!=OF)).
+            c.xor_(rdx, rcx);
+            c.and_(rdx, 1);
+            // rdx = (SF != OF). We want NOT(ZF=1 OR (SF!=OF)).
             c.mov(rcx, rax);
             c.shr(rcx, 6);
             c.and_(rcx, 1);
-            c.or_(rcx, r8);
+            c.or_(rcx, rdx);
             // rcx is now (ZF=1 OR SF!=OF). Invert.
             c.not_(rcx);
             c.and_(rcx, 1);
