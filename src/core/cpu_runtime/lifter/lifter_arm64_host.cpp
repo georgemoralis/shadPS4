@@ -825,11 +825,14 @@ bool EmitAlu(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     // ---- Lazy-flag side-band (width-tagged), stashed BEFORE write-back.
     //      The narrow merge path below reuses vLhs/vRhs as scratch, so the
     //      operands must be committed to the side-band first. The materializer
-    //      reads these from memory and masks to flag_width. ----
-    c.mov(kWScratch3, flag_op);
-    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
-    c.mov(kWScratch3, w);
-    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+    //      reads these from memory and masks to flag_width.
+    //      NB: must NOT use kWScratch3 here — it is WReg(13), which aliases
+    //      vAddr (XReg(13)); clobbering it would corrupt the mem-dest store
+    //      address. Use WReg(9) (kScratch0's W view), free after operand load. ----
+    c.mov(WReg(9), flag_op);
+    c.str(WReg(9), ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(WReg(9), w);
+    c.str(WReg(9), ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
     c.str(vLhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
     c.str(vRhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
     c.str(vRes, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
