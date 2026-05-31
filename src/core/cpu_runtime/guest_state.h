@@ -56,7 +56,13 @@ struct alignas(64) GuestState {
     // (fused jcc, etc.), the lifter can short-circuit and emit a
     // direct branch without materializing rflags at all.
     u32 flag_op;
-    u32 _pad_flag;
+    // flag_width: operand width in bits (8/16/32/64) for the lazy-flag
+    // computation. The materializer derives ZF/SF/PF over the low `flag_width`
+    // bits and applies width-correct CF/OF. A value of 0 is treated as 64 so
+    // that producers which predate this field (e.g. the x86 host lifter, which
+    // computes flags natively and never sets it) keep their existing 64-bit
+    // behavior. Occupies the former _pad_flag slot — no layout change.
+    u32 flag_width;
     u64 flag_lhs;
     u64 flag_rhs;
     u64 flag_result;
