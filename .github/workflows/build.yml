@@ -160,13 +160,23 @@ jobs:
           --output-junit "${{ github.workspace }}/ctest-results.xml"
         shell: bash
 
-      - name: Upload test report
-        if: always()
+      - name: Collect failed tests
+        if: failure()
+        run: |
+          ctest --test-dir build --rerun-failed --output-on-failure \
+            > "${{ github.workspace }}/failed-tests.log" 2>&1 || true
+        shell: bash
+
+      - name: Upload test report (on failure)
+        if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: ctest-results-${{ matrix.name }}
-          path: ${{ github.workspace }}/ctest-results.xml
-          if-no-files-found: warn
+          path: |
+            ${{ github.workspace }}/ctest-results.xml
+            ${{ github.workspace }}/failed-tests.log
+          if-no-files-found: error
+        shell: bash
 
   windows-sdl:
     runs-on: windows-2025-vs2026
