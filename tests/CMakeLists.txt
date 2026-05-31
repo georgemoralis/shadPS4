@@ -300,6 +300,7 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/code_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/hle_registry.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/runtime.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/runtime_diagnostics.cpp
 
         # Required by logger
         ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -348,6 +349,19 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
     target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
         BOOST_ASIO_STANDALONE
         SHADPS4_USES_RUNTIME=1)
+
+    # This target compiles the runtime sources directly (it does not link the
+    # cpu_runtime library), so it does not inherit that library's diagnostics
+    # toggle. Mirror it here so runtime_diagnostics.{h,cpp} land on the same
+    # side of the #ifdef in the test build: with the option off (the default,
+    # and the right setting for running tests) the diagnostics TU is empty and
+    # the runtime.cpp calls are inline no-ops; with it on, both the header
+    # declarations and the out-of-line definitions are compiled, keeping them
+    # consistent and avoiding an undefined-symbol link error.
+    if (SHADPS4_RUNTIME_DIAGNOSTICS)
+        target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+            SHADPS4_RUNTIME_DIAGNOSTICS)
+    endif()
 
     target_link_libraries(shadps4_cpu_runtime_test PRIVATE
         GTest::gtest_main

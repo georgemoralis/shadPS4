@@ -17,10 +17,21 @@
 # they must simply not be handed to the compiler on an x86 build.
 # ============================================================================
 
+# Opt-in JIT corruption-investigation instrumentation. OFF by default: when
+# off, the diagnostics subsystem (runtime_diagnostics.cpp) compiles to an empty
+# translation unit and the dispatcher's diagnostics calls become inline no-ops
+# (see runtime_diagnostics.h), so there is zero hot-path cost in normal builds.
+# Turn on only for targeted debugging:  -DSHADPS4_RUNTIME_DIAGNOSTICS=ON
+option(SHADPS4_RUNTIME_DIAGNOSTICS
+    "Build the JIT runtime corruption-investigation diagnostics (RAXTRACE / \
+GPRSNAP / block dumps). Off by default; adds hot-path tracing when on." OFF)
+
 # Architecture-independent runtime sources — always compiled.
 set(CPU_RUNTIME_COMMON_SRCS
     runtime.cpp
     runtime.h
+    runtime_diagnostics.cpp
+    runtime_diagnostics.h
     code_cache.cpp
     code_cache.h
     block_cache.cpp
@@ -59,6 +70,15 @@ add_library(cpu_runtime STATIC
     ${CPU_RUNTIME_COMMON_SRCS}
     ${CPU_RUNTIME_BACKEND_SRCS}
 )
+
+# Propagate the diagnostics toggle as a compile definition. PUBLIC so that any
+# consumer including runtime_diagnostics.h sees the same active/no-op decision
+# the library was built with — otherwise the inline stubs in the header (chosen
+# by this macro) could disagree with the out-of-line definitions in the
+# library, an ODR hazard.
+if (SHADPS4_RUNTIME_DIAGNOSTICS)
+    target_compile_definitions(cpu_runtime PUBLIC SHADPS4_RUNTIME_DIAGNOSTICS)
+endif()
 
 # Zydis (guest x86 decoder) is needed by every configuration — the lifter
 # decodes guest x86 regardless of host arch, and the runtime's block

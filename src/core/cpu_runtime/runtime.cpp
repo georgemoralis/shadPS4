@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
-#include <unordered_set>
 
 #include "common/assert.h"
 #include "common/arch.h"
@@ -19,6 +18,7 @@
 #include "core/cpu_runtime/gateway/gateway.h"
 #include "core/cpu_runtime/lifter/lifter.h"
 #include "core/cpu_runtime/hle_registry.h"
+#include "core/cpu_runtime/runtime_diagnostics.h"
 
 #ifdef ARCH_X86_64
 #include <Zydis/Zydis.h>
@@ -96,49 +96,6 @@ thread_local Runtime* tl_active_runtime = nullptr;
 //
 // nullptr when no JIT execution is active on this thread.
 thread_local GuestState* tl_current_guest_state = nullptr;
-
-// Hex-dump a fixed window of a compiled block's emitted host code for offline
-// disassembly. This runs *inside crash/corruption diagnostics*, so it must not
-// itself fault: we never blindly read off a host pointer. Before touching any
-// byte we verify, via CodeCache::Contains() (a signal-safe pure range
-// compare), that BOTH the first and last byte of the window lie inside the
-// code cache. If the block sits near the end of a cache region, or the cache
-// was flushed, or a bad pointer found its way into the block cache, the read
-// would otherwise walk off mapped memory and we'd crash while diagnosing
-// another crash. On any failure we log the reason and read nothing.
-//
-// `kWindow` bytes are dumped: the block plus a little of whatever follows,
-// which is fine for offline disassembly.
-void SafeDumpBlockCode(Runtime* rt, u64 block_rip, const void* hp,
-                       const char* tag) {
-    constexpr int kWindow = 256;
-    if (rt == nullptr || hp == nullptr) {
-        return;
-    }
-    const u8* p = reinterpret_cast<const u8*>(hp);
-    const CodeCache& cc = rt->GetCodeCache();
-    // Guard the whole [p, p+kWindow) range, not just the start: a block can be
-    // close enough to the end of a cache region that the fixed overscan would
-    // otherwise run past it.
-    if (!cc.Contains(p) || !cc.Contains(p + (kWindow - 1))) {
-        LOG_ERROR(Core,
-                  "[{}] block {:#x}: host code window [{}, +{}) is not fully "
-                  "inside the code cache; skipping dump to avoid faulting in "
-                  "diagnostics",
-                  tag, block_rip, hp, kWindow);
-        return;
-    }
-    const char* digits = "0123456789abcdef";
-    char hex[kWindow * 3 + 1];
-    for (int k = 0; k < kWindow; ++k) {
-        hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
-        hex[k * 3 + 1] = digits[p[k] & 0xF];
-        hex[k * 3 + 2] = ' ';
-    }
-    hex[kWindow * 3] = '\0';
-    LOG_ERROR(Core, "[{}] block {:#x} host code ({} bytes): {}",
-              tag, block_rip, kWindow, hex);
-}
 
 /// HLE bridge — calls a host function as if it were the next-block
 /// continuation of guest execution.
@@ -371,212 +328,17 @@ void* DispatcherTrampoline(GuestState* state) {
         }
     }
 
-    // [DIAG-RAXTRACE] Corruption tracer. The crash at guest_rip
-    // 0x800274c09 dereferences a guest GPR (RAX) holding 0x414c40040 —
-    // an address ABOVE all mapped guest memory (which tops out around
-    // 0x8'xxxxxxxx for code/heap and 0x2'xxxxxxxx for dmem). That value
-    // is produced by an EARLIER block and persists in GuestState. To pin
-    // the producing instruction, watch for any GPR transitioning INTO the
-    // impossible range and log the RIP of the block that just ran (the
-    // culprit), plus the prior RIP for context. The dispatcher runs
-    // between blocks (a safe point, plain C++), so reading GPRs here is
-    // safe. Fires at most once per (gpr,rip) site to avoid loop spam.
-    {
-        // [RAXTRACE] One-time presence beacon: proves THIS runtime.cpp
-        // (with the tracer) is the binary actually running. If you see a
-        // crash but never see this line, runtime.o was not rebuilt.
-        static thread_local bool announced = false;
-        if (!announced) {
-            announced = true;
-            LOG_ERROR(Core, "[RAXTRACE] tracer-v3 active (dispatcher first entry, rip={:#x})",
-                      cur_rip);
-        }
-        // A guest VA is "impossible" if it's at/above 0x10'00000000 (the
-        // GPU carveout floor) yet not a normal code/heap (0x8__) or dmem
-        // (0x2__) pointer. Simplest robust filter: flag the specific high
-        // nibble pattern we keep seeing (bits >= 0x4'00000000 that aren't
-        // 0x8__ code/heap). We log any GPR whose top byte is in [0x3,0x7]
-        // — squarely in the unmapped gap between dmem and code.
-        static thread_local u64 last_block_rip = 0;
-        static thread_local u64 reported_sites = 0;  // bitset of gpr indices already reported
-        const char* const kGprNames[16] = {
-            "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
-            "r8","r9","r10","r11","r12","r13","r14","r15",
-        };
-        for (int i = 0; i < 16; ++i) {
-            if (i == 4 || i == 5) continue;  // skip rsp/rbp (host-ish stack values)
-            const u64 v = state->gpr[i];
-            const u64 top = v >> 32;
-            // Unmapped gap: high dword in [0x3 .. 0x7] (above dmem 0x2__,
-            // below code/heap 0x8__). 0x414c40040 -> top = 0x4.
-            // EXCLUDE the legitimately-mapped high "anon" stack region
-            // (~0x7ef000000..0x7f0000000) which also has top byte 0x7 —
-            // those are valid pointers, not corruption (false positives).
-            const bool in_anon_stack = (v >= 0x7ef000000ull && v < 0x800000000ull);
-            if (top >= 0x3 && top <= 0x7 && !in_anon_stack) {
-                if (!(reported_sites & (1ull << i))) {
-                    reported_sites |= (1ull << i);
-                    LOG_ERROR(Core,
-                              "[RAXTRACE] guest {} = {:#x} (UNMAPPED gap) first seen after "
-                              "block rip={:#x}; next rip={:#x}",
-                              kGprNames[i], v, last_block_rip, cur_rip);
-                    // Auto-dump the culprit block's emitted host code. Look
-                    // up its host pointer in the block cache and dump a
-                    // fixed window (the block plus a little of the next —
-                    // fine for offline disassembly). This removes the need
-                    // for a per-RIP allowlist and any compile-time timing
-                    // dependence: whatever block produced the bad value
-                    // gets its code dumped right here.
-                    if (rt != nullptr && last_block_rip != 0) {
-                        BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
-                        if (void* hp = bc.Lookup(last_block_rip)) {
-                            SafeDumpBlockCode(rt, last_block_rip, hp, "RAXTRACE");
-                        }
-                    }
-                }
-            }
-        }
-        last_block_rip = cur_rip;
-
-        // [GPRSNAP] Per-block full-GPR snapshot ring + value-origin walk.
-        //
-        // The gap detector above names the block AFTER which a register was
-        // first seen holding a bad value, but it cannot say where that value
-        // was actually WRITTEN — the bad register often persists unchanged
-        // across many blocks before the gap detector first inspects it, and
-        // the block-RIP ring records only RIPs, never values. This snapshot
-        // ring records ALL 16 GPRs at every block boundary. When a register
-        // first enters the unmapped gap, we walk the ring backward to find
-        // the FIRST boundary where that register's value differs from the
-        // boundary before it — i.e. the block that actually produced the
-        // bad value — and report old->new with the producing block's RIP.
-        //
-        // This is the decisive attribution the prior tracers could not give:
-        // it converts "corruption happened somewhere in the last N blocks"
-        // into "block X wrote <bad> into <reg> (was <good>)".
-        {
-            constexpr int kSnapDepth = 64;
-            struct GprSnap {
-                u64 rip;            // block RIP recorded at this boundary
-                u64 gpr[16];        // full GPR file at this boundary
-                bool valid;
-            };
-            static thread_local GprSnap snaps[kSnapDepth] = {};
-            static thread_local u32 snap_pos = 0;
-            static thread_local u64 origin_reported = 0;  // bitset per gpr idx
-
-            // Record this boundary's snapshot.
-            const u32 cur_slot = snap_pos % kSnapDepth;
-            snaps[cur_slot].rip = cur_rip;
-            for (int i = 0; i < 16; ++i) snaps[cur_slot].gpr[i] = state->gpr[i];
-            snaps[cur_slot].valid = true;
-            snap_pos++;
-
-            // For each GPR now sitting in the unmapped gap that we haven't
-            // already attributed, walk the ring backward to find where it
-            // first took on its current (bad) value.
-            for (int i = 0; i < 16; ++i) {
-                if (i == 4 || i == 5) continue;  // rsp/rbp: stack-ish, skip
-                const u64 bad = state->gpr[i];
-                const u64 top = bad >> 32;
-                const bool in_anon_stack =
-                    (bad >= 0x7ef000000ull && bad < 0x800000000ull);
-                const bool is_bad = (top >= 0x3 && top <= 0x7 && !in_anon_stack);
-                if (!is_bad) continue;
-                if (origin_reported & (1ull << i)) continue;
-
-                // Walk backward over recorded snapshots (newest first).
-                // We have snap_pos total writes; only the last min(snap_pos,
-                // kSnapDepth) are live. Find the oldest CONTIGUOUS run in
-                // which gpr[i] == bad, then the snapshot just before that run
-                // holds the prior (good) value and its RIP is the producer.
-                const u32 live = (snap_pos < (u32)kSnapDepth) ? snap_pos
-                                                              : (u32)kSnapDepth;
-                if (live < 2) continue;
-
-                // newest live snapshot is at (snap_pos-1).
-                u64 prev_val = 0;
-                u64 producer_rip = 0;
-                bool found = false;
-                bool seen_bad_run = false;
-                for (u32 k = 1; k <= live; ++k) {
-                    const u32 slot = (snap_pos - k) % kSnapDepth;
-                    if (!snaps[slot].valid) break;
-                    const u64 v = snaps[slot].gpr[i];
-                    if (v == bad) {
-                        seen_bad_run = true;
-                        // keep walking back; this boundary still had the bad value
-                        continue;
-                    }
-                    // First boundary (going back) where the value was NOT bad.
-                    if (seen_bad_run) {
-                        // Snapshot timing: snaps[].rip labels the block ABOUT
-                        // TO RUN at that boundary, while snaps[].gpr is the
-                        // state the PREVIOUS block produced. So the block that
-                        // actually produced the good->bad transition is the one
-                        // about-to-run at THIS (last-good) boundary — i.e.
-                        // snaps[slot].rip, not the next-newer slot. (The newer
-                        // slot's value is already bad, so its about-to-run block
-                        // merely inherited the bad value.)
-                        prev_val = v;
-                        producer_rip = snaps[slot].rip;
-                        found = true;
-                    }
-                    break;
-                }
-
-                if (found) {
-                    origin_reported |= (1ull << i);
-                    LOG_ERROR(Core,
-                              "[GPRSNAP] {} VALUE-ORIGIN: block {:#x} changed it "
-                              "from {:#x} -> {:#x} (bad now persists into rip={:#x})",
-                              kGprNames[i], producer_rip, prev_val, bad, cur_rip);
-                    // Dump the producing block's emitted host code for offline
-                    // disassembly, same format as the gap detector above.
-                    if (rt != nullptr && producer_rip != 0) {
-                        BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
-                        if (void* hp = bc.Lookup(producer_rip)) {
-                            SafeDumpBlockCode(rt, producer_rip, hp, "GPRSNAP");
-                        }
-                    }
-                } else if (seen_bad_run) {
-                    // The bad value was already present at the oldest live
-                    // snapshot — the producer is older than our ring depth.
-                    // Report that so we know to deepen the ring if needed.
-                    origin_reported |= (1ull << i);
-                    LOG_ERROR(Core,
-                              "[GPRSNAP] {} VALUE-ORIGIN: bad value {:#x} predates "
-                              "the {}-deep snapshot ring (producer older than "
-                              "rip={:#x}); increase kSnapDepth to catch it",
-                              kGprNames[i], bad, kSnapDepth,
-                              snaps[(snap_pos - live) % kSnapDepth].rip);
-                }
-            }
-        }
-
-        // [RAXTRACE] Block-RIP ring buffer. Records the last 32 block
-        // entries on this thread. When a corruption is first reported
-        // (above), we also dump this ring so the actual loop CYCLE is
-        // visible — which blocks repeat, in what order. This reveals the
-        // OUTER loop (the one resetting RBX and restarting the copy) that
-        // the per-block attribution can't name on its own. Dumped once,
-        // right after the first corruption report.
-        {
-            static thread_local u64 ring[32] = {};
-            static thread_local u32 ring_pos = 0;
-            static thread_local bool ring_dumped = false;
-            ring[ring_pos & 31] = cur_rip;
-            ring_pos++;
-            if (reported_sites != 0 && !ring_dumped) {
-                ring_dumped = true;
-                // Emit the last 32 block RIPs oldest→newest.
-                for (u32 k = 0; k < 32; ++k) {
-                    u32 idx = (ring_pos + k) & 31;
-                    LOG_ERROR(Core, "[RAXTRACE] ring[{}] block rip={:#x}", k, ring[idx]);
-                }
-            }
-        }
-    }
+    // Corruption-investigation instrumentation. These observers read the
+    // guest state at this block boundary and log; they never alter
+    // execution. The whole subsystem compiles out unless
+    // SHADPS4_RUNTIME_DIAGNOSTICS is defined (see runtime_diagnostics.h),
+    // so in normal builds the following calls vanish entirely and the hot
+    // path carries zero cost. Order matters: RecordBlockBoundary must run
+    // before CheckRegisterCorruption, which consumes the snapshot and ring
+    // it records.
+    Diagnostics::AnnounceOnce(cur_rip);
+    Diagnostics::RecordBlockBoundary(state, cur_rip);
+    Diagnostics::CheckRegisterCorruption(rt, state, cur_rip);
 
     while (true) {
         // Sentinel check: if guest code RET'd through the call chain
@@ -765,23 +527,10 @@ void* DispatcherTrampoline(GuestState* state) {
             const u64 xmm0_bits = std::bit_cast<u64>(ret.xmm0);
             std::memcpy(&state->ymm[0], &xmm0_bits, sizeof(u64));
 
-            // [RAXTRACE] If an HLE stub just returned a value in the
-            // unmapped gap (high dword 0x3..0x7) into guest RAX, that is
-            // very likely the source of the bad pointer dereferenced later
-            // at 0x800274c09. Name the function so we know which stub to
-            // fix. Fires once.
-            {
-                static thread_local bool hle_bad_reported = false;
-                const u64 top = ret.rax >> 32;
-                if (!hle_bad_reported && top >= 0x3 && top <= 0x7) {
-                    hle_bad_reported = true;
-                    LOG_ERROR(Core,
-                              "[RAXTRACE] HLE stub '{}' (host={:#x}) returned rax={:#x} "
-                              "in UNMAPPED gap — likely the bad-pointer source",
-                              name.empty() ? std::string_view{"<unregistered>"} : name,
-                              host_fn, ret.rax);
-                }
-            }
+            // Diagnostics: flag an HLE stub that returned a gap-range value in
+            // RAX (a likely bad-pointer source). No-op unless diagnostics are
+            // compiled in.
+            Diagnostics::CheckHleReturn(name, host_fn, ret.rax);
 
             // Post-return rax/xmm0 as TRACE detail. If a debug trace
             // shows the "call" line for a host_fn but never this "ret"
@@ -803,24 +552,10 @@ void* DispatcherTrampoline(GuestState* state) {
         // Guest path: cache lookup, compile on miss.
         BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
 
-        // [RAXTRACE] Targeted pre-block dump: if we are about to enter the
-        // known faulting block, dump all guest GPRs HERE — this is the
-        // exact state feeding the crash, captured at a safe point before
-        // the block runs. Shows which register already holds the bad
-        // pointer and what the others look like one block earlier than the
-        // fault handler sees. Fires once.
-        {
-            static thread_local bool dumped = false;
-            if (!dumped && state->rip == 0x800274c09ull) {
-                dumped = true;
-                static const char* const kN[16] = {
-                    "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
-                    "r8","r9","r10","r11","r12","r13","r14","r15"};
-                LOG_ERROR(Core, "[RAXTRACE] about to enter faulting block 0x800274c09; guest GPRs:");
-                for (int i = 0; i < 16; ++i)
-                    LOG_ERROR(Core, "[RAXTRACE]   {} = {:#x}", kN[i], state->gpr[i]);
-            }
-        }
+        // Diagnostics: if the block we're about to enter is one under
+        // investigation, dump guest GPRs at this safe point. No-op unless
+        // diagnostics are compiled in.
+        Diagnostics::MaybeDumpPreBlock(state);
 
         if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
             return host_ptr;
@@ -887,158 +622,11 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
     const u64 used_before = code_cache_->Used();
     void* host_ptr = lifter_->CompileBlock(guest_rip);
     if (host_ptr != nullptr) {
-#ifdef ARCH_X86_64
-        // Optional: disassemble EVERY compiled block straight into the log,
-        // once per guest RIP, so blocks are human-readable without any offline
-        // tool. Off by default (this floods the log); enable by setting the
-        // environment variable SHADPS4_DUMP_BLOCKS=1 before launching. Output
-        // is one header line per block plus one line per host instruction:
-        //   block 0x800274c09 (32 host bytes):
-        //     +0x00  mov eax, [r13+0x50]        ; guest R10
-        //     +0x04  mov [r13+0x10], rax        ; guest RDX
-        //     ...
-        // The r13-relative annotation maps the access back to the guest
-        // register / state field, since r13 is pinned to the GuestState base.
-        // x86-only: it decodes the emitted HOST instructions with Zydis, whose
-        // formatter is x86. On the arm64 host the emitted code is AArch64, which
-        // Zydis can't format, so the feature is compiled out there (the Zydis
-        // include itself is also gated to ARCH_X86_64).
-        static const bool dump_all_blocks = [] {
-            const char* e = std::getenv("SHADPS4_DUMP_BLOCKS");
-            return e != nullptr && e[0] != '\0' && e[0] != '0';
-        }();
-        if (dump_all_blocks) {
-            // De-dup per guest RIP so re-dispatched blocks don't re-print.
-            static thread_local std::unordered_set<u64> seen_blocks;
-            if (seen_blocks.insert(guest_rip).second) {
-                const u64 used_after = code_cache_->Used();
-                u64 n = used_after - used_before;
-                constexpr u64 kMaxDump = 1024;
-                if (n > kMaxDump) n = kMaxDump;
-                const auto* code = reinterpret_cast<const u8*>(host_ptr);
-
-                LOG_ERROR(Core, "block {:#x} ({} host bytes):", guest_rip, n);
-
-                // Map an r13-relative displacement to a guest register / state
-                // field name (GuestState layout: gpr[0..15] at 0x00..0x78,
-                // then rip/rflags/lazy-flag fields/fs_base/gs_base).
-                auto slot_name = [](u64 off) -> const char* {
-                    static const char* kGpr[16] = {
-                        "RAX","RCX","RDX","RBX","RSP","RBP","RSI","RDI",
-                        "R8","R9","R10","R11","R12","R13","R14","R15"};
-                    if (off < 0x80 && (off % 8) == 0) return kGpr[off / 8];
-                    switch (off) {
-                    case 0x80: return "rip";
-                    case 0x88: return "rflags";
-                    case 0x90: return "flag_op";
-                    case 0x98: return "flag_lhs";
-                    case 0xa0: return "flag_rhs";
-                    case 0xa8: return "flag_result";
-                    case 0xb0: return "fs_base";
-                    case 0xb8: return "gs_base";
-                    default:   return nullptr;
-                    }
-                };
-
-                ZydisDecoder dec;
-                ZydisFormatter fmt;
-                if (ZYAN_SUCCESS(ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64,
-                                                  ZYDIS_STACK_WIDTH_64)) &&
-                    ZYAN_SUCCESS(ZydisFormatterInit(&fmt, ZYDIS_FORMATTER_STYLE_INTEL))) {
-                    u64 off = 0;
-                    while (off < n) {
-                        // Stop at zero-padding: the code-cache "used" delta
-                        // can over-report a block's true length (alignment /
-                        // post-flush bump), and the tail is zeroed cache that
-                        // decodes as a meaningless run of `add [rax], al`
-                        // (opcode 00 00). A 00 00 here is never real emitted
-                        // code, so treat it as the end of the block.
-                        if (off + 1 < n && code[off] == 0x00 && code[off + 1] == 0x00) {
-                            break;
-                        }
-                        ZydisDecodedInstruction insn;
-                        ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-                        if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(
-                                &dec, code + off, n - off, &insn, ops))) {
-                            LOG_ERROR(Core, "  +{:#04x}  <bad decode>", off);
-                            break;
-                        }
-                        char text[160];
-                        ZydisFormatterFormatInstruction(&fmt, &insn, ops,
-                                                        insn.operand_count_visible,
-                                                        text, sizeof(text),
-                                                        /*runtime_address=*/off,
-                                                        ZYAN_NULL);
-                        // Annotate the first r13-relative memory operand with
-                        // the guest slot it touches. We read disp.value
-                        // directly: a zero displacement is a valid slot
-                        // access ([r13] == guest RAX), and the
-                        // `has_displacement` flag isn't present across all
-                        // Zydis versions in the tree.
-                        const char* note = nullptr;
-                        for (u32 i = 0; i < insn.operand_count; ++i) {
-                            if (ops[i].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                                ops[i].mem.base == ZYDIS_REGISTER_R13) {
-                                const u64 d =
-                                    static_cast<u64>(ops[i].mem.disp.value);
-                                note = slot_name(d);
-                                break;
-                            }
-                        }
-                        if (note != nullptr) {
-                            LOG_ERROR(Core, "  +{:#04x}  {}    ; guest {}",
-                                      off, text, note);
-                        } else {
-                            LOG_ERROR(Core, "  +{:#04x}  {}", off, text);
-                        }
-                        off += insn.length;
-
-                        // A block ends with its terminator: an indirect jump
-                        // through r14 (dispatcher loop) or r15 (clean/fatal
-                        // exit). Once we've emitted that, everything after is
-                        // the next block or padding — stop here so we don't
-                        // walk past the real end.
-                        if (insn.mnemonic == ZYDIS_MNEMONIC_JMP &&
-                            ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                            (ops[0].reg.value == ZYDIS_REGISTER_R14 ||
-                             ops[0].reg.value == ZYDIS_REGISTER_R15)) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-#endif // ARCH_X86_64
-        // [RAXTRACE] Dump emitted host bytes for the loop blocks involved
-        // in the bit-33 corruption (0x800274c00 / ...c09 / ...cae), so the
-        // exact lifted sequence can be disassembled. Computed from the
-        // code-cache bump delta; host_ptr is the block's start. Fires once
-        // per guest_rip of interest.
-        if (guest_rip == 0x800274c00ull || guest_rip == 0x800274c09ull ||
-            guest_rip == 0x800274caeull || guest_rip == 0x800302f60ull) {
-            static thread_local u64 dumped_mask = 0;
-            int slot = (guest_rip == 0x800274c00ull) ? 0
-                     : (guest_rip == 0x800274c09ull) ? 1
-                     : (guest_rip == 0x800274caeull) ? 2 : 3;
-            if (!(dumped_mask & (1ull << slot))) {
-                dumped_mask |= (1ull << slot);
-                const u64 used_after = code_cache_->Used();
-                u64 n = used_after - used_before;
-                if (n > 256) n = 256;
-                const u8* p = reinterpret_cast<const u8*>(host_ptr);
-                const char* digits = "0123456789abcdef";
-                char hex[256 * 3 + 1];
-                u64 m = (n > 256) ? 256 : n;
-                for (u64 i = 0; i < m; ++i) {
-                    hex[i * 3 + 0] = digits[(p[i] >> 4) & 0xF];
-                    hex[i * 3 + 1] = digits[p[i] & 0xF];
-                    hex[i * 3 + 2] = ' ';
-                }
-                hex[m * 3] = '\0';
-                LOG_ERROR(Core, "[RAXTRACE] emitted block {:#x} ({} host bytes): {}",
-                          guest_rip, n, hex);
-            }
-        }
+        // Diagnostics: optional full per-instruction disassembly of the block
+        // (env-gated dev tool) and, for blocks under investigation, a raw
+        // host-byte dump. All no-ops unless diagnostics are compiled in.
+        Diagnostics::OnBlockCompiled(guest_rip, host_ptr,
+                                     code_cache_->Used() - used_before);
         return host_ptr;
     }
     // CompileBlock returned nullptr. The common (and benign) cause is
