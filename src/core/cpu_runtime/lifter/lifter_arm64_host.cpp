@@ -877,6 +877,321 @@ bool EmitShift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
+// guest: rol/ror r/m, imm8|CL — rotates at widths 8/16/32/64, register dest.
+//   x86 flag semantics: ROL/ROR affect ONLY CF and OF; SF/ZF/PF/AF are
+//   preserved. Count masked to 0x3F (w==64) else 0x1F. If the masked count is
+//   0, NO flags change and the value is unchanged.
+//     ROL: result rotated left; CF = bit 0 of result; OF(count==1)=MSB(res)^CF.
+//     ROR: result rotated right; CF = MSB of result;
+//          OF(count==1) = MSB(res) ^ bit(w-2) of res.
+//   Register conventions: val=x14, cnt=x15, res=x12, scratch x9/x10/x13.
+enum class RotateKind { Rol, Ror };
+bool EmitRotate(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                RotateKind kind, CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (insn.operand_count_visible < 2) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+
+    const XReg val = XReg(14), cnt = XReg(15), res = kScratch2;  // x12
+    const XReg t = XReg(13), oldfl = kScratch0, msk = kScratch1;
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+    const u32 cntmask = (w == 64) ? 0x3F : 0x1F;
+    const u32 sb = w - 1;
+
+    // Load count -> cnt (masked to 5/6 bits).
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(cnt, static_cast<u64>(ops[1].imm.value.u & cntmask));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (ops[1].reg.value != ZYDIS_REGISTER_CL) return false;
+        c.ldr(cnt, ptr(kState, GprOffset(1)));
+        c.and_(cnt, cnt, cntmask);
+    } else {
+        return false;
+    }
+
+    // Load value truncated to width.
+    c.ldr(val, ptr(kState, GprOffset(d)));
+    if (w != 64) c.and_(val, val, wmask);
+
+    // Compute rotated result into res.
+    if (w == 64) {
+        if (kind == RotateKind::Ror) {
+            c.rorv(res, val, cnt);
+        } else {
+            // ROL(n) = ROR((64 - n) & 63). For n==0 this is ROR(0)=identity.
+            c.mov(t, 64);
+            c.sub(t, t, cnt);
+            c.and_(t, t, 0x3F);
+            c.rorv(res, val, t);
+        }
+    } else if (w == 32) {
+        if (kind == RotateKind::Ror) {
+            c.rorv(WReg(res.getIdx()), WReg(val.getIdx()), WReg(cnt.getIdx()));
+        } else {
+            c.mov(WReg(t.getIdx()), 32);
+            c.sub(WReg(t.getIdx()), WReg(t.getIdx()), WReg(cnt.getIdx()));
+            c.and_(WReg(t.getIdx()), WReg(t.getIdx()), 0x1F);
+            c.rorv(WReg(res.getIdx()), WReg(val.getIdx()), WReg(t.getIdx()));
+        }
+        c.mov(WReg(res.getIdx()), WReg(res.getIdx()));  // zero-extend
+    } else {
+        // 8/16-bit: rotate within w bits via shifts. effective e = cnt mod w.
+        // res = ((val << e) | (val >> (w - e))) & wmask, with e==0 -> val.
+        c.mov(t, cnt);
+        if (w == 8)  c.and_(t, t, 0x7);   // cnt mod 8
+        else         c.and_(t, t, 0xF);   // cnt mod 16
+        Label rotzero, rotdone;
+        c.cmp(t, 0);
+        c.b(EQ, rotzero);
+        if (kind == RotateKind::Rol) {
+            // left part: val << e
+            c.lsl(res, val, t);
+            // right part: val >> (w - e)
+            c.mov(msk, w);
+            c.sub(msk, msk, t);
+            c.lsr(XReg(10), val, msk);   // x10 scratch (msk reg is x10)
+            // NB: msk==x10, lsr dest also x10 — fold: compute shift then store.
+            c.orr(res, res, XReg(10));
+        } else {
+            // ror: right part: val >> e ; left part: val << (w - e)
+            c.lsr(res, val, t);
+            c.mov(msk, w);
+            c.sub(msk, msk, t);
+            c.lsl(XReg(10), val, msk);
+            c.orr(res, res, XReg(10));
+        }
+        c.and_(res, res, wmask);
+        c.b(rotdone);
+        c.L(rotzero);
+        c.mov(res, val);
+        c.L(rotdone);
+    }
+
+    // Store result back at width (preserve upper bits for narrow).
+    if (w == 64) {
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else if (w == 32) {
+        c.str(res, ptr(kState, GprOffset(d)));   // already zero-extended
+    } else {
+        XReg slot = XReg(14);  // reuse val
+        c.ldr(slot, ptr(kState, GprOffset(d)));
+        c.mov(msk, ~wmask);
+        c.and_(slot, slot, msk);
+        c.and_(res, res, wmask);
+        c.orr(slot, slot, res);
+        c.str(slot, ptr(kState, GprOffset(d)));
+    }
+
+    // Flags: only CF and OF, and only when masked count != 0.
+    {
+        Label noflags;
+        c.cmp(cnt, 0);
+        c.b(EQ, noflags);
+
+        c.ldr(oldfl, ptr(kState, Offsets::Rflags));
+        // Clear only CF(0) and OF(11); preserve SF/ZF/PF/AF/etc.
+        c.mov(msk, ~((1ull<<0)|(1ull<<11)));
+        c.and_(oldfl, oldfl, msk);
+
+        // CF: ROL -> bit 0 of res; ROR -> bit (w-1) of res.
+        if (kind == RotateKind::Rol) {
+            c.and_(t, res, 1);              // CF = res[0]
+        } else {
+            c.lsr(t, res, sb);
+            c.and_(t, t, 1);               // CF = res[w-1]
+        }
+        c.orr(oldfl, oldfl, t);            // place CF at bit 0
+
+        // OF: ROL -> MSB(res) ^ CF ; ROR -> MSB(res) ^ bit(w-2).
+        // (x86 defines OF only for count==1; for count>1 any value is fine.)
+        if (kind == RotateKind::Rol) {
+            c.lsr(XReg(10), res, sb);
+            c.and_(XReg(10), XReg(10), 1);
+            c.eor(XReg(10), XReg(10), t);  // ^ CF (t still holds CF=res[0])
+        } else {
+            c.lsr(XReg(10), res, sb);      // MSB
+            c.and_(XReg(10), XReg(10), 1);
+            c.lsr(t, res, sb - 1);         // bit(w-2)
+            c.and_(t, t, 1);
+            c.eor(XReg(10), XReg(10), t);
+        }
+        c.lsl(XReg(10), XReg(10), 11);
+        c.orr(oldfl, oldfl, XReg(10));
+
+        c.str(oldfl, ptr(kState, Offsets::Rflags));
+        c.L(noflags);
+    }
+    return true;
+}
+
+// guest: adc/sbb r/m, r/imm/m — widths 8/16/32/64, register destination.
+//   Reads carry-in from state.rflags bit 0 (the previous op's materialized CF),
+//   computes lhs +/- rhs +/- cf, and writes CF/OF/SF/ZF/PF directly to rflags.
+//   ADC: res = lhs + rhs + cf;  CF = unsigned carry out.
+//        OF = (~(lhs^rhs) & (lhs^res)) sign bit.
+//   SBB: res = lhs - rhs - cf;  CF = borrow out (res, as unsigned, > lhs path).
+//        OF = ((lhs^rhs) & (lhs^res)) sign bit.
+//   Register conventions: lhs=x14, rhs=x15, res=x12, cf=x13, carry/scratch x9/x10.
+enum class AdcSbbKind { Adc, Sbb };
+bool EmitAdcSbb(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                AdcSbbKind kind, CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (insn.operand_count_visible < 2) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+
+    const XReg lhs = XReg(14), rhs = XReg(15), res = kScratch2;  // x12
+    const XReg cf = XReg(13), c1 = kScratch0, c2 = kScratch1;    // x9, x10
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+    const u32 sb = w - 1;
+
+    // Load lhs (dst reg) and rhs (reg/imm/mem), truncated to width.
+    c.ldr(lhs, ptr(kState, GprOffset(d)));
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisGprToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        c.ldr(rhs, ptr(kState, GprOffset(s)));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(rhs, static_cast<u64>(ops[1].imm.value.s));  // sign-extended imm
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, /*next_rip*/0, c)) return false;
+        switch (w) {
+            case 8:  c.ldrb(WReg(rhs.getIdx()), ptr(kAddr)); break;
+            case 16: c.ldrh(WReg(rhs.getIdx()), ptr(kAddr)); break;
+            case 32: c.ldr(WReg(rhs.getIdx()), ptr(kAddr)); break;
+            default: c.ldr(rhs, ptr(kAddr)); break;
+        }
+    } else {
+        return false;
+    }
+    if (w != 64) { c.and_(lhs, lhs, wmask); c.and_(rhs, rhs, wmask); }
+
+    // Carry-in: cf = rflags & 1.
+    c.ldr(cf, ptr(kState, Offsets::Rflags));
+    c.and_(cf, cf, 1);
+
+    if (kind == AdcSbbKind::Adc) {
+        // res = lhs + rhs + cf.
+        c.add(res, lhs, rhs);
+        c.add(res, res, cf);
+        if (w == 64) {
+            // CF = (lhs+rhs overflowed) | ((lhs+rhs)+cf overflowed).
+            // c1 = (lhs+rhs) < lhs ; recompute partial in c1.
+            c.add(c1, lhs, rhs);
+            c.cmp(c1, lhs);
+            c.cset(c2, LO);          // c2 = carry from lhs+rhs
+            c.cmp(res, c1);
+            c.cset(c1, LO);          // c1 = carry from +cf
+            c.orr(cf, c1, c2);       // CF out
+        } else {
+            c.lsr(cf, res, w);       // CF = bit w of the 64-bit sum
+            c.and_(cf, cf, 1);
+            c.and_(res, res, wmask);
+        }
+    } else {
+        // SBB: res = lhs - rhs - cf.
+        c.sub(res, lhs, rhs);
+        c.sub(res, res, cf);
+        if (w == 64) {
+            // Borrow out = (lhs < rhs) | (lhs == rhs && cf) ... compute via
+            // unsigned compares: b1 = lhs < rhs ; partial = lhs - rhs ;
+            // b2 = partial < cf.
+            c.cmp(lhs, rhs);
+            c.cset(c2, LO);          // b1
+            c.sub(c1, lhs, rhs);
+            c.cmp(c1, cf);
+            c.cset(c1, LO);          // b2
+            c.orr(cf, c1, c2);       // CF (borrow) out
+        } else {
+            // In 64-bit math, res = lhs - rhs - cf; borrow if res has bit w set
+            // (i.e. went negative within width). CF = (res >> w) & 1 of the
+            // two's-complement low (w+something) — detect via sign beyond width.
+            c.lsr(cf, res, w);
+            c.and_(cf, cf, 1);
+            c.and_(res, res, wmask);
+        }
+    }
+
+    // Compute the OF sign-bit NOW, before the narrow store-back reuses rhs.
+    //   ADC: OF = sign bit of (~(lhs^rhs) & (lhs^res)).
+    //   SBB: OF = sign bit of ( (lhs^rhs) & (lhs^res)).
+    // Result (0/1) parked in x5 (block-local scratch) until flag assembly.
+    {
+        const XReg ofa = XReg(5), ofb = XReg(6);
+        c.eor(ofa, lhs, rhs);
+        if (kind == AdcSbbKind::Adc) c.mvn(ofa, ofa);
+        c.eor(ofb, lhs, res);
+        c.and_(ofa, ofa, ofb);
+        c.lsr(ofa, ofa, sb);
+        c.and_(ofa, ofa, 1);     // x5 = OF (0/1)
+    }
+
+    // Write result back at width.
+    if (w == 64) {
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else if (w == 32) {
+        c.mov(WReg(res.getIdx()), WReg(res.getIdx()));
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else {
+        XReg slot = XReg(15);  // reuse rhs (safe now: OF already captured)
+        c.ldr(slot, ptr(kState, GprOffset(d)));
+        c.mov(c1, ~wmask);
+        c.and_(slot, slot, c1);
+        c.orr(slot, slot, res);
+        c.str(slot, ptr(kState, GprOffset(d)));
+    }
+
+    // Flags: CF (computed), ZF, SF, PF, OF. AF left as-is.
+    c.ldr(c1, ptr(kState, Offsets::Rflags));
+    c.mov(c2, ~((1ull<<0)|(1ull<<2)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+    c.and_(c1, c1, c2);
+    // CF (bit 0).
+    c.orr(c1, c1, cf);
+    // ZF (bit 6): res == 0 in width.
+    c.cmp(res, 0);
+    c.cset(c2, EQ);
+    c.lsl(c2, c2, 6);
+    c.orr(c1, c1, c2);
+    // SF (bit 7): res[w-1].
+    c.lsr(c2, res, sb);
+    c.and_(c2, c2, 1);
+    c.lsl(c2, c2, 7);
+    c.orr(c1, c1, c2);
+    // PF (bit 2): parity of low byte.
+    c.and_(c2, res, 0xFF);
+    c.eor(c2, c2, c2, LSR, 4);
+    c.eor(c2, c2, c2, LSR, 2);
+    c.eor(c2, c2, c2, LSR, 1);
+    c.mvn(c2, c2);
+    c.and_(c2, c2, 1);
+    c.lsl(c2, c2, 2);
+    c.orr(c1, c1, c2);
+    // OF (bit 11): from x5 captured above.
+    c.lsl(XReg(5), XReg(5), 11);
+    c.orr(c1, c1, XReg(5));
+    c.str(c1, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: stc/clc/cmc — directly set/clear/toggle CF (bit 0) of rflags.
+bool EmitFlagOp(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
+    const XReg fl = kScratch0;
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_STC: c.orr(fl, fl, 1); break;
+        case ZYDIS_MNEMONIC_CLC: c.and_(fl, fl, ~1ull); break;
+        case ZYDIS_MNEMONIC_CMC: c.eor(fl, fl, 1); break;
+        default: return false;
+    }
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // UNIFIED ALU EMITTER (ADD / SUB / AND / OR / XOR).
 //
@@ -1676,6 +1991,23 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_SAR:
             handled = EmitShift(insn, ops, ShiftKind::Sar, c);
+            break;
+        case ZYDIS_MNEMONIC_ROL:
+            handled = EmitRotate(insn, ops, RotateKind::Rol, c);
+            break;
+        case ZYDIS_MNEMONIC_ROR:
+            handled = EmitRotate(insn, ops, RotateKind::Ror, c);
+            break;
+        case ZYDIS_MNEMONIC_ADC:
+            handled = EmitAdcSbb(insn, ops, AdcSbbKind::Adc, c);
+            break;
+        case ZYDIS_MNEMONIC_SBB:
+            handled = EmitAdcSbb(insn, ops, AdcSbbKind::Sbb, c);
+            break;
+        case ZYDIS_MNEMONIC_STC:
+        case ZYDIS_MNEMONIC_CLC:
+        case ZYDIS_MNEMONIC_CMC:
+            handled = EmitFlagOp(insn, c);
             break;
         case ZYDIS_MNEMONIC_NOT:
             handled = EmitNot(insn, ops, next_rip, c);
