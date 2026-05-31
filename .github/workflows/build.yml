@@ -155,8 +155,18 @@ jobs:
         shell: bash
 
       - name: Run tests with CTest
-        run: ctest --test-dir build --output-on-failure --progress -E 'GcnTest'
+        run: >
+          ctest --test-dir build --output-on-failure --progress -E 'GcnTest'
+          --output-junit "${{ github.workspace }}/ctest-results.xml"
         shell: bash
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ctest-results-${{ matrix.name }}
+          path: ${{ github.workspace }}/ctest-results.xml
+          if-no-files-found: warn
 
   windows-sdl:
     runs-on: windows-2025-vs2026
