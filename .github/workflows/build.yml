@@ -176,7 +176,6 @@ jobs:
             ${{ github.workspace }}/ctest-results.xml
             ${{ github.workspace }}/failed-tests.log
           if-no-files-found: error
-        shell: bash
 
   windows-sdl:
     runs-on: windows-2025-vs2026
