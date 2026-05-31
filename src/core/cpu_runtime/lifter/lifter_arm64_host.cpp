@@ -2662,6 +2662,209 @@ void EmitUnsupportedExit(u64 rip, CodeGenerator& c) {
     c.br(kExitStub); // fatal exit (do not re-dispatch the bad address)
 }
 
+// guest: cld/std — clear/set the direction flag (RFLAGS bit 10). Other flags
+// untouched.
+bool EmitCldStd(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
+    constexpr u64 DF = 1ull << 10;
+    const XReg fl = kScratch0;
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    if (insn.mnemonic == ZYDIS_MNEMONIC_CLD) {
+        c.mov(kScratch1, ~DF);
+        c.and_(fl, fl, kScratch1);
+    } else if (insn.mnemonic == ZYDIS_MNEMONIC_STD) {
+        c.orr(fl, fl, DF);
+    } else {
+        return false;
+    }
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: stos/movs/lods/scas/cmps with optional REP/REPE/REPNE. Implicit
+// operands RDI(7)/RSI(6)/RAX(0)/RCX(1). Block terminator: on completion it sets
+// state.rip=next_rip, exit_reason=BlockEnd, and re-enters the dispatcher. A
+// near-null pointer bails cleanly (HelperRequestedExit -> exit stub), matching
+// the x86 host. SCAS/CMPS set flags via the lazy-flag side-band (FLAG_OP_SUB),
+// materialized each iteration so REPE/REPNE can read ZF.
+bool EmitStringOp(const ZydisDecodedInstruction& insn, u64 next_rip,
+                  CodeGenerator& c) {
+    if (insn.operand_count_visible != 0) return false;  // disambiguate vs SSE MOVSD/CMPSD
+
+    enum class Kind { Stos, Movs, Lods, Scas, Cmps } kind;
+    bool uses_rsi = false, uses_rdi = false, is_cmp = false;
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW:
+        case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ:
+            kind = Kind::Stos; uses_rdi = true; break;
+        case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW:
+        case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_MOVSQ:
+            kind = Kind::Movs; uses_rsi = uses_rdi = true; break;
+        case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW:
+        case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_LODSQ:
+            kind = Kind::Lods; uses_rsi = true; break;
+        case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW:
+        case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ:
+            kind = Kind::Scas; uses_rdi = true; is_cmp = true; break;
+        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW:
+        case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ:
+            kind = Kind::Cmps; uses_rsi = uses_rdi = true; is_cmp = true; break;
+        default: return false;
+    }
+
+    int esz;
+    switch (insn.operand_width) {
+        case 8:  esz = 1; break;
+        case 16: esz = 2; break;
+        case 32: esz = 4; break;
+        case 64: esz = 8; break;
+        default: return false;
+    }
+    const u32 w = insn.operand_width;
+
+    const bool repeated =
+        (insn.attributes & (ZYDIS_ATTRIB_HAS_REP | ZYDIS_ATTRIB_HAS_REPE |
+                            ZYDIS_ATTRIB_HAS_REPNE)) != 0;
+    const bool has_repe  = (insn.attributes & ZYDIS_ATTRIB_HAS_REPE)  != 0;
+    const bool has_repne = (insn.attributes & ZYDIS_ATTRIB_HAS_REPNE) != 0;
+
+    constexpr int RAX_IDX = 0, RCX_IDX = 1, RSI_IDX = 6, RDI_IDX = 7;
+    const u64 cur_rip = next_rip - insn.length;
+
+    const XReg rcx = kScratch1;     // x10: loop counter
+    const XReg rdi = XReg(13);      // dest ptr
+    const XReg rsi = XReg(14);      // src ptr
+    const XReg acc = kScratch2;     // x12: load/compare accumulator
+    const XReg tmp = XReg(15), tmp2 = XReg(5);
+
+    Label loop_top, loop_done, do_bail;
+
+    if (repeated) {
+        c.ldr(rcx, ptr(kState, GprOffset(RCX_IDX)));
+        c.cbz(rcx, loop_done);
+    }
+
+    c.L(loop_top);
+
+    // Pointer null-guard (below 0x10000 bails).
+    constexpr u64 kMinGuestPtr = 0x10000;
+    if (uses_rdi) {
+        c.ldr(rdi, ptr(kState, GprOffset(RDI_IDX)));
+        c.mov(tmp, kMinGuestPtr);
+        c.cmp(rdi, tmp);
+        c.b(LO, do_bail);
+    }
+    if (uses_rsi) {
+        c.ldr(rsi, ptr(kState, GprOffset(RSI_IDX)));
+        c.mov(tmp, kMinGuestPtr);
+        c.cmp(rsi, tmp);
+        c.b(LO, do_bail);
+    }
+
+    auto load_w = [&](const XReg& dstreg, const XReg& ptrreg) {
+        switch (esz) {
+            case 1: c.ldrb(WReg(dstreg.getIdx()), ptr(ptrreg)); break;
+            case 2: c.ldrh(WReg(dstreg.getIdx()), ptr(ptrreg)); break;
+            case 4: c.ldr(WReg(dstreg.getIdx()), ptr(ptrreg)); break;
+            default: c.ldr(dstreg, ptr(ptrreg)); break;
+        }
+    };
+    auto store_w = [&](const XReg& srcreg, const XReg& ptrreg) {
+        switch (esz) {
+            case 1: c.strb(WReg(srcreg.getIdx()), ptr(ptrreg)); break;
+            case 2: c.strh(WReg(srcreg.getIdx()), ptr(ptrreg)); break;
+            case 4: c.str(WReg(srcreg.getIdx()), ptr(ptrreg)); break;
+            default: c.str(srcreg, ptr(ptrreg)); break;
+        }
+    };
+
+    if (kind == Kind::Stos) {
+        c.ldr(acc, ptr(kState, GprOffset(RAX_IDX)));
+        store_w(acc, rdi);
+    } else if (kind == Kind::Movs) {
+        load_w(acc, rsi);
+        store_w(acc, rdi);
+    } else if (kind == Kind::Lods) {
+        load_w(acc, rsi);
+        if (esz == 1 || esz == 2) {
+            c.ldr(tmp, ptr(kState, GprOffset(RAX_IDX)));
+            c.mov(tmp2, (esz == 1) ? ~0xFFull : ~0xFFFFull);
+            c.and_(tmp, tmp, tmp2);
+            c.and_(acc, acc, (esz == 1) ? 0xFF : 0xFFFF);
+            c.orr(tmp, tmp, acc);
+            c.str(tmp, ptr(kState, GprOffset(RAX_IDX)));
+        } else {
+            if (esz == 4) c.and_(acc, acc, 0xFFFFFFFFull);
+            c.str(acc, ptr(kState, GprOffset(RAX_IDX)));
+        }
+    } else {
+        // Scas/Cmps: lhs - rhs (width-masked), set flags via side-band.
+        const XReg lhs = acc, rhs = tmp;
+        if (kind == Kind::Scas) {
+            c.ldr(lhs, ptr(kState, GprOffset(RAX_IDX)));
+            load_w(rhs, rdi);
+        } else {
+            load_w(lhs, rsi);
+            load_w(rhs, rdi);
+        }
+        const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+        if (w != 64) { c.and_(lhs, lhs, wmask); c.and_(rhs, rhs, wmask); }
+        c.sub(tmp2, lhs, rhs);
+        if (w != 64) c.and_(tmp2, tmp2, wmask);
+        c.mov(WReg(9), FLAG_OP_SUB);
+        c.str(WReg(9), ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+        c.mov(WReg(9), w);
+        c.str(WReg(9), ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+        c.str(lhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+        c.str(rhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+        c.str(tmp2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+        EmitMaterializeFlags(c);
+    }
+
+    // Advance pointers per DF (rflags bit 10). delta = DF ? -esz : +esz.
+    {
+        Label df_set, adv_done;
+        c.ldr(tmp, ptr(kState, Offsets::Rflags));
+        c.tbnz(tmp, 10, df_set);
+        if (uses_rdi) { c.ldr(rdi, ptr(kState, GprOffset(RDI_IDX))); c.add(rdi, rdi, esz); c.str(rdi, ptr(kState, GprOffset(RDI_IDX))); }
+        if (uses_rsi) { c.ldr(rsi, ptr(kState, GprOffset(RSI_IDX))); c.add(rsi, rsi, esz); c.str(rsi, ptr(kState, GprOffset(RSI_IDX))); }
+        c.b(adv_done);
+        c.L(df_set);
+        if (uses_rdi) { c.ldr(rdi, ptr(kState, GprOffset(RDI_IDX))); c.sub(rdi, rdi, esz); c.str(rdi, ptr(kState, GprOffset(RDI_IDX))); }
+        if (uses_rsi) { c.ldr(rsi, ptr(kState, GprOffset(RSI_IDX))); c.sub(rsi, rsi, esz); c.str(rsi, ptr(kState, GprOffset(RSI_IDX))); }
+        c.L(adv_done);
+    }
+
+    if (repeated) {
+        c.ldr(rcx, ptr(kState, GprOffset(RCX_IDX)));
+        c.sub(rcx, rcx, 1);
+        c.str(rcx, ptr(kState, GprOffset(RCX_IDX)));
+        if (is_cmp && (has_repe || has_repne)) {
+            c.ldr(tmp, ptr(kState, Offsets::Rflags));
+            if (has_repe) {
+                c.tbz(tmp, 6, loop_done);   // ZF==0 -> stop
+            } else {
+                c.tbnz(tmp, 6, loop_done);  // ZF==1 -> stop
+            }
+        }
+        c.cbnz(rcx, loop_top);
+    }
+
+    c.L(loop_done);
+    c.mov(kScratch0, next_rip);
+    c.str(kScratch0, ptr(kState, Offsets::Rip));
+    c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
+    c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
+    c.br(kDispatchTop);
+
+    c.L(do_bail);
+    c.mov(kScratch0, cur_rip);
+    c.str(kScratch0, ptr(kState, Offsets::Rip));
+    c.mov(kWScratch0, static_cast<u32>(ExitReason::HelperRequestedExit));
+    c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
+    c.br(kExitStub);
+    return true;
+}
+
 } // namespace
 
 // ============================================================================
@@ -2785,6 +2988,23 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_DIV:
             handled = EmitDiv(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_CLD:
+        case ZYDIS_MNEMONIC_STD:
+            handled = EmitCldStd(insn, c);
+            break;
+        case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW:
+        case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ:
+        case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW:
+        case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_MOVSQ:
+        case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW:
+        case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_LODSQ:
+        case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW:
+        case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ:
+        case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW:
+        case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ:
+            handled = EmitStringOp(insn, next_rip, c);
+            if (handled) emitted_terminator = true;  // string op is a terminator
             break;
         case ZYDIS_MNEMONIC_NOT:
             handled = EmitNot(insn, ops, next_rip, c);
