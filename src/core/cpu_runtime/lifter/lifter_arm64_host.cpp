@@ -525,6 +525,192 @@ bool EmitRet(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
 }
 
 // ----------------------------------------------------------------------------
+// CONDITIONAL FAMILY (Setcc / Cmovcc / Jcc).
+//
+// All three decode an x86 condition code from the mnemonic and act on the
+// guest RFLAGS that a PRIOR instruction already materialized into
+// state.rflags (via EmitMaterializeFlags). They do NOT consult the lazy-flag
+// side-band directly: by the time a conditional runs, the producing
+// instruction has already written the full RFLAGS word, so we read the
+// finished bits — exactly mirroring the x86 host lifter's EmitJccCondition,
+// which reads rax(=materialized flags) too.
+//
+// EmitConditionToReg loads state.rflags and computes the boolean (0/1) for the
+// given condition into `out`. Scratch used: x9..x14 (caller-saved); `out`
+// should be one of those. Returns false if the mnemonic's condition suffix is
+// not recognized (caller then routes to unsupported-exit).
+//
+// RFLAGS bit positions (x86): CF=0, PF=2, ZF=6, SF=7, OF=11.
+// ----------------------------------------------------------------------------
+
+// Condition classes, keyed off the shared suffix of the Jcc/SETcc/CMOVcc
+// mnemonic. "N" variants are the boolean negation of the base.
+enum class CondClass { O, B, Z, BE, S, P, L, LE };
+
+// Map any Jcc/SETcc/CMOVcc mnemonic to (class, negated). Returns false if not
+// a recognized conditional.
+bool DecodeCondition(ZydisMnemonic m, CondClass& cls, bool& neg) {
+    switch (m) {
+    // Overflow
+    case ZYDIS_MNEMONIC_JO:    case ZYDIS_MNEMONIC_SETO:    case ZYDIS_MNEMONIC_CMOVO:
+        cls = CondClass::O;  neg = false; return true;
+    case ZYDIS_MNEMONIC_JNO:   case ZYDIS_MNEMONIC_SETNO:   case ZYDIS_MNEMONIC_CMOVNO:
+        cls = CondClass::O;  neg = true;  return true;
+    // Below / carry
+    case ZYDIS_MNEMONIC_JB:    case ZYDIS_MNEMONIC_SETB:    case ZYDIS_MNEMONIC_CMOVB:
+        cls = CondClass::B;  neg = false; return true;
+    case ZYDIS_MNEMONIC_JNB:   case ZYDIS_MNEMONIC_SETNB:   case ZYDIS_MNEMONIC_CMOVNB:
+        cls = CondClass::B;  neg = true;  return true;
+    // Zero / equal
+    case ZYDIS_MNEMONIC_JZ:    case ZYDIS_MNEMONIC_SETZ:    case ZYDIS_MNEMONIC_CMOVZ:
+        cls = CondClass::Z;  neg = false; return true;
+    case ZYDIS_MNEMONIC_JNZ:   case ZYDIS_MNEMONIC_SETNZ:   case ZYDIS_MNEMONIC_CMOVNZ:
+        cls = CondClass::Z;  neg = true;  return true;
+    // Below-or-equal
+    case ZYDIS_MNEMONIC_JBE:   case ZYDIS_MNEMONIC_SETBE:   case ZYDIS_MNEMONIC_CMOVBE:
+        cls = CondClass::BE; neg = false; return true;
+    case ZYDIS_MNEMONIC_JNBE:  case ZYDIS_MNEMONIC_SETNBE:  case ZYDIS_MNEMONIC_CMOVNBE:
+        cls = CondClass::BE; neg = true;  return true;
+    // Sign
+    case ZYDIS_MNEMONIC_JS:    case ZYDIS_MNEMONIC_SETS:    case ZYDIS_MNEMONIC_CMOVS:
+        cls = CondClass::S;  neg = false; return true;
+    case ZYDIS_MNEMONIC_JNS:   case ZYDIS_MNEMONIC_SETNS:   case ZYDIS_MNEMONIC_CMOVNS:
+        cls = CondClass::S;  neg = true;  return true;
+    // Parity
+    case ZYDIS_MNEMONIC_JP:    case ZYDIS_MNEMONIC_SETP:    case ZYDIS_MNEMONIC_CMOVP:
+        cls = CondClass::P;  neg = false; return true;
+    case ZYDIS_MNEMONIC_JNP:   case ZYDIS_MNEMONIC_SETNP:   case ZYDIS_MNEMONIC_CMOVNP:
+        cls = CondClass::P;  neg = true;  return true;
+    // Less (SF != OF)
+    case ZYDIS_MNEMONIC_JL:    case ZYDIS_MNEMONIC_SETL:    case ZYDIS_MNEMONIC_CMOVL:
+        cls = CondClass::L;  neg = false; return true;
+    case ZYDIS_MNEMONIC_JNL:   case ZYDIS_MNEMONIC_SETNL:   case ZYDIS_MNEMONIC_CMOVNL:
+        cls = CondClass::L;  neg = true;  return true;
+    // Less-or-equal (ZF | (SF != OF))
+    case ZYDIS_MNEMONIC_JLE:   case ZYDIS_MNEMONIC_SETLE:   case ZYDIS_MNEMONIC_CMOVLE:
+        cls = CondClass::LE; neg = false; return true;
+    case ZYDIS_MNEMONIC_JNLE:  case ZYDIS_MNEMONIC_SETNLE:  case ZYDIS_MNEMONIC_CMOVNLE:
+        cls = CondClass::LE; neg = true;  return true;
+    default:
+        return false;
+    }
+}
+
+// Compute the 0/1 boolean for (cls, neg) into `out` from state.rflags.
+// Clobbers x9, x10, x11 (and `out`, which should be one of x9..x14).
+void EmitConditionToReg(CondClass cls, bool neg, const XReg& out,
+                        CodeGenerator& c) {
+    const XReg fl = XReg(9);   // rflags
+    const XReg a  = XReg(10);  // term A
+    const XReg b  = XReg(11);  // term B
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+
+    auto bit = [&](const XReg& dst, int pos) {
+        c.lsr(dst, fl, pos);
+        c.and_(dst, dst, 1);
+    };
+
+    switch (cls) {
+    case CondClass::O:  bit(out, 11); break;                 // OF
+    case CondClass::B:  bit(out, 0);  break;                 // CF
+    case CondClass::Z:  bit(out, 6);  break;                 // ZF
+    case CondClass::S:  bit(out, 7);  break;                 // SF
+    case CondClass::P:  bit(out, 2);  break;                 // PF
+    case CondClass::BE:                                      // CF | ZF
+        bit(a, 0); bit(b, 6); c.orr(out, a, b); break;
+    case CondClass::L:                                       // SF ^ OF
+        bit(a, 7); bit(b, 11); c.eor(out, a, b); break;
+    case CondClass::LE:                                      // ZF | (SF ^ OF)
+        bit(a, 7); bit(b, 11); c.eor(a, a, b);   // a = SF^OF
+        bit(b, 6);                               // b = ZF
+        c.orr(out, a, b); break;
+    }
+    if (neg) {
+        c.eor(out, out, 1);  // boolean negate (out is exactly 0 or 1)
+    }
+}
+
+// guest: setcc r/m8 (register form only; mem form deferred).
+//   Writes the condition (0/1) into the destination byte, preserving the
+//   upper 56 bits of the 64-bit GPR slot (x86 SETcc writes only 8 bits).
+bool EmitSetcc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c) {
+    CondClass cls; bool neg;
+    if (!DecodeCondition(insn.mnemonic, cls, neg)) return false;
+    if (insn.operand_count_visible != 1) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisGprToIndex(ops[0].reg.value);
+    if (dst < 0) return false;  // AH/CH/DH/BH high-byte regs unsupported
+
+    const XReg cond = XReg(12);          // result of condition (0/1)
+    EmitConditionToReg(cls, neg, cond, c);
+    // Merge low byte: slot = (slot & ~0xFF) | cond.
+    const XReg slot = XReg(13);
+    c.ldr(slot, ptr(kState, GprOffset(dst)));
+    c.and_(slot, slot, ~0xFFULL);
+    c.orr(slot, slot, cond);             // cond is 0/1, fits the low byte
+    c.str(slot, ptr(kState, GprOffset(dst)));
+    return true;
+}
+
+// guest: cmovcc r64, r64  (register source; mem source deferred).
+//   dst = cond ? src : dst. Full 64-bit move when taken (matches the test
+//   coverage; cmov r32 would zero-extend — deferred with other 32-bit forms).
+bool EmitCmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    CondClass cls; bool neg;
+    if (!DecodeCondition(insn.mnemonic, cls, neg)) return false;
+    if (insn.operand_width != 64) return false;
+    if (insn.operand_count_visible != 2) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;  // mem deferred
+    const int dst = ZydisGprToIndex(ops[0].reg.value);
+    const int src = ZydisGprToIndex(ops[1].reg.value);
+    if (dst < 0 || src < 0) return false;
+
+    const XReg cond = XReg(12);
+    EmitConditionToReg(cls, neg, cond, c);
+    const XReg dval = XReg(13);
+    const XReg sval = XReg(14);
+    c.ldr(dval, ptr(kState, GprOffset(dst)));
+    c.ldr(sval, ptr(kState, GprOffset(src)));
+    // csel: dst = (cond != 0) ? sval : dval.
+    c.cmp(cond, 0);
+    c.csel(dval, sval, dval, NE);
+    c.str(dval, ptr(kState, GprOffset(dst)));
+    return true;
+}
+
+// guest: jcc rel  — conditional branch. Block terminator. Mirrors the x86
+//   host EmitJcc: select (taken target | next_rip) into state.rip, set
+//   BlockEnd, and re-enter the dispatcher, which compiles/runs whichever block
+//   the chosen RIP names. No in-block branch is emitted.
+bool EmitJcc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             u64 next_rip, CodeGenerator& c) {
+    CondClass cls; bool neg;
+    if (!DecodeCondition(insn.mnemonic, cls, neg)) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+    const u64 target = ops[0].imm.is_relative
+        ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+        : static_cast<u64>(ops[0].imm.value.s);
+
+    const XReg cond = XReg(12);
+    EmitConditionToReg(cls, neg, cond, c);
+    const XReg taken = XReg(13);
+    const XReg fall  = XReg(14);
+    c.mov(taken, target);
+    c.mov(fall, next_rip);
+    c.cmp(cond, 0);
+    c.csel(fall, taken, fall, NE);       // rip = cond ? target : next_rip
+    c.str(fall, ptr(kState, Offsets::Rip));
+
+    c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
+    c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
+    c.br(kDispatchTop);  // normal dispatcher re-entry
+    return true;
+}
+
+// ----------------------------------------------------------------------------
 // Fatal-exit tail (unsupported instruction).
 //   set state.rip, set exit_reason, br x25.
 // ----------------------------------------------------------------------------
@@ -596,7 +782,6 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         }
 
         const u64 next_rip = rip + insn.length;
-        (void)next_rip; // unused until mem-operand emitters (need RIP-relative)
         bool handled = false;
         switch (insn.mnemonic) {
         case ZYDIS_MNEMONIC_MOV:
@@ -622,6 +807,40 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_RET:
             handled = EmitRet(insn, c);
             if (handled) emitted_terminator = true; // RET is a block terminator
+            break;
+        // SETcc (all 16 conditions) — register byte form.
+        case ZYDIS_MNEMONIC_SETO:  case ZYDIS_MNEMONIC_SETNO:
+        case ZYDIS_MNEMONIC_SETB:  case ZYDIS_MNEMONIC_SETNB:
+        case ZYDIS_MNEMONIC_SETZ:  case ZYDIS_MNEMONIC_SETNZ:
+        case ZYDIS_MNEMONIC_SETBE: case ZYDIS_MNEMONIC_SETNBE:
+        case ZYDIS_MNEMONIC_SETS:  case ZYDIS_MNEMONIC_SETNS:
+        case ZYDIS_MNEMONIC_SETP:  case ZYDIS_MNEMONIC_SETNP:
+        case ZYDIS_MNEMONIC_SETL:  case ZYDIS_MNEMONIC_SETNL:
+        case ZYDIS_MNEMONIC_SETLE: case ZYDIS_MNEMONIC_SETNLE:
+            handled = EmitSetcc(insn, ops, c);
+            break;
+        // CMOVcc (all 16 conditions) — register/register form.
+        case ZYDIS_MNEMONIC_CMOVO:  case ZYDIS_MNEMONIC_CMOVNO:
+        case ZYDIS_MNEMONIC_CMOVB:  case ZYDIS_MNEMONIC_CMOVNB:
+        case ZYDIS_MNEMONIC_CMOVZ:  case ZYDIS_MNEMONIC_CMOVNZ:
+        case ZYDIS_MNEMONIC_CMOVBE: case ZYDIS_MNEMONIC_CMOVNBE:
+        case ZYDIS_MNEMONIC_CMOVS:  case ZYDIS_MNEMONIC_CMOVNS:
+        case ZYDIS_MNEMONIC_CMOVP:  case ZYDIS_MNEMONIC_CMOVNP:
+        case ZYDIS_MNEMONIC_CMOVL:  case ZYDIS_MNEMONIC_CMOVNL:
+        case ZYDIS_MNEMONIC_CMOVLE: case ZYDIS_MNEMONIC_CMOVNLE:
+            handled = EmitCmov(insn, ops, c);
+            break;
+        // Jcc (all 16 conditions) — relative, block terminator.
+        case ZYDIS_MNEMONIC_JO:  case ZYDIS_MNEMONIC_JNO:
+        case ZYDIS_MNEMONIC_JB:  case ZYDIS_MNEMONIC_JNB:
+        case ZYDIS_MNEMONIC_JZ:  case ZYDIS_MNEMONIC_JNZ:
+        case ZYDIS_MNEMONIC_JBE: case ZYDIS_MNEMONIC_JNBE:
+        case ZYDIS_MNEMONIC_JS:  case ZYDIS_MNEMONIC_JNS:
+        case ZYDIS_MNEMONIC_JP:  case ZYDIS_MNEMONIC_JNP:
+        case ZYDIS_MNEMONIC_JL:  case ZYDIS_MNEMONIC_JNL:
+        case ZYDIS_MNEMONIC_JLE: case ZYDIS_MNEMONIC_JNLE:
+            handled = EmitJcc(insn, ops, next_rip, c);
+            if (handled) emitted_terminator = true; // Jcc terminates the block
             break;
         default:
             break;
