@@ -217,7 +217,8 @@ using namespace Xbyak::util;
 /// supported (e.g. segment override, non-GPR base).
 bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
                           u64 next_rip,
-                          Xbyak::CodeGenerator& c) {
+                          Xbyak::CodeGenerator& c,
+                          bool addr32 = false) {
     // Segment overrides other than the standard DS/SS aren't
     // supported. shadPS4 guest code rarely uses FS/GS, and when it
     // does it's for TLS via specific helper sequences we'd lift
@@ -283,6 +284,18 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
             c.mov(rax, static_cast<u64>(disp));
             c.add(rdx, rax);
         }
+    }
+
+    // Address-size override (0x67 prefix): the effective address is
+    // computed in 32-bit arithmetic — base and index are read as 32-bit
+    // (upper 32 ignored) and the whole sum wraps at 2^32. Because
+    // (a+b) mod 2^32 == ((a mod 2^32)+(b mod 2^32)) mod 2^32, masking the
+    // final sum to 32 bits is equivalent to masking each term first. This
+    // is what lets `mov [ebx], eax` reach a sub-4GiB address even when the
+    // upper 32 bits of RBX hold garbage.
+    if (addr32) {
+        c.mov(eax, edx);   // zero-extend low 32 of rdx into rax
+        c.mov(rdx, rax);   // rdx = (address & 0xFFFFFFFF)
     }
 
     return true;
@@ -402,7 +415,8 @@ bool EmitMov32(const ZydisDecodedInstruction& insn,
     // ----- Memory destination -----
     if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY) {
         // Compute effective address into rdx.
-        if (!EmitEffectiveAddress(dst.mem, next_rip, c)) return false;
+        if (!EmitEffectiveAddress(dst.mem, next_rip, c,
+                                  insn.address_width == 32)) return false;
 
         if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int src_idx = ZydisGprToIndex(src.reg.value);
@@ -442,7 +456,8 @@ bool EmitMov32(const ZydisDecodedInstruction& insn,
     }
 
     if (src.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (!EmitEffectiveAddress(src.mem, next_rip, c)) return false;
+        if (!EmitEffectiveAddress(src.mem, next_rip, c,
+                                  insn.address_width == 32)) return false;
         // 32-bit load zero-extends rax. Store full 64.
         c.mov(eax, dword[rdx]);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
