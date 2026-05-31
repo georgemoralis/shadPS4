@@ -16422,5 +16422,216 @@ TEST_F(CpuRuntimeTest, Cwde_ZeroExtendsPositiveAx) {
         << "AX=0x7FFF (positive) extends to EAX=0x00007FFF";
 }
 
+// ============================================================================
+// EXTENDED EMITTER COVERAGE, BATCH 3
+//
+// The remaining untested-but-supported families: x87 pop-arithmetic
+// (FMULP/FSUBP/FDIVP -- the non-reverse forms, complementing the existing
+// FADDP/FSUBRP/FDIVRP tests), the PREFETCH* hint no-ops, SFENCE, and the
+// packed-double min/max plus the remaining packed bitwise variants
+// (VANDPD/VANDNPD/VORPD). All encodings byte-verified.
+//
+// x87 setup recap: `fld qword[mem]` (DD /0) pushes; after loading A then B,
+// ST(0)=B and ST(1)=A. `DE Cx/Ex/Fx` performs ST(1) = ST(1) <op> ST(0) and
+// pops, leaving the result in ST(0); `fstp qword[mem]` (DD /3) stores it.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// x87 pop-arithmetic: non-reverse forms.
+// ----------------------------------------------------------------------------
+
+// FMULP st(1), st(0): ST(1) = A * B, pop. (A=6, B=7 -> 42.)
+TEST_F(CpuRuntimeTest, X87_Fmulp_MultiplyAndPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 6.0, B = 7.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, &A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, &B
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx, &out
+        0xdd, 0x00,                    // fld qword[rax]  -> ST0=A
+        0xdd, 0x01,                    // fld qword[rcx]  -> ST0=B, ST1=A
+        0xde, 0xc9,                    // fmulp st1,st0   -> ST1=A*B, pop
+        0xdd, 0x1a,                    // fstp qword[rdx]
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 42.0) << "fmulp: 6*7 = 42";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// FSUBP st(1), st(0): ST(1) = A - B, pop. (A=20, B=8 -> 12.)
+TEST_F(CpuRuntimeTest, X87_Fsubp_SubtractAndPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 20.0, B = 8.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00,
+        0xdd, 0x01,
+        0xde, 0xe9,                    // fsubp st1,st0 -> ST1 = ST1 - ST0 = A - B
+        0xdd, 0x1a,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 12.0) << "fsubp: 20-8 = 12 (ST1-ST0, not reversed)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// FDIVP st(1), st(0): ST(1) = A / B, pop. (A=84, B=4 -> 21.)
+TEST_F(CpuRuntimeTest, X87_Fdivp_DivideAndPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 84.0, B = 4.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00,
+        0xdd, 0x01,
+        0xde, 0xf9,                    // fdivp st1,st0 -> ST1 = ST1 / ST0 = A / B
+        0xdd, 0x1a,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 21.0) << "fdivp: 84/4 = 21 (ST1/ST0, not reversed)";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ----------------------------------------------------------------------------
+// PREFETCH* / SFENCE -- architecturally inert. The test proves they decode,
+// emit, and let execution flow to a following instruction that mutates state.
+// PREFETCH must NOT fault even on a wild address (it's a pure hint), so we
+// point it at a deliberately bogus pointer and confirm the trailing MOV ran.
+// Encoding (modrm with rax base): 0F 18 /n  ; prefetchw is 0F 0D /1.
+// ----------------------------------------------------------------------------
+
+#define PREFETCH_TEST(NAME, OPC1, OPC2, MODRM)                               \
+    TEST_F(CpuRuntimeTest, PrefetchHint_##NAME) {                           \
+        const u8 program[] = {                                             \
+            0x48, 0xb8, 0x39,0x05,0,0,0,0,0,0, /* mov rax, 0x539 (bogus) */ \
+            OPC1, OPC2, MODRM,                 /* prefetch* [rax] */        \
+            0x48, 0xc7, 0xc3, 0x2a,0,0,0,      /* mov rbx, 42 */            \
+            0xc3,                                                          \
+        };                                                                 \
+        const auto r = RunProgram(program, sizeof(program), mem);          \
+        EXPECT_EQ(r.state.gpr[3], 42u) << #NAME " is a no-op; flow continues"; \
+        EXPECT_EQ(r.state.gpr[0], 0x539u) << "bogus prefetch addr untouched";  \
+        EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd)); \
+    }
+
+PREFETCH_TEST(Prefetcht0, 0x0f, 0x18, 0x08)
+PREFETCH_TEST(Prefetcht1, 0x0f, 0x18, 0x10)
+PREFETCH_TEST(Prefetcht2, 0x0f, 0x18, 0x18)
+PREFETCH_TEST(Prefetchw,  0x0f, 0x0d, 0x08)
+
+#undef PREFETCH_TEST
+
+// SFENCE (0F AE F8): store fence, inert for our single-threaded model.
+TEST_F(CpuRuntimeTest, Sfence_IsNoOp_ExecutionContinues) {
+    const u8 program[] = {
+        0x0f, 0xae, 0xf8,                  // sfence
+        0x48, 0xc7, 0xc0, 0x63,0,0,0,      // mov rax, 99
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 99u);
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ----------------------------------------------------------------------------
+// Packed-double min/max and the remaining packed bitwise variants. Reuses the
+// RunPackedFp / PackD / XmmLaneD helpers defined in batch 2.
+// ----------------------------------------------------------------------------
+
+TEST_F(CpuRuntimeTest, PackedFp_Vminpd_PerLaneMin) {
+    // vminpd xmm0, xmm1, xmm2 : c5 f1 5d c2
+    const u8 program[] = {0xc5, 0xf1, 0x5d, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackD(3.0), PackD(50.0), PackD(9.0), PackD(20.0));
+    EXPECT_EQ(XmmLaneD(st, 0), 3.0);
+    EXPECT_EQ(XmmLaneD(st, 1), 20.0);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vmaxps_PerLaneMax) {
+    // vmaxps xmm0, xmm1, xmm2 : c5 f0 5f c2
+    const u8 program[] = {0xc5, 0xf0, 0x5f, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(1.0f, 50.0f), PackF2(3.0f, 8.0f),
+        PackF2(9.0f, 20.0f), PackF2(30.0f, 2.0f));
+    EXPECT_EQ(XmmLaneF(st, 0), 9.0f);
+    EXPECT_EQ(XmmLaneF(st, 1), 50.0f);
+    EXPECT_EQ(XmmLaneF(st, 2), 30.0f);
+    EXPECT_EQ(XmmLaneF(st, 3), 8.0f);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vandpd_BitwiseAnd) {
+    // vandpd xmm0, xmm1, xmm2 : c5 f1 54 c2
+    const u8 program[] = {0xc5, 0xf1, 0x54, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0xFFFFFFFF00000000ULL, 0x0F0F0F0FF0F0F0F0ULL,
+        0x123456789ABCDEF0ULL, 0xFFFFFFFFFFFFFFFFULL);
+    EXPECT_EQ(st.ymm[0], 0xFFFFFFFF00000000ULL & 0x123456789ABCDEF0ULL);
+    EXPECT_EQ(st.ymm[1], 0x0F0F0F0FF0F0F0F0ULL & 0xFFFFFFFFFFFFFFFFULL);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vandnpd_NotSrc1AndSrc2) {
+    // vandnpd xmm0, xmm1, xmm2 : c5 f1 55 c2  -> (~xmm1) & xmm2
+    const u8 program[] = {0xc5, 0xf1, 0x55, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0xFF00FF00FF00FF00ULL, 0x0000000000000000ULL,
+        0x123456789ABCDEF0ULL, 0xCAFEF00DBAADF00DULL);
+    EXPECT_EQ(st.ymm[0], (~0xFF00FF00FF00FF00ULL) & 0x123456789ABCDEF0ULL);
+    EXPECT_EQ(st.ymm[1], (~0x0000000000000000ULL) & 0xCAFEF00DBAADF00DULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vorpd_BitwiseOr) {
+    // vorpd xmm0, xmm1, xmm2 : c5 f1 56 c2
+    const u8 program[] = {0xc5, 0xf1, 0x56, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0x00000000FFFF0000ULL, 0x1010101010101010ULL,
+        0xFFFF000000000000ULL, 0x0101010101010101ULL);
+    EXPECT_EQ(st.ymm[0], 0x00000000FFFF0000ULL | 0xFFFF000000000000ULL);
+    EXPECT_EQ(st.ymm[1], 0x1010101010101010ULL | 0x0101010101010101ULL);
+}
+
+// ----------------------------------------------------------------------------
+// Min/Max non-commutative NaN-propagation corner: SSE min/max return the
+// SECOND operand when either input is NaN (Intel's defined behavior). This
+// pins down that the host instruction's NaN semantics flow through unchanged.
+// vminps xmm0, xmm1(NaN in lane0), xmm2 -> lane0 takes xmm2's value.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, PackedFp_Vminps_NanTakesSecondOperand) {
+    const u8 program[] = {0xc5, 0xf0, 0x5d, 0xc2, 0xc3}; // vminps xmm0,xmm1,xmm2
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(nan, 5.0f), PackF2(1.0f, 2.0f),     // xmm1 lane0 = NaN
+        PackF2(7.0f, 99.0f), PackF2(3.0f, 4.0f));  // xmm2
+    // lane0: min(NaN, 7.0) -> 7.0 (second operand on unordered)
+    EXPECT_EQ(XmmLaneF(st, 0), 7.0f) << "NaN in src1 -> result is src2";
+    // lane1: min(5.0, 99.0) -> 5.0 (ordinary)
+    EXPECT_EQ(XmmLaneF(st, 1), 5.0f);
+}
+
 } // namespace
 } // namespace Core::Runtime
