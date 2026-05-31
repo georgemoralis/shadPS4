@@ -5,6 +5,7 @@
 
 #include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -96,6 +97,49 @@ thread_local Runtime* tl_active_runtime = nullptr;
 // nullptr when no JIT execution is active on this thread.
 thread_local GuestState* tl_current_guest_state = nullptr;
 
+// Hex-dump a fixed window of a compiled block's emitted host code for offline
+// disassembly. This runs *inside crash/corruption diagnostics*, so it must not
+// itself fault: we never blindly read off a host pointer. Before touching any
+// byte we verify, via CodeCache::Contains() (a signal-safe pure range
+// compare), that BOTH the first and last byte of the window lie inside the
+// code cache. If the block sits near the end of a cache region, or the cache
+// was flushed, or a bad pointer found its way into the block cache, the read
+// would otherwise walk off mapped memory and we'd crash while diagnosing
+// another crash. On any failure we log the reason and read nothing.
+//
+// `kWindow` bytes are dumped: the block plus a little of whatever follows,
+// which is fine for offline disassembly.
+void SafeDumpBlockCode(Runtime* rt, u64 block_rip, const void* hp,
+                       const char* tag) {
+    constexpr int kWindow = 256;
+    if (rt == nullptr || hp == nullptr) {
+        return;
+    }
+    const u8* p = reinterpret_cast<const u8*>(hp);
+    const CodeCache& cc = rt->GetCodeCache();
+    // Guard the whole [p, p+kWindow) range, not just the start: a block can be
+    // close enough to the end of a cache region that the fixed overscan would
+    // otherwise run past it.
+    if (!cc.Contains(p) || !cc.Contains(p + (kWindow - 1))) {
+        LOG_ERROR(Core,
+                  "[{}] block {:#x}: host code window [{}, +{}) is not fully "
+                  "inside the code cache; skipping dump to avoid faulting in "
+                  "diagnostics",
+                  tag, block_rip, hp, kWindow);
+        return;
+    }
+    const char* digits = "0123456789abcdef";
+    char hex[kWindow * 3 + 1];
+    for (int k = 0; k < kWindow; ++k) {
+        hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
+        hex[k * 3 + 1] = digits[p[k] & 0xF];
+        hex[k * 3 + 2] = ' ';
+    }
+    hex[kWindow * 3] = '\0';
+    LOG_ERROR(Core, "[{}] block {:#x} host code ({} bytes): {}",
+              tag, block_rip, kWindow, hex);
+}
+
 /// HLE bridge — calls a host function as if it were the next-block
 /// continuation of guest execution.
 ///
@@ -122,6 +166,51 @@ struct HostReturn {
     u64 rax;
     double xmm0;
 };
+
+// ─────────────────────────────────────────────────────────────────────────
+// DO NOT "SIMPLIFY" HostReturn. The two-field layout is load-bearing.
+//
+// The entire HLE return path depends on this struct being classified by the
+// SysV AMD64 ABI into exactly two eightbytes — the first INTEGER (→ rax), the
+// second SSE (→ xmm0) — so that a single call site can recover *both* a
+// possible integer return and a possible floating return without knowing the
+// callee's declared return type. Any of the following "cleanups" silently
+// breaks that and produces garbage returns that are extremely hard to trace:
+//
+//   * Replacing it with a bare u64 (loses the xmm0 eightbyte; double-returning
+//     HLE callees would have their result dropped).
+//   * Reordering the members (the INTEGER eightbyte MUST be first so it maps
+//     to rax; swapping puts the double in rax and the int in xmm0).
+//   * Adding a third member, or widening either field past 8 bytes (pushes the
+//     aggregate over two eightbytes → returned via hidden pointer in rdi, not
+//     rax:xmm0, which this path does not implement).
+//   * Making it non-trivial / non-standard-layout (e.g. adding a constructor),
+//     which can change ABI classification on some toolchains.
+//
+// The static_asserts below pin the invariants the ABI trick relies on. If one
+// trips, the fix is to restore the layout, NOT to relax the assert.
+static_assert(std::is_standard_layout_v<HostReturn>,
+              "HostReturn must be standard-layout for predictable SysV "
+              "eightbyte classification (INTEGER+SSE → rax:xmm0).");
+static_assert(std::is_trivially_copyable_v<HostReturn>,
+              "HostReturn must be trivially copyable; a non-trivial type can "
+              "be classified as MEMORY and returned via hidden pointer.");
+static_assert(sizeof(HostReturn) == 16,
+              "HostReturn must occupy exactly two eightbytes (16 bytes). A "
+              "different size changes ABI return classification.");
+static_assert(offsetof(HostReturn, rax) == 0,
+              "The INTEGER eightbyte (rax) MUST be the first member so it maps "
+              "to the rax return register, not xmm0.");
+static_assert(offsetof(HostReturn, xmm0) == 8,
+              "The SSE eightbyte (xmm0) MUST be the second member so it maps "
+              "to the xmm0 return register.");
+static_assert(std::is_same_v<decltype(HostReturn::rax), u64>,
+              "The first eightbyte must be an integer type to classify INTEGER "
+              "(→ rax).");
+static_assert(std::is_same_v<decltype(HostReturn::xmm0), double>,
+              "The second eightbyte must be a floating type to classify SSE "
+              "(→ xmm0).");
+// ─────────────────────────────────────────────────────────────────────────
 
 /// HLE bridge — calls a host function with full SysV-ABI marshaling.
 ///
@@ -341,18 +430,7 @@ void* DispatcherTrampoline(GuestState* state) {
                     if (rt != nullptr && last_block_rip != 0) {
                         BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
                         if (void* hp = bc.Lookup(last_block_rip)) {
-                            const u8* p = reinterpret_cast<const u8*>(hp);
-                            const char* digits = "0123456789abcdef";
-                            char hex[256 * 3 + 1];
-                            for (int k = 0; k < 256; ++k) {
-                                hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
-                                hex[k * 3 + 1] = digits[p[k] & 0xF];
-                                hex[k * 3 + 2] = ' ';
-                            }
-                            hex[256 * 3] = '\0';
-                            LOG_ERROR(Core,
-                                      "[RAXTRACE] culprit block {:#x} host code (256 bytes): {}",
-                                      last_block_rip, hex);
+                            SafeDumpBlockCode(rt, last_block_rip, hp, "RAXTRACE");
                         }
                     }
                 }
@@ -458,19 +536,7 @@ void* DispatcherTrampoline(GuestState* state) {
                     if (rt != nullptr && producer_rip != 0) {
                         BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
                         if (void* hp = bc.Lookup(producer_rip)) {
-                            const u8* p = reinterpret_cast<const u8*>(hp);
-                            const char* digits = "0123456789abcdef";
-                            char hex[256 * 3 + 1];
-                            for (int k = 0; k < 256; ++k) {
-                                hex[k * 3 + 0] = digits[(p[k] >> 4) & 0xF];
-                                hex[k * 3 + 1] = digits[p[k] & 0xF];
-                                hex[k * 3 + 2] = ' ';
-                            }
-                            hex[256 * 3] = '\0';
-                            LOG_ERROR(Core,
-                                      "[GPRSNAP] producer block {:#x} host code "
-                                      "(256 bytes): {}",
-                                      producer_rip, hex);
+                            SafeDumpBlockCode(rt, producer_rip, hp, "GPRSNAP");
                         }
                     }
                 } else if (seen_bad_run) {
@@ -564,6 +630,19 @@ void* DispatcherTrampoline(GuestState* state) {
             // case. We use a page bound rather than a VMA query because the
             // bridge runs from a JIT gateway frame where taking the memory
             // manager's mutex is unsafe (same reason this path avoids spdlog).
+            //
+            // RESIDUAL LIMITATION: the page bound proves the read stays within
+            // the *same page* as guest_rsp; it does NOT prove that page is
+            // mapped and readable. guest_rsp itself is necessarily mapped (the
+            // guest is executing on it), so a read at or just above it is safe
+            // in practice. But if guest stack mappings ever become fragmented
+            // such that guest_rsp's own page is partially unmapped, an in-page
+            // read could still fault. We accept this deliberately: a correct
+            // mapped/readable check would require a VMA/MM query, and taking
+            // the MM lock from this fault-adjacent, no-lock context risks
+            // turning a crash into a deadlock -- strictly worse than the rare
+            // fault this would prevent. If a lock-free "is this address mapped"
+            // query becomes available, this is the place to use it.
             constexpr u64 kPageSize = 0x1000;
             const u64 rsp_page_end = (guest_rsp & ~(kPageSize - 1)) + kPageSize;
             const auto safe_read_qword = [&](u64 addr) -> u64 {
@@ -1325,6 +1404,25 @@ u64 Runtime::InvokeGuestCallback(VAddr guest_fn,
 // A naive address-range check (e.g. "ptr >= 0x800000000") was tempting
 // but wrong: under PIE+ASLR on Linux, host code itself often lives well
 // above that threshold. dladdr is the right primitive.
+//
+// KNOWN LIMITATION — this is a heuristic, not a definitive test. The
+// assumption is "not in any loaded host module ⇒ guest". That holds for
+// everything in the tree today (host code is in loaded .so/.exe/.dll
+// modules; guest memory is mapped by shadPS4's loader and belongs to no
+// module), but it can misclassify any *executable host memory that is not
+// part of a loaded module*, which would be reported as "guest". Future
+// sources of such memory include:
+//   - JIT-generated host trampolines / stubs not registered with the loader
+//   - executable memory allocated by third-party libraries
+//   - LLVM-generated stubs, if an LLVM-backed path is ever added
+//   - additional runtime helper code allocated at run time
+// None of these exist today, so the heuristic is currently safe.
+//
+// TODO: once a guest-address range is queryable from the memory manager,
+// prefer a positive test — MemoryManager::ContainsGuestAddress(ptr) — over
+// this negative "not a host module" inference. That test must be callable
+// from the fault path without taking locks (this can run in a signal/fault
+// context), so it depends on a lock-free range query being available.
 
 #ifdef _WIN32
 #include <windows.h>
