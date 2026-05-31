@@ -1415,6 +1415,176 @@ bool EmitRet(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
 //   result = lhs +/- 1; CF is PRESERVED (the defining quirk of INC/DEC vs
 //   ADD/SUB); OF/SF/ZF/AF/PF derived from the result. rhs is stashed as 1 so
 //   the materializer's shared OF/AF math applies unchanged.
+// guest: cbw/cwde/cdqe (sign-extend accumulator) and cwd/cdq/cqo (sign-extend
+// rAX into rDX:rAX). No flags affected. The 0x98/0x99 opcodes are
+// operand-width-disambiguated; Zydis resolves the mnemonic for us.
+//   CBW : AL ->  AX  (sign);  CWDE: AX  -> EAX (sign, zero-ext to RAX);
+//   CDQE: EAX -> RAX (sign).
+//   CWD : AX  -> DX:AX  (DX = sign bits of AX, upper of RDX preserved);
+//   CDQ : EAX -> EDX:EAX (EDX = sign of EAX, zero-ext into RDX);
+//   CQO : RAX -> RDX:RAX (RDX = all sign bits of RAX).
+bool EmitConvert(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
+    const XReg a = kScratch0, t = kScratch1;
+    c.ldr(a, ptr(kState, GprOffset(0)));   // rax
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_CBW: {
+            // AL -> AX: sign-extend low 8 into bits 15:8, preserve upper 48.
+            c.sxtb(t, WReg(a.getIdx()));        // t = sign-extended byte (64)
+            c.mov(XReg(12), ~0xFFFFull);
+            c.and_(a, a, XReg(12));             // clear low 16
+            c.and_(t, t, 0xFFFF);               // keep low 16 of extension
+            c.orr(a, a, t);
+            c.str(a, ptr(kState, GprOffset(0)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CWDE: {
+            // AX -> EAX: sign-extend low 16 to 32, then zero-extend to 64.
+            c.sxth(WReg(t.getIdx()), WReg(a.getIdx()));   // 16->32 sign
+            c.mov(WReg(t.getIdx()), WReg(t.getIdx()));    // zero-ext 32->64
+            c.str(t, ptr(kState, GprOffset(0)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CDQE: {
+            // EAX -> RAX: sign-extend low 32 to 64.
+            c.sxtw(t, WReg(a.getIdx()));
+            c.str(t, ptr(kState, GprOffset(0)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CWD: {
+            // AX -> DX:AX. DX = 0xFFFF if AX bit15 set else 0; preserve upper 48 of RDX.
+            c.ldr(t, ptr(kState, GprOffset(2)));   // rdx
+            c.mov(XReg(12), ~0xFFFFull);
+            c.and_(t, t, XReg(12));                // clear DX
+            c.sbfx(XReg(13), a, 15, 1);            // x13 = sign of bit15 (all-ones/zero)
+            c.and_(XReg(13), XReg(13), 0xFFFF);
+            c.orr(t, t, XReg(13));
+            c.str(t, ptr(kState, GprOffset(2)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CDQ: {
+            // EAX -> EDX:EAX. EDX = sign of bit31, zero-extended into RDX.
+            c.sbfx(WReg(13), WReg(a.getIdx()), 31, 1);  // w13 = 0 or 0xFFFFFFFF
+            c.mov(WReg(13), WReg(13));                  // zero-ext to 64
+            c.str(XReg(13), ptr(kState, GprOffset(2)));
+            return true;
+        }
+        case ZYDIS_MNEMONIC_CQO: {
+            // RAX -> RDX:RAX. RDX = all sign bits of RAX.
+            c.asr(t, a, 63);
+            c.str(t, ptr(kState, GprOffset(2)));
+            return true;
+        }
+        default:
+            return false;
+    }
+}
+
+// guest: inc/dec r/m at widths 8/16/32/64, register (incl. AH/CH/DH/BH
+// high-byte) or memory destination. INC/DEC preserve CF and set OF/SF/ZF/PF;
+// the lazy-flag side-band (FLAG_OP_INC/DEC, width-tagged) lets the materializer
+// reproduce exactly that (it reloads the old CF and keeps it). High-byte regs
+// occupy bits 15:8 of parent slot 0..3 (AH/CH/DH/BH).
+bool EmitIncDec(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                CodeGenerator& c) {
+    const bool is_inc = (insn.mnemonic == ZYDIS_MNEMONIC_INC);
+    if (!is_inc && insn.mnemonic != ZYDIS_MNEMONIC_DEC) return false;
+    if (insn.operand_count_visible != 1) return false;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+
+    const XReg lhs = kScratch0, rhs = kScratch1, res = kScratch2;  // x9,x10,x12
+    const XReg vAddr = XReg(13);
+
+    // Detect high-byte register (AH/CH/DH/BH): parent slot 0..3, byte offset 1.
+    int hi_parent = -1;
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        switch (ops[0].reg.value) {
+            case ZYDIS_REGISTER_AH: hi_parent = 0; break;
+            case ZYDIS_REGISTER_CH: hi_parent = 1; break;
+            case ZYDIS_REGISTER_DH: hi_parent = 2; break;
+            case ZYDIS_REGISTER_BH: hi_parent = 3; break;
+            default: break;
+        }
+    }
+
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int dst = -1;
+    if (!dst_mem && hi_parent < 0) {
+        dst = ZydisGprToIndex(ops[0].reg.value);
+        if (dst < 0) return false;
+    }
+
+    // Load lhs (width-truncated) and compute res = lhs +/- 1.
+    if (dst_mem) {
+        const bool addr32 = (insn.address_width == 32);
+        if (!EmitEffectiveAddress(ops[0].mem, /*next_rip*/0, c, addr32)) return false;
+        c.mov(vAddr, kAddr);
+        switch (w) {
+            case 8:  c.ldrb(WReg(lhs.getIdx()), ptr(vAddr)); break;
+            case 16: c.ldrh(WReg(lhs.getIdx()), ptr(vAddr)); break;
+            case 32: c.ldr(WReg(lhs.getIdx()), ptr(vAddr)); break;
+            default: c.ldr(lhs, ptr(vAddr)); break;
+        }
+    } else if (hi_parent >= 0) {
+        c.ldr(lhs, ptr(kState, GprOffset(hi_parent)));
+        c.ubfx(lhs, lhs, 8, 8);   // extract byte 1
+    } else {
+        c.ldr(lhs, ptr(kState, GprOffset(dst)));
+        if (w != 64) c.and_(lhs, lhs, wmask);
+    }
+
+    c.mov(rhs, 1);
+    if (is_inc) c.add(res, lhs, rhs);
+    else        c.sub(res, lhs, rhs);
+    if (w != 64) c.and_(res, res, wmask);
+
+    // Lazy-flag side-band (width-tagged). Use WReg(9)... wait, lhs IS x9; use a
+    // free reg for the flag_op/width immediates that doesn't alias lhs/res/vAddr.
+    // x14 is free here.
+    c.mov(WReg(14), is_inc ? FLAG_OP_INC : FLAG_OP_DEC);
+    c.str(WReg(14), ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(WReg(14), w);
+    c.str(WReg(14), ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+    c.str(lhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(rhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(res, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+
+    // Write back.
+    if (dst_mem) {
+        switch (w) {
+            case 8:  c.strb(WReg(res.getIdx()), ptr(vAddr)); break;
+            case 16: c.strh(WReg(res.getIdx()), ptr(vAddr)); break;
+            case 32: c.str(WReg(res.getIdx()), ptr(vAddr)); break;
+            default: c.str(res, ptr(vAddr)); break;
+        }
+    } else if (hi_parent >= 0) {
+        // Merge res into bits 15:8 of parent slot, preserve the rest.
+        c.ldr(XReg(14), ptr(kState, GprOffset(hi_parent)));
+        c.mov(XReg(15), ~(0xFFull << 8));
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(res, res, 0xFF);
+        c.lsl(res, res, 8);
+        c.orr(XReg(14), XReg(14), res);
+        c.str(XReg(14), ptr(kState, GprOffset(hi_parent)));
+    } else if (w == 64) {
+        c.str(res, ptr(kState, GprOffset(dst)));
+    } else if (w == 32) {
+        c.mov(WReg(res.getIdx()), WReg(res.getIdx()));
+        c.str(res, ptr(kState, GprOffset(dst)));
+    } else {
+        // 8/16 merge-preserve upper.
+        c.ldr(XReg(14), ptr(kState, GprOffset(dst)));
+        c.mov(XReg(15), ~wmask);
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.orr(XReg(14), XReg(14), res);
+        c.str(XReg(14), ptr(kState, GprOffset(dst)));
+    }
+
+    EmitMaterializeFlags(c);
+    return true;
+}
+
 bool EmitIncDec64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                   CodeGenerator& c) {
     const bool is_inc = (insn.mnemonic == ZYDIS_MNEMONIC_INC);
@@ -2045,9 +2215,17 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_LEA:
             handled = EmitLea(insn, ops, next_rip, c);
             break;
+        case ZYDIS_MNEMONIC_CBW:
+        case ZYDIS_MNEMONIC_CWDE:
+        case ZYDIS_MNEMONIC_CDQE:
+        case ZYDIS_MNEMONIC_CWD:
+        case ZYDIS_MNEMONIC_CDQ:
+        case ZYDIS_MNEMONIC_CQO:
+            handled = EmitConvert(insn, c);
+            break;
         case ZYDIS_MNEMONIC_INC:
         case ZYDIS_MNEMONIC_DEC:
-            handled = EmitIncDec64(insn, ops, c);
+            handled = EmitIncDec(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_PUSH:
             handled = EmitPush(insn, ops, c);
