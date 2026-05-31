@@ -479,6 +479,242 @@ bool EmitMov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     return false;
 }
 
+// guest: not r/m — bitwise complement at width 8/16/32/64. No flags.
+//   reg dest: 8/16 merge-preserve, 32 zero-extend, 64 full.
+//   mem dest: write exactly width bytes.
+bool EmitNot(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_NOT) return false;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> x11
+        c.mov(XReg(13), kAddr);
+        switch (w) {
+            case 8:  c.ldrb(WReg(12), ptr(XReg(13))); break;
+            case 16: c.ldrh(WReg(12), ptr(XReg(13))); break;
+            case 32: c.ldr(WReg(12), ptr(XReg(13))); break;
+            default: c.ldr(kScratch2, ptr(XReg(13))); break;
+        }
+        c.mvn(kScratch2, kScratch2);
+        switch (w) {
+            case 8:  c.strb(WReg(12), ptr(XReg(13))); break;
+            case 16: c.strh(WReg(12), ptr(XReg(13))); break;
+            case 32: c.str(WReg(12), ptr(XReg(13))); break;
+            default: c.str(kScratch2, ptr(XReg(13))); break;
+        }
+        return true;
+    }
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    c.ldr(kScratch0, ptr(kState, GprOffset(d)));
+    c.mvn(kScratch2, kScratch0);
+    if (w == 64) {
+        c.str(kScratch2, ptr(kState, GprOffset(d)));
+    } else if (w == 32) {
+        c.mov(WReg(12), WReg(12));  // zero-extend low 32
+        c.str(kScratch2, ptr(kState, GprOffset(d)));
+    } else {
+        c.and_(kScratch2, kScratch2, wmask);
+        c.ldr(kScratch0, ptr(kState, GprOffset(d)));
+        c.mov(kScratch1, ~wmask);
+        c.and_(kScratch0, kScratch0, kScratch1);
+        c.orr(kScratch0, kScratch0, kScratch2);
+        c.str(kScratch0, ptr(kState, GprOffset(d)));
+    }
+    return true;
+}
+
+// guest: neg r/m — two's-complement negate at width. Flags as SUB(0, operand):
+//   CF = (operand != 0), and ZF/SF/OF/PF/AF as for 0 - operand. Uses the
+//   width-aware materializer with FLAG_OP_SUB, lhs=0, rhs=operand.
+bool EmitNeg(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_NEG) return false;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+
+    const XReg vOperand = XReg(15);  // rhs
+    const XReg vRes = kScratch2;
+    const bool mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+
+    if (mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(XReg(13), kAddr);
+        switch (w) {
+            case 8:  c.ldrb(WReg(15), ptr(XReg(13))); break;
+            case 16: c.ldrh(WReg(15), ptr(XReg(13))); break;
+            case 32: c.ldr(WReg(15), ptr(XReg(13))); break;
+            default: c.ldr(vOperand, ptr(XReg(13))); break;
+        }
+    } else {
+        const int d = ZydisGprToIndex(ops[0].reg.value);
+        if (d < 0) return false;
+        c.ldr(vOperand, ptr(kState, GprOffset(d)));
+    }
+
+    c.mov(kScratch0, 0);                 // lhs = 0
+    c.sub(vRes, kScratch0, vOperand);    // result = 0 - operand
+
+    // Write back at width.
+    if (mem) {
+        switch (w) {
+            case 8:  c.strb(WReg(12), ptr(XReg(13))); break;
+            case 16: c.strh(WReg(12), ptr(XReg(13))); break;
+            case 32: c.str(WReg(12), ptr(XReg(13))); break;
+            default: c.str(vRes, ptr(XReg(13))); break;
+        }
+    } else {
+        const int d = ZydisGprToIndex(ops[0].reg.value);
+        if (w == 64) {
+            c.str(vRes, ptr(kState, GprOffset(d)));
+        } else if (w == 32) {
+            c.mov(WReg(12), WReg(12));
+            c.str(vRes, ptr(kState, GprOffset(d)));
+        } else {
+            XReg t = XReg(14);
+            c.and_(t, vRes, wmask);
+            c.ldr(kScratch0, ptr(kState, GprOffset(d)));
+            c.mov(kScratch1, ~wmask);
+            c.and_(kScratch0, kScratch0, kScratch1);
+            c.orr(kScratch0, kScratch0, t);
+            c.str(kScratch0, ptr(kState, GprOffset(d)));
+        }
+    }
+
+    // Flags: SUB(0, operand), width-tagged.
+    c.mov(kWScratch3, FLAG_OP_SUB);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(kWScratch3, w);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(vOperand, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(vRes, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
+    return true;
+}
+
+// guest: movzx r, r/m8|r/m16 — zero-extend source into dest (16/32/64). No flags.
+bool EmitMovzx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_MOVZX) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const u32 dst_size = insn.operand_width;
+    if (dst_size != 16 && dst_size != 32 && dst_size != 64) return false;
+    const u32 src_size = ops[1].size;
+    if (src_size != 8 && src_size != 16) return false;
+
+    // Load zero-extended source into kScratch0 (ldrb/ldrh/uxt zero-extend).
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisGprToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        c.ldr(kScratch0, ptr(kState, GprOffset(s)));
+        if (src_size == 8) c.uxtb(kScratch0, kScratch0);
+        else               c.uxth(kScratch0, kScratch0);
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        if (src_size == 8) c.ldrb(WReg(9), ptr(kAddr));   // zero-extends to X
+        else               c.ldrh(WReg(9), ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    // Width-aware store. 16-bit dst merges low word; 32/64 store full (already
+    // zero-extended, so a 64-bit store of a value < 2^16 is correct for both).
+    if (dst_size == 16) {
+        c.and_(kScratch0, kScratch0, 0xFFFF);
+        c.ldr(kScratch1, ptr(kState, GprOffset(d)));
+        c.mov(kScratch2, ~0xFFFFull);
+        c.and_(kScratch1, kScratch1, kScratch2);
+        c.orr(kScratch1, kScratch1, kScratch0);
+        c.str(kScratch1, ptr(kState, GprOffset(d)));
+    } else {
+        c.str(kScratch0, ptr(kState, GprOffset(d)));
+    }
+    return true;
+}
+
+// guest: movsx r, r/m8|r/m16 — sign-extend source into dest (16/32/64). No flags.
+//   For a 32-bit dst the value is sign-extended to 32 bits then the upper 32
+//   are zeroed (32-bit write semantics); we do this by sign-extending into a
+//   W register and storing it zero-extended into the 64-bit slot.
+bool EmitMovsx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_MOVSX) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const u32 dst_size = insn.operand_width;
+    if (dst_size != 16 && dst_size != 32 && dst_size != 64) return false;
+    const u32 src_size = ops[1].size;
+    if (src_size != 8 && src_size != 16) return false;
+
+    // Load the raw source bits into kScratch0 (low byte/word significant).
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisGprToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        c.ldr(kScratch0, ptr(kState, GprOffset(s)));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        if (src_size == 8) c.ldrb(WReg(9), ptr(kAddr));
+        else               c.ldrh(WReg(9), ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    // Sign-extend to the destination width.
+    if (dst_size == 64) {
+        if (src_size == 8) c.sxtb(kScratch0, WReg(9));
+        else               c.sxth(kScratch0, WReg(9));
+        c.str(kScratch0, ptr(kState, GprOffset(d)));
+    } else if (dst_size == 32) {
+        // Sign-extend into a W reg; the 64-bit store of that (already only low
+        // 32 meaningful, upper bits zero) gives 32-bit zero-extended write.
+        if (src_size == 8) c.sxtb(WReg(9), WReg(9));
+        else               c.sxth(WReg(9), WReg(9));
+        c.mov(WReg(9), WReg(9));  // ensure upper 32 of X are zero
+        c.str(kScratch0, ptr(kState, GprOffset(d)));
+    } else {  // dst_size == 16, src_size == 8 (16->16 isn't a movsx)
+        c.sxtb(WReg(9), WReg(9));
+        c.and_(kScratch0, kScratch0, 0xFFFF);
+        c.ldr(kScratch1, ptr(kState, GprOffset(d)));
+        c.mov(kScratch2, ~0xFFFFull);
+        c.and_(kScratch1, kScratch1, kScratch2);
+        c.orr(kScratch1, kScratch1, kScratch0);
+        c.str(kScratch1, ptr(kState, GprOffset(d)));
+    }
+    return true;
+}
+
+// guest: movsxd r64, r/m32 — sign-extend 32->64. No flags.
+bool EmitMovsxd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_MOVSXD) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisGprToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        c.ldr(WReg(9), ptr(kState, GprOffset(s)));  // low 32
+        c.sxtw(kScratch0, WReg(9));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.ldrsw(kScratch0, ptr(kAddr));  // sign-extending 32->64 load
+    } else {
+        return false;
+    }
+    c.str(kScratch0, ptr(kState, GprOffset(d)));
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // UNIFIED ALU EMITTER (ADD / SUB / AND / OR / XOR).
 //
@@ -1262,6 +1498,21 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_TEST:
             handled = EmitTest(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_NOT:
+            handled = EmitNot(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_NEG:
+            handled = EmitNeg(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_MOVZX:
+            handled = EmitMovzx(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_MOVSX:
+            handled = EmitMovsx(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_MOVSXD:
+            handled = EmitMovsxd(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_NOP:
             handled = true;  // NOP (incl. multi-byte forms): emit nothing.
