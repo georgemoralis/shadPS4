@@ -195,6 +195,13 @@ constexpr u32 FLAG_OP_LOGIC = 3;
 constexpr u32 FLAG_OP_INC = 4;
 constexpr u32 FLAG_OP_DEC = 5;
 
+// Forward declaration: EmitEffectiveAddress is defined later (near LEA) but is
+// called earlier by the ALU mem-source paths (EmitAdd64/EmitSub64). Declaring
+// it here keeps the address-emitter grouped with its address-consuming
+// emitters while satisfying C++'s define-before-use for the earlier callers.
+bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem, u64 next_rip,
+                          CodeGenerator& c, bool addr32 = false);
+
 // ----------------------------------------------------------------------------
 // INSTRUCTION EMITTERS.
 //
@@ -674,7 +681,7 @@ bool EmitIncDec64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 // 2^32)) mod 2^32. Lets e.g. `mov [ebx], eax` reach a sub-4GiB address even
 // when the upper 32 bits of the base register hold garbage.
 bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem, u64 next_rip,
-                          CodeGenerator& c, bool addr32 = false) {
+                          CodeGenerator& c, bool addr32) {
     // Only flat segments (DS/SS/CS/ES). FS/GS would need TLS-base handling.
     if (mem.segment != ZYDIS_REGISTER_DS && mem.segment != ZYDIS_REGISTER_SS &&
         mem.segment != ZYDIS_REGISTER_CS && mem.segment != ZYDIS_REGISTER_ES) {
