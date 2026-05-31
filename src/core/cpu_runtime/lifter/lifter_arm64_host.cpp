@@ -188,6 +188,12 @@ constexpr u32 FLAG_OP_SUB = 2;
 // tag; lhs/rhs are still stashed for uniformity but are not needed to
 // derive the logical flags.
 constexpr u32 FLAG_OP_LOGIC = 3;
+// INC / DEC: identical OF/SF/ZF/AF/PF derivation to ADD/SUB with rhs==1, but
+// x86 INC/DEC leave CF UNCHANGED. The materializer treats these like ADD/SUB
+// for the result-derived flags and preserves the prior CF bit instead of
+// computing one. (rhs is stashed as 1 so the shared OF/AF math is reused.)
+constexpr u32 FLAG_OP_INC = 4;
+constexpr u32 FLAG_OP_DEC = 5;
 
 // ----------------------------------------------------------------------------
 // INSTRUCTION EMITTERS.
@@ -265,11 +271,15 @@ void EmitMaterializeFlags(CodeGenerator& c) {
     c.orr(fl, fl, t);
 
     // CF and OF are operation-dependent.
-    Label isSub, isLogic, doneCfOf;
+    Label isSub, isLogic, isInc, isDec, doneCfOf;
     c.cmp(opw, FLAG_OP_SUB);
     c.b(EQ, isSub);
     c.cmp(opw, FLAG_OP_LOGIC);
     c.b(EQ, isLogic);
+    c.cmp(opw, FLAG_OP_INC);
+    c.b(EQ, isInc);
+    c.cmp(opw, FLAG_OP_DEC);
+    c.b(EQ, isDec);
 
     // ADD: CF = (result < lhs) unsigned (wrap). OF when both operands share a
     // sign that differs from the result's: (~(lhs^rhs) & (lhs^result)) >> 63.
@@ -296,6 +306,36 @@ void EmitMaterializeFlags(CodeGenerator& c) {
     c.lsr(t, t, 63);
     c.lsl(t, t, 11);
     c.orr(fl, fl, t);
+    c.b(doneCfOf);
+
+    c.L(isInc);
+    // INC: like ADD with rhs==1 for OF, but CF is PRESERVED (not computed).
+    // OF = (~(lhs^rhs) & (lhs^result)) >> 63 with rhs==1.
+    c.eor(t, lhs, rhs);
+    c.mvn(t, t);
+    c.eor(u, lhs, res);
+    c.and_(t, t, u);
+    c.lsr(t, t, 63);
+    c.lsl(t, t, 11);
+    c.orr(fl, fl, t);
+    // Preserve prior CF: OR in bit 0 of the existing rflags.
+    c.ldr(u, ptr(kState, Offsets::Rflags));
+    c.and_(u, u, 1);
+    c.orr(fl, fl, u);
+    c.b(doneCfOf);
+
+    c.L(isDec);
+    // DEC: like SUB with rhs==1 for OF, but CF is PRESERVED.
+    // OF = ((lhs^rhs) & (lhs^result)) >> 63 with rhs==1.
+    c.eor(t, lhs, rhs);
+    c.eor(u, lhs, res);
+    c.and_(t, t, u);
+    c.lsr(t, t, 63);
+    c.lsl(t, t, 11);
+    c.orr(fl, fl, t);
+    c.ldr(u, ptr(kState, Offsets::Rflags));
+    c.and_(u, u, 1);
+    c.orr(fl, fl, u);
     c.b(doneCfOf);
 
     c.L(isLogic);
@@ -521,6 +561,39 @@ bool EmitRet(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
     c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
     c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
     c.br(kDispatchTop); // normal dispatcher re-entry (NOT fatal exit)
+    return true;
+}
+
+// guest: inc/dec r64 (register form; 8/16/32-bit and memory forms deferred —
+//   they need width-aware flag derivation and the effective-address emitter).
+//   result = lhs +/- 1; CF is PRESERVED (the defining quirk of INC/DEC vs
+//   ADD/SUB); OF/SF/ZF/AF/PF derived from the result. rhs is stashed as 1 so
+//   the materializer's shared OF/AF math applies unchanged.
+bool EmitIncDec64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  CodeGenerator& c) {
+    const bool is_inc = (insn.mnemonic == ZYDIS_MNEMONIC_INC);
+    if (!is_inc && insn.mnemonic != ZYDIS_MNEMONIC_DEC) return false;
+    if (insn.operand_width != 64) return false;            // narrow/mem deferred
+    if (insn.operand_count_visible != 1) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisGprToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    c.ldr(kScratch0, ptr(kState, GprOffset(dst)));         // lhs
+    c.mov(kScratch1, 1);                                   // rhs = 1
+    if (is_inc) {
+        c.add(kScratch2, kScratch0, kScratch1);
+    } else {
+        c.sub(kScratch2, kScratch0, kScratch1);
+    }
+    c.str(kScratch2, ptr(kState, GprOffset(dst)));
+
+    c.mov(kWScratch3, is_inc ? FLAG_OP_INC : FLAG_OP_DEC);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
     return true;
 }
 
@@ -797,6 +870,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_OR:
         case ZYDIS_MNEMONIC_XOR:
             handled = EmitLogic64(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_INC:
+        case ZYDIS_MNEMONIC_DEC:
+            handled = EmitIncDec64(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_PUSH:
             handled = EmitPush(insn, ops, c);
