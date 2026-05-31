@@ -16043,5 +16043,384 @@ TEST_F(CpuRuntimeTest, Shl32_CountMaskedTo5Bits) {
     EXPECT_EQ(r.state.gpr[0], 2u) << "33 masks to 1: 1<<1 = 2, upper32 zeroed";
 }
 
+// ============================================================================
+// EXTENDED EMITTER COVERAGE, BATCH 2
+//
+// Packed-FP arithmetic and bitwise families, the ordered scalar compares
+// (VCOMISS/VCOMISD, distinct from the already-covered unordered VUCOMI*),
+// the unaligned vector moves, the float-duplicate moves, and CWDE. Every
+// encoding below was byte-verified with the assembler. xmm register -> YMM
+// slot mapping: xmm_n low64 = ymm[n*4], high64 = ymm[n*4+1]; VEX-128 zeros
+// ymm[dst*4+2 .. +3].
+// ============================================================================
+
+namespace {
+// Pack two floats into a 64-bit chunk (low lane in bits 0:31).
+inline u64 PackF2(float lo, float hi) {
+    return (static_cast<u64>(std::bit_cast<u32>(hi)) << 32) |
+            static_cast<u64>(std::bit_cast<u32>(lo));
+}
+// Read lane `i` (0..3) of xmm0 from the post-run state as a float.
+inline float XmmLaneF(const GuestState& st, int lane) {
+    const u64 chunk = st.ymm[(lane >> 1)];        // xmm0 low=ymm[0], high=ymm[1]
+    const u32 bits = (lane & 1) ? static_cast<u32>(chunk >> 32)
+                                : static_cast<u32>(chunk & 0xFFFFFFFFULL);
+    return std::bit_cast<float>(bits);
+}
+// Standard packed-FP fixture run: load xmm1 and xmm2 with caller data,
+// poison xmm0's upper YMM, run a 5-byte program (4-byte op + RET).
+GuestState RunPackedFp(const u8* program, size_t n, GuestMemory& mem,
+                       u64 x1_lo, u64 x1_hi, u64 x2_lo, u64 x2_hi) {
+    std::memcpy(mem.CodePtr(), program, n);
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = x1_lo; st.ymm[5] = x1_hi;   // xmm1
+    st.ymm[8] = x2_lo; st.ymm[9] = x2_hi;   // xmm2
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;       // xmm0 upper, must be zeroed
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+    Runtime rt;
+    rt.Run(st);
+    return st;
+}
+} // namespace
+
+// ----------------------------------------------------------------------------
+// Packed single-precision arithmetic. Inputs are chosen so each lane has a
+// distinct, exactly-representable result and so operand order matters
+// (sub/div are not commutative).
+// ----------------------------------------------------------------------------
+
+// vaddps xmm0, xmm1, xmm2 : lanewise xmm1 + xmm2.
+TEST_F(CpuRuntimeTest, PackedFp_Vaddps_Lanewise) {
+    const u8 program[] = {0xc5, 0xf0, 0x58, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(1.0f, 2.0f), PackF2(3.0f, 4.0f),     // xmm1 = [1,2,3,4]
+        PackF2(10.0f, 20.0f), PackF2(30.0f, 40.0f)); // xmm2 = [10,20,30,40]
+    EXPECT_EQ(XmmLaneF(st, 0), 11.0f);
+    EXPECT_EQ(XmmLaneF(st, 1), 22.0f);
+    EXPECT_EQ(XmmLaneF(st, 2), 33.0f);
+    EXPECT_EQ(XmmLaneF(st, 3), 44.0f);
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vsubps : order matters (xmm1 - xmm2).
+TEST_F(CpuRuntimeTest, PackedFp_Vsubps_OrderMatters) {
+    const u8 program[] = {0xc5, 0xf0, 0x5c, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(10.0f, 20.0f), PackF2(30.0f, 40.0f),
+        PackF2(1.0f, 2.0f), PackF2(3.0f, 4.0f));
+    EXPECT_EQ(XmmLaneF(st, 0), 9.0f);
+    EXPECT_EQ(XmmLaneF(st, 1), 18.0f);
+    EXPECT_EQ(XmmLaneF(st, 2), 27.0f);
+    EXPECT_EQ(XmmLaneF(st, 3), 36.0f);
+}
+
+// vmulps : lanewise product.
+TEST_F(CpuRuntimeTest, PackedFp_Vmulps_Lanewise) {
+    const u8 program[] = {0xc5, 0xf0, 0x59, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(2.0f, 3.0f), PackF2(4.0f, 5.0f),
+        PackF2(0.5f, 2.0f), PackF2(0.25f, 10.0f));
+    EXPECT_EQ(XmmLaneF(st, 0), 1.0f);
+    EXPECT_EQ(XmmLaneF(st, 1), 6.0f);
+    EXPECT_EQ(XmmLaneF(st, 2), 1.0f);
+    EXPECT_EQ(XmmLaneF(st, 3), 50.0f);
+}
+
+// vminps : per-lane minimum.
+TEST_F(CpuRuntimeTest, PackedFp_Vminps_PerLaneMin) {
+    const u8 program[] = {0xc5, 0xf0, 0x5d, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(1.0f, 50.0f), PackF2(3.0f, 8.0f),
+        PackF2(9.0f, 20.0f), PackF2(30.0f, 2.0f));
+    EXPECT_EQ(XmmLaneF(st, 0), 1.0f);
+    EXPECT_EQ(XmmLaneF(st, 1), 20.0f);
+    EXPECT_EQ(XmmLaneF(st, 2), 3.0f);
+    EXPECT_EQ(XmmLaneF(st, 3), 2.0f);
+}
+
+// ----------------------------------------------------------------------------
+// Packed double-precision arithmetic. xmm holds two doubles: low64 = lane0,
+// high64 = lane1.
+// ----------------------------------------------------------------------------
+
+namespace {
+inline u64 PackD(double d) { return std::bit_cast<u64>(d); }
+inline double XmmLaneD(const GuestState& st, int lane) {
+    return std::bit_cast<double>(st.ymm[lane]); // xmm0 lane0=ymm[0], lane1=ymm[1]
+}
+} // namespace
+
+TEST_F(CpuRuntimeTest, PackedFp_Vaddpd_Lanewise) {
+    const u8 program[] = {0xc5, 0xf1, 0x58, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackD(1.5), PackD(2.5), PackD(10.0), PackD(20.0));
+    EXPECT_EQ(XmmLaneD(st, 0), 11.5);
+    EXPECT_EQ(XmmLaneD(st, 1), 22.5);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vsubpd_OrderMatters) {
+    const u8 program[] = {0xc5, 0xf1, 0x5c, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackD(100.0), PackD(7.0), PackD(1.0), PackD(2.0));
+    EXPECT_EQ(XmmLaneD(st, 0), 99.0);
+    EXPECT_EQ(XmmLaneD(st, 1), 5.0);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vmulpd_Lanewise) {
+    const u8 program[] = {0xc5, 0xf1, 0x59, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackD(3.0), PackD(4.0), PackD(2.0), PackD(0.5));
+    EXPECT_EQ(XmmLaneD(st, 0), 6.0);
+    EXPECT_EQ(XmmLaneD(st, 1), 2.0);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vdivpd_OrderMatters) {
+    const u8 program[] = {0xc5, 0xf1, 0x5e, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackD(20.0), PackD(9.0), PackD(4.0), PackD(3.0));
+    EXPECT_EQ(XmmLaneD(st, 0), 5.0);
+    EXPECT_EQ(XmmLaneD(st, 1), 3.0);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vmaxpd_PerLaneMax) {
+    const u8 program[] = {0xc5, 0xf1, 0x5f, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackD(1.0), PackD(50.0), PackD(9.0), PackD(20.0));
+    EXPECT_EQ(XmmLaneD(st, 0), 9.0);
+    EXPECT_EQ(XmmLaneD(st, 1), 50.0);
+}
+
+// ----------------------------------------------------------------------------
+// Packed FP bitwise ops operate on the raw 128-bit pattern, lane-agnostic.
+// We treat the xmm as two u64 halves and check the bit math directly.
+// ----------------------------------------------------------------------------
+
+TEST_F(CpuRuntimeTest, PackedFp_Vandps_BitwiseAnd) {
+    const u8 program[] = {0xc5, 0xf0, 0x54, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0xFF00FF00FF00FF00ULL, 0x0F0F0F0F0F0F0F0FULL,
+        0x0FF00FF00FF00FF0ULL, 0xFFFF0000FFFF0000ULL);
+    EXPECT_EQ(st.ymm[0], 0xFF00FF00FF00FF00ULL & 0x0FF00FF00FF00FF0ULL);
+    EXPECT_EQ(st.ymm[1], 0x0F0F0F0F0F0F0F0FULL & 0xFFFF0000FFFF0000ULL);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vorps_BitwiseOr) {
+    const u8 program[] = {0xc5, 0xf0, 0x56, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0x00FF00FF00FF00FFULL, 0xAAAAAAAAAAAAAAAAULL,
+        0xFF00FF00FF00FF00ULL, 0x5555555555555555ULL);
+    EXPECT_EQ(st.ymm[0], 0xFFFFFFFFFFFFFFFFULL);
+    EXPECT_EQ(st.ymm[1], 0xFFFFFFFFFFFFFFFFULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedFp_Vxorpd_BitwiseXor) {
+    const u8 program[] = {0xc5, 0xf1, 0x57, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0x1234567812345678ULL, 0xFFFFFFFFFFFFFFFFULL,
+        0x0F0F0F0F0F0F0F0FULL, 0x00000000FFFFFFFFULL);
+    EXPECT_EQ(st.ymm[0], 0x1234567812345678ULL ^ 0x0F0F0F0F0F0F0F0FULL);
+    EXPECT_EQ(st.ymm[1], 0xFFFFFFFFFFFFFFFFULL ^ 0x00000000FFFFFFFFULL);
+}
+
+// vandnps : (NOT src1) AND src2 -- the bit-clear primitive.
+TEST_F(CpuRuntimeTest, PackedFp_Vandnps_NotSrc1AndSrc2) {
+    const u8 program[] = {0xc5, 0xf0, 0x55, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0xFF00FF00FF00FF00ULL, 0x0000000000000000ULL,
+        0x1234567812345678ULL, 0xCAFEF00DCAFEF00DULL);
+    EXPECT_EQ(st.ymm[0], (~0xFF00FF00FF00FF00ULL) & 0x1234567812345678ULL);
+    EXPECT_EQ(st.ymm[1], (~0x0000000000000000ULL) & 0xCAFEF00DCAFEF00DULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedInt_Vpor_BitwiseOr) {
+    const u8 program[] = {0xc5, 0xf1, 0xeb, 0xc2, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0x00000000FFFFFFFFULL, 0x1111111100000000ULL,
+        0xFFFFFFFF00000000ULL, 0x0000000022222222ULL);
+    EXPECT_EQ(st.ymm[0], 0xFFFFFFFFFFFFFFFFULL);
+    EXPECT_EQ(st.ymm[1], 0x1111111122222222ULL);
+}
+
+TEST_F(CpuRuntimeTest, PackedInt_Vpxor_SelfZeroesRegister) {
+    // vpxor xmm0, xmm1, xmm1 -- the canonical zero idiom (src2 == src1).
+    // Encoding: c5 f1 ef c1  (xmm0 = xmm1 ^ xmm1).
+    const u8 program[] = {0xc5, 0xf1, 0xef, 0xc1, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0xDEADBEEFCAFEF00DULL, 0x1234567887654321ULL, 0, 0);
+    EXPECT_EQ(st.ymm[0], 0ULL) << "x ^ x = 0";
+    EXPECT_EQ(st.ymm[1], 0ULL);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ----------------------------------------------------------------------------
+// VCOMISS / VCOMISD -- ORDERED scalar compares. They set CF/ZF/PF from the
+// low-lane comparison; an unordered (NaN) operand sets ZF=PF=CF=1, identical
+// in flag output to the unordered VUCOMI* form. We verify the three ordered
+// outcomes plus the NaN case.
+// flag layout: equal -> ZF=1,CF=0,PF=0; less -> CF=1,ZF=0,PF=0;
+//              greater -> all clear; unordered -> ZF=CF=PF=1.
+// ----------------------------------------------------------------------------
+
+namespace {
+GuestState RunComiss(float a, float b, GuestMemory& mem) {
+    // vcomiss xmm0, xmm1 : c5 f8 2f c1
+    const u8 program[] = {0xc5, 0xf8, 0x2f, 0xc1, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(rsp);
+    st.ymm[0] = std::bit_cast<u32>(a);   // xmm0 low lane
+    st.ymm[4] = std::bit_cast<u32>(b);   // xmm1 low lane
+    Runtime rt; rt.Run(st);
+    return st;
+}
+constexpr u64 C_CF = 1ULL << 0, C_PF = 1ULL << 2, C_ZF = 1ULL << 6;
+} // namespace
+
+TEST_F(CpuRuntimeTest, Vcomiss_Equal_SetsZfOnly) {
+    const auto st = RunComiss(3.5f, 3.5f, mem);
+    EXPECT_TRUE(st.rflags & C_ZF);
+    EXPECT_FALSE(st.rflags & C_CF);
+    EXPECT_FALSE(st.rflags & C_PF);
+}
+TEST_F(CpuRuntimeTest, Vcomiss_Less_SetsCf) {
+    const auto st = RunComiss(1.0f, 2.0f, mem);
+    EXPECT_TRUE(st.rflags & C_CF);
+    EXPECT_FALSE(st.rflags & C_ZF);
+    EXPECT_FALSE(st.rflags & C_PF);
+}
+TEST_F(CpuRuntimeTest, Vcomiss_Greater_AllClear) {
+    const auto st = RunComiss(5.0f, 2.0f, mem);
+    EXPECT_FALSE(st.rflags & C_CF);
+    EXPECT_FALSE(st.rflags & C_ZF);
+    EXPECT_FALSE(st.rflags & C_PF);
+}
+TEST_F(CpuRuntimeTest, Vcomiss_Nan_SetsAllThree) {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const auto st = RunComiss(nan, 1.0f, mem);
+    EXPECT_TRUE(st.rflags & C_ZF) << "unordered sets ZF";
+    EXPECT_TRUE(st.rflags & C_CF) << "unordered sets CF";
+    EXPECT_TRUE(st.rflags & C_PF) << "unordered sets PF";
+}
+
+namespace {
+GuestState RunComisd(double a, double b, GuestMemory& mem) {
+    // vcomisd xmm0, xmm1 : c5 f9 2f c1
+    const u8 program[] = {0xc5, 0xf9, 0x2f, 0xc1, 0xc3};
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(rsp);
+    st.ymm[0] = std::bit_cast<u64>(a);
+    st.ymm[4] = std::bit_cast<u64>(b);
+    Runtime rt; rt.Run(st);
+    return st;
+}
+} // namespace
+
+TEST_F(CpuRuntimeTest, Vcomisd_Equal_SetsZfOnly) {
+    const auto st = RunComisd(2.0, 2.0, mem);
+    EXPECT_TRUE(st.rflags & C_ZF);
+    EXPECT_FALSE(st.rflags & C_CF);
+}
+TEST_F(CpuRuntimeTest, Vcomisd_Less_SetsCf) {
+    const auto st = RunComisd(-1.0, 0.0, mem);
+    EXPECT_TRUE(st.rflags & C_CF);
+    EXPECT_FALSE(st.rflags & C_ZF);
+}
+TEST_F(CpuRuntimeTest, Vcomisd_Nan_SetsAllThree) {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const auto st = RunComisd(1.0, nan, mem);
+    EXPECT_TRUE(st.rflags & C_ZF);
+    EXPECT_TRUE(st.rflags & C_CF);
+    EXPECT_TRUE(st.rflags & C_PF);
+}
+
+// ----------------------------------------------------------------------------
+// Unaligned vector moves: VMOVUPS / VMOVDQU register-to-register. Both copy
+// the full 128 bits and (VEX-128) zero the upper YMM.
+// ----------------------------------------------------------------------------
+
+TEST_F(CpuRuntimeTest, Vmovups_RegReg_CopiesAndZeroesUpper) {
+    // vmovups xmm0, xmm1 : c5 f8 10 c1
+    const u8 program[] = {0xc5, 0xf8, 0x10, 0xc1, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0x1122334455667788ULL, 0x99AABBCCDDEEFF00ULL, 0, 0);
+    EXPECT_EQ(st.ymm[0], 0x1122334455667788ULL);
+    EXPECT_EQ(st.ymm[1], 0x99AABBCCDDEEFF00ULL);
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX-128 zeros upper YMM";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vmovdqu_RegReg_CopiesAndZeroesUpper) {
+    // vmovdqu xmm0, xmm1 : c5 fa 6f c1
+    const u8 program[] = {0xc5, 0xfa, 0x6f, 0xc1, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        0xCAFEF00DBAADF00DULL, 0x0123456789ABCDEFULL, 0, 0);
+    EXPECT_EQ(st.ymm[0], 0xCAFEF00DBAADF00DULL);
+    EXPECT_EQ(st.ymm[1], 0x0123456789ABCDEFULL);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ----------------------------------------------------------------------------
+// VMOVSHDUP -- duplicate the odd (high) single-precision lanes:
+//   dst = [src[1], src[1], src[3], src[3]].
+// (Complements the existing VMOVSLDUP even-lane test.)
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Vmovshdup_DuplicatesOddLanes) {
+    // vmovshdup xmm0, xmm1 : c5 fa 16 c1
+    const u8 program[] = {0xc5, 0xfa, 0x16, 0xc1, 0xc3};
+    const auto st = RunPackedFp(program, sizeof(program), mem,
+        PackF2(1.0f, 2.0f), PackF2(3.0f, 4.0f), 0, 0); // xmm1 = [1,2,3,4]
+    EXPECT_EQ(XmmLaneF(st, 0), 2.0f) << "lane0 <- src lane1";
+    EXPECT_EQ(XmmLaneF(st, 1), 2.0f) << "lane1 <- src lane1";
+    EXPECT_EQ(XmmLaneF(st, 2), 4.0f) << "lane2 <- src lane3";
+    EXPECT_EQ(XmmLaneF(st, 3), 4.0f) << "lane3 <- src lane3";
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// ----------------------------------------------------------------------------
+// CWDE -- sign-extend AX into EAX (and, per x86-64 32-bit-write rules, the
+// result zero-extends into RAX). Complements the existing CDQE/CDQ/CQO tests.
+// Encoding: 98 (no REX.W).
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Cwde_SignExtendsNegativeAx) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x00,0x80, 0xEF,0xBE,0xAD,0xDE,0x00,0x00, // mov rax,0x000000DEADBEEF8000
+        0x98,                                                  // cwde
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // ax = 0x8000 (negative). cwde sign-extends to eax = 0xFFFF8000, which
+    // then zero-extends to rax (32-bit write clears bits 63:32).
+    EXPECT_EQ(r.state.gpr[0], 0x00000000FFFF8000ULL)
+        << "AX=0x8000 sign-extends to EAX=0xFFFF8000, upper32 zeroed";
+}
+TEST_F(CpuRuntimeTest, Cwde_ZeroExtendsPositiveAx) {
+    const u8 program[] = {
+        0x48, 0xb8, 0xFF,0x7F, 0xEF,0xBE,0xAD,0xDE,0x00,0x00, // rax low16 = 0x7FFF
+        0x98,                                                  // cwde
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x0000000000007FFFULL)
+        << "AX=0x7FFF (positive) extends to EAX=0x00007FFF";
+}
+
 } // namespace
 } // namespace Core::Runtime
