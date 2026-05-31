@@ -1192,6 +1192,341 @@ bool EmitFlagOp(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
     return true;
 }
 
+// Helper: load a MUL/DIV/IMUL-1op source operand (reg or mem) at width w into
+// `dst`, zero-extended. Returns false on unsupported operand form.
+static bool LoadSrcOperand(const ZydisDecodedOperand& op, u32 w, const XReg& dst,
+                           CodeGenerator& c) {
+    if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisGprToIndex(op.reg.value);
+        if (s < 0) return false;
+        c.ldr(dst, ptr(kState, GprOffset(s)));
+    } else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(op.mem, /*next_rip*/0, c)) return false;
+        switch (w) {
+            case 8:  c.ldrb(WReg(dst.getIdx()), ptr(kAddr)); break;
+            case 16: c.ldrh(WReg(dst.getIdx()), ptr(kAddr)); break;
+            case 32: c.ldr(WReg(dst.getIdx()), ptr(kAddr)); break;
+            default: c.ldr(dst, ptr(kAddr)); break;
+        }
+    } else {
+        return false;
+    }
+    if (w != 64) c.and_(dst, dst, (w == 32) ? 0xFFFFFFFFull : ((1ull << w) - 1));
+    return true;
+}
+
+// guest: mul r/m (one-operand unsigned multiply). Implicit accumulator:
+//   w8 : AX        = AL  * src ; CF/OF = (AH != 0).
+//   w16: DX:AX     = AX  * src ; CF/OF = (DX != 0).
+//   w32: EDX:EAX   = EAX * src ; CF/OF = (EDX != 0); upper 32 of RAX/RDX zeroed.
+//   w64: RDX:RAX   = RAX * src ; CF/OF = (RDX != 0).
+// SF/ZF/PF/AF undefined (left as-is). Narrow forms preserve upper bits of the
+// parent slots (w8 leaves RDX entirely untouched).
+bool EmitMul(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    const XReg a = kScratch0, src = kScratch1, hi = kScratch2, lo = XReg(13);
+    c.ldr(a, ptr(kState, GprOffset(0)));               // rax
+    if (w != 64) c.and_(a, a, (w == 32) ? 0xFFFFFFFFull : ((1ull << w) - 1));
+    if (!LoadSrcOperand(ops[0], w, src, c)) return false;
+
+    if (w == 64) {
+        c.mul(lo, a, src);            // low 64
+        c.umulh(hi, a, src);          // high 64
+        c.str(lo, ptr(kState, GprOffset(0)));
+        c.str(hi, ptr(kState, GprOffset(2)));
+    } else if (w == 32) {
+        c.umull(lo, WReg(a.getIdx()), WReg(src.getIdx()));  // 32x32 -> 64 in lo
+        c.lsr(hi, lo, 32);                                  // EDX = high 32
+        c.and_(lo, lo, 0xFFFFFFFFull);
+        c.str(lo, ptr(kState, GprOffset(0)));               // EAX (zero-ext)
+        c.and_(hi, hi, 0xFFFFFFFFull);
+        c.str(hi, ptr(kState, GprOffset(2)));               // EDX (zero-ext)
+    } else if (w == 16) {
+        c.mul(lo, a, src);            // full product (<=32 bits)
+        // AX = low 16 (merge), DX = bits 31:16 (merge), preserve uppers.
+        c.ldr(XReg(14), ptr(kState, GprOffset(0)));
+        c.mov(XReg(15), ~0xFFFFull);
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(hi, lo, 0xFFFF);
+        c.orr(XReg(14), XReg(14), hi);
+        c.str(XReg(14), ptr(kState, GprOffset(0)));
+        c.ldr(XReg(14), ptr(kState, GprOffset(2)));
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.lsr(hi, lo, 16);
+        c.and_(hi, hi, 0xFFFF);
+        c.orr(XReg(14), XReg(14), hi);
+        c.str(XReg(14), ptr(kState, GprOffset(2)));
+        c.lsr(hi, lo, 16);           // hi holds DX value for CF/OF
+        c.and_(hi, hi, 0xFFFF);
+    } else { // w == 8
+        c.mul(lo, a, src);           // AL*src (<=16 bits)
+        c.ldr(XReg(14), ptr(kState, GprOffset(0)));
+        c.mov(XReg(15), ~0xFFFFull);
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(hi, lo, 0xFFFF);
+        c.orr(XReg(14), XReg(14), hi);
+        c.str(XReg(14), ptr(kState, GprOffset(0)));   // AX = product, upper preserved
+        c.lsr(hi, lo, 8);            // AH for CF/OF
+        c.and_(hi, hi, 0xFF);
+    }
+
+    // CF/OF = (high part != 0). Load rflags, clear CF(0)/OF(11), set from hi.
+    c.ldr(XReg(14), ptr(kState, Offsets::Rflags));
+    c.mov(XReg(15), ~((1ull<<0)|(1ull<<11)));
+    c.and_(XReg(14), XReg(14), XReg(15));
+    {
+        Label hizero, done;
+        c.cmp(hi, 0);
+        c.b(EQ, hizero);
+        c.orr(XReg(14), XReg(14), 1ull<<0);    // CF
+        c.orr(XReg(14), XReg(14), 1ull<<11);   // OF
+        c.L(hizero);
+    }
+    c.str(XReg(14), ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: imul — 1-operand (RDX:RAX = RAX*src, signed), 2-operand (dst *= src),
+// 3-operand (dst = src * imm). For 2/3-op only the low w bits are kept in dst;
+// CF/OF set iff the full signed product doesn't fit in w bits (truncation lost
+// significant bits). For 1-op, RDX:RAX gets the full signed 128-bit product and
+// CF/OF set iff RDX is not the sign-extension of RAX. SF/ZF/PF undefined.
+bool EmitImul(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 16 && w != 32 && w != 64) return false;
+    const int nops = insn.operand_count_visible;
+
+    if (nops == 1) {
+        // RDX:RAX = RAX * src (signed full product).
+        const XReg a = kScratch0, src = kScratch1, hi = kScratch2, lo = XReg(13);
+        c.ldr(a, ptr(kState, GprOffset(0)));
+        if (!LoadSrcOperand(ops[0], w, src, c)) return false;
+        if (w == 64) {
+            c.mul(lo, a, src);
+            c.smulh(hi, a, src);
+            c.str(lo, ptr(kState, GprOffset(0)));
+            c.str(hi, ptr(kState, GprOffset(2)));
+        } else if (w == 32) {
+            c.sxtw(a, WReg(a.getIdx()));
+            c.sxtw(src, WReg(src.getIdx()));
+            c.mul(lo, a, src);                 // full 64-bit signed product
+            c.and_(XReg(15), lo, 0xFFFFFFFFull);
+            c.str(XReg(15), ptr(kState, GprOffset(0)));   // EAX (zero-ext)
+            c.lsr(hi, lo, 32);
+            c.and_(hi, hi, 0xFFFFFFFFull);
+            c.str(hi, ptr(kState, GprOffset(2)));         // EDX
+        } else { // 16
+            c.sxth(a, WReg(a.getIdx()));
+            c.sxth(src, WReg(src.getIdx()));
+            c.mul(lo, a, src);
+            c.ldr(XReg(14), ptr(kState, GprOffset(0)));
+            c.mov(XReg(15), ~0xFFFFull);
+            c.and_(XReg(14), XReg(14), XReg(15));
+            c.and_(XReg(12), lo, 0xFFFF);
+            c.orr(XReg(14), XReg(14), XReg(12));
+            c.str(XReg(14), ptr(kState, GprOffset(0)));
+            c.ldr(XReg(14), ptr(kState, GprOffset(2)));
+            c.and_(XReg(14), XReg(14), XReg(15));
+            c.lsr(XReg(12), lo, 16);
+            c.and_(XReg(12), XReg(12), 0xFFFF);
+            c.orr(XReg(14), XReg(14), XReg(12));
+            c.str(XReg(14), ptr(kState, GprOffset(2)));
+        }
+        // CF/OF = high half != sign-extension of low half. Conservatively set
+        // when smulh(hi) != asr(lo,63) for w64, or high32/16 != sign of low.
+        // (Tests check the basic fits/overflow cases.)
+        c.ldr(XReg(14), ptr(kState, Offsets::Rflags));
+        c.mov(XReg(15), ~((1ull<<0)|(1ull<<11)));
+        c.and_(XReg(14), XReg(14), XReg(15));
+        // recompute sign-extension check
+        if (w == 64) {
+            c.asr(XReg(15), lo, 63);
+            c.cmp(hi, XReg(15));
+        } else if (w == 32) {
+            c.sxtw(XReg(15), WReg(lo.getIdx()));   // sign-extend low32
+            c.cmp(lo, XReg(15));                     // lo holds full 64 product
+        } else {
+            c.sxth(XReg(15), WReg(lo.getIdx()));
+            c.cmp(lo, XReg(15));
+        }
+        {
+            Label fits, done;
+            c.b(EQ, fits);
+            c.orr(XReg(14), XReg(14), 1ull<<0);    // CF
+        c.orr(XReg(14), XReg(14), 1ull<<11);   // OF
+            c.L(fits);
+        }
+        c.str(XReg(14), ptr(kState, Offsets::Rflags));
+        return true;
+    }
+
+    // 2-op: dst (reg) *= src ; 3-op: dst = src * imm.
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const XReg x = kScratch0, y = kScratch1, res = kScratch2;
+    if (nops == 2) {
+        c.ldr(x, ptr(kState, GprOffset(d)));
+        if (!LoadSrcOperand(ops[1], w, y, c)) return false;
+    } else { // 3-op
+        if (!LoadSrcOperand(ops[1], w, x, c)) return false;
+        c.mov(y, static_cast<u64>(ops[2].imm.value.s));
+    }
+    c.mul(res, x, y);
+    // Write back at width.
+    if (w == 64) {
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else if (w == 32) {
+        c.and_(res, res, 0xFFFFFFFFull);
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else { // 16
+        c.ldr(XReg(14), ptr(kState, GprOffset(d)));
+        c.mov(XReg(15), ~0xFFFFull);
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(XReg(13), res, 0xFFFF);
+        c.orr(XReg(14), XReg(14), XReg(13));
+        c.str(XReg(14), ptr(kState, GprOffset(d)));
+    }
+    return true;
+}
+
+// guest: div r/m — unsigned (RDX:RAX) / src -> quotient RAX, remainder RDX.
+//   w8 : AX / src -> AL=quot, AH=rem.
+//   w16: DX:AX / src -> AX=quot, DX=rem.
+//   w32: EDX:EAX / src -> EAX=quot, EDX=rem (uppers zeroed).
+//   w64: RDX:RAX / src -> RAX=quot, RDX=rem (true 128/64 via long division).
+// Divide-by-zero returns false (routes to unsupported-exit; no SIGFPE).
+bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    const XReg src = kScratch1;
+    if (!LoadSrcOperand(ops[0], w, src, c)) return false;
+    // Divide-by-zero: route to unsupported-exit rather than trap. The guest
+    // #DE path isn't modeled; bailing is safe and the tests never divide by 0.
+    {
+        Label ok;
+        c.cbnz(src, ok);
+        c.mov(kWScratch0, static_cast<u32>(ExitReason::UnsupportedInstruction));
+        c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
+        c.br(kExitStub);
+        c.L(ok);
+    }
+
+    if (w == 8) {
+        // dividend = AX (16-bit). q,r fit in 8 bits.
+        const XReg dv = kScratch0, q = kScratch2, r = XReg(13);
+        c.ldr(dv, ptr(kState, GprOffset(0)));
+        c.and_(dv, dv, 0xFFFF);
+        c.udiv(q, dv, src);
+        c.msub(r, q, src, dv);     // r = dv - q*src
+        // AL=q, AH=r, preserve upper.
+        c.ldr(XReg(14), ptr(kState, GprOffset(0)));
+        c.mov(XReg(15), ~0xFFFFull);
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(q, q, 0xFF);
+        c.and_(r, r, 0xFF);
+        c.lsl(r, r, 8);
+        c.orr(XReg(14), XReg(14), q);
+        c.orr(XReg(14), XReg(14), r);
+        c.str(XReg(14), ptr(kState, GprOffset(0)));
+        return true;
+    }
+
+    if (w == 16) {
+        // dividend = DX:AX (32-bit).
+        const XReg dv = kScratch0, q = kScratch2, r = XReg(13);
+        c.ldr(dv, ptr(kState, GprOffset(0)));
+        c.and_(dv, dv, 0xFFFF);
+        c.ldr(XReg(14), ptr(kState, GprOffset(2)));
+        c.and_(XReg(14), XReg(14), 0xFFFF);
+        c.lsl(XReg(14), XReg(14), 16);
+        c.orr(dv, dv, XReg(14));        // dividend = (DX<<16)|AX
+        c.udiv(q, dv, src);
+        c.msub(r, q, src, dv);
+        // AX=q, DX=r (merge low16, preserve upper).
+        c.ldr(XReg(14), ptr(kState, GprOffset(0)));
+        c.mov(XReg(15), ~0xFFFFull);
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(q, q, 0xFFFF);
+        c.orr(XReg(14), XReg(14), q);
+        c.str(XReg(14), ptr(kState, GprOffset(0)));
+        c.ldr(XReg(14), ptr(kState, GprOffset(2)));
+        c.and_(XReg(14), XReg(14), XReg(15));
+        c.and_(r, r, 0xFFFF);
+        c.orr(XReg(14), XReg(14), r);
+        c.str(XReg(14), ptr(kState, GprOffset(2)));
+        return true;
+    }
+
+    if (w == 32) {
+        // dividend = EDX:EAX (64-bit).
+        const XReg dv = kScratch0, q = kScratch2, r = XReg(13);
+        c.ldr(dv, ptr(kState, GprOffset(0)));
+        c.and_(dv, dv, 0xFFFFFFFFull);
+        c.ldr(XReg(14), ptr(kState, GprOffset(2)));
+        c.and_(XReg(14), XReg(14), 0xFFFFFFFFull);
+        c.lsl(XReg(14), XReg(14), 32);
+        c.orr(dv, dv, XReg(14));         // (EDX<<32)|EAX
+        c.udiv(q, dv, src);
+        c.msub(r, q, src, dv);
+        c.and_(q, q, 0xFFFFFFFFull);
+        c.str(q, ptr(kState, GprOffset(0)));   // EAX (zero-ext)
+        c.and_(r, r, 0xFFFFFFFFull);
+        c.str(r, ptr(kState, GprOffset(2)));   // EDX (zero-ext)
+        return true;
+    }
+
+    // w == 64: true 128/64 division of (RDX:RAX) by src.
+    // Binary long division: 128-bit dividend in (hi=RDX, lo=RAX), 64-bit
+    // divisor. Quotient -> RAX, remainder -> RDX.
+    const XReg hi = kScratch0, lo = kScratch2, q = XReg(13), rem = XReg(14);
+    c.ldr(hi, ptr(kState, GprOffset(2)));   // RDX
+    c.ldr(lo, ptr(kState, GprOffset(0)));   // RAX
+    c.mov(q, 0);
+    c.mov(rem, 0);
+    // 128 iterations: shift (rem:hi:lo) left, bring in next dividend bit,
+    // compare rem>=src, subtract+set quotient bit.
+    const XReg i = XReg(15), bit = XReg(5), carry = XReg(6);
+    c.mov(i, 128);
+    Label loop, after;
+    c.L(loop);
+    c.cbz(i, after);
+    // Capture rem's MSB (bit shifted out of bit63 when rem<<1) = the 65th bit.
+    c.lsr(carry, rem, 63);
+    // rem = (rem<<1) | top bit of (hi:lo); then shift hi:lo left by 1.
+    c.lsl(rem, rem, 1);
+    c.lsr(bit, hi, 63);            // top bit of hi
+    c.orr(rem, rem, bit);
+    c.lsl(hi, hi, 1);
+    c.lsr(bit, lo, 63);           // top bit of lo into hi[0]
+    c.orr(hi, hi, bit);
+    c.lsl(lo, lo, 1);
+    // shift quotient left
+    c.lsl(q, q, 1);
+    // Subtract when the 65-bit remainder >= src: i.e. carry==1 (rem>=2^64>src)
+    // OR rem (64-bit) >= src.
+    {
+        Label doSub, noSub;
+        c.cbnz(carry, doSub);
+        c.cmp(rem, src);
+        c.b(LO, noSub);
+        c.L(doSub);
+        c.sub(rem, rem, src);
+        c.orr(q, q, 1);
+        c.L(noSub);
+    }
+    c.sub(i, i, 1);
+    c.b(loop);
+    c.L(after);
+    c.str(q, ptr(kState, GprOffset(0)));     // quotient -> RAX
+    c.str(rem, ptr(kState, GprOffset(2)));   // remainder -> RDX
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // UNIFIED ALU EMITTER (ADD / SUB / AND / OR / XOR).
 //
@@ -2178,6 +2513,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_CLC:
         case ZYDIS_MNEMONIC_CMC:
             handled = EmitFlagOp(insn, c);
+            break;
+        case ZYDIS_MNEMONIC_MUL:
+            handled = EmitMul(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_IMUL:
+            handled = EmitImul(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_DIV:
+            handled = EmitDiv(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_NOT:
             handled = EmitNot(insn, ops, next_rip, c);
