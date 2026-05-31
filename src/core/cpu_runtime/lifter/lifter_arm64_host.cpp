@@ -202,6 +202,109 @@ constexpr u32 FLAG_OP_LOGIC = 3;
 // we do NOT map host NZCV onto guest RFLAGS (different layout; AF/PF absent).
 // ----------------------------------------------------------------------------
 
+// ----------------------------------------------------------------------------
+// FLAG MATERIALIZATION.
+//
+// AArch64's NZCV does not map onto x86 RFLAGS (different bit layout, and x86
+// has AF/PF which NZCV lacks), so rather than translate host flags we derive
+// the x86 arithmetic flags arithmetically from (op, lhs, rhs, result). This is
+// the consumer of the lazy-flag side-band the arith/logic emitters stash.
+//
+// Derives and writes CF(0), PF(2), AF(4), ZF(6), SF(7), OF(11) into
+// state.rflags from the side-band fields already in GuestState. The bit
+// derivations were validated end-to-end under QEMU (cross-compiled
+// aarch64) against the exact x86 reference cases the runtime tests assert.
+//
+// Scratch: x9..x15 (caller-saved). Reads flag_op/lhs/rhs/result, writes
+// rflags. Call AFTER the side-band stores (it reloads them from memory, so
+// ordering is by memory, not register liveness).
+void EmitMaterializeFlags(CodeGenerator& c) {
+    const XReg lhs = XReg(9);
+    const XReg rhs = XReg(10);
+    const XReg res = XReg(11);
+    const XReg fl  = XReg(12);
+    const XReg t   = XReg(13);
+    const XReg u   = XReg(14);
+    const WReg opw = WReg(15);
+
+    c.ldr(opw, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.ldr(lhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.ldr(rhs, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.ldr(res, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    c.mov(fl, 0);
+
+    // ZF: result == 0  -> bit 6
+    c.cmp(res, 0);
+    c.cset(t, EQ);
+    c.lsl(t, t, 6);
+    c.orr(fl, fl, t);
+
+    // SF: bit 63 of result -> bit 7
+    c.lsr(t, res, 63);
+    c.lsl(t, t, 7);
+    c.orr(fl, fl, t);
+
+    // PF: even parity of the low byte -> bit 2. AArch64 has no GPR popcount
+    // before FEAT_CSSC, so fold the low byte: x^=x>>4; x^=x>>2; x^=x>>1;
+    // PF = (~x) & 1 (x86 PF is set when the number of set bits is EVEN).
+    c.and_(t, res, 0xFF);
+    c.eor(t, t, t, LSR, 4);
+    c.eor(t, t, t, LSR, 2);
+    c.eor(t, t, t, LSR, 1);
+    c.mvn(t, t);
+    c.and_(t, t, 1);
+    c.lsl(t, t, 2);
+    c.orr(fl, fl, t);
+
+    // AF: bit 4 of (lhs ^ rhs ^ result) -> bit 4
+    c.eor(t, lhs, rhs);
+    c.eor(t, t, res);
+    c.lsr(t, t, 4);
+    c.and_(t, t, 1);
+    c.lsl(t, t, 4);
+    c.orr(fl, fl, t);
+
+    // CF and OF are operation-dependent.
+    Label isSub, isLogic, doneCfOf;
+    c.cmp(opw, FLAG_OP_SUB);
+    c.b(EQ, isSub);
+    c.cmp(opw, FLAG_OP_LOGIC);
+    c.b(EQ, isLogic);
+
+    // ADD: CF = (result < lhs) unsigned (wrap). OF when both operands share a
+    // sign that differs from the result's: (~(lhs^rhs) & (lhs^result)) >> 63.
+    c.cmp(res, lhs);
+    c.cset(t, CC);              // CC (unsigned lower): result < lhs
+    c.orr(fl, fl, t);          // CF -> bit 0
+    c.eor(t, lhs, rhs);
+    c.mvn(t, t);
+    c.eor(u, lhs, res);
+    c.and_(t, t, u);
+    c.lsr(t, t, 63);
+    c.lsl(t, t, 11);
+    c.orr(fl, fl, t);
+    c.b(doneCfOf);
+
+    c.L(isSub);
+    // SUB: CF = (lhs < rhs) unsigned (borrow). OF = ((lhs^rhs) & (lhs^result)) >> 63.
+    c.cmp(lhs, rhs);
+    c.cset(t, CC);             // lhs < rhs unsigned
+    c.orr(fl, fl, t);
+    c.eor(t, lhs, rhs);
+    c.eor(u, lhs, res);
+    c.and_(t, t, u);
+    c.lsr(t, t, 63);
+    c.lsl(t, t, 11);
+    c.orr(fl, fl, t);
+    c.b(doneCfOf);
+
+    c.L(isLogic);
+    // LOGIC: CF = OF = 0 (x86 clears both for AND/OR/XOR/TEST). Nothing to OR.
+
+    c.L(doneCfOf);
+    c.str(fl, ptr(kState, Offsets::Rflags));
+}
+
 // guest: mov r64, r64  /  mov r64, imm
 //   reg<-reg  ldr x9,[x28,#src]; str x9,[x28,#dst]
 //   reg<-imm  mov x9,#imm (movz/movk); str x9,[x28,#dst]
@@ -262,6 +365,7 @@ bool EmitAdd64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
     c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
     c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
     return true;
 }
 
@@ -299,6 +403,7 @@ bool EmitSub64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
     c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
     c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
     return true;
 }
 
@@ -350,6 +455,7 @@ bool EmitLogic64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
     c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
     c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
     return true;
 }
 
