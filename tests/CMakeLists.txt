@@ -294,7 +294,22 @@ gtest_discover_tests(shadps4_http_test
 # Built only when the runtime backend is compiled. Mirrors the structure
 # of the HTTP test block above.
 if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
-    set(CPU_RUNTIME_TEST_SOURCES
+    # Shared support: the runtime/backend sources and minimal common deps that
+    # both test executables need. Built once into a static lib so the heavy
+    # lifter/runtime objects are not recompiled per test binary.
+    #
+    # NOTE: the test executables are deliberately SEPARATE (not one binary with
+    # both test files). Each test translation unit carries its own copy of the
+    # test harness (GuestMemory, the CpuRuntimeTest fixture, RunProgram, the
+    # kReturnSentinel constant, etc.) in an anonymous namespace. Linking both
+    # test TUs into a single program is an ODR hazard: GoogleTest registers a
+    # TEST_F by its fixture+test name globally, but each TU defines its own
+    # anonymous-namespace `CpuRuntimeTest`, so a combined binary binds all
+    # CpuRuntimeTest tests to ONE of the two fixtures and the other TU's tests
+    # silently run against the wrong harness/helpers. Keeping them in separate
+    # executables gives each TU its own process and its own harness, which is
+    # also why the split must not be "collapsed" back into one target later.
+    set(CPU_RUNTIME_TEST_SUPPORT_SRCS
         # Under test
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/block_cache.cpp
         ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/code_cache.cpp
@@ -317,54 +332,47 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         stubs/common_stub.cpp
         stubs/scm_rev_stub.cpp
         stubs/sdl_stub.cpp
-
-        # Tests
-        test_cpu_runtime.cpp
     )
 
     if (ARCHITECTURE STREQUAL "x86_64")
-        list(APPEND CPU_RUNTIME_TEST_SOURCES
+        list(APPEND CPU_RUNTIME_TEST_SUPPORT_SRCS
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/gateway/gateway_x86.cpp
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_x86_host.cpp)
     elseif (ARCHITECTURE STREQUAL "arm64")
         # arm64 host backend. NOTE: the arm64 lifter is currently a skeleton
-        # (a few representative emitters), so most tests in test_cpu_runtime.cpp
-        # — which assert x86-lifter behavior by running emitted code — will FAIL
-        # here until the full emitter port lands. The arm64 CI test job is
-        # allowed to fail for exactly this reason; building the target gives
-        # compile/link coverage of the arm64 backend in the meantime.
-        list(APPEND CPU_RUNTIME_TEST_SOURCES
+        # (a few representative emitters), so most lifter tests in
+        # test_lifter.cpp — which assert x86-lifter behavior by running emitted
+        # code — will FAIL here until the full emitter port lands. The arm64 CI
+        # test job is allowed to fail for exactly this reason; building the
+        # target gives compile/link coverage of the arm64 backend in the
+        # meantime.
+        list(APPEND CPU_RUNTIME_TEST_SUPPORT_SRCS
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/gateway/gateway_arm64.cpp
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_arm64_host.cpp)
     endif()
 
-    add_executable(shadps4_cpu_runtime_test ${CPU_RUNTIME_TEST_SOURCES})
-    list(APPEND TEST_TARGETS shadps4_cpu_runtime_test)
-
-    target_include_directories(shadps4_cpu_runtime_test PRIVATE
+    add_library(shadps4_cpu_runtime_test_support STATIC
+        ${CPU_RUNTIME_TEST_SUPPORT_SRCS})
+    target_include_directories(shadps4_cpu_runtime_test_support PUBLIC
         ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}
     )
-    target_compile_features(shadps4_cpu_runtime_test PRIVATE cxx_std_23)
-    target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+    target_compile_features(shadps4_cpu_runtime_test_support PUBLIC cxx_std_23)
+    target_compile_definitions(shadps4_cpu_runtime_test_support PUBLIC
         BOOST_ASIO_STANDALONE
         SHADPS4_USES_RUNTIME=1)
 
-    # This target compiles the runtime sources directly (it does not link the
-    # cpu_runtime library), so it does not inherit that library's diagnostics
-    # toggle. Mirror it here so runtime_diagnostics.{h,cpp} land on the same
-    # side of the #ifdef in the test build: with the option off (the default,
-    # and the right setting for running tests) the diagnostics TU is empty and
-    # the runtime.cpp calls are inline no-ops; with it on, both the header
-    # declarations and the out-of-line definitions are compiled, keeping them
-    # consistent and avoiding an undefined-symbol link error.
+    # Mirror the runtime diagnostics toggle (see runtime/CMakeLists.txt). The
+    # support lib compiles runtime.cpp + runtime_diagnostics.cpp directly rather
+    # than linking the cpu_runtime library, so it does not inherit that lib's
+    # definition; set it here so runtime_diagnostics.{h,cpp} land on the same
+    # side of the #ifdef. PUBLIC so the test TUs that include the header agree.
     if (SHADPS4_RUNTIME_DIAGNOSTICS)
-        target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+        target_compile_definitions(shadps4_cpu_runtime_test_support PUBLIC
             SHADPS4_RUNTIME_DIAGNOSTICS)
     endif()
 
-    target_link_libraries(shadps4_cpu_runtime_test PRIVATE
-        GTest::gtest_main
+    target_link_libraries(shadps4_cpu_runtime_test_support PUBLIC
         fmt::fmt
         magic_enum::magic_enum
         nlohmann_json::nlohmann_json
@@ -378,9 +386,9 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
     # Code generator for the runtime lifter: x86 xbyak on x86_64,
     # xbyak_aarch64 on arm64 — matching the backend sources added above.
     if (ARCHITECTURE STREQUAL "x86_64")
-        target_link_libraries(shadps4_cpu_runtime_test PRIVATE xbyak::xbyak)
+        target_link_libraries(shadps4_cpu_runtime_test_support PUBLIC xbyak::xbyak)
     elseif (ARCHITECTURE STREQUAL "arm64")
-        target_link_libraries(shadps4_cpu_runtime_test PRIVATE xbyak_aarch64)
+        target_link_libraries(shadps4_cpu_runtime_test_support PUBLIC xbyak_aarch64)
     endif()
 
     if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
@@ -388,14 +396,14 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         include(CheckCXXSymbolExists)
         check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
         if (LIBCPP)
-            target_compile_options(shadps4_cpu_runtime_test PRIVATE
+            target_compile_options(shadps4_cpu_runtime_test_support PUBLIC
                 -fexperimental-library)
         endif()
     endif()
 
     if (WIN32)
-        target_link_libraries(shadps4_cpu_runtime_test PRIVATE onecore)
-        target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+        target_link_libraries(shadps4_cpu_runtime_test_support PUBLIC onecore)
+        target_compile_definitions(shadps4_cpu_runtime_test_support PUBLIC
             NOMINMAX
             WIN32_LEAN_AND_MEAN
             NTDDI_VERSION=0x0A000006
@@ -403,7 +411,7 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
             WINVER=0x0A00
         )
         if (MSVC)
-            target_compile_definitions(shadps4_cpu_runtime_test PRIVATE
+            target_compile_definitions(shadps4_cpu_runtime_test_support PUBLIC
                 _CRT_SECURE_NO_WARNINGS
                 _CRT_NONSTDC_NO_DEPRECATE
                 _SCL_SECURE_NO_WARNINGS
@@ -412,8 +420,18 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         endif()
     endif()
 
-    gtest_discover_tests(shadps4_cpu_runtime_test
-        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
-        PROPERTIES TIMEOUT 60
-    )
+    # Two thin test executables, one per area. Each links the shared support
+    # lib (which carries all the include dirs, definitions, compile features,
+    # and library deps via its PUBLIC usage requirements) plus gtest_main.
+    foreach(area runtime lifter)
+        add_executable(shadps4_cpu_${area}_test test_${area}.cpp)
+        target_link_libraries(shadps4_cpu_${area}_test PRIVATE
+            shadps4_cpu_runtime_test_support
+            GTest::gtest_main)
+        list(APPEND TEST_TARGETS shadps4_cpu_${area}_test)
+        gtest_discover_tests(shadps4_cpu_${area}_test
+            WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+            PROPERTIES TIMEOUT 60
+        )
+    endforeach()
 endif()
