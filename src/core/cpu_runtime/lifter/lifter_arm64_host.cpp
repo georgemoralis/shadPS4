@@ -715,6 +715,168 @@ bool EmitMovsxd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     return true;
 }
 
+// guest: shl/shr/sar r/m, imm8|CL — shifts at widths 8/16/32/64, register dest.
+//   x86 flag semantics (computed directly into rflags here, since "CF = last
+//   bit shifted out" doesn't fit the lazy-flag (lhs,rhs,result) model):
+//     - count is masked to 0x3F (w==64) else 0x1F, matching x86.
+//     - count==0: NO flags change, value unchanged.
+//     - SHL: CF = bit (w-count) of original; result = val<<count.
+//     - SHR: CF = bit (count-1) of original (logical, zero-fill).
+//     - SAR: CF = bit (count-1) of original (arithmetic, sign-fill).
+//     - SF/ZF/PF from the width-truncated result; AF undefined (left as-is).
+//     - OF only meaningful for count==1; we set it per-op (SHL: MSB(res)^CF;
+//       SHR: MSB(original); SAR: 0). For count>1 x86 leaves OF undefined, so
+//       any value is architecturally acceptable.
+//   Register conventions: val=x14, cnt=x15, res=x12, oldflags/scratch x9/x10,
+//   bitwork x13.
+enum class ShiftKind { Shl, Shr, Sar };
+bool EmitShift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               ShiftKind kind, CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (insn.operand_count_visible < 2) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+
+    const XReg val = XReg(14), cnt = XReg(15), res = kScratch2;  // x12
+    const XReg t = XReg(13), oldfl = kScratch0, msk = kScratch1;
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+    const u32 cntmask = (w == 64) ? 0x3F : 0x1F;
+    const u32 sb = w - 1;
+
+    // Load count -> cnt (masked).
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(cnt, static_cast<u64>(ops[1].imm.value.u & cntmask));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (ops[1].reg.value != ZYDIS_REGISTER_CL) return false;
+        c.ldr(cnt, ptr(kState, GprOffset(1)));     // rcx
+        c.and_(cnt, cnt, cntmask);
+    } else {
+        return false;
+    }
+
+    // Load value, truncated to width into val.
+    c.ldr(val, ptr(kState, GprOffset(d)));
+    if (w != 64) c.and_(val, val, wmask);
+    if (kind == ShiftKind::Sar && w != 64) {
+        // sign-extend the width-w value to 64 so asr fills correctly.
+        if (w == 8)       c.sxtb(val, WReg(val.getIdx()));
+        else if (w == 16) c.sxth(val, WReg(val.getIdx()));
+        else              c.sxtw(val, WReg(val.getIdx()));
+    }
+    // Capture MSB of the original (width-w) value into x6 now, before val is
+    // later reused as the merge slot — SHR's OF needs it.
+    c.lsr(XReg(6), val, sb);
+    c.and_(XReg(6), XReg(6), 1);
+
+    // Compute result = val (shift) cnt, using variable shift by cnt.
+    switch (kind) {
+        case ShiftKind::Shl: c.lsl(res, val, cnt); break;
+        case ShiftKind::Shr: c.lsr(res, val, cnt); break;
+        case ShiftKind::Sar: c.asr(res, val, cnt); break;
+    }
+    if (w != 64) c.and_(res, res, wmask);   // truncate result to width
+
+    // Compute CF (only valid when cnt != 0). Done before storing flags.
+    // SHL: CF = (val >> (w - cnt)) & 1; SHR/SAR: CF = (val >> (cnt-1)) & 1.
+    // Use t as the CF bit.
+    {
+        Label cntzero, cfdone;
+        c.cmp(cnt, 0);
+        c.b(EQ, cntzero);
+        if (kind == ShiftKind::Shl) {
+            // shamt = w - cnt
+            c.mov(t, w);
+            c.sub(t, t, cnt);
+            c.lsr(t, val, t);
+        } else {
+            // shamt = cnt - 1
+            c.sub(t, cnt, 1);
+            // For SAR the sign bits don't affect bit (cnt-1) extraction of the
+            // original magnitude; val already holds the (sign-extended) value,
+            // and bit (cnt-1) is within width, so this is correct.
+            c.lsr(t, val, t);
+        }
+        c.and_(t, t, 1);
+        c.b(cfdone);
+        c.L(cntzero);
+        c.mov(t, 0);   // placeholder; for cnt==0 we won't update flags at all
+        c.L(cfdone);
+    }
+
+    // Store result back at width (8/16 merge-preserve, 32 zero-extend, 64 full).
+    if (w == 64) {
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else if (w == 32) {
+        c.mov(WReg(res.getIdx()), WReg(res.getIdx()));
+        c.str(res, ptr(kState, GprOffset(d)));
+    } else {
+        XReg slot = XReg(14);  // reuse val
+        c.ldr(slot, ptr(kState, GprOffset(d)));
+        c.mov(msk, ~wmask);
+        c.and_(slot, slot, msk);
+        c.orr(slot, slot, res);
+        c.str(slot, ptr(kState, GprOffset(d)));
+    }
+
+    // Flags. For cnt==0, leave rflags untouched. Otherwise recompute
+    // CF/ZF/SF/PF (+OF for cnt==1, approximated for cnt>1).
+    {
+        Label noflags;
+        c.cmp(cnt, 0);
+        c.b(EQ, noflags);
+
+        c.ldr(oldfl, ptr(kState, Offsets::Rflags));
+        // Clear CF(0) PF(2) ZF(6) SF(7) OF(11); keep the rest (AF etc.).
+        c.mov(msk, ~((1ull<<0)|(1ull<<2)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+        c.and_(oldfl, oldfl, msk);
+
+        // CF (bit 0) from t.
+        c.orr(oldfl, oldfl, t);
+
+        // ZF: res == 0 -> bit 6.
+        c.cmp(res, 0);
+        c.cset(XReg(10), EQ);   // reuse msk's reg (x10) as scratch now
+        c.lsl(XReg(10), XReg(10), 6);
+        c.orr(oldfl, oldfl, XReg(10));
+
+        // SF: bit (w-1) of res -> bit 7.
+        c.lsr(XReg(10), res, sb);
+        c.and_(XReg(10), XReg(10), 1);
+        c.lsl(XReg(10), XReg(10), 7);
+        c.orr(oldfl, oldfl, XReg(10));
+
+        // PF: parity of low byte -> bit 2.
+        c.and_(XReg(10), res, 0xFF);
+        c.eor(XReg(10), XReg(10), XReg(10), LSR, 4);
+        c.eor(XReg(10), XReg(10), XReg(10), LSR, 2);
+        c.eor(XReg(10), XReg(10), XReg(10), LSR, 1);
+        c.mvn(XReg(10), XReg(10));
+        c.and_(XReg(10), XReg(10), 1);
+        c.lsl(XReg(10), XReg(10), 2);
+        c.orr(oldfl, oldfl, XReg(10));
+
+        // OF: SHL -> MSB(res) ^ CF; SHR -> MSB(original val); SAR -> 0.
+        if (kind == ShiftKind::Shl) {
+            c.lsr(XReg(10), res, sb);   // MSB(res)
+            c.and_(XReg(10), XReg(10), 1);
+            c.eor(XReg(10), XReg(10), t);  // ^ CF
+            c.lsl(XReg(10), XReg(10), 11);
+            c.orr(oldfl, oldfl, XReg(10));
+        } else if (kind == ShiftKind::Shr) {
+            c.and_(XReg(10), XReg(6), 1);   // MSB(original), captured earlier
+            c.lsl(XReg(10), XReg(10), 11);
+            c.orr(oldfl, oldfl, XReg(10));
+        }
+        // SAR: OF cleared (already masked off above).
+
+        c.str(oldfl, ptr(kState, Offsets::Rflags));
+        c.L(noflags);
+    }
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // UNIFIED ALU EMITTER (ADD / SUB / AND / OR / XOR).
 //
@@ -1505,6 +1667,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_TEST:
             handled = EmitTest(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_SHL:
+            handled = EmitShift(insn, ops, ShiftKind::Shl, c);
+            break;
+        case ZYDIS_MNEMONIC_SHR:
+            handled = EmitShift(insn, ops, ShiftKind::Shr, c);
+            break;
+        case ZYDIS_MNEMONIC_SAR:
+            handled = EmitShift(insn, ops, ShiftKind::Sar, c);
             break;
         case ZYDIS_MNEMONIC_NOT:
             handled = EmitNot(insn, ops, next_rip, c);
