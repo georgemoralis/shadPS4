@@ -16848,5 +16848,242 @@ TEST_F(CpuRuntimeTest, Addr_Sib32BitLoad_ZeroExtends) {
         << "32-bit load takes low dword and zero-extends bits 63:32";
 }
 
+// ============================================================================
+// EXTENDED EMITTER COVERAGE, BATCH 5 -- NARROW MEM, RIP-RELATIVE, REJECTIONS
+//
+// Three layers:
+//  (1) Narrow-width memory-destination ALU (8/16/32-bit add/sub [mem],reg)
+//      and narrow memory-source loads (movzx from byte/word), with flag
+//      precision -- the per-opcode tests mostly used 64-bit or register forms.
+//  (2) The two EmitEffectiveAddress paths distinct from base+index: RIP-
+//      relative ([rip+disp], constant-folded to next_rip+disp) and the plain
+//      absolute [disp32] form (no base, no index).
+//  (3) Rejection paths: a segment-override prefix (FS/GS) must NOT be
+//      miscompiled -- it must cleanly reach the UnsupportedInstruction exit
+//      with RIP pointing at the offending instruction.
+//
+// All encodings byte-verified. Reuses RunAddrTest from batch 4 for the
+// base-register-relative cases.
+// ============================================================================
+
+// ----------------------------------------------------------------------------
+// (1) Narrow memory-destination ALU.
+// ----------------------------------------------------------------------------
+
+// add byte[rcx], al  (00 01). Only the low byte of [mem] changes; flags from
+// the 8-bit result.
+TEST_F(CpuRuntimeTest, NarrowMem_AddByteDest_WrapsAndSetsFlags) {
+    const u8 program[] = {0x00, 0x01, 0xc3};
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            // surround byte with sentinel so we can prove only 1 byte changed
+            *reinterpret_cast<u64*>(scratch) = 0xAAAAAAAAAAAAAA01ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch); // rcx = &mem
+            s.gpr[0] = 0xFF;                            // al = 0xFF
+        });
+    ASSERT_NE(cap, nullptr);
+    // 0x01 + 0xFF = 0x00 (carry out), only low byte written.
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0xAAAAAAAAAAAAAA00ULL)
+        << "only the addressed byte changes";
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set (8-bit result is 0)";
+    EXPECT_TRUE(st.rflags & (1ULL << 0)) << "CF set (carry out of bit 7)";
+}
+
+// add word[rcx], ax  (66 01 01). 16-bit write-back, upper bytes preserved.
+TEST_F(CpuRuntimeTest, NarrowMem_AddWordDest_PreservesUpper) {
+    const u8 program[] = {0x66, 0x01, 0x01, 0xc3};
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            *reinterpret_cast<u64*>(scratch) = 0xBBBBBBBBBBBB1000ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0x0234; // ax
+        });
+    ASSERT_NE(cap, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0xBBBBBBBBBBBB1234ULL)
+        << "only the low word changes";
+}
+
+// add dword[rcx], eax  (01 01). 32-bit write-back; upper 32 of the 8-byte
+// slot are left as the original memory held (memory store is 4 bytes).
+TEST_F(CpuRuntimeTest, NarrowMem_AddDwordDest_Writes4Bytes) {
+    const u8 program[] = {0x01, 0x01, 0xc3};
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            *reinterpret_cast<u64*>(scratch) = 0xCCCCCCCC00001000ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0x00000234;
+        });
+    ASSERT_NE(cap, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0xCCCCCCCC00001234ULL)
+        << "low dword updated, high dword untouched";
+}
+
+// sub byte[rcx], al  (28 01) to zero -> ZF.
+TEST_F(CpuRuntimeTest, NarrowMem_SubByteDest_ToZero_SetsZf) {
+    const u8 program[] = {0x28, 0x01, 0xc3};
+    u8* cap = nullptr;
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [&](GuestState& s, u8* scratch) {
+            cap = scratch;
+            *reinterpret_cast<u64*>(scratch) = 0x1111111111111142ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0x42; // al == low byte -> 0
+        });
+    ASSERT_NE(cap, nullptr);
+    EXPECT_EQ(*reinterpret_cast<u64*>(cap), 0x1111111111111100ULL);
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set";
+}
+
+// ----------------------------------------------------------------------------
+// (1b) Narrow memory-source: MOVZX zero-extends a byte / word load.
+// ----------------------------------------------------------------------------
+
+// movzx eax, byte[rcx]  (0f b6 01). High bytes of source ignored; result
+// zero-extended into RAX.
+TEST_F(CpuRuntimeTest, NarrowMem_MovzxByteLoad_ZeroExtends) {
+    const u8 program[] = {0x0f, 0xb6, 0x01, 0xc3};
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            *reinterpret_cast<u64*>(scratch) = 0xFFFFFFFFFFFFFF80ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0xDEADBEEFDEADBEEFULL; // poison
+        });
+    EXPECT_EQ(st.gpr[0], 0x0000000000000080ULL)
+        << "byte 0x80 zero-extended (not sign-extended) to 64";
+}
+
+// movzx eax, word[rcx]  (0f b7 01).
+TEST_F(CpuRuntimeTest, NarrowMem_MovzxWordLoad_ZeroExtends) {
+    const u8 program[] = {0x0f, 0xb7, 0x01, 0xc3};
+    const auto st = RunAddrTest(program, sizeof(program), mem,
+        [](GuestState& s, u8* scratch) {
+            *reinterpret_cast<u64*>(scratch) = 0xFFFFFFFFFFFF8000ULL;
+            s.gpr[1] = reinterpret_cast<u64>(scratch);
+            s.gpr[0] = 0xDEADBEEFDEADBEEFULL;
+        });
+    EXPECT_EQ(st.gpr[0], 0x0000000000008000ULL)
+        << "word 0x8000 zero-extended to 64";
+}
+
+// ----------------------------------------------------------------------------
+// (2) RIP-relative addressing: mov rax, [rip + disp]. The lifter constant-
+// folds this to next_rip + disp. We lay out the program so the target slot
+// sits at a known offset and seed it.
+//
+//   offset 0: mov rax, [rip + disp]   (7 bytes: 48 8b 05 <disp32>)
+//   offset 7: ret                     (1 byte)
+//   next_rip after the mov = base + 7. We want the target at base + 0x40,
+//   so disp = 0x40 - 7 = 0x39.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_RipRelative_Loads) {
+    const u8 program[] = {
+        0x48, 0x8b, 0x05, 0x39, 0x00, 0x00, 0x00, // mov rax, [rip+0x39]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    // target = base + 7 (next_rip) + 0x39 = base + 0x40
+    *reinterpret_cast<u64*>(mem.CodePtr() + 0x40) = 0x1234ABCD5678EF00ULL;
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0; // rax poison
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x1234ABCD5678EF00ULL)
+        << "RIP-relative load folded to next_rip + disp";
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// ----------------------------------------------------------------------------
+// (2b) Absolute [disp32]: mov rax, [0x20000000]  (48 8b 04 25 <disp32>).
+// The lifter folds this to the literal absolute address, so we must map a
+// page at exactly that address (MapLowScratch maps 0x20000000).
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Addr_AbsoluteDisp32_Loads) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no low mapping at 0x20000000";
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(low), 0x20000000ull)
+        << "MapLowScratch returned the expected fixed address";
+    *reinterpret_cast<u64*>(low) = 0xFACEFEEDD00DCAFEULL;
+
+    // mov rax, [0x20000000] : 48 8b 04 25 00 00 00 20
+    const u8 program[] = {
+        0x48, 0x8b, 0x04, 0x25, 0x00, 0x00, 0x00, 0x20,
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0;
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xFACEFEEDD00DCAFEULL)
+        << "absolute [disp32] load";
+#if !defined(_WIN32)
+    ::munmap(low, 4096);
+#endif
+}
+
+// ----------------------------------------------------------------------------
+// (3) Rejection: a segment-override prefix on a memory operand is not
+// supported and must reach the UnsupportedInstruction exit cleanly, with RIP
+// left at the offending instruction (so a host emulator could diagnose it),
+// rather than being silently miscompiled.
+//
+// Layout: a harmless MOV first (proves the block starts), then the FS-prefixed
+// load. The unsupported exit should report RIP at the FS instruction's offset.
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Reject_FsSegmentOverride_UnsupportedExit) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7   (offset 0..6)
+        0x64, 0x48, 0x8b, 0x09,                    // mov rcx, fs:[rcx] (offset 7)
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    const u64 base = reinterpret_cast<u64>(mem.CodePtr());
+    st.rip = base;
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction));
+    EXPECT_EQ(st.rip, base + 7) << "RIP points at the FS-prefixed instruction";
+    EXPECT_EQ(st.gpr[0], 7u) << "the MOV before the unsupported insn ran";
+}
+
+// GS override: same expectation, different prefix byte (65).
+TEST_F(CpuRuntimeTest, Reject_GsSegmentOverride_UnsupportedExit) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x09, 0x00, 0x00, 0x00, // mov rax, 9
+        0x65, 0x48, 0x8b, 0x09,                    // mov rcx, gs:[rcx]
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    const u64 base = reinterpret_cast<u64>(mem.CodePtr());
+    st.rip = base;
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction));
+    EXPECT_EQ(st.rip, base + 7) << "RIP points at the GS-prefixed instruction";
+    EXPECT_EQ(st.gpr[0], 9u);
+}
+
 } // namespace
 } // namespace Core::Runtime
