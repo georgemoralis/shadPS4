@@ -1527,6 +1527,251 @@ bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     return true;
 }
 
+// Set SF/ZF from `res` (width w) into rflags, clearing CF/OF/PF... actually:
+// helper used by BMI ops that set ZF/SF and clear CF/OF (ANDN, BEXTR). Writes
+// CF=0, OF=0, ZF=(res==0), SF=(res[w-1]); PF/AF left as-is.
+static void SetZnFlagsClearCO(const XReg& res, u32 w, CodeGenerator& c) {
+    const XReg fl = XReg(14), t = XReg(15);
+    const u32 sb = w - 1;
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~((1ull<<0)|(1ull<<6)|(1ull<<7)|(1ull<<11)));   // clear CF,ZF,SF,OF
+    c.and_(fl, fl, t);
+    c.cmp(res, 0);
+    c.cset(t, EQ);
+    c.lsl(t, t, 6);
+    c.orr(fl, fl, t);                 // ZF
+    c.lsr(t, res, sb);
+    c.and_(t, t, 1);
+    c.lsl(t, t, 7);
+    c.orr(fl, fl, t);                 // SF
+    c.str(fl, ptr(kState, Offsets::Rflags));
+}
+
+// guest: andn dst, src1, src2  ->  dst = (~src1) & src2. Widths 32/64.
+//   ops[0]=dst, ops[1]=src1 (VEX.vvvv reg), ops[2]=src2 (reg/mem).
+//   Flags: ZF/SF from result; CF=OF=0. 32-bit zero-extends.
+bool EmitAndn(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int s1 = ZydisGprToIndex(ops[1].reg.value);
+    if (s1 < 0) return false;
+    const XReg a = kScratch0, b = kScratch1, res = kScratch2;
+    c.ldr(a, ptr(kState, GprOffset(s1)));
+    if (!LoadSrcOperand(ops[2], w, b, c)) return false;
+    if (w != 64) c.and_(a, a, 0xFFFFFFFFull);
+    c.bic(res, b, a);                 // res = b & ~a  (AArch64 bic = and-not)
+    if (w == 32) c.and_(res, res, 0xFFFFFFFFull);
+    c.str(res, ptr(kState, GprOffset(d)));
+    SetZnFlagsClearCO(res, w, c);
+    return true;
+}
+
+// guest: blsi dst, src  ->  dst = src & (-src) (isolate lowest set bit).
+//   ops[0]=dst (VEX.vvvv), ops[1]=src (reg/mem). Widths 32/64.
+//   CF = (src != 0); ZF/SF from result; OF=0.
+bool EmitBlsi(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const XReg s = kScratch0, neg = kScratch1, res = kScratch2;
+    if (!LoadSrcOperand(ops[1], w, s, c)) return false;
+    c.neg(neg, s);
+    c.and_(res, s, neg);
+    if (w == 32) c.and_(res, res, 0xFFFFFFFFull);
+    c.str(res, ptr(kState, GprOffset(d)));
+    // Flags: CF = (src != 0); ZF/SF from result; OF=0; PF/AF as-is.
+    const XReg fl = XReg(14), t = XReg(15);
+    const u32 sb = w - 1;
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~((1ull<<0)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+    c.and_(fl, fl, t);
+    c.cmp(s, 0);
+    c.cset(t, NE);
+    c.orr(fl, fl, t);                 // CF = src != 0
+    c.cmp(res, 0);
+    c.cset(t, EQ);
+    c.lsl(t, t, 6);
+    c.orr(fl, fl, t);                 // ZF
+    c.lsr(t, res, sb);
+    c.and_(t, t, 1);
+    c.lsl(t, t, 7);
+    c.orr(fl, fl, t);                 // SF
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: bextr dst, src, ctrl -> start=ctrl[7:0], len=ctrl[15:8];
+//   dst = (src >> start) & ((1<<len)-1). Widths 32/64.
+//   ops[0]=dst, ops[1]=src (reg/mem), ops[2]=ctrl (reg). ZF from result;
+//   CF/OF cleared. 32-bit zero-extends.
+bool EmitBextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int cidx = ZydisGprToIndex(ops[2].reg.value);
+    if (cidx < 0) return false;
+    const XReg src = kScratch0, ctrl = kScratch1, res = kScratch2;
+    const XReg start = XReg(13), len = XReg(14);
+    if (!LoadSrcOperand(ops[1], w, src, c)) return false;
+    c.ldr(ctrl, ptr(kState, GprOffset(cidx)));
+    c.and_(start, ctrl, 0xFF);          // start = ctrl[7:0]
+    c.ubfx(len, ctrl, 8, 8);            // len = ctrl[15:8]
+    // res = src >> start (logical, variable). For start>=width AArch64 lsr by
+    // (start mod 64); x86 BEXTR with start>=opsize gives 0. Clamp by masking
+    // start to <64 is fine for the variable shift; large start -> 0 result via
+    // mask below when len handling. We follow common impl: shift then mask len.
+    c.lsr(res, src, start);
+    // mask = (len>=64)? all : (1<<len)-1. Build via: if len==0 -> 0; else
+    // (1<<len)-1 with len clamped to 64.
+    {
+        Label lenBig, lenDone, lenZero;
+        const XReg mask = XReg(15);
+        c.cmp(len, 0);
+        c.b(EQ, lenZero);
+        c.cmp(len, 64);
+        c.b(HS, lenBig);                // len>=64 -> full mask
+        c.mov(mask, 1);
+        c.lsl(mask, mask, len);
+        c.sub(mask, mask, 1);
+        c.and_(res, res, mask);
+        c.b(lenDone);
+        c.L(lenBig);
+        // full mask: leave res as-is (all bits kept)
+        c.b(lenDone);
+        c.L(lenZero);
+        c.mov(res, 0);                  // len==0 -> 0
+        c.L(lenDone);
+    }
+    if (w == 32) c.and_(res, res, 0xFFFFFFFFull);
+    c.str(res, ptr(kState, GprOffset(d)));
+    SetZnFlagsClearCO(res, w, c);
+    return true;
+}
+
+// guest: bt src, index -> CF = bit (index mod width) of src. Only CF affected;
+//   all other flags preserved (per test). ops[0]=src (reg), ops[1]=imm or reg.
+bool EmitBt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+            CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 16 && w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int s = ZydisGprToIndex(ops[0].reg.value);
+    if (s < 0) return false;
+    const u32 modmask = (w == 64) ? 0x3F : (w == 32 ? 0x1F : 0x0F);
+    const XReg src = kScratch0, idx = kScratch1, bit = kScratch2;
+    c.ldr(src, ptr(kState, GprOffset(s)));
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        c.mov(idx, static_cast<u64>(ops[1].imm.value.u & modmask));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int r = ZydisGprToIndex(ops[1].reg.value);
+        if (r < 0) return false;
+        c.ldr(idx, ptr(kState, GprOffset(r)));
+        c.and_(idx, idx, modmask);
+    } else {
+        return false;
+    }
+    c.lsr(bit, src, idx);
+    c.and_(bit, bit, 1);
+    // CF = bit; preserve all other flags.
+    const XReg fl = XReg(14), t = XReg(15);
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~1ull);
+    c.and_(fl, fl, t);
+    c.orr(fl, fl, bit);
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: lzcnt dst, src -> count leading zeros at width. CF=(src==0),
+//   ZF=(result==0). Widths 32/64. ops[0]=dst, ops[1]=src(reg/mem).
+bool EmitLzcnt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const XReg src = kScratch0, res = kScratch2;
+    if (!LoadSrcOperand(ops[1], w, src, c)) return false;
+    if (w == 32) c.clz(WReg(res.getIdx()), WReg(src.getIdx()));
+    else         c.clz(res, src);
+    if (w == 32) c.and_(res, res, 0xFFFFFFFFull);
+    c.str(res, ptr(kState, GprOffset(d)));
+    // CF = (src==0) ; ZF = (result==0). SF/OF/PF undefined -> clear CF/ZF only.
+    const XReg fl = XReg(14), t = XReg(15);
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~((1ull<<0)|(1ull<<6)));
+    c.and_(fl, fl, t);
+    c.cmp(src, 0);
+    c.cset(t, EQ);
+    c.orr(fl, fl, t);                 // CF = src==0
+    c.cmp(res, 0);
+    c.cset(t, EQ);
+    c.lsl(t, t, 6);
+    c.orr(fl, fl, t);                 // ZF = result==0
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: popcnt dst, src -> population count. ZF=(src==0); CF/OF/SF/PF/AF=0.
+//   Widths 32/64. SWAR popcount (no NEON). ops[0]=dst, ops[1]=src(reg/mem).
+bool EmitPopcnt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const XReg src = kScratch0, x = kScratch2, t = XReg(13), m = XReg(14);
+    if (!LoadSrcOperand(ops[1], w, src, c)) return false;
+    // SWAR popcount on 64-bit x (operate full width; src already width-masked).
+    c.mov(x, src);
+    // x = x - ((x>>1) & 0x5555...);
+    c.lsr(t, x, 1);
+    c.mov(m, 0x5555555555555555ull);
+    c.and_(t, t, m);
+    c.sub(x, x, t);
+    // x = (x & 0x3333...) + ((x>>2) & 0x3333...);
+    c.mov(m, 0x3333333333333333ull);
+    c.and_(t, x, m);
+    c.lsr(x, x, 2);
+    c.and_(x, x, m);
+    c.add(x, x, t);
+    // x = (x + (x>>4)) & 0x0F0F...;
+    c.lsr(t, x, 4);
+    c.add(x, x, t);
+    c.mov(m, 0x0F0F0F0F0F0F0F0Full);
+    c.and_(x, x, m);
+    // count = (x * 0x0101...) >> 56;
+    c.mov(m, 0x0101010101010101ull);
+    c.mul(x, x, m);
+    c.lsr(x, x, 56);
+    c.str(x, ptr(kState, GprOffset(d)));
+    // ZF = (src==0); clear CF/OF/SF/PF/AF.
+    const XReg fl = XReg(14), tt = XReg(15);
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(tt, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+    c.and_(fl, fl, tt);
+    c.cmp(src, 0);
+    c.cset(tt, EQ);
+    c.lsl(tt, tt, 6);
+    c.orr(fl, fl, tt);                // ZF
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // UNIFIED ALU EMITTER (ADD / SUB / AND / OR / XOR).
 //
@@ -2513,6 +2758,24 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_CLC:
         case ZYDIS_MNEMONIC_CMC:
             handled = EmitFlagOp(insn, c);
+            break;
+        case ZYDIS_MNEMONIC_ANDN:
+            handled = EmitAndn(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_BLSI:
+            handled = EmitBlsi(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_BEXTR:
+            handled = EmitBextr(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_BT:
+            handled = EmitBt(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_LZCNT:
+            handled = EmitLzcnt(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_POPCNT:
+            handled = EmitPopcnt(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_MUL:
             handled = EmitMul(insn, ops, c);
