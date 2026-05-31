@@ -395,31 +395,88 @@ void EmitMaterializeFlags(CodeGenerator& c) {
 // guest: mov r64, r64  /  mov r64, imm
 //   reg<-reg  ldr x9,[x28,#src]; str x9,[x28,#dst]
 //   reg<-imm  mov x9,#imm (movz/movk); str x9,[x28,#dst]
+// guest: mov — supports widths 8/16/32/64 and reg/imm/mem on both sides.
+//   Narrow-write semantics: 8/16-bit writes preserve the destination slot's
+//   upper bits; 32-bit writes zero-extend bits 63:32; 64-bit is a full write.
+//   AH/CH/DH/BH high-byte registers are not handled (return false). No flags.
 bool EmitMov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-             CodeGenerator& c) {
+             u64 next_rip, CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_MOV) return false;
-    if (insn.operand_width != 64) return false;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     if (insn.operand_count_visible != 2) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst = ZydisGprToIndex(ops[0].reg.value);
-    if (dst < 0) return false;
 
-    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int src = ZydisGprToIndex(ops[1].reg.value);
-        if (src < 0) return false;
-        c.ldr(kScratch0, ptr(kState, GprOffset(src)));
-        c.str(kScratch0, ptr(kState, GprOffset(dst)));
+    const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+
+    // Load the source VALUE (already width-masked for the narrow cases where it
+    // matters on store) into kScratch0.
+    auto load_src = [&]() -> bool {
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src = ZydisGprToIndex(ops[1].reg.value);
+            if (src < 0) return false;
+            c.ldr(kScratch0, ptr(kState, GprOffset(src)));
+            return true;
+        }
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(kScratch0, static_cast<u64>(ops[1].imm.value.s));
+            return true;
+        }
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+            switch (w) {
+                case 8:  c.ldrb(WReg(9), ptr(kAddr)); break;
+                case 16: c.ldrh(WReg(9), ptr(kAddr)); break;
+                case 32: c.ldr(WReg(9), ptr(kAddr)); break;   // zero-extends
+                default: c.ldr(kScratch0, ptr(kAddr)); break;
+            }
+            return true;
+        }
+        return false;
+    };
+
+    // ---- Register destination ----
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int dst = ZydisGprToIndex(ops[0].reg.value);
+        if (dst < 0) return false;  // AH/CH/DH/BH unsupported
+        if (!load_src()) return false;
+        if (w == 64) {
+            c.str(kScratch0, ptr(kState, GprOffset(dst)));
+        } else if (w == 32) {
+            // 32-bit write zero-extends: mask src low 32, store full slot.
+            c.mov(WReg(9), WReg(9));  // zero-extend low 32 of kScratch0
+            c.str(kScratch0, ptr(kState, GprOffset(dst)));
+        } else {
+            // 8/16-bit: merge low bits into the existing slot (preserve upper).
+            c.and_(kScratch0, kScratch0, wmask);          // src & wmask
+            c.ldr(kScratch1, ptr(kState, GprOffset(dst)));
+            c.mov(kScratch2, ~wmask);
+            c.and_(kScratch1, kScratch1, kScratch2);      // slot & ~wmask
+            c.orr(kScratch1, kScratch1, kScratch0);
+            c.str(kScratch1, ptr(kState, GprOffset(dst)));
+        }
         return true;
     }
-    if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        // Both x86 encodings (B8+r imm64, C7 /0 imm32-sign-extended) arrive
-        // pre-resolved in imm.value.s. mov(XReg,u64) materializes any 64-bit
-        // constant (movz/movk) — same call the terminator uses for the RIP.
-        c.mov(kScratch0, static_cast<u64>(ops[1].imm.value.s));
-        c.str(kScratch0, ptr(kState, GprOffset(dst)));
+
+    // ---- Memory destination ----
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute the store value first (into kScratch0). If the SOURCE is also
+        // memory that's not a real x86 mov form, so source is reg or imm here.
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) return false;
+        if (!load_src()) return false;          // value -> kScratch0 (does not use EA)
+        // Now compute the destination address (EA clobbers x9=kScratch0!), so
+        // stash the value in kScratch1 first.
+        c.mov(kScratch1, kScratch0);
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> kAddr
+        switch (w) {
+            case 8:  c.strb(WReg(10), ptr(kAddr)); break;  // kScratch1 low byte
+            case 16: c.strh(WReg(10), ptr(kAddr)); break;
+            case 32: c.str(WReg(10), ptr(kAddr)); break;
+            default: c.str(kScratch1, ptr(kAddr)); break;
+        }
         return true;
     }
-    return false; // mem forms deferred
+
+    return false;
 }
 
 // guest: add r64, r64  /  add r64, imm   (with lazy-flag side-band)
@@ -768,6 +825,171 @@ bool EmitLea(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     return true;
 }
 
+// guest: cmp lhs, rhs — SUB that discards the result but sets flags. Supports
+//   reg/reg, reg/imm, reg/mem, and mem/reg at widths 8/16/32/64. The flag
+//   side-band carries the operation width so the materializer derives
+//   width-correct ZF/SF/CF/OF.
+bool EmitCmp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_CMP) return false;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (insn.operand_count_visible != 2) return false;
+
+    // Load lhs (ops[0]) into kScratch0, rhs (ops[1]) into kScratch1.
+    auto load_operand = [&](const ZydisDecodedOperand& op, const XReg& dstreg) -> bool {
+        if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int idx = ZydisGprToIndex(op.reg.value);
+            if (idx < 0) return false;
+            c.ldr(dstreg, ptr(kState, GprOffset(idx)));
+            return true;
+        }
+        if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(dstreg, static_cast<u64>(op.imm.value.s));
+            return true;
+        }
+        if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(op.mem, next_rip, c)) return false;  // -> kAddr
+            c.ldr(dstreg, ptr(kAddr));
+            return true;
+        }
+        return false;
+    };
+    // Memory operand uses kAddr/x9 during EA; load mem operand first if either
+    // side is memory to avoid clobbering an already-loaded register operand.
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!load_operand(ops[1], kScratch1)) return false;
+        if (!load_operand(ops[0], kScratch0)) return false;
+    } else {
+        if (!load_operand(ops[0], kScratch0)) return false;
+        if (!load_operand(ops[1], kScratch1)) return false;
+    }
+    c.sub(kScratch2, kScratch0, kScratch1);  // result (discarded except flags)
+
+    c.mov(kWScratch3, FLAG_OP_SUB);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(kWScratch3, w);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
+    return true;
+}
+
+// guest: test lhs, rhs — AND that discards the result but sets flags (CF=OF=0,
+//   ZF/SF/PF from result). Supports reg/reg, reg/imm, mem/reg at 8/16/32/64.
+bool EmitTest(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_TEST) return false;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (insn.operand_count_visible != 2) return false;
+
+    auto load_operand = [&](const ZydisDecodedOperand& op, const XReg& dstreg) -> bool {
+        if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int idx = ZydisGprToIndex(op.reg.value);
+            if (idx < 0) return false;
+            c.ldr(dstreg, ptr(kState, GprOffset(idx)));
+            return true;
+        }
+        if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(dstreg, static_cast<u64>(op.imm.value.s));
+            return true;
+        }
+        if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(op.mem, next_rip, c)) return false;
+            c.ldr(dstreg, ptr(kAddr));
+            return true;
+        }
+        return false;
+    };
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!load_operand(ops[0], kScratch0)) return false;
+        if (!load_operand(ops[1], kScratch1)) return false;
+    } else {
+        if (!load_operand(ops[0], kScratch0)) return false;
+        if (!load_operand(ops[1], kScratch1)) return false;
+    }
+    c.and_(kScratch2, kScratch0, kScratch1);  // result (discarded except flags)
+
+    c.mov(kWScratch3, FLAG_OP_LOGIC);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(kWScratch3, w);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+    c.str(kScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_lhs))));
+    c.str(kScratch1, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_rhs))));
+    c.str(kScratch2, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_result))));
+    EmitMaterializeFlags(c);
+    return true;
+}
+
+// guest: jmp rel / jmp r64 / jmp [mem] — unconditional. Block terminator.
+bool EmitJmp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_JMP) return false;
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const u64 target = ops[0].imm.is_relative
+            ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+            : static_cast<u64>(ops[0].imm.value.s);
+        c.mov(kScratch0, target);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int idx = ZydisGprToIndex(ops[0].reg.value);
+        if (idx < 0) return false;
+        c.ldr(kScratch0, ptr(kState, GprOffset(idx)));
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.ldr(kScratch0, ptr(kAddr));  // jmp [mem]: target = *(addr)
+    } else {
+        return false;
+    }
+    c.str(kScratch0, ptr(kState, Offsets::Rip));
+    c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
+    c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
+    c.br(kDispatchTop);
+    return true;
+}
+
+// guest: call rel / call r64 / call [mem] — push return addr, jump. Terminator.
+//   Target is computed BEFORE the push (the mem form uses kAddr/x9, which the
+//   push also touches), mirroring the x86 host emitter's ordering.
+bool EmitCall(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_CALL) return false;
+    constexpr int RSP_IDX = 4;
+
+    // Step 1: target -> kScratch1 (x10), survives the push.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const u64 target = ops[0].imm.is_relative
+            ? static_cast<u64>(static_cast<s64>(next_rip) + ops[0].imm.value.s)
+            : static_cast<u64>(ops[0].imm.value.s);
+        c.mov(kScratch1, target);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int idx = ZydisGprToIndex(ops[0].reg.value);
+        if (idx < 0) return false;
+        c.ldr(kScratch1, ptr(kState, GprOffset(idx)));
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.ldr(kScratch1, ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    // Step 2: push next_rip. rsp -= 8; [rsp] = next_rip.
+    c.ldr(kScratch0, ptr(kState, GprOffset(RSP_IDX)));
+    c.sub(kScratch0, kScratch0, 8);
+    c.mov(kScratch2, next_rip);
+    c.str(kScratch2, ptr(kScratch0));
+    c.str(kScratch0, ptr(kState, GprOffset(RSP_IDX)));
+
+    // Step 3: rip = target, exit to dispatcher.
+    c.str(kScratch1, ptr(kState, Offsets::Rip));
+    c.mov(kWScratch0, static_cast<u32>(ExitReason::BlockEnd));
+    c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
+    c.br(kDispatchTop);
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // CONDITIONAL FAMILY (Setcc / Cmovcc / Jcc).
 //
@@ -1029,7 +1251,24 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         bool handled = false;
         switch (insn.mnemonic) {
         case ZYDIS_MNEMONIC_MOV:
-            handled = EmitMov(insn, ops, c);
+            handled = EmitMov(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_CMP:
+            handled = EmitCmp(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_TEST:
+            handled = EmitTest(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_NOP:
+            handled = true;  // NOP (incl. multi-byte forms): emit nothing.
+            break;
+        case ZYDIS_MNEMONIC_JMP:
+            handled = EmitJmp(insn, ops, next_rip, c);
+            if (handled) emitted_terminator = true;
+            break;
+        case ZYDIS_MNEMONIC_CALL:
+            handled = EmitCall(insn, ops, next_rip, c);
+            if (handled) emitted_terminator = true;
             break;
         case ZYDIS_MNEMONIC_ADD:
             handled = EmitAdd64(insn, ops, next_rip, c);
