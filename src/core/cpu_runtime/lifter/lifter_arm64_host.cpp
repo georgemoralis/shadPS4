@@ -4534,6 +4534,101 @@ bool EmitVpackusdw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
     return true;
 }
 
+// cpuid — spoof an AMD Jaguar (PS4 APU). Reads leaf in EAX, subleaf in ECX;
+// writes EAX/EBX/ECX/EDX (guest slots 0/3/1/2), zero-extended. Mirrors the x86
+// host's canned values exactly.
+bool EmitCpuid(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c) {
+    (void)insn; (void)ops;
+    const XReg leaf = XReg(5), sub = XReg(6);
+    c.ldr(WReg(5), ptr(kState, GprOffset(0)));   // leaf = EAX
+    c.ldr(WReg(6), ptr(kState, GprOffset(1)));   // subleaf = ECX
+
+    auto put = [&](u32 a, u32 b, u32 cc, u32 d) {
+        c.mov(WReg(9), a); c.str(kScratch0, ptr(kState, GprOffset(0)));
+        c.mov(WReg(9), b); c.str(kScratch0, ptr(kState, GprOffset(3)));
+        c.mov(WReg(9), cc); c.str(kScratch0, ptr(kState, GprOffset(1)));
+        c.mov(WReg(9), d); c.str(kScratch0, ptr(kState, GprOffset(2)));
+    };
+
+    Label l1, l7, lb2, lb3, lb4, ldef, ldone;
+    c.mov(WReg(10), 0x00000000u); c.cmp(WReg(5), WReg(10)); c.b(NE, l1);
+    put(0x00000007u, 0x68747541u, 0x444D4163u, 0x69746E65u); c.b(ldone);
+
+    c.L(l1);
+    c.mov(WReg(10), 0x00000001u); c.cmp(WReg(5), WReg(10)); c.b(NE, l7);
+    put(0x00700F01u, 0x00000000u,
+        (1u<<0)|(1u<<19)|(1u<<20)|(1u<<23)|(1u<<28),
+        (1u<<0)|(1u<<25)|(1u<<26));
+    c.b(ldone);
+
+    c.L(l7);
+    c.mov(WReg(10), 0x00000007u); c.cmp(WReg(5), WReg(10)); c.b(NE, lb2);
+    c.cbnz(WReg(6), ldef);                 // only subleaf 0 responds
+    put(0x00000000u, (1u<<3), 0x00000000u, 0x00000000u);  // EBX: BMI1
+    c.b(ldone);
+
+    c.L(lb2);
+    c.mov(WReg(10), 0x80000002u); c.cmp(WReg(5), WReg(10)); c.b(NE, lb3);
+    put(0x20444D41u, 0x74737543u, 0x4A206D6Fu, 0x61756761u);
+    c.b(ldone);
+
+    c.L(lb3);
+    c.mov(WReg(10), 0x80000003u); c.cmp(WReg(5), WReg(10)); c.b(NE, lb4);
+    put(0x2D382072u, 0x65726F43u, 0x55504120u, 0x00000000u);
+    c.b(ldone);
+
+    c.L(lb4);
+    c.mov(WReg(10), 0x80000004u); c.cmp(WReg(5), WReg(10)); c.b(NE, ldef);
+    put(0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u);
+    c.b(ldone);
+
+    c.L(ldef);
+    put(0, 0, 0, 0);
+    c.L(ldone);
+    return true;
+}
+
+// xgetbv — report XCR0 = x87|SSE|AVX (bits 0,1,2 set) in EDX:EAX. EAX=7, EDX=0.
+bool EmitXgetbv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                CodeGenerator& c) {
+    (void)insn; (void)ops;
+    c.mov(WReg(9), 0x7u);
+    c.str(kScratch0, ptr(kState, GprOffset(0)));   // EAX
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, GprOffset(2)));   // EDX
+    return true;
+}
+
+// stmxcsr m32 / ldmxcsr m32 — store/load the guest MXCSR field.
+bool EmitMxcsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    const u32 off = static_cast<u32>(offsetof(GuestState, mxcsr));
+    if (store) {
+        c.ldr(WReg(9), ptr(kState, off));
+        c.str(WReg(9), ptr(kAddr));
+    } else {
+        c.ldr(WReg(9), ptr(kAddr));
+        c.str(WReg(9), ptr(kState, off));
+    }
+    return true;
+}
+
+// fnstcw m16 — store the (fixed) x87 control word 0x037F. fldcw is a no-op in
+// our model (rounding/precision control not emulated).
+bool EmitFnstcw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic == ZYDIS_MNEMONIC_FLDCW) return true;  // no-op
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    c.mov(WReg(9), 0x037Fu);
+    c.strh(WReg(9), ptr(kAddr));
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -4788,6 +4883,19 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_NOP:
             handled = true;  // NOP (incl. multi-byte forms): emit nothing.
             break;
+        case ZYDIS_MNEMONIC_MFENCE: case ZYDIS_MNEMONIC_LFENCE:
+        case ZYDIS_MNEMONIC_SFENCE:
+        case ZYDIS_MNEMONIC_PREFETCH:    case ZYDIS_MNEMONIC_PREFETCHNTA:
+        case ZYDIS_MNEMONIC_PREFETCHT0:  case ZYDIS_MNEMONIC_PREFETCHT1:
+        case ZYDIS_MNEMONIC_PREFETCHT2:  case ZYDIS_MNEMONIC_PREFETCHW:
+            handled = true;  // memory hints / fences: no-op for this model.
+            break;
+        case ZYDIS_MNEMONIC_CPUID:  handled = EmitCpuid(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_STMXCSR: case ZYDIS_MNEMONIC_LDMXCSR:
+            handled = EmitMxcsr(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FNSTCW: case ZYDIS_MNEMONIC_FLDCW:
+            handled = EmitFnstcw(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_JMP:
             handled = EmitJmp(insn, ops, next_rip, c);
             if (handled) emitted_terminator = true;
