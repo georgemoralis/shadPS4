@@ -505,6 +505,44 @@ static PS4_SYSV_ABI u64 HleBridgeTestFn_EightArgs(u64 a, u64 b, u64 c, u64 d, u6
            h * 10000000;
 }
 
+// ---- Additional HLE bridge test host functions (new coverage) -------------
+
+// Eight double args, all passed in xmm0..xmm7 (SysV SSE pool). Position-
+// weighted so a misrouted lane is obvious. Used to exercise the bridge's
+// full f0..f7 marshalling (load_xmm_low(0..7)); the prior suite only set
+// xmm0/xmm1.
+static PS4_SYSV_ABI double HleBridgeTestFn_EightDoubles(double a, double b, double c, double d,
+                                                        double e, double f, double g, double h) {
+    return a * 1.0 + b * 10.0 + c * 100.0 + d * 1000.0 +
+           e * 10000.0 + f * 100000.0 + g * 1000000.0 + h * 10000000.0;
+}
+
+// Fourteen integer args: 6 in registers (rdi,rsi,rdx,rcx,r8,r9) and 8 spilled
+// to the guest stack at [rsp+8 .. rsp+64] (args 7..14). Exercises the bridge's
+// full s0..s7 stack-marshalling; the prior suite only reached 2 stack args.
+// Multipliers are powers of two so the 64-bit sum stays exact and a wrong slot
+// is identifiable from the bit that is off.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_FourteenArgs(u64 a, u64 b, u64 c, u64 d, u64 e, u64 f,
+                                                     u64 g, u64 h, u64 i, u64 j, u64 k, u64 l,
+                                                     u64 m, u64 n) {
+    return (a << 0)  | (b << 1)  | (c << 2)  | (d << 3)  | (e << 4)  | (f << 5)  | (g << 6)  |
+           (h << 7)  | (i << 8)  | (j << 9)  | (k << 10) | (l << 11) | (m << 12) | (n << 13);
+}
+
+// Returns a fixed high-bit-set 64-bit value regardless of args. Verifies the
+// integer return round-trips through ret.rax with no truncation or sign games,
+// and (on AArch64) that the x0 capture is byte-exact for a value with bit 63 set.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_ReturnsHighBits(u64) {
+    return 0xFEEDFACECAFEBEEFULL;
+}
+
+// Pure integer function whose result is in rax; it does NOT compute or return
+// a double, so the host's d0/xmm0 on return is undefined. The guest must read
+// rax (gpr[0]); the meaningless xmm0 write-back must not corrupt the int path.
+static PS4_SYSV_ABI u64 HleBridgeTestFn_IntReturnIgnoresXmm(u64 a, u64 b) {
+    return a + b;
+}
+
 // HLE bridge: guest calls a PS4_SYSV_ABI host function with 6
 // distinct int args, captures the return value.
 //
@@ -1161,5 +1199,262 @@ TEST_F(CpuRuntimeTest, CallGuestSimple_SumsTwoArgsViaLea) {
                                           /*a0=*/40, /*a1=*/2);
     EXPECT_EQ(result, 42ULL) << "RDI(40) + RSI(2) via lea, returned in RAX";
 }
+
+// ============================================================================
+// HLE bridge: extended marshalling coverage.
+//
+// The original bridge suite exercised up to xmm1 for float args and up to 2
+// stack args. CallHostFromGuest actually marshals 8 float args (f0..f7 from
+// state.ymm[i*4]) and 8 stack args (s0..s7 from [guest_rsp+8..+64]), and
+// returns both an integer (ret.rax -> gpr[0]) and a double (ret.xmm0 ->
+// ymm[0] low 64). These tests cover the previously-untested far slots and the
+// return-value edge cases, including the AArch64 x0/d0 capture path that this
+// series rewrote.
+// ============================================================================
+
+// --- Group 1: all 8 XMM float args (f0..f7) --------------------------------
+// The bridge reads xmm_i from state.ymm[i*4], so the test sets those slots
+// directly; no guest instructions are needed to populate the XMM registers.
+// The guest just loads the fn pointer and `call rax`. Position-weighted result
+// makes a misrouted lane obvious.
+TEST_F(CpuRuntimeTest, HleBridge_EightFloatArgs_AllXmmLanes) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_EightDoubles);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_EightDoubles");
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0, // mov rax, <fn> (imm @2..9)
+        0xff, 0xd0,                  // call rax
+        0xc3,                        // ret
+    };
+    std::memcpy(&program[2], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm0..xmm7 = a..h = 1..8 (low 64 of each = ymm[i*4]).
+    for (unsigned i = 0; i < 8; ++i)
+        state.ymm[i * 4] = std::bit_cast<u64>(static_cast<double>(i + 1));
+
+    Runtime rt;
+    rt.Run(state);
+
+    // 1*1 + 2*10 + 3*100 + 4*1000 + 5*10000 + 6*100000 + 7*1000000 + 8*10000000
+    //   = 1 + 20 + 300 + 4000 + 50000 + 600000 + 7000000 + 80000000 = 87654321
+    const double got = std::bit_cast<double>(state.ymm[0]);
+    EXPECT_EQ(got, 87654321.0)
+        << "all 8 xmm lanes must route to f0..f7 in order";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// Single far lane: only xmm5 (f5) nonzero proves f5 specifically is wired
+// (not just an aggregate that could mask a swap among the high lanes).
+TEST_F(CpuRuntimeTest, HleBridge_FloatArg_Xmm5_RoutesToF5) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_EightDoubles);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_EightDoubles");
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xff, 0xd0,
+        0xc3,
+    };
+    std::memcpy(&program[2], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.ymm[5 * 4] = std::bit_cast<u64>(3.0); // xmm5 = f = 3.0, all others 0
+
+    Runtime rt;
+    rt.Run(state);
+
+    // f has multiplier 100000 -> 3 * 100000 = 300000.
+    EXPECT_EQ(std::bit_cast<double>(state.ymm[0]), 300000.0)
+        << "xmm5 must map to the 6th float param (f), multiplier 100000";
+}
+
+// --- Group 2: full 14-arg call (6 register + 8 stack) ----------------------
+// Pushes args 14..7 (highest address first), leaving arg7 at [rsp+8]=s0 and
+// arg14 at [rsp+64]=s7. Powers-of-two multipliers keep the sum exact and make
+// any misrouted slot a single wrong bit.
+TEST_F(CpuRuntimeTest, HleBridge_FourteenArgs_EightStackSlots) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_FourteenArgs);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_FourteenArgs");
+
+    // Each stack arg pushed via `mov rax, imm32; push rax`. We push args
+    // 14,13,...,7 so that after all pushes arg7 is at the lowest address
+    // ([rsp+8] once the call pushes the return addr). All arg values are 1, so
+    // the result is the OR of all 14 weight bits = (1<<14)-1 = 0x3FFF.
+    auto push_imm = [](std::vector<u8>& p, u32 v) {
+        p.push_back(0x48); p.push_back(0xc7); p.push_back(0xc0); // mov rax, imm32
+        p.push_back(v & 0xFF); p.push_back((v >> 8) & 0xFF);
+        p.push_back((v >> 16) & 0xFF); p.push_back((v >> 24) & 0xFF);
+        p.push_back(0x50); // push rax
+    };
+    std::vector<u8> prog;
+    // Register args a..f = 1 (rdi,rsi,rdx,rcx,r8,r9).
+    auto mov_reg = [&](u8 op0, u8 op1, u8 op2, u32 v) {
+        prog.push_back(op0); prog.push_back(op1); prog.push_back(op2);
+        prog.push_back(v & 0xFF); prog.push_back((v >> 8) & 0xFF);
+        prog.push_back((v >> 16) & 0xFF); prog.push_back((v >> 24) & 0xFF);
+    };
+    mov_reg(0x48, 0xc7, 0xc7, 1); // mov rdi, 1
+    mov_reg(0x48, 0xc7, 0xc6, 1); // mov rsi, 1
+    mov_reg(0x48, 0xc7, 0xc2, 1); // mov rdx, 1
+    mov_reg(0x48, 0xc7, 0xc1, 1); // mov rcx, 1
+    mov_reg(0x49, 0xc7, 0xc0, 1); // mov r8, 1
+    mov_reg(0x49, 0xc7, 0xc1, 1); // mov r9, 1
+    // Push stack args 14 down to 7 (each = 1).
+    for (int arg = 14; arg >= 7; --arg) push_imm(prog, 1);
+    // mov rax, <fn> ; call rax
+    prog.push_back(0x48); prog.push_back(0xb8);
+    for (int i = 0; i < 8; ++i) prog.push_back((host_fn_addr >> (i * 8)) & 0xFF);
+    prog.push_back(0xff); prog.push_back(0xd0); // call rax
+    prog.push_back(0x48); prog.push_back(0x83); prog.push_back(0xc4); prog.push_back(0x40); // add rsp, 64
+    prog.push_back(0xc3); // ret
+
+    std::memcpy(mem.CodePtr(), prog.data(), prog.size());
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // All 14 args = 1 -> OR of bits 0..13 = 0x3FFF.
+    EXPECT_EQ(state.gpr[0], 0x3FFFULL)
+        << "all 14 args (6 reg + 8 stack) must reach their slots; a missing "
+           "slot leaves its weight bit clear";
+}
+
+// Distinct stack-arg values to pin ORDER across all 8 stack slots: arg7..arg14
+// = 7..14, so the result's set bits are exactly {arg<<(arg-1)} ORed. We use
+// powers of two values too, but here verify a specific high slot (arg14) lands
+// at s7 by making only it nonzero.
+TEST_F(CpuRuntimeTest, HleBridge_FourteenArgs_HighestStackSlotIsArg14) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_FourteenArgs);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_FourteenArgs");
+
+    std::vector<u8> prog;
+    auto mov_reg = [&](u8 a, u8 b, u8 c, u32 v) {
+        prog.insert(prog.end(), {a, b, c,
+            static_cast<u8>(v & 0xFF), static_cast<u8>((v >> 8) & 0xFF),
+            static_cast<u8>((v >> 16) & 0xFF), static_cast<u8>((v >> 24) & 0xFF)});
+    };
+    auto push_imm = [&](u32 v) {
+        prog.insert(prog.end(), {0x48, 0xc7, 0xc0,
+            static_cast<u8>(v & 0xFF), static_cast<u8>((v >> 8) & 0xFF),
+            static_cast<u8>((v >> 16) & 0xFF), static_cast<u8>((v >> 24) & 0xFF), 0x50});
+    };
+    // Register args all 0.
+    mov_reg(0x48, 0xc7, 0xc7, 0); mov_reg(0x48, 0xc7, 0xc6, 0);
+    mov_reg(0x48, 0xc7, 0xc2, 0); mov_reg(0x48, 0xc7, 0xc1, 0);
+    mov_reg(0x49, 0xc7, 0xc0, 0); mov_reg(0x49, 0xc7, 0xc1, 0);
+    // Push args 14..7: only arg14 (=1) nonzero, rest 0. arg14 pushed first
+    // (highest address) -> lands at s7 = [rsp+64].
+    push_imm(1); // arg14 = 1
+    for (int arg = 13; arg >= 7; --arg) push_imm(0);
+    prog.push_back(0x48); prog.push_back(0xb8);
+    for (int i = 0; i < 8; ++i) prog.push_back((host_fn_addr >> (i * 8)) & 0xFF);
+    prog.push_back(0xff); prog.push_back(0xd0);
+    prog.insert(prog.end(), {0x48, 0x83, 0xc4, 0x40}); // add rsp, 64
+    prog.push_back(0xc3);
+
+    std::memcpy(mem.CodePtr(), prog.data(), prog.size());
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    // arg14 has weight bit 13 -> result = 1 << 13 = 0x2000.
+    EXPECT_EQ(state.gpr[0], 0x2000ULL)
+        << "arg14 must occupy the highest stack slot (s7); a wrong slot yields "
+           "a different single bit";
+}
+
+// --- Group 3: return-value edge cases --------------------------------------
+
+// A host fn returning a value with bit 63 set must round-trip through ret.rax
+// into gpr[0] with no truncation or sign mangling. This specifically guards
+// the AArch64 x0 capture (register u64 asm("x0")) rewritten this series.
+TEST_F(CpuRuntimeTest, HleBridge_HighBitIntReturn_RoundTripsExactly) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_ReturnsHighBits);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_ReturnsHighBits");
+
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0xff, 0xd0,
+        0xc3,
+    };
+    std::memcpy(&program[2], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    state.gpr[0] = 0; // rax pre-cleared
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 0xFEEDFACECAFEBEEFULL)
+        << "high-bit-set 64-bit return must land in gpr[0] byte-exact";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+// A pure-integer host fn leaves xmm0/d0 undefined on return. The guest reads
+// rax (gpr[0]); the bridge's unconditional xmm0 write-back must not corrupt
+// the integer result, and gpr[0] must equal the true sum.
+TEST_F(CpuRuntimeTest, HleBridge_IntReturn_UnaffectedByXmmWriteback) {
+    HleRegistry::Instance().ClearForTesting();
+    const u64 host_fn_addr = reinterpret_cast<u64>(&HleBridgeTestFn_IntReturnIgnoresXmm);
+    HleRegistry::Instance().Register(host_fn_addr, "HleBridgeTestFn_IntReturnIgnoresXmm");
+
+    u8 program[] = {
+        0x48, 0xc7, 0xc7, 0x0a, 0x00, 0x00, 0x00, // mov rdi, 10
+        0x48, 0xc7, 0xc6, 0x20, 0x00, 0x00, 0x00, // mov rsi, 32
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,              // mov rax, <fn>
+        0xff, 0xd0,                                // call rax
+        0xc3,
+    };
+    std::memcpy(&program[16], &host_fn_addr, sizeof(host_fn_addr));
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState state{};
+    state.rip = reinterpret_cast<u64>(mem.CodePtr());
+    state.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    Runtime rt;
+    rt.Run(state);
+
+    EXPECT_EQ(state.gpr[0], 42ULL) << "int return (10+32) must reach gpr[0] intact";
+    EXPECT_EQ(state.rip, kReturnSentinel);
+}
+
+
 } // namespace
 } // namespace Core::Runtime
