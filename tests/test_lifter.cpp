@@ -16856,5 +16856,132 @@ TEST_F(CpuRuntimeTest, X87_Fnstsw_ReflectsCompareAndTop) {
     EXPECT_EQ((ax >> 11) & 0x7u, 6u) << "TOP field = 6 after two pushes";
 }
 
+
+// ============================================================================
+// IDIV (signed division). The lifter previously handled only unsigned DIV;
+// IDIV was unimplemented. x86 IDIV truncates toward zero and the remainder
+// takes the sign of the dividend. Quotient -> AL/AX/EAX/RAX, remainder ->
+// AH/DX/EDX/RDX. Dividend is sign-extended into the high half by CDQ/CQO (or
+// CBW for 8-bit) before the divide. Results cross-checked against native x86
+// IDIV and the arm64 emitter under QEMU.
+// Encodings: idiv r/m32 = F7 /7, idiv r/m64 = REX.W F7 /7, idiv r/m8 = F6 /7.
+// ============================================================================
+
+// 64-bit positive / positive.
+TEST_F(CpuRuntimeTest, Idiv64_PositivePositive) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100
+        0x48, 0x99,                               // cqo  (sign-extend into rdx)
+        0x48, 0xc7, 0xc1, 0x07, 0x00, 0x00, 0x00, // mov rcx, 7
+        0x48, 0xf7, 0xf9,                         // idiv rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[0]), 14LL) << "100 / 7 = 14";
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[2]), 2LL)  << "100 % 7 = 2";
+}
+
+// 64-bit negative dividend: remainder takes the dividend's sign.
+TEST_F(CpuRuntimeTest, Idiv64_NegativeDividend) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x9c, 0xff, 0xff, 0xff, // mov rax, -100 (sign-ext imm32)
+        0x48, 0x99,                               // cqo -> rdx = -1
+        0x48, 0xc7, 0xc1, 0x07, 0x00, 0x00, 0x00, // mov rcx, 7
+        0x48, 0xf7, 0xf9,                         // idiv rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[0]), -14LL) << "-100 / 7 = -14";
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[2]), -2LL)  << "-100 % 7 = -2 (sign of dividend)";
+}
+
+// 64-bit negative divisor.
+TEST_F(CpuRuntimeTest, Idiv64_NegativeDivisor) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x64, 0x00, 0x00, 0x00, // mov rax, 100
+        0x48, 0x99,                               // cqo
+        0x48, 0xc7, 0xc1, 0xf9, 0xff, 0xff, 0xff, // mov rcx, -7
+        0x48, 0xf7, 0xf9,                         // idiv rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[0]), -14LL) << "100 / -7 = -14";
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[2]), 2LL)   << "100 % -7 = 2 (sign of dividend)";
+}
+
+// 64-bit both negative -> positive quotient, negative remainder.
+TEST_F(CpuRuntimeTest, Idiv64_BothNegative) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0x9c, 0xff, 0xff, 0xff, // mov rax, -100
+        0x48, 0x99,                               // cqo
+        0x48, 0xc7, 0xc1, 0xf9, 0xff, 0xff, 0xff, // mov rcx, -7
+        0x48, 0xf7, 0xf9,                         // idiv rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[0]), 14LL)  << "-100 / -7 = 14";
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[2]), -2LL)  << "-100 % -7 = -2";
+}
+
+// 64-bit truncation toward zero (not floor): -7 / 2 = -3 rem -1.
+TEST_F(CpuRuntimeTest, Idiv64_TruncatesTowardZero) {
+    const u8 program[] = {
+        0x48, 0xc7, 0xc0, 0xf9, 0xff, 0xff, 0xff, // mov rax, -7
+        0x48, 0x99,                               // cqo
+        0x48, 0xc7, 0xc1, 0x02, 0x00, 0x00, 0x00, // mov rcx, 2
+        0x48, 0xf7, 0xf9,                         // idiv rcx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[0]), -3LL) << "-7 / 2 = -3 (toward zero, not -4)";
+    EXPECT_EQ(static_cast<s64>(r.state.gpr[2]), -1LL) << "-7 % 2 = -1";
+}
+
+// 32-bit signed: -100 / 7. Quotient in EAX (zero-extends RAX), rem in EDX.
+TEST_F(CpuRuntimeTest, Idiv32_NegativeDividend) {
+    const u8 program[] = {
+        0xb8, 0x9c, 0xff, 0xff, 0xff,             // mov eax, -100
+        0x99,                                     // cdq -> edx = -1
+        0xb9, 0x07, 0x00, 0x00, 0x00,             // mov ecx, 7
+        0xf7, 0xf9,                               // idiv ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s32>(r.state.gpr[0] & 0xFFFFFFFF), -14) << "-100 / 7 = -14";
+    EXPECT_EQ(static_cast<s32>(r.state.gpr[2] & 0xFFFFFFFF), -2)  << "-100 % 7 = -2";
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "EAX result zero-extends RAX";
+}
+
+// 32-bit positive sanity.
+TEST_F(CpuRuntimeTest, Idiv32_PositivePositive) {
+    const u8 program[] = {
+        0xb8, 0xc8, 0x00, 0x00, 0x00,             // mov eax, 200
+        0x99,                                     // cdq
+        0xb9, 0x07, 0x00, 0x00, 0x00,             // mov ecx, 7
+        0xf7, 0xf9,                               // idiv ecx
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(static_cast<s32>(r.state.gpr[0] & 0xFFFFFFFF), 28) << "200 / 7 = 28";
+    EXPECT_EQ(static_cast<s32>(r.state.gpr[2] & 0xFFFFFFFF), 4)  << "200 % 7 = 4";
+}
+
+// 8-bit signed: AX = -100, divisor 7 -> AL = -14, AH = -2. CBW sign-extends
+// AL into AX first. Encoding: cbw = 66 98, idiv cl = F6 F9.
+TEST_F(CpuRuntimeTest, Idiv8_NegativeDividend) {
+    const u8 program[] = {
+        0xb0, 0x9c,                               // mov al, -100 (0x9C)
+        0x66, 0x98,                               // cbw -> AX = -100
+        0xb1, 0x07,                               // mov cl, 7
+        0xf6, 0xf9,                               // idiv cl
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    const s8 al = static_cast<s8>(r.state.gpr[0] & 0xFF);
+    const s8 ah = static_cast<s8>((r.state.gpr[0] >> 8) & 0xFF);
+    EXPECT_EQ(al, -14) << "AL quotient: -100 / 7 = -14";
+    EXPECT_EQ(ah, -2)  << "AH remainder: -100 % 7 = -2";
+}
+
 } // namespace
 } // namespace Core::Runtime

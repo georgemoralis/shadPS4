@@ -2056,6 +2056,76 @@ bool EmitDiv(const ZydisDecodedInstruction& insn,
     return true;
 }
 
+/// IDIV r/m — signed division. Mirrors EmitDiv exactly but uses the host's
+/// native `idiv`, which already matches x86 IDIV semantics (the host IS x86).
+/// Dividend implicit in (R/E)DX:(R/E)AX (AX for 8-bit); quotient -> (R/E)AX/AL,
+/// remainder -> (R/E)DX/AH. The guest is responsible for having sign-extended
+/// the dividend into the high half (via CWD/CDQ/CQO/CBW) before IDIV.
+bool EmitIdiv(const ZydisDecodedInstruction& insn,
+              const ZydisDecodedOperand* ops,
+              u64 next_rip,
+              Xbyak::CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 32 && w != 64) return false;
+
+    // ---- 8-bit: dividend AX, quotient AL, remainder AH. ----
+    if (w == 8) {
+        c.mov(r8, qword[r13 + GprOffset(0)]);     // r8 = full guest RAX
+        c.mov(ax, word[r13 + GprOffset(0)]);      // ax = dividend (AX)
+
+        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int d_idx = ZydisGprToIndex(ops[0].reg.value);
+            if (d_idx < 0) return false;
+            c.mov(cl, byte[r13 + GprOffset(d_idx)]);
+        } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+            c.mov(cl, byte[rdx]);
+            c.mov(ax, r8w);                       // EA clobbered rax; reload
+        } else {
+            return false;
+        }
+
+        c.idiv(cl);                               // AL = AX/cl, AH = AX%cl (signed)
+
+        c.movzx(rdx, ax);
+        c.mov(rcx, 0xFFFFFFFFFFFF0000ULL);
+        c.and_(r8, rcx);
+        c.or_(r8, rdx);
+        c.mov(qword[r13 + GprOffset(0)], r8);
+        return true;
+    }
+
+    // ---- 32/64-bit: load divisor into r9 (handling reg/mem), then set up
+    //      host (R/E)DX:(R/E)AX from the guest slots and run idiv. ----
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int d_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (d_idx < 0) return false;
+        c.mov(r9, qword[r13 + GprOffset(d_idx)]);
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(r9, qword[rdx]);
+    } else {
+        return false;
+    }
+
+    if (w == 32) {
+        c.mov(eax, dword[r13 + GprOffset(0)]);    // EAX = dividend low
+        c.mov(edx, dword[r13 + GprOffset(2)]);    // EDX = dividend high
+        c.idiv(r9d);                              // EAX=quot, EDX=rem (signed)
+        c.mov(qword[r13 + GprOffset(0)], rax);    // results zero-extend
+        c.mov(qword[r13 + GprOffset(2)], rdx);
+        return true;
+    }
+
+    // w == 64: dividend RDX:RAX, quotient RAX, remainder RDX.
+    c.mov(rax, qword[r13 + GprOffset(0)]);
+    c.mov(rdx, qword[r13 + GprOffset(2)]);
+    c.idiv(r9);
+    c.mov(qword[r13 + GprOffset(0)], rax);
+    c.mov(qword[r13 + GprOffset(2)], rdx);
+    return true;
+}
+
 /// XADD dst, src — exchange-and-add:
 ///   tmp = dst + src; src = dst (old); dst = tmp
 /// Sets all arithmetic flags (CF/OF/SF/ZF/AF/PF) from the addition.
@@ -7765,6 +7835,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_DEC:  handled = EmitDec(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_BT:   handled = EmitBt(insn, ops, c); break;
             case ZYDIS_MNEMONIC_DIV:  handled = EmitDiv(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_IDIV: handled = EmitIdiv(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_CMPXCHG: handled = EmitCmpxchg(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_XADD:    handled = EmitXadd(insn, ops, next_rip, c); break;
             // SETcc family — all 16 conditions route through EmitSetcc.
