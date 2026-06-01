@@ -3311,6 +3311,175 @@ bool EmitVShuffle(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
     return true;
 }
 
+// Integer per-element compare: vpcmpeqb/eqd (equal), vpcmpgtd (signed >).
+// Each element becomes all-ones (true) or all-zeros (false). NEON cmeq/cmgt
+// have identical semantics. XMM zeroes upper 128; YMM per-lane.
+enum class VCmpIntKind { EqB, EqD, GtD };
+
+bool EmitVCmpInt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, VCmpIntKind k, CodeGenerator& c) {
+    if (insn.operand_count_visible < 3) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        c.add(kScratch0, kState, YmmChunkOffset(s1, chunk));
+        c.ldr(QReg(0), ptr(kScratch0));
+        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int s2 = ZydisVecToIndex(ops[2].reg.value);
+            if (s2 < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(s2, chunk));
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else {
+            return false;
+        }
+        switch (k) {
+            case VCmpIntKind::EqB: c.cmeq(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VCmpIntKind::EqD: c.cmeq(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+            case VCmpIntKind::GtD: c.cmgt(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(0), ptr(kScratch0));
+    }
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+// vptest a, b — ZF = ((a AND b) == 0); CF = ((b AND NOT a) == 0). a=ops[0],
+// b=ops[1] (both reg here). Sets ZF/CF, clears OF/SF/AF/PF. 128-bit only in
+// the tested forms; we OR the two 64-bit halves to test each 128-bit AND result.
+bool EmitVptest(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int a = ZydisVecToIndex(ops[0].reg.value);
+    const int b = ZydisVecToIndex(ops[1].reg.value);
+    if (a < 0 || b < 0) return false;
+
+    // andLow/andHigh = a & b ; subset = b & ~a, per 64-bit half.
+    const XReg a0 = XReg(9), a1 = XReg(10), b0 = XReg(12), b1 = XReg(13);
+    const XReg t = XReg(14), fl = XReg(15);
+    c.ldr(a0, ptr(kState, YmmChunkOffset(a, 0)));
+    c.ldr(a1, ptr(kState, YmmChunkOffset(a, 1)));
+    c.ldr(b0, ptr(kState, YmmChunkOffset(b, 0)));
+    c.ldr(b1, ptr(kState, YmmChunkOffset(b, 1)));
+
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    // Clear ZF(6),CF(0),PF(2),SF(7),OF(11),AF(4).
+    c.mov(t, ~((1ull<<6)|(1ull<<0)|(1ull<<2)|(1ull<<7)|(1ull<<11)|(1ull<<4)));
+    c.and_(fl, fl, t);
+
+    // ZF = (a&b)==0 over 128 bits.
+    c.and_(t, a0, b0);
+    {
+        XReg t2 = XReg(5);
+        c.and_(t2, a1, b1);
+        c.orr(t, t, t2);            // t = OR of both halves of (a&b)
+        Label nz;
+        c.cbnz(t, nz);
+        c.orr(fl, fl, 1ull<<6);     // ZF=1
+        c.L(nz);
+    }
+    // CF = (b & ~a)==0 over 128 bits.
+    c.bic(t, b0, a0);               // b0 & ~a0
+    {
+        XReg t2 = XReg(5);
+        c.bic(t2, b1, a1);
+        c.orr(t, t, t2);
+        Label nz;
+        c.cbnz(t, nz);
+        c.orr(fl, fl, 1ull<<0);     // CF=1
+        c.L(nz);
+    }
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// vcomiss/vcomisd/vucomiss/vucomisd — ordered scalar compare of src1.low vs
+// src2.low, setting ZF/PF/CF (clearing OF/SF/AF). x86 result:
+//   unordered(NaN): ZF=CF=PF=1 ; a>b: 000 ; a<b: CF ; a==b: ZF.
+// (COMI signals on SNaN, UCOMI on QNaN; the flag outcome is identical, so one
+// path serves both.) We derive eq/gt/lt masks via NEON scalar compares; if none
+// hold the inputs are unordered.
+bool EmitVcomi(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VCOMISD ||
+                     insn.mnemonic == ZYDIS_MNEMONIC_VUCOMISD);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int s1 = ZydisVecToIndex(ops[0].reg.value);
+    if (s1 < 0) return false;
+
+    // a = src1.low -> v0 ; b = src2.low -> v1.
+    if (sd) c.ldr(DReg(0), ptr(kState, YmmChunkOffset(s1, 0)));
+    else    c.ldr(SReg(0), ptr(kState, YmmChunkOffset(s1, 0)));
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[1].reg.value);
+        if (s2 < 0) return false;
+        if (sd) c.ldr(DReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
+        else    c.ldr(SReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        if (sd) c.ldr(DReg(1), ptr(kAddr));
+        else    c.ldr(SReg(1), ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    // eq -> v2, gt(a>b) -> v3, lt(a<b)=gt(b,a) -> v4. Read low bit to GPR.
+    const XReg eq = XReg(9), gt = XReg(10), lt = XReg(12), fl = XReg(13), t = XReg(14);
+    if (sd) {
+        c.fcmeq(DReg(2), DReg(0), DReg(1));
+        c.fcmgt(DReg(3), DReg(0), DReg(1));
+        c.fcmgt(DReg(4), DReg(1), DReg(0));
+        c.fmov(eq, DReg(2)); c.fmov(gt, DReg(3)); c.fmov(lt, DReg(4));
+    } else {
+        c.fcmeq(SReg(2), SReg(0), SReg(1));
+        c.fcmgt(SReg(3), SReg(0), SReg(1));
+        c.fcmgt(SReg(4), SReg(1), SReg(0));
+        c.fmov(WReg(9), SReg(2)); c.fmov(WReg(10), SReg(3)); c.fmov(WReg(12), SReg(4));
+    }
+
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~((1ull<<6)|(1ull<<0)|(1ull<<2)|(1ull<<7)|(1ull<<11)|(1ull<<4)));
+    c.and_(fl, fl, t);
+
+    // if eq: ZF. elif lt: CF. elif gt: (nothing). else unordered: ZF|CF|PF.
+    Label done, notEq, notLt;
+    c.cbz(eq, notEq);
+    c.orr(fl, fl, 1ull<<6);          // ZF
+    c.b(done);
+    c.L(notEq);
+    c.cbz(lt, notLt);
+    c.orr(fl, fl, 1ull<<0);          // CF
+    c.b(done);
+    c.L(notLt);
+    // if gt -> nothing; else unordered.
+    c.cbnz(gt, done);
+    c.orr(fl, fl, 1ull<<6);          // ZF
+    c.orr(fl, fl, 1ull<<0);          // CF
+    c.orr(fl, fl, 1ull<<2);          // PF
+    c.L(done);
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -3485,6 +3654,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VMOVHLPS:    handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::MOVHLPS, c); break;
         case ZYDIS_MNEMONIC_VPSHUFD:
         case ZYDIS_MNEMONIC_VSHUFPS:     handled = EmitVShuffle(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPCMPEQB: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqB, c); break;
+        case ZYDIS_MNEMONIC_VPCMPEQD: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqD, c); break;
+        case ZYDIS_MNEMONIC_VPCMPGTD: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::GtD, c); break;
+        case ZYDIS_MNEMONIC_VPTEST:   handled = EmitVptest(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_VCOMISS:  case ZYDIS_MNEMONIC_VCOMISD:
+        case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
+            handled = EmitVcomi(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
