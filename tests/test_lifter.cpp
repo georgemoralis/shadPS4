@@ -16460,5 +16460,96 @@ TEST_F(CpuRuntimeTest, Cqo_PositiveRax_ClearsRdx) {
     EXPECT_EQ(r.state.gpr[0], 0x7FFFFFFFFFFFFFFFULL) << "CQO must not modify RAX";
 }
 
+
+// ============================================================================
+// VSQRTSS, VPUNPCKLBW, VPUNPCKHBW: implemented on the arm64 lifter but were
+// previously missing from the x86 reference lifter (now added) and untested on
+// both. Encodings (VEX.128, dst=xmm0, src1=xmm1, src2=xmm2):
+//   vsqrtss    xmm0,xmm1,xmm2 = C5 F2 51 C2
+//   vpunpcklbw xmm0,xmm1,xmm2 = C5 F1 60 C2
+//   vpunpckhbw xmm0,xmm1,xmm2 = C5 F1 68 C2
+// src1 occupies ymm chunks 4,5; src2 chunks 8,9; dst chunks 0,1. All values
+// were cross-checked against native x86 execution of the emitted sequence.
+// ============================================================================
+
+// VSQRTSS: low 32 = sqrt(src2.low32); bits 127:32 from src1; VEX zeros 255:128.
+TEST_F(CpuRuntimeTest, Vsqrtss_ScalarSingle_MergesSrc1AndZerosUpper) {
+    const u8 program[] = {0xc5, 0xf2, 0x51, 0xc2, 0xc3}; // vsqrtss xmm0,xmm1,xmm2 ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+
+    const float kSixteen = 16.0f;
+    u32 sixteen_bits;
+    std::memcpy(&sixteen_bits, &kSixteen, sizeof(u32));
+    st.ymm[8] = static_cast<u64>(sixteen_bits);     // src2 (xmm2) low32 = 16.0f
+    st.ymm[4] = 0x1111111122222222ULL;              // src1 (xmm1) low 64
+    st.ymm[5] = 0x3333333344444444ULL;              // src1 bits 127:64
+    st.ymm[0] = 0xDEAD; st.ymm[1] = 0xBEEF;         // dst poison
+    st.ymm[2] = 0xCAFE; st.ymm[3] = 0xF00D;         // upper poison
+
+    Runtime rt; rt.Run(st);
+
+    float got;
+    u32 lo = static_cast<u32>(st.ymm[0]);
+    std::memcpy(&got, &lo, sizeof(float));
+    EXPECT_EQ(got, 4.0f) << "low 32 = sqrt(16.0) = 4.0";
+    EXPECT_EQ(static_cast<u32>(st.ymm[0] >> 32), 0x11111111U)
+        << "bits 63:32 carried from src1";
+    EXPECT_EQ(st.ymm[1], 0x3333333344444444ULL) << "bits 127:64 carried from src1";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros bits 255:128";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// VPUNPCKLBW: interleave the low 8 bytes of src1 and src2:
+//   dst = s1[0] s2[0] s1[1] s2[1] ... s1[7] s2[7]
+TEST_F(CpuRuntimeTest, Vpunpcklbw_InterleavesLowBytes) {
+    const u8 program[] = {0xc5, 0xf1, 0x60, 0xc2, 0xc3}; // vpunpcklbw xmm0,xmm1,xmm2 ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x0706050403020100ULL; // src1 bytes 00..07
+    st.ymm[8] = 0x1716151413121110ULL; // src2 bytes 10..17
+    st.ymm[0] = 0xDEAD; st.ymm[2] = 0xCAFE; st.ymm[3] = 0xF00D;
+
+    Runtime rt; rt.Run(st);
+
+    // low 64: 00 10 01 11 02 12 03 13 (little-endian)
+    EXPECT_EQ(st.ymm[0], 0x1303120211011000ULL) << "low 8 bytes interleaved";
+    EXPECT_EQ(st.ymm[1], 0x1707160615051404ULL) << "next 8 bytes interleaved";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros bits 255:128";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// VPUNPCKHBW: interleave the HIGH 8 bytes of src1 and src2.
+TEST_F(CpuRuntimeTest, Vpunpckhbw_InterleavesHighBytes) {
+    const u8 program[] = {0xc5, 0xf1, 0x68, 0xc2, 0xc3}; // vpunpckhbw xmm0,xmm1,xmm2 ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x0706050403020100ULL; // src1 low 8 bytes (ignored by H form)
+    st.ymm[5] = 0x0f0e0d0c0b0a0908ULL; // src1 high 8 bytes 08..0f
+    st.ymm[8] = 0x1716151413121110ULL; // src2 low 8 (ignored)
+    st.ymm[9] = 0x1f1e1d1c1b1a1918ULL; // src2 high 8 bytes 18..1f
+    st.ymm[0] = 0xDEAD; st.ymm[2] = 0xCAFE; st.ymm[3] = 0xF00D;
+
+    Runtime rt; rt.Run(st);
+
+    // high bytes interleaved: 08 18 09 19 0a 1a 0b 1b | 0c 1c 0d 1d 0e 1e 0f 1f
+    EXPECT_EQ(st.ymm[0], 0x1b0b1a0a19091808ULL) << "high 8 bytes interleaved (low half)";
+    EXPECT_EQ(st.ymm[1], 0x1f0f1e0e1d0d1c0cULL) << "high 8 bytes interleaved (high half)";
+    EXPECT_EQ(st.ymm[2], 0ULL) << "VEX zeros bits 255:128";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
 } // namespace
 } // namespace Core::Runtime

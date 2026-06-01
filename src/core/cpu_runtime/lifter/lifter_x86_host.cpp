@@ -5592,6 +5592,7 @@ bool EmitVecHostStaged(const ZydisDecodedInstruction& insn,
         case ZYDIS_MNEMONIC_VPACKUSDW:
         case ZYDIS_MNEMONIC_VMOVLHPS:  case ZYDIS_MNEMONIC_VMOVHLPS:
         case ZYDIS_MNEMONIC_VSQRTSD:
+        case ZYDIS_MNEMONIC_VSQRTSS:
             break;
         default: return false;
     }
@@ -5635,6 +5636,7 @@ bool EmitVecHostStaged(const ZydisDecodedInstruction& insn,
         case ZYDIS_MNEMONIC_VMOVLHPS:  c.vmovlhps(xmm0, xmm0, xmm1); break;
         case ZYDIS_MNEMONIC_VMOVHLPS:  c.vmovhlps(xmm0, xmm0, xmm1); break;
         case ZYDIS_MNEMONIC_VSQRTSD:   c.vsqrtsd(xmm0, xmm0, xmm1); break;
+        case ZYDIS_MNEMONIC_VSQRTSS:   c.vsqrtss(xmm0, xmm0, xmm1); break;
         default: return false;
     }
 #undef VEC_OP
@@ -6593,7 +6595,8 @@ bool EmitVpunpck(const ZydisDecodedInstruction& insn,
     const ZydisMnemonic m = insn.mnemonic;
     if (m != ZYDIS_MNEMONIC_VPUNPCKLQDQ && m != ZYDIS_MNEMONIC_VPUNPCKHQDQ &&
         m != ZYDIS_MNEMONIC_VPUNPCKLDQ  && m != ZYDIS_MNEMONIC_VPUNPCKHDQ  &&
-        m != ZYDIS_MNEMONIC_VPUNPCKLWD  && m != ZYDIS_MNEMONIC_VPUNPCKHWD) {
+        m != ZYDIS_MNEMONIC_VPUNPCKLWD  && m != ZYDIS_MNEMONIC_VPUNPCKHWD  &&
+        m != ZYDIS_MNEMONIC_VPUNPCKLBW  && m != ZYDIS_MNEMONIC_VPUNPCKHBW) {
         return false;
     }
 
@@ -6646,6 +6649,8 @@ bool EmitVpunpck(const ZydisDecodedInstruction& insn,
             case ZYDIS_MNEMONIC_VPUNPCKHDQ:  c.vpunpckhdq (ymm0, ymm0, ymm1); break;
             case ZYDIS_MNEMONIC_VPUNPCKLWD:  c.vpunpcklwd (ymm0, ymm0, ymm1); break;
             case ZYDIS_MNEMONIC_VPUNPCKHWD:  c.vpunpckhwd (ymm0, ymm0, ymm1); break;
+            case ZYDIS_MNEMONIC_VPUNPCKLBW:  c.vpunpcklbw (ymm0, ymm0, ymm1); break;
+            case ZYDIS_MNEMONIC_VPUNPCKHBW:  c.vpunpckhbw (ymm0, ymm0, ymm1); break;
             default: return false;
         }
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], ymm0);
@@ -6657,6 +6662,8 @@ bool EmitVpunpck(const ZydisDecodedInstruction& insn,
             case ZYDIS_MNEMONIC_VPUNPCKHDQ:  c.vpunpckhdq (xmm0, xmm0, xmm1); break;
             case ZYDIS_MNEMONIC_VPUNPCKLWD:  c.vpunpcklwd (xmm0, xmm0, xmm1); break;
             case ZYDIS_MNEMONIC_VPUNPCKHWD:  c.vpunpckhwd (xmm0, xmm0, xmm1); break;
+            case ZYDIS_MNEMONIC_VPUNPCKLBW:  c.vpunpcklbw (xmm0, xmm0, xmm1); break;
+            case ZYDIS_MNEMONIC_VPUNPCKHBW:  c.vpunpckhbw (xmm0, xmm0, xmm1); break;
             default: return false;
         }
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], xmm0);
@@ -7481,6 +7488,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_VPUNPCKHDQ:
             case ZYDIS_MNEMONIC_VPUNPCKLWD:
             case ZYDIS_MNEMONIC_VPUNPCKHWD:
+            case ZYDIS_MNEMONIC_VPUNPCKLBW:
+            case ZYDIS_MNEMONIC_VPUNPCKHBW:
                 handled = EmitVpunpck(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VPHADDD:
@@ -7767,6 +7776,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_VPACKUSDW:
             case ZYDIS_MNEMONIC_VMOVLHPS:  case ZYDIS_MNEMONIC_VMOVHLPS:
             case ZYDIS_MNEMONIC_VSQRTSD:
+            case ZYDIS_MNEMONIC_VSQRTSS:
                 handled = EmitVecHostStaged(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VSHUFPS: case ZYDIS_MNEMONIC_VBLENDPS:
