@@ -241,10 +241,45 @@ HostReturn CallHostFromGuest(VAddr host_fn,
                              double f4, double f5, double f6, double f7,
                              u64 s0, u64 s1, u64 s2, u64 s3,
                              u64 s4, u64 s5, u64 s6, u64 s7) {
+#if defined(ARCH_X86_64) || defined(__x86_64__) || defined(_M_X64)
+    // x86-64 SysV: the HostHleFn return type {u64; double} is classified into
+    // two eightbytes (INTEGER→rax, SSE→xmm0), so a single typed call recovers
+    // both a possible integer and a possible floating return.
     auto fn = reinterpret_cast<HostHleFn>(host_fn);
     return fn(a0, a1, a2, a3, a4, a5,
               f0, f1, f2, f3, f4, f5, f6, f7,
               s0, s1, s2, s3, s4, s5, s6, s7);
+#elif defined(__aarch64__)
+    // AArch64 AAPCS: the {u64; double} struct-return trick does NOT apply — a
+    // mixed aggregate returns in x0:x1 (both GPRs), not x0:d0, and the
+    // x86-only sysv_abi attribute is ignored here. Instead we let the compiler
+    // marshal all arguments via a normal typed call (AAPCS already routes the
+    // integer args to x0..x7/stack and the double args to d0..d7), then capture
+    // BOTH the integer return (x0) and the floating return (d0) — exactly the
+    // two registers a callee of unknown return type may have written.
+    //
+    // The call is made through a pointer typed to return void so the compiler
+    // emits a standard AAPCS call and arg setup; immediately afterward, inline
+    // asm reads x0 and d0 before any other code can clobber them.
+    using HostHleFnA64 = void (*)(u64, u64, u64, u64, u64, u64,
+                                  double, double, double, double,
+                                  double, double, double, double,
+                                  u64, u64, u64, u64, u64, u64, u64, u64);
+    auto fn = reinterpret_cast<HostHleFnA64>(host_fn);
+    fn(a0, a1, a2, a3, a4, a5,
+       f0, f1, f2, f3, f4, f5, f6, f7,
+       s0, s1, s2, s3, s4, s5, s6, s7);
+    HostReturn ret;
+    // Capture x0 (integer return) and d0 (floating return) post-call.
+    register u64 x0_val asm("x0");
+    register double d0_val asm("d0");
+    asm volatile("" : "=r"(x0_val), "=w"(d0_val));
+    ret.rax = x0_val;
+    ret.xmm0 = d0_val;
+    return ret;
+#else
+#error "CallHostFromGuest: unsupported host architecture"
+#endif
 }
 
 /// Dispatcher trampoline. Called from the gateway with the current
