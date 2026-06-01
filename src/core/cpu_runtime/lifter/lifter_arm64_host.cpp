@@ -3165,6 +3165,152 @@ bool EmitVPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     return true;
 }
 
+// Unpack / interleave family: vpunpck{l,h}{bw,wd,dq,qdq}, vunpck{l,h}{ps,pd},
+// vmovlhps, vmovhlps. These map to NEON zip1/zip2 at the right element width.
+// x86 PUNPCKLDQ dst,a,b -> {a0,b0,a1,b1} == zip1(d, a, b); high half == zip2.
+// Per 128-bit lane for YMM. XMM zeroes the upper 128.
+enum class VUnpackKind {
+    LBW, HBW, LWD, HWD, LDQ, HDQ, LQDQ, HQDQ,   // integer punpck
+    LPS, HPS, LPD, HPD,                          // fp unpck
+    MOVLHPS, MOVHLPS,
+};
+
+bool EmitVUnpack(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, VUnpackKind k, CodeGenerator& c) {
+    if (insn.operand_count_visible < 3) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        c.add(kScratch0, kState, YmmChunkOffset(s1, chunk));
+        c.ldr(QReg(0), ptr(kScratch0));
+        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int s2 = ZydisVecToIndex(ops[2].reg.value);
+            if (s2 < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(s2, chunk));
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else {
+            return false;
+        }
+
+        // v0 = src1 half, v1 = src2 half. Result -> v2.
+        switch (k) {
+            case VUnpackKind::LBW:  c.zip1(VReg16B(2), VReg16B(0), VReg16B(1)); break;
+            case VUnpackKind::HBW:  c.zip2(VReg16B(2), VReg16B(0), VReg16B(1)); break;
+            case VUnpackKind::LWD:  c.zip1(VReg8H(2),  VReg8H(0),  VReg8H(1));  break;
+            case VUnpackKind::HWD:  c.zip2(VReg8H(2),  VReg8H(0),  VReg8H(1));  break;
+            case VUnpackKind::LDQ:  c.zip1(VReg4S(2),  VReg4S(0),  VReg4S(1));  break;
+            case VUnpackKind::HDQ:  c.zip2(VReg4S(2),  VReg4S(0),  VReg4S(1));  break;
+            case VUnpackKind::LQDQ: c.zip1(VReg2D(2),  VReg2D(0),  VReg2D(1));  break;
+            case VUnpackKind::HQDQ: c.zip2(VReg2D(2),  VReg2D(0),  VReg2D(1));  break;
+            case VUnpackKind::LPS:  c.zip1(VReg4S(2),  VReg4S(0),  VReg4S(1));  break;
+            case VUnpackKind::HPS:  c.zip2(VReg4S(2),  VReg4S(0),  VReg4S(1));  break;
+            case VUnpackKind::LPD:  c.zip1(VReg2D(2),  VReg2D(0),  VReg2D(1));  break;
+            case VUnpackKind::HPD:  c.zip2(VReg2D(2),  VReg2D(0),  VReg2D(1));  break;
+            // movlhps: dst.q0=src1.q0, dst.q1=src2.q0 == zip1(2D, src1, src2).
+            case VUnpackKind::MOVLHPS: c.zip1(VReg2D(2), VReg2D(0), VReg2D(1)); break;
+            // movhlps: dst.q0=src2.q1, dst.q1=src1.q1 == zip2(2D, src2, src1).
+            case VUnpackKind::MOVHLPS: c.zip2(VReg2D(2), VReg2D(1), VReg2D(0)); break;
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(2), ptr(kScratch0));
+    }
+
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+// vpshufd dst, src/m, imm8  — dst.dword[i] = src.dword[(imm8>>(2i))&3].
+// vshufps dst, src1, src2, imm8 — dst[0]=src1[imm&3], dst[1]=src1[(imm>>2)&3],
+//   dst[2]=src2[(imm>>4)&3], dst[3]=src2[(imm>>6)&3].
+// Element selects are compile-time-known, so we emit per-lane NEON ins from the
+// loaded source(s) into a fresh temp (v2), avoiding self-clobber. XMM-only here.
+bool EmitVShuffle(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  u64 next_rip, CodeGenerator& c) {
+    const bool shufps = (insn.mnemonic == ZYDIS_MNEMONIC_VSHUFPS);
+    const bool pshufd = (insn.mnemonic == ZYDIS_MNEMONIC_VPSHUFD);
+    if (!shufps && !pshufd) return false;
+
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    if (pshufd) {
+        // ops: dst, src(reg/mem), imm8.
+        const int imm = static_cast<int>(ops[2].imm.value.u) & 0xFF;
+        // Load src -> v1.
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int s = ZydisVecToIndex(ops[1].reg.value);
+            if (s < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(s, 0));
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+            c.ldr(QReg(1), ptr(kAddr));
+        } else {
+            return false;
+        }
+        for (int i = 0; i < 4; ++i) {
+            const int sel = (imm >> (2 * i)) & 3;
+            c.ins(VReg4S(2)[i], VReg4S(1)[sel]);
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+        c.str(QReg(2), ptr(kScratch0));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+        return true;
+    }
+
+    // vshufps: dst, src1, src2, imm8.
+    if (insn.operand_count_visible < 4) return false;
+    const int s1 = ZydisVecToIndex(ops[1].reg.value);
+    if (s1 < 0) return false;
+    const int imm = static_cast<int>(ops[3].imm.value.u) & 0xFF;
+    c.add(kScratch0, kState, YmmChunkOffset(s1, 0));
+    c.ldr(QReg(0), ptr(kScratch0));
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        if (s2 < 0) return false;
+        c.add(kScratch0, kState, YmmChunkOffset(s2, 0));
+        c.ldr(QReg(1), ptr(kScratch0));
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        c.ldr(QReg(1), ptr(kAddr));
+    } else {
+        return false;
+    }
+    // lanes 0,1 from src1 (v0); lanes 2,3 from src2 (v1). Build in v2.
+    c.ins(VReg4S(2)[0], VReg4S(0)[(imm >> 0) & 3]);
+    c.ins(VReg4S(2)[1], VReg4S(0)[(imm >> 2) & 3]);
+    c.ins(VReg4S(2)[2], VReg4S(1)[(imm >> 4) & 3]);
+    c.ins(VReg4S(2)[3], VReg4S(1)[(imm >> 6) & 3]);
+    c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+    c.str(QReg(2), ptr(kScratch0));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -3323,6 +3469,22 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPXOR:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::Xor, c); break;
         case ZYDIS_MNEMONIC_VANDNPS: case ZYDIS_MNEMONIC_VANDNPD:
         case ZYDIS_MNEMONIC_VPANDN:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::AndN, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKLBW:  handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::LBW, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKHBW:  handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::HBW, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKLWD:  handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::LWD, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKHWD:  handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::HWD, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKLDQ:  handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::LDQ, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKHDQ:  handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::HDQ, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKLQDQ: handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::LQDQ, c); break;
+        case ZYDIS_MNEMONIC_VPUNPCKHQDQ: handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::HQDQ, c); break;
+        case ZYDIS_MNEMONIC_VUNPCKLPS:   handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::LPS, c); break;
+        case ZYDIS_MNEMONIC_VUNPCKHPS:   handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::HPS, c); break;
+        case ZYDIS_MNEMONIC_VUNPCKLPD:   handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::LPD, c); break;
+        case ZYDIS_MNEMONIC_VUNPCKHPD:   handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::HPD, c); break;
+        case ZYDIS_MNEMONIC_VMOVLHPS:    handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::MOVLHPS, c); break;
+        case ZYDIS_MNEMONIC_VMOVHLPS:    handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::MOVHLPS, c); break;
+        case ZYDIS_MNEMONIC_VPSHUFD:
+        case ZYDIS_MNEMONIC_VSHUFPS:     handled = EmitVShuffle(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
