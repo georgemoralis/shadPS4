@@ -2931,8 +2931,16 @@ bool EmitVScalarArith(const ZydisDecodedInstruction& insn,
             case VScalarOp::Sub:  c.fsub(DReg(0), DReg(0), DReg(1)); break;
             case VScalarOp::Mul:  c.fmul(DReg(0), DReg(0), DReg(1)); break;
             case VScalarOp::Div:  c.fdiv(DReg(0), DReg(0), DReg(1)); break;
-            case VScalarOp::Min:  c.fmin(DReg(0), DReg(0), DReg(1)); break;
-            case VScalarOp::Max:  c.fmax(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Min:
+                c.fcmgt(VReg2D(2), VReg2D(1), VReg2D(0));   // mask = b>a (a<b)
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
+            case VScalarOp::Max:
+                c.fcmgt(VReg2D(2), VReg2D(0), VReg2D(1));   // mask = a>b
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
             case VScalarOp::Sqrt: c.fsqrt(DReg(0), DReg(1)); break;  // sqrt(src2)
         }
     } else {
@@ -2941,8 +2949,16 @@ bool EmitVScalarArith(const ZydisDecodedInstruction& insn,
             case VScalarOp::Sub:  c.fsub(SReg(0), SReg(0), SReg(1)); break;
             case VScalarOp::Mul:  c.fmul(SReg(0), SReg(0), SReg(1)); break;
             case VScalarOp::Div:  c.fdiv(SReg(0), SReg(0), SReg(1)); break;
-            case VScalarOp::Min:  c.fmin(SReg(0), SReg(0), SReg(1)); break;
-            case VScalarOp::Max:  c.fmax(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Min:
+                c.fcmgt(VReg4S(2), VReg4S(1), VReg4S(0));   // mask = b>a (a<b)
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
+            case VScalarOp::Max:
+                c.fcmgt(VReg4S(2), VReg4S(0), VReg4S(1));   // mask = a>b
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
             case VScalarOp::Sqrt: c.fsqrt(SReg(0), SReg(1)); break;
         }
     }
@@ -3098,14 +3114,34 @@ bool EmitVPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
             case VPackKind::SubPS: c.fsub(VReg4S(0), VReg4S(0), VReg4S(1)); break;
             case VPackKind::MulPS: c.fmul(VReg4S(0), VReg4S(0), VReg4S(1)); break;
             case VPackKind::DivPS: c.fdiv(VReg4S(0), VReg4S(0), VReg4S(1)); break;
-            case VPackKind::MinPS: c.fmin(VReg4S(0), VReg4S(0), VReg4S(1)); break;
-            case VPackKind::MaxPS: c.fmax(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            // x86 MIN/MAX: dst = (a<b)?a:b  / (a>b)?a:b. On a NaN operand the
+            // compare is false, so the result is src2 (b) — NOT IEEE minNum. NEON
+            // fmin/fmax pick the non-NaN operand, which diverges, so use an
+            // explicit compare-select. v0=a(src1), v1=b(src2), v2=mask.
+            case VPackKind::MinPS:
+                c.fcmgt(VReg4S(2), VReg4S(1), VReg4S(0));   // mask = b>a  (=> a<b)
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));  // a<b ? a : b
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
+            case VPackKind::MaxPS:
+                c.fcmgt(VReg4S(2), VReg4S(0), VReg4S(1));   // mask = a>b
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));  // a>b ? a : b
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
             case VPackKind::AddPD: c.fadd(VReg2D(0), VReg2D(0), VReg2D(1)); break;
             case VPackKind::SubPD: c.fsub(VReg2D(0), VReg2D(0), VReg2D(1)); break;
             case VPackKind::MulPD: c.fmul(VReg2D(0), VReg2D(0), VReg2D(1)); break;
             case VPackKind::DivPD: c.fdiv(VReg2D(0), VReg2D(0), VReg2D(1)); break;
-            case VPackKind::MinPD: c.fmin(VReg2D(0), VReg2D(0), VReg2D(1)); break;
-            case VPackKind::MaxPD: c.fmax(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::MinPD:
+                c.fcmgt(VReg2D(2), VReg2D(1), VReg2D(0));   // mask = b>a
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
+            case VPackKind::MaxPD:
+                c.fcmgt(VReg2D(2), VReg2D(0), VReg2D(1));   // mask = a>b
+                c.bsl(VReg16B(2), VReg16B(0), VReg16B(1));
+                c.mov(VReg16B(0), VReg16B(2));
+                break;
             case VPackKind::AddD:  c.add(VReg4S(0), VReg4S(0), VReg4S(1)); break;
             case VPackKind::SubD:  c.sub(VReg4S(0), VReg4S(0), VReg4S(1)); break;
             case VPackKind::MulD:  c.mul(VReg4S(0), VReg4S(0), VReg4S(1)); break;
