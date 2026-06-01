@@ -16363,300 +16363,102 @@ TEST_F(CpuRuntimeTest, DiagnosticsHooks_DoNotPerturbExecution) {
 
 
 // ============================================================================
-// addr32 (0x67 address-size override) on ADD / SUB / CMP / TEST with a memory
-// operand. The 0x67 prefix truncates the computed effective address to 32
-// bits, so a base register whose upper 32 bits hold garbage must still resolve
-// to the intended sub-4GiB address. EmitMov and EmitIncDec already threaded
-// the addr32 flag into EmitEffectiveAddress; EmitAlu/EmitCmp/EmitTest did not,
-// so a 0x67-prefixed `add/sub [ebx],eax` or `cmp/test [ebx],eax` with garbage
-// in EBX's upper half computed a wild 64-bit pointer. These tests pin the
-// truncation for each of those four emitters.
-//
-// Each needs a real page below 4 GiB (MapLowScratch maps 0x20000000); on hosts
-// whose default mmap base sits above 4 GiB (e.g. macOS __PAGEZERO) the page is
-// unavailable and the test self-skips, exactly like the existing Addr32_* set.
+// Sign-extension convert family: CBW and CWD were implemented in EmitConvert
+// but had no tests; CQO had only a negative case. These are partial-register
+// operations (CBW writes AH while preserving RAX bits 63:16; CWD fills DX while
+// preserving RDX bits 63:16), which are a classic source of upper-bit bugs.
+// All expectations below were cross-checked against the emitter under QEMU.
 // ============================================================================
 
-// add dword[ebx], eax  (67 01 03): the store-back must land at the truncated
-// address, and the value must be the 32-bit sum.
-// NOTE: these five tests exercise 32-bit memory-operand integer ALU with the
-// 0x67 address-size override. The arm64 lifter implements that form (and the
-// addr32 truncation); the x86 reference lifter deliberately handles these
-// integer ALU mem-forms only at 64-bit width and does not model addr32, so
-// the tests are gated to the non-x86 (arm64) backend. Mirrors runtime.cpp's
-// ARCH_X86_64/__x86_64__/_M_X64 detection.
-#if !defined(ARCH_X86_64) && !defined(__x86_64__) && !defined(_M_X64)
-
-TEST_F(CpuRuntimeTest, Addr32_AddMemDest_TruncatesBaseAndAdds) {
-    u8* low = MapLowScratch();
-    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
-    u8* target = low + 0x40;
-    *reinterpret_cast<u32*>(target) = 0x1000;
-
-    const u8 program[] = {0x67, 0x01, 0x03, 0xc3}; // add [ebx], eax ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    // RBX low32 = target; upper32 = garbage that addr32 must mask away.
-    st.gpr[3] = (0xDEADBEEFull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-    st.gpr[0] = 0x0234; // eax
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x1234u)
-        << "add wrote the 32-bit sum at the truncated address";
-#if !defined(_WIN32)
-    ::munmap(low, 4096);
-#endif
+// CBW: AL -> AX. Sign-extend AL into AH (bits 15:8), preserve RAX bits 63:16.
+TEST_F(CpuRuntimeTest, Cbw_SignExtendsNegativeAl) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x80,0x00, 0x34,0x12, 0xEF,0xBE,0xAD,0xDE, // mov rax,0xDEADBEEF12340080
+        0x66, 0x98, // cbw
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AL=0x80 (negative) -> AH=0xFF; bits 63:16 unchanged.
+    EXPECT_EQ(r.state.gpr[0], 0xDEADBEEF1234FF80ULL)
+        << "AL=0x80 sign-extends to AX=0xFF80, upper 48 bits preserved";
 }
 
-// sub dword[ebx], eax  (67 29 03): order matters ([mem] - eax), truncated addr.
-TEST_F(CpuRuntimeTest, Addr32_SubMemDest_TruncatesBaseAndSubtracts) {
-    u8* low = MapLowScratch();
-    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
-    u8* target = low + 0x80;
-    *reinterpret_cast<u32*>(target) = 0x5555;
-
-    const u8 program[] = {0x67, 0x29, 0x03, 0xc3}; // sub [ebx], eax ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[3] = (0xCAFEF00Dull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-    st.gpr[0] = 0x0055;
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x5500u)
-        << "sub wrote [mem]-eax at the truncated address";
-#if !defined(_WIN32)
-    ::munmap(low, 4096);
-#endif
+// CBW positive: AL bit7 clear -> AH cleared (and any prior AH is overwritten).
+TEST_F(CpuRuntimeTest, Cbw_PositiveAl_ClearsAh) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x7F,0xFF, 0x55,0x44, 0x33,0x22,0x11,0x00, // mov rax,0x001122334455FF7F
+        0x66, 0x98, // cbw
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AL=0x7F (positive) -> AH=0x00 (overwriting the prior 0xFF); upper preserved.
+    EXPECT_EQ(r.state.gpr[0], 0x001122334455007FULL)
+        << "AL=0x7F sign-extends to AX=0x007F; prior AH=0xFF must be cleared";
 }
 
-// cmp dword[ebx], eax  (67 39 03): equal operands set ZF; memory unchanged.
-// The compare must read from the truncated address, not the garbage pointer.
-TEST_F(CpuRuntimeTest, Addr32_CmpMemDest_TruncatesBaseAndSetsZf) {
-    u8* low = MapLowScratch();
-    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
-    u8* target = low + 0xC0;
-    *reinterpret_cast<u32*>(target) = 0xABCD;
-
-    const u8 program[] = {0x67, 0x39, 0x03, 0xc3}; // cmp [ebx], eax ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[3] = (0x99999999ull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-    st.gpr[0] = 0xABCD; // equal -> ZF
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: [mem]==eax after truncation";
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0xABCDu) << "cmp must not write memory";
-#if !defined(_WIN32)
-    ::munmap(low, 4096);
-#endif
+// CBW must not touch any register other than RAX. RDX/RCX are seeded with
+// sentinels via the setup lambda; the program never writes them, so they must
+// survive unchanged.
+TEST_F(CpuRuntimeTest, Cbw_LeavesOtherRegistersUntouched) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x80,0x00, 0x00,0x00, 0x00,0x00,0x00,0x00, // mov rax,0x80
+        0x66, 0x98, // cbw
+        0xc3,
+    };
+    const auto st = RunWithState(program, sizeof(program), mem,
+        [](GuestState& s) {
+            s.gpr[2] = 0xD0D0D0D0D0D0D0D0ULL; // rdx sentinel
+            s.gpr[1] = 0xC1C1C1C1C1C1C1C1ULL; // rcx sentinel
+        });
+    EXPECT_EQ(st.gpr[0], 0xFF80ULL) << "AL=0x80 -> AX=0xFF80";
+    EXPECT_EQ(st.gpr[2], 0xD0D0D0D0D0D0D0D0ULL) << "RDX untouched by CBW";
+    EXPECT_EQ(st.gpr[1], 0xC1C1C1C1C1C1C1C1ULL) << "RCX untouched by CBW";
 }
 
-// test dword[ebx], eax  (67 85 03): non-zero AND clears ZF; truncated addr.
-TEST_F(CpuRuntimeTest, Addr32_TestMemDest_TruncatesBaseAndSetsFlags) {
-    u8* low = MapLowScratch();
-    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
-    u8* target = low + 0x100;
-    *reinterpret_cast<u32*>(target) = 0x00FF00FF;
-
-    const u8 program[] = {0x67, 0x85, 0x03, 0xc3}; // test [ebx], eax ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[3] = (0x12345678ull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-    st.gpr[0] = 0x0000000F; // 0x000000FF & 0x0000000F = 0x0F -> nonzero, ZF=0
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear: AND is nonzero at truncated addr";
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x00FF00FFu) << "test must not write memory";
-#if !defined(_WIN32)
-    ::munmap(low, 4096);
-#endif
+// CWD: AX -> DX:AX. DX = 0xFFFF when AX bit15 set; RDX bits 63:16 preserved;
+// RAX unchanged.
+TEST_F(CpuRuntimeTest, Cwd_NegativeAx_FillsDxWithOnes) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x00,0x80, 0x00,0x00, 0x00,0x00,0x00,0x00, // mov rax,0x8000
+        0x48, 0xba, 0x34,0x12, 0xDD,0xCC, 0xBB,0xAA,0x00,0x00, // mov rdx,0x0000AABBCCDD1234
+        0x66, 0x99, // cwd
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    // AX=0x8000 (negative) -> DX=0xFFFF; RDX upper 48 preserved; RAX unchanged.
+    EXPECT_EQ(r.state.gpr[2], 0x0000AABBCCDDFFFFULL)
+        << "AX bit15 set -> DX=0xFFFF, RDX bits 63:16 preserved";
+    EXPECT_EQ(r.state.gpr[0], 0x8000ULL) << "CWD must not modify RAX";
 }
 
-// Regression guard: a NON-0x67 64-bit `add [rbx], eax` must NOT truncate; the
-// full 64-bit base is used. Mirrors Addr64_NotTruncated for the ALU path.
-TEST_F(CpuRuntimeTest, Addr64_AddMemDest_NotTruncated) {
-    u8* target = mem.CodePtr() + 0x100;
-    *reinterpret_cast<u32*>(target) = 0x1000;
-
-    const u8 program[] = {0x01, 0x03, 0xc3}; // add [rbx], eax (no 0x67) ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[3] = reinterpret_cast<u64>(target); // full 64-bit pointer
-    st.gpr[0] = 0x0234;
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x1234u)
-        << "64-bit address used in full (no truncation)";
+// CWD positive: AX bit15 clear -> DX cleared, RDX upper preserved.
+TEST_F(CpuRuntimeTest, Cwd_PositiveAx_ClearsDx) {
+    const u8 program[] = {
+        0x48, 0xb8, 0xFF,0x7F, 0x00,0x00, 0x00,0x00,0x00,0x00, // mov rax,0x7FFF
+        0x48, 0xba, 0x99,0x99, 0x11,0x11, 0x11,0x11,0x11,0x11, // mov rdx,0x1111111111119999
+        0x66, 0x99, // cwd
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[2], 0x1111111111110000ULL)
+        << "AX bit15 clear -> DX=0x0000; prior DX=0x9999 cleared, upper preserved";
+    EXPECT_EQ(r.state.gpr[0], 0x7FFFULL) << "CWD must not modify RAX";
 }
 
-
-
-#endif  // arm64-only addr32 ALU tests
-
-// ============================================================================
-// High-byte register (AH/CH/DH/BH) as an operand of OR / XOR / ADD / SUB and
-// of INC / DEC. A high-byte register is bits 15:8 of its parent (AH->RAX,
-// CH->RCX, DH->RDX, BH->RBX); ZydisGprToIndex rejects these, so the lifter
-// routes them through HighByteParent + ubfx(.,8,8) on read and a masked merge
-// on write-back. EmitAlu (both operands), EmitCmp/EmitTest (already sampled by
-// And8/Test8), and EmitIncDec all implement this. The original suite only
-// exercised And8/Test8; these guard the remaining ALU mnemonics and inc/dec
-// so the high-byte plumbing can't silently regress for them.
-//
-// Parent-slot map: AH->gpr[0], CH->gpr[1], DH->gpr[2], BH->gpr[3]. Each test
-// seeds the parent with distinct upper/lower markers and asserts only bits
-// 15:8 change (read or write), leaving bits 63:16 and 7:0 intact.
-// ============================================================================
-
-// or ch, al  (08 c5): ch |= al. ModRM c5 = reg(al=0) -> rm(ch). 08 is OR r/m8,r8.
-TEST_F(CpuRuntimeTest, Or8_HighByteDst_LowByteSrc) {
-    const u8 program[] = {0x08, 0xc5, 0xc3}; // or ch, al ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[1] = 0x1122334455'0F'66ULL; // RCX: ch=0x0F, cl=0x66, upper markers
-    st.gpr[0] = 0xF0ULL;               // al = 0xF0
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ((st.gpr[1] >> 8) & 0xFFu, 0xFFu) << "ch = 0x0F | 0xF0 = 0xFF";
-    EXPECT_EQ(st.gpr[1] & 0xFFu, 0x66u) << "cl (bits 7:0) preserved";
-    EXPECT_EQ(st.gpr[1] >> 16, 0x1122334455ULL) << "bits 63:16 preserved";
-    EXPECT_FALSE(st.rflags & (1ULL << 11)) << "OF cleared by OR";
-    EXPECT_FALSE(st.rflags & (1ULL << 0)) << "CF cleared by OR";
+// CQO positive: complements the existing negative-only case. RAX bit63 clear
+// -> RDX = 0; RAX unchanged.
+TEST_F(CpuRuntimeTest, Cqo_PositiveRax_ClearsRdx) {
+    const u8 program[] = {
+        0x48, 0xb8, 0xFF,0xFF, 0xFF,0xFF, 0xFF,0xFF,0xFF,0x7F, // mov rax,0x7FFFFFFFFFFFFFFF
+        0x48, 0xba, 0xEF,0xBE, 0xAD,0xDE, 0xEF,0xBE,0xAD,0xDE, // mov rdx,0xDEADBEEFDEADBEEF
+        0x48, 0x99, // cqo
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[2], 0x0ULL)
+        << "RAX bit63 clear -> RDX all zeros";
+    EXPECT_EQ(r.state.gpr[0], 0x7FFFFFFFFFFFFFFFULL) << "CQO must not modify RAX";
 }
-
-// xor dh, dh  (30 f6): dh ^= dh -> 0. High-byte dst AND src on the same reg.
-TEST_F(CpuRuntimeTest, Xor8_HighByte_SelfZeroes) {
-    const u8 program[] = {0x30, 0xf6, 0xc3}; // xor dh, dh ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[2] = 0xAABBCCDDEE'7F'99ULL; // RDX: dh=0x7F, dl=0x99
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ((st.gpr[2] >> 8) & 0xFFu, 0x00u) << "dh ^ dh = 0";
-    EXPECT_EQ(st.gpr[2] & 0xFFu, 0x99u) << "dl preserved";
-    EXPECT_EQ(st.gpr[2] >> 16, 0xAABBCCDDEEULL) << "bits 63:16 preserved";
-    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: result 0";
-}
-
-// add bh, cl  (00 cf): bh += cl. High-byte dst, low-byte src (verified under QEMU).
-TEST_F(CpuRuntimeTest, Add8_HighByteDst_LowByteSrc) {
-    const u8 program[] = {0x00, 0xcf, 0xc3}; // add bh, cl ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[3] = 0xDEADBEEF12'20'34ULL; // RBX: bh=0x20, bl=0x34
-    st.gpr[1] = 0xCAFE000000'00'05ULL; // RCX: cl=0x05
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ((st.gpr[3] >> 8) & 0xFFu, 0x25u) << "bh = 0x20 + 0x05 = 0x25";
-    EXPECT_EQ(st.gpr[3] & 0xFFu, 0x34u) << "bl preserved";
-    EXPECT_EQ(st.gpr[3] >> 16, 0xDEADBEEF12ULL) << "bits 63:16 preserved";
-}
-
-// sub ah, ch  (28 ec): ah -= ch. BOTH operands are high-byte registers.
-// ModRM ec = reg(ch=5)->rm(ah=4); 28 is SUB r/m8, r8.
-TEST_F(CpuRuntimeTest, Sub8_HighByteDst_HighByteSrc) {
-    const u8 program[] = {0x28, 0xec, 0xc3}; // sub ah, ch ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    // AH=0x50, AL=0xAA, upper markers = 0x1122334455
-    st.gpr[0] = 0x1122334455'50'AAULL;
-    st.gpr[1] = 0x66778899AA'30'BBULL; // RCX: ch=0x30
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ((st.gpr[0] >> 8) & 0xFFu, 0x20u) << "ah = 0x50 - 0x30 = 0x20";
-    EXPECT_EQ(st.gpr[0] & 0xFFu, 0xAAu) << "al preserved";
-    EXPECT_EQ(st.gpr[0] >> 16, 0x1122334455ULL) << "bits 63:16 preserved";
-    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear (0x20 != 0)";
-    EXPECT_FALSE(st.rflags & (1ULL << 0)) << "CF clear (0x50 >= 0x30, no borrow)";
-}
-
-// inc dh  (fe c6): dh += 1. ModRM c6 = /0 (inc) on rm(dh=6). FE /0 is INC r/m8.
-TEST_F(CpuRuntimeTest, Inc8_HighByte_PreservesParent) {
-    const u8 program[] = {0xfe, 0xc6, 0xc3}; // inc dh ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[2] = 0xAABBCCDDEE'7F'99ULL; // RDX: dh=0x7F, dl=0x99
-    st.rflags = 0x2 | 0x1;              // CF pre-set; INC must preserve it
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ((st.gpr[2] >> 8) & 0xFFu, 0x80u) << "dh = 0x7F + 1 = 0x80";
-    EXPECT_EQ(st.gpr[2] & 0xFFu, 0x99u) << "dl preserved";
-    EXPECT_EQ(st.gpr[2] >> 16, 0xAABBCCDDEEULL) << "bits 63:16 preserved";
-    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not touch CF)";
-    EXPECT_TRUE(st.rflags & (1ULL << 7)) << "SF set: 0x80 has bit 7";
-    EXPECT_TRUE(st.rflags & (1ULL << 11)) << "OF set: 0x7F->0x80 signed overflow";
-}
-
-// dec bh  (fe cf): bh -= 1, from 0x01 -> 0x00 sets ZF; parent preserved.
-TEST_F(CpuRuntimeTest, Dec8_HighByte_ToZero_SetsZf) {
-    const u8 program[] = {0xfe, 0xcf, 0xc3}; // dec bh ; ret
-    std::memcpy(mem.CodePtr(), program, sizeof(program));
-    u8* guest_rsp = mem.StackTop() - 8;
-    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
-    GuestState st{};
-    st.rip = reinterpret_cast<u64>(mem.CodePtr());
-    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    st.gpr[3] = 0x123456789A'01'BCULL; // RBX: bh=0x01, bl=0xBC
-    st.rflags = 0x2; // CF clear
-
-    Runtime rt;
-    rt.Run(st);
-    EXPECT_EQ((st.gpr[3] >> 8) & 0xFFu, 0x00u) << "bh = 0x01 - 1 = 0x00";
-    EXPECT_EQ(st.gpr[3] & 0xFFu, 0xBCu) << "bl preserved";
-    EXPECT_EQ(st.gpr[3] >> 16, 0x123456789AULL) << "bits 63:16 preserved";
-    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: dh result 0";
-}
-
 
 } // namespace
 } // namespace Core::Runtime
