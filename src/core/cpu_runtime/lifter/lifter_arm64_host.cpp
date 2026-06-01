@@ -5344,6 +5344,233 @@ bool EmitX87ArithPop(const ZydisDecodedInstruction& insn, const ZydisDecodedOper
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// x87 non-pop arithmetic: FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR.
+// Forms (from Zydis):
+//   2 reg ops:  fadd st(0), st(i)   -> dst = op0 = ST0,  other = op1 = ST(i)
+//               fadd st(i), st(0)   -> dst = op0 = ST(i),other = op1 = ST0
+//   1 mem op:   fadd m32/m64        -> dst = ST0, other = mem (converted to double)
+// FSUBR/FDIVR reverse the operand order (dst = other - dst, dst = other / dst).
+// No pop (that's the *P forms in EmitX87ArithPop). Result written back to dst slot.
+static bool EmitX87Arith(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                         u64 next_rip, CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const bool rev = (m == ZYDIS_MNEMONIC_FSUBR || m == ZYDIS_MNEMONIC_FDIVR);
+    const bool isadd = (m == ZYDIS_MNEMONIC_FADD);
+    const bool ismul = (m == ZYDIS_MNEMONIC_FMUL);
+    const bool issub = (m == ZYDIS_MNEMONIC_FSUB || m == ZYDIS_MNEMONIC_FSUBR);
+    const bool isdiv = (m == ZYDIS_MNEMONIC_FDIV || m == ZYDIS_MNEMONIC_FDIVR);
+    if (!(isadd || ismul || issub || isdiv)) return false;
+
+    // Memory form: dst = ST0, operand from memory (m32 -> double, m64 -> double).
+    if (insn.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(kScratch1, kAddr);                       // stable mem addr
+        const int w = ops[0].size;
+        if (w == 32) { c.ldr(SReg(1), ptr(kScratch1)); c.fcvt(DReg(1), SReg(1)); }
+        else         { c.ldr(DReg(1), ptr(kScratch1)); }   // m64
+        EmitX87RegAddr(XReg(11), 0, c);
+        c.mov(XReg(15), XReg(11));                     // stable &ST0
+        c.ldr(DReg(0), ptr(XReg(15)));                 // DReg0 = ST0
+        // dst = ST0 (DReg0), other = mem (DReg1).
+        if (isadd)      c.fadd(DReg(0), DReg(0), DReg(1));
+        else if (ismul) c.fmul(DReg(0), DReg(0), DReg(1));
+        else if (issub) c.fsub(DReg(0), rev ? DReg(1) : DReg(0), rev ? DReg(0) : DReg(1));
+        else            c.fdiv(DReg(0), rev ? DReg(1) : DReg(0), rev ? DReg(0) : DReg(1));
+        c.str(DReg(0), ptr(XReg(15)));
+        return true;
+    }
+
+    // Register form: two ST operands.
+    if (insn.operand_count_visible != 2 ||
+        ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[0].reg.value < ZYDIS_REGISTER_ST0 || ops[0].reg.value > ZYDIS_REGISTER_ST7) return false;
+    if (ops[1].reg.value < ZYDIS_REGISTER_ST0 || ops[1].reg.value > ZYDIS_REGISTER_ST7) return false;
+    const int di = ops[0].reg.value - ZYDIS_REGISTER_ST0;   // dst slot
+    const int si = ops[1].reg.value - ZYDIS_REGISTER_ST0;   // other slot
+
+    EmitX87RegAddr(XReg(11), di, c);
+    c.mov(XReg(15), XReg(11));                         // stable &dst
+    c.ldr(DReg(0), ptr(XReg(15)));                     // DReg0 = dst
+    EmitX87RegAddr(XReg(11), si, c);
+    c.ldr(DReg(1), ptr(XReg(11)));                     // DReg1 = other
+    if (isadd)      c.fadd(DReg(0), DReg(0), DReg(1));
+    else if (ismul) c.fmul(DReg(0), DReg(0), DReg(1));
+    else if (issub) c.fsub(DReg(0), rev ? DReg(1) : DReg(0), rev ? DReg(0) : DReg(1));
+    else            c.fdiv(DReg(0), rev ? DReg(1) : DReg(0), rev ? DReg(0) : DReg(1));
+    c.str(DReg(0), ptr(XReg(15)));
+    return true;
+}
+
+// x87 unary on ST(0): FCHS (negate), FABS, FSQRT.
+static bool EmitX87Unary(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.mov(XReg(15), XReg(11));
+    c.ldr(DReg(0), ptr(XReg(15)));
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FCHS:  c.fneg(DReg(0), DReg(0)); break;
+        case ZYDIS_MNEMONIC_FABS:  c.fabs(DReg(0), DReg(0)); break;
+        case ZYDIS_MNEMONIC_FSQRT: c.fsqrt(DReg(0), DReg(0)); break;
+        default: return false;
+    }
+    c.str(DReg(0), ptr(XReg(15)));
+    return true;
+}
+
+// x87 push-constant: FLD1 (push 1.0), FLDZ (push 0.0).
+static bool EmitX87LoadConst(const ZydisDecodedInstruction& insn, CodeGenerator& c) {
+    u64 bits;
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FLD1: bits = 0x3FF0000000000000ull; break;  // 1.0
+        case ZYDIS_MNEMONIC_FLDZ: bits = 0x0000000000000000ull; break;  // 0.0
+        default: return false;
+    }
+    // Materialize the double bit pattern into DReg(0), then push.
+    c.mov(kScratch0, bits);
+    c.fmov(DReg(0), kScratch0);
+    EmitX87Push(c);
+    return true;
+}
+
+// FXCH st(i): swap ST(0) and ST(i). Default i=1 if no operand.
+static bool EmitFxch(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                     CodeGenerator& c) {
+    int i = 1;
+    if (insn.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[0].reg.value >= ZYDIS_REGISTER_ST0 && ops[0].reg.value <= ZYDIS_REGISTER_ST7)
+        i = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+    if (i == 0) return true;   // fxch st(0) is a no-op.
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.mov(XReg(15), XReg(11));                         // stable &ST0
+    c.ldr(DReg(0), ptr(XReg(15)));
+    EmitX87RegAddr(XReg(11), i, c);
+    c.mov(XReg(5), XReg(11));                          // stable &ST(i)
+    c.ldr(DReg(1), ptr(XReg(5)));
+    c.str(DReg(1), ptr(XReg(15)));                     // ST0 = old ST(i)
+    c.str(DReg(0), ptr(XReg(5)));                      // ST(i) = old ST0
+    return true;
+}
+
+// x87 compare. Two families:
+//   FCOMI/FUCOMI/FCOMIP/FUCOMIP -> set EFLAGS ZF/PF/CF directly (and pop on *IP).
+//   FCOM/FCOMP/FCOMPP/FUCOM/FUCOMP -> set x87 condition codes C3/C2/C0 in
+//     fpu_sw_cc (C3=bit14, C2=bit10, C0=bit8); C1 (bit9) cleared. Pop on *P/*PP.
+// Comparison is ST(0) vs the other operand. Mapping (x86 semantics):
+//   ST0 > other : ZF=0 PF=0 CF=0  (C3=0 C2=0 C0=0)
+//   ST0 < other : ZF=0 PF=0 CF=1  (C3=0 C2=0 C0=1)
+//   ST0 = other : ZF=1 PF=0 CF=0  (C3=1 C2=0 C0=0)
+//   unordered   : ZF=1 PF=1 CF=1  (C3=1 C2=1 C0=1)
+static bool EmitX87Compare(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                           CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const bool to_eflags = (m == ZYDIS_MNEMONIC_FCOMI || m == ZYDIS_MNEMONIC_FUCOMI ||
+                            m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP);
+    const bool to_cc     = (m == ZYDIS_MNEMONIC_FCOM || m == ZYDIS_MNEMONIC_FCOMP ||
+                            m == ZYDIS_MNEMONIC_FCOMPP || m == ZYDIS_MNEMONIC_FUCOM ||
+                            m == ZYDIS_MNEMONIC_FUCOMP);
+    if (!to_eflags && !to_cc) return false;
+    const int npop = (m == ZYDIS_MNEMONIC_FCOMPP) ? 2 :
+                     (m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP ||
+                      m == ZYDIS_MNEMONIC_FCOMP  || m == ZYDIS_MNEMONIC_FUCOMP) ? 1 : 0;
+
+    // Resolve "other" ST index. FCOMI/FUCOMI have 2 ops (op0=ST0, op1=other).
+    // FCOM/FUCOM/FCOMP/FUCOMP have 1 op (other). FCOMPP has 0 ops (other=ST1).
+    int other = 1;
+    if (insn.operand_count_visible == 2 && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].reg.value >= ZYDIS_REGISTER_ST0 && ops[1].reg.value <= ZYDIS_REGISTER_ST7) {
+        other = ops[1].reg.value - ZYDIS_REGISTER_ST0;
+    } else if (insn.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+               ops[0].reg.value >= ZYDIS_REGISTER_ST0 && ops[0].reg.value <= ZYDIS_REGISTER_ST7) {
+        other = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+    }
+
+    // Load ST0 -> DReg0, ST(other) -> DReg1.
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.ldr(DReg(0), ptr(XReg(11)));
+    EmitX87RegAddr(XReg(11), other, c);
+    c.ldr(DReg(1), ptr(XReg(11)));
+
+    const XReg eq = XReg(9), gt = XReg(10), lt = XReg(12), v = XReg(13), t = XReg(14);
+    c.fcmeq(DReg(2), DReg(0), DReg(1));
+    c.fcmgt(DReg(3), DReg(0), DReg(1));    // ST0 > other
+    c.fcmgt(DReg(4), DReg(1), DReg(0));    // other > ST0  => ST0 < other
+    c.fmov(eq, DReg(2)); c.fmov(gt, DReg(3)); c.fmov(lt, DReg(4));
+
+    if (to_eflags) {
+        c.ldr(v, ptr(kState, Offsets::Rflags));
+        c.mov(t, ~((1ull<<6)|(1ull<<0)|(1ull<<2)|(1ull<<7)|(1ull<<11)|(1ull<<4)));
+        c.and_(v, v, t);
+        Label done, notEq, notLt;
+        c.cbz(eq, notEq);
+        c.orr(v, v, 1ull<<6);              // ZF (equal)
+        c.b(done);
+        c.L(notEq);
+        c.cbz(lt, notLt);
+        c.orr(v, v, 1ull<<0);              // CF (less)
+        c.b(done);
+        c.L(notLt);
+        c.cbnz(gt, done);                  // greater -> all clear
+        c.orr(v, v, 1ull<<6);              // unordered: ZF
+        c.orr(v, v, 1ull<<0);              //            CF
+        c.orr(v, v, 1ull<<2);              //            PF
+        c.L(done);
+        c.str(v, ptr(kState, Offsets::Rflags));
+    } else {
+        // Build C3(bit14)/C2(bit10)/C0(bit8) in fpu_sw_cc; clear C1(bit9).
+        // ldrh/strh require a WReg; use the W views of v/t.
+        const WReg vw = WReg(v.getIdx()), tw = WReg(t.getIdx());
+        c.ldrh(vw, ptr(kState, (u32)offsetof(GuestState, fpu_sw_cc)));
+        c.mov(tw, ~((1u<<14)|(1u<<10)|(1u<<9)|(1u<<8)));
+        c.and_(vw, vw, tw);
+        Label done, notEq, notLt;
+        c.cbz(eq, notEq);
+        c.orr(vw, vw, 1u<<14);             // C3 (equal)
+        c.b(done);
+        c.L(notEq);
+        c.cbz(lt, notLt);
+        c.orr(vw, vw, 1u<<8);              // C0 (less)
+        c.b(done);
+        c.L(notLt);
+        c.cbnz(gt, done);                  // greater -> all clear
+        c.orr(vw, vw, 1u<<14);             // unordered: C3
+        c.orr(vw, vw, 1u<<10);             //            C2
+        c.orr(vw, vw, 1u<<8);              //            C0
+        c.L(done);
+        c.strh(vw, ptr(kState, (u32)offsetof(GuestState, fpu_sw_cc)));
+    }
+
+    for (int p = 0; p < npop; ++p) EmitX87PopDiscard(c);
+    return true;
+}
+
+// FNSTSW ax / m16: build the status word = (fpu_sw_cc condition bits) |
+// (fpu_top << 11), store to AX (guest gpr[0] low 16) or to memory.
+static bool EmitFnstsw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                       u64 next_rip, CodeGenerator& c) {
+    // sw = fpu_sw_cc | (top << 11).
+    c.ldrh(WReg(9), ptr(kState, (u32)offsetof(GuestState, fpu_sw_cc)));
+    c.ldr(WReg(10), ptr(kState, (u32)offsetof(GuestState, fpu_top)));
+    c.lsl(WReg(10), WReg(10), 11);
+    c.orr(WReg(9), WReg(9), WReg(10));
+    c.and_(WReg(9), WReg(9), 0xFFFF);
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        // Destination is AX: write low 16 of gpr[0], preserve bits 63:16.
+        c.ldr(XReg(12), ptr(kState, GprOffset(0)));
+        c.mov(XReg(13), ~0xFFFFull);
+        c.and_(XReg(12), XReg(12), XReg(13));
+        c.orr(XReg(12), XReg(12), XReg(9));
+        c.str(XReg(12), ptr(kState, GprOffset(0)));
+        return true;
+    }
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.strh(WReg(9), ptr(kAddr));
+        return true;
+    }
+    return false;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -5624,6 +5851,25 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_FSUBP: case ZYDIS_MNEMONIC_FSUBRP:
         case ZYDIS_MNEMONIC_FDIVP: case ZYDIS_MNEMONIC_FDIVRP:
             handled = EmitX87ArithPop(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_FADD: case ZYDIS_MNEMONIC_FMUL:
+        case ZYDIS_MNEMONIC_FSUB: case ZYDIS_MNEMONIC_FSUBR:
+        case ZYDIS_MNEMONIC_FDIV: case ZYDIS_MNEMONIC_FDIVR:
+            handled = EmitX87Arith(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FCHS: case ZYDIS_MNEMONIC_FABS:
+        case ZYDIS_MNEMONIC_FSQRT:
+            handled = EmitX87Unary(insn, c); break;
+        case ZYDIS_MNEMONIC_FLD1: case ZYDIS_MNEMONIC_FLDZ:
+            handled = EmitX87LoadConst(insn, c); break;
+        case ZYDIS_MNEMONIC_FXCH:
+            handled = EmitFxch(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_FCOMI: case ZYDIS_MNEMONIC_FUCOMI:
+        case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMIP:
+        case ZYDIS_MNEMONIC_FCOM: case ZYDIS_MNEMONIC_FCOMP:
+        case ZYDIS_MNEMONIC_FCOMPP: case ZYDIS_MNEMONIC_FUCOM:
+        case ZYDIS_MNEMONIC_FUCOMP:
+            handled = EmitX87Compare(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_FNSTSW:
+            handled = EmitFnstsw(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_JMP:
             handled = EmitJmp(insn, ops, next_rip, c);
             if (handled) emitted_terminator = true;

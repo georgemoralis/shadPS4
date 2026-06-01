@@ -16551,5 +16551,310 @@ TEST_F(CpuRuntimeTest, Vpunpckhbw_InterleavesHighBytes) {
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
 
+
+// ============================================================================
+// x87 Tier 1+2: non-pop arithmetic (FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR, register
+// and memory forms), unary (FCHS/FABS/FSQRT), constants (FLD1/FLDZ), FXCH,
+// comparisons (FCOMI/FUCOMI -> EFLAGS; FCOM/FUCOM -> x87 status-word C-bits),
+// and FNSTSW. Semantics verified against native x86 execution of the emitted
+// sequence and against the arm64 emitter under QEMU.
+//
+// Stack setup convention: two `fld qword[mem]` push A then B, so afterwards
+// ST(0)=B and ST(1)=A. Helpers: fld m64 = DD /0, fst m64 = DD /2,
+// fstp m64 = DD /3.
+// ============================================================================
+
+// FADD st(1), st(0): non-pop, ST(1) = ST(1) + ST(0) = A + B. Result read from
+// ST(1) which we then store with fstp st1->mem isn't directly possible, so we
+// pop ST0 first (fstp to scratch) then fstp ST1.  Simpler: use fadd st0,st1
+// then store ST0.
+TEST_F(CpuRuntimeTest, X87_Fadd_NonPop_RegForm) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 10.0, B = 20.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,  // mov rax, &A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,  // mov rcx, &B
+        0x48, 0xba, 0,0,0,0,0,0,0,0,  // mov rdx, &out
+        0xdd, 0x00,                   // fld [rax]  -> st0=A
+        0xdd, 0x01,                   // fld [rcx]  -> st0=B, st1=A
+        0xd8, 0xc1,                   // fadd st0, st1  -> st0 = B + A = 30 (no pop)
+        0xdd, 0x1a,                   // fstp [rdx] -> store st0
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 30.0) << "fadd st0,st1 (non-pop): 20+10=30";
+    EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+}
+
+// FSUB st(0), st(1): ST(0) = ST(0) - ST(1) = B - A.
+TEST_F(CpuRuntimeTest, X87_Fsub_NonPop_RegForm) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 10.0, B = 30.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,       // st0=B(30), st1=A(10)
+        0xd8, 0xe1,                   // fsub st0, st1 -> 30 - 10 = 20
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 20.0) << "fsub st0,st1: 30-10=20";
+}
+
+// FSUBR st(0), st(1): reversed -> ST(0) = ST(1) - ST(0) = A - B.
+TEST_F(CpuRuntimeTest, X87_Fsubr_NonPop_RegForm) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 10.0, B = 30.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,       // st0=B(30), st1=A(10)
+        0xd8, 0xe9,                   // fsubr st0, st1 -> st1 - st0 = 10 - 30 = -20
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, -20.0) << "fsubr st0,st1: 10-30=-20";
+}
+
+// FADD m64 (memory form): ST(0) += [mem].
+TEST_F(CpuRuntimeTest, X87_Fadd_MemForm) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pm = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 100.0, M = 23.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pm, &M, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,  // rax=&A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,  // rcx=&M
+        0x48, 0xba, 0,0,0,0,0,0,0,0,  // rdx=&out
+        0xdd, 0x00,                   // fld [rax] -> st0=100
+        0xdc, 0x01,                   // fadd qword [rcx] -> st0 = 100 + 23 = 123
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),mm=reinterpret_cast<u64>(pm),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&mm,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 123.0) << "fadd m64: 100+23=123";
+}
+
+// FCHS: negate ST(0).
+TEST_F(CpuRuntimeTest, X87_Fchs_Negates) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 7.5;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00,                   // fld [rax] -> st0=7.5
+        0xd9, 0xe0,                   // fchs -> -7.5
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, -7.5) << "fchs negates 7.5";
+}
+
+// FABS: absolute value of ST(0).
+TEST_F(CpuRuntimeTest, X87_Fabs_AbsoluteValue) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = -42.0;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xd9, 0xe1,       // fld; fabs
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 42.0) << "fabs(-42)=42";
+}
+
+// FSQRT: square root of ST(0).
+TEST_F(CpuRuntimeTest, X87_Fsqrt_SquareRoot) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 144.0;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xd9, 0xfa,       // fld; fsqrt
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 12.0) << "fsqrt(144)=12";
+}
+
+// FLD1: push 1.0.
+TEST_F(CpuRuntimeTest, X87_Fld1_PushesOne) {
+    u8* out = mem.CodePtr() + 0x320;
+    u8 program[] = {
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xd9, 0xe8,                   // fld1 -> st0=1.0
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 1.0) << "fld1 pushes 1.0";
+}
+
+// FLDZ: push 0.0.
+TEST_F(CpuRuntimeTest, X87_Fldz_PushesZero) {
+    u8* out = mem.CodePtr() + 0x320;
+    u8 program[] = {
+        0x48, 0xba, 0,0,0,0,0,0,0,0,
+        0xd9, 0xee,                   // fldz
+        0xdd, 0x1a, 0xc3,
+    };
+    const u64 o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 0.0) << "fldz pushes 0.0";
+}
+
+// FXCH: swap ST(0) and ST(1), then store both to confirm the swap.
+TEST_F(CpuRuntimeTest, X87_Fxch_SwapsTop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out0 = mem.CodePtr() + 0x320;
+    u8* out1 = mem.CodePtr() + 0x330;
+    const double A = 11.0, B = 22.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,  // rax=&A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,  // rcx=&B
+        0x48, 0xba, 0,0,0,0,0,0,0,0,  // rdx=&out0
+        0x49, 0xb8, 0,0,0,0,0,0,0,0,  // r8=&out1
+        0xdd, 0x00, 0xdd, 0x01,       // st0=B(22), st1=A(11)
+        0xd9, 0xc9,                   // fxch st1 -> st0=A(11), st1=B(22)
+        0xdd, 0x1a,                   // fstp [rdx] -> out0 = st0 = 11, pop
+        0x41, 0xdd, 0x18,             // fstp [r8]  -> out1 = new st0 = 22
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),
+              o0=reinterpret_cast<u64>(out0),o1=reinterpret_cast<u64>(out1);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8);
+    std::memcpy(&program[22],&o0,8); std::memcpy(&program[32],&o1,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double r0, r1; std::memcpy(&r0, out0, 8); std::memcpy(&r1, out1, 8);
+    EXPECT_EQ(r0, 11.0) << "after fxch, st0 = original A";
+    EXPECT_EQ(r1, 22.0) << "after fxch+pop, new st0 = original B";
+}
+
+// FCOMI: ST(0) > ST(1) -> ZF=CF=0. We branch on it via setb/sete to capture
+// flags into a GPR, but simpler: read rflags after the compare. Use a JA
+// (ja = above = CF=0 and ZF=0) to set a register.
+TEST_F(CpuRuntimeTest, X87_Fcomi_GreaterClearsZfCf) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    const double A = 3.0, B = 5.0;   // ST1=A=3, ST0=B=5 -> ST0 > ST1
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,       // st0=B(5), st1=A(3)
+        0xdb, 0xf1,                   // fcomi st0, st1 -> ST0>ST1: ZF=0 CF=0
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear (5 > 3, not equal)";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 0)) << "CF clear (5 > 3, not below)";
+}
+
+// FCOMI: ST(0) < ST(1) -> CF=1.
+TEST_F(CpuRuntimeTest, X87_Fcomi_LessSetsCf) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    const double A = 9.0, B = 2.0;   // ST1=A=9, ST0=B=2 -> ST0 < ST1
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,
+        0xdb, 0xf1, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(r.state.rflags & (1ULL << 0)) << "CF set (2 < 9)";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 6)) << "ZF clear";
+}
+
+// FCOMI: equal -> ZF=1.
+TEST_F(CpuRuntimeTest, X87_Fcomi_EqualSetsZf) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    const double A = 4.0, B = 4.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,
+        0xdb, 0xf1, 0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set (4 == 4)";
+    EXPECT_FALSE(r.state.rflags & (1ULL << 0)) << "CF clear";
+}
+
+// FNSTSW AX: status word reflects TOP and a prior compare's C3 (equal).
+// fld a; fld a; fcom (equal -> C3=1); fnstsw ax. TOP after two pushes is 6.
+TEST_F(CpuRuntimeTest, X87_Fnstsw_ReflectsCompareAndTop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    const double A = 1.0;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,  // rax=&A
+        0xdd, 0x00, 0xdd, 0x00,       // fld[rax]x2 -> st0=st1=1.0, TOP=6
+        0xd8, 0xd1,                   // fcom st1 -> equal: C3=1
+        0xdf, 0xe0,                   // fnstsw ax
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa);
+    std::memcpy(&program[2],&a,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    const u16 ax = static_cast<u16>(r.state.gpr[0] & 0xFFFF);
+    EXPECT_TRUE(ax & (1u << 14)) << "C3 set in status word (operands equal)";
+    EXPECT_EQ((ax >> 11) & 0x7u, 6u) << "TOP field = 6 after two pushes";
+}
+
 } // namespace
 } // namespace Core::Runtime

@@ -4589,6 +4589,220 @@ bool EmitFpuArithPop(const ZydisDecodedInstruction& insn,
     return true;
 }
 
+/// FADD/FMUL/FSUB/FSUBR/FDIV/FDIVR (non-pop). Forms:
+///   2 reg ops: `fadd st(0),st(i)` (dst=ST0) or `fadd st(i),st(0)` (dst=STi).
+///   1 mem op:  `fadd m32/m64` (dst=ST0, operand from memory).
+/// FSUBR/FDIVR reverse operand order. Computes on host SSE2 doubles; writes
+/// the result to dst's slot. No pop.
+bool EmitFpuArith(const ZydisDecodedInstruction& insn,
+                  const ZydisDecodedOperand* ops,
+                  u64 next_rip,
+                  Xbyak::CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const bool rev   = (m == ZYDIS_MNEMONIC_FSUBR || m == ZYDIS_MNEMONIC_FDIVR);
+    const bool isadd = (m == ZYDIS_MNEMONIC_FADD);
+    const bool ismul = (m == ZYDIS_MNEMONIC_FMUL);
+    const bool issub = (m == ZYDIS_MNEMONIC_FSUB || m == ZYDIS_MNEMONIC_FSUBR);
+    const bool isdiv = (m == ZYDIS_MNEMONIC_FDIV || m == ZYDIS_MNEMONIC_FDIVR);
+    if (!(isadd || ismul || issub || isdiv)) return false;
+
+    auto do_op = [&](void) {
+        // xmm0 = dst, xmm1 = other. Compute dst <- result into xmm0.
+        if (isadd)      c.addsd(xmm0, xmm1);
+        else if (ismul) c.mulsd(xmm0, xmm1);
+        else if (issub) { if (rev) { c.subsd(xmm1, xmm0); c.movsd(xmm0, xmm1); } else c.subsd(xmm0, xmm1); }
+        else            { if (rev) { c.divsd(xmm1, xmm0); c.movsd(xmm0, xmm1); } else c.divsd(xmm0, xmm1); }
+    };
+
+    // Memory form: dst = ST0, other = mem.
+    if (insn.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        // rdx = &mem (EmitEffectiveAddress leaves the address in rdx).
+        c.mov(r11, rdx);                 // stable mem addr
+        const int w = ops[0].size;
+        if (w == 32) { c.movss(xmm1, ptr[r11]); c.cvtss2sd(xmm1, xmm1); }
+        else         { c.movsd(xmm1, ptr[r11]); }   // m64
+        EmitX87RegAddr(c, r8, 0);
+        c.movsd(xmm0, ptr[r8]);          // xmm0 = ST0
+        do_op();
+        c.movsd(ptr[r8], xmm0);
+        return true;
+    }
+
+    // Register form: two ST operands.
+    if (insn.operand_count_visible != 2 ||
+        ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[0].reg.value < ZYDIS_REGISTER_ST0 || ops[0].reg.value > ZYDIS_REGISTER_ST7) return false;
+    if (ops[1].reg.value < ZYDIS_REGISTER_ST0 || ops[1].reg.value > ZYDIS_REGISTER_ST7) return false;
+    const int di = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+    const int si = ops[1].reg.value - ZYDIS_REGISTER_ST0;
+
+    EmitX87RegAddr(c, r8, di);
+    c.movsd(xmm0, ptr[r8]);              // xmm0 = dst
+    EmitX87RegAddr(c, r10, si);
+    c.movsd(xmm1, ptr[r10]);             // xmm1 = other
+    do_op();
+    c.movsd(ptr[r8], xmm0);
+    return true;
+}
+
+/// FCHS (negate) / FABS / FSQRT on ST(0).
+bool EmitFpuUnary(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
+    EmitX87RegAddr(c, r8, 0);
+    c.movsd(xmm0, ptr[r8]);
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FCHS: {
+            // Flip sign bit (bit 63). xmm1 = mask 0x8000000000000000.
+            c.mov(rax, 0x8000000000000000ULL);
+            c.movq(xmm1, rax);
+            c.xorpd(xmm0, xmm1);
+            break;
+        }
+        case ZYDIS_MNEMONIC_FABS: {
+            // Clear sign bit. mask = 0x7FFFFFFFFFFFFFFF.
+            c.mov(rax, 0x7FFFFFFFFFFFFFFFULL);
+            c.movq(xmm1, rax);
+            c.andpd(xmm0, xmm1);
+            break;
+        }
+        case ZYDIS_MNEMONIC_FSQRT: c.sqrtsd(xmm0, xmm0); break;
+        default: return false;
+    }
+    c.movsd(ptr[r8], xmm0);
+    return true;
+}
+
+/// FLD1 (push 1.0) / FLDZ (push 0.0).
+bool EmitFpuLoadConst(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
+    u64 bits;
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FLD1: bits = 0x3FF0000000000000ULL; break;  // 1.0
+        case ZYDIS_MNEMONIC_FLDZ: bits = 0x0000000000000000ULL; break;  // 0.0
+        default: return false;
+    }
+    c.mov(rax, bits);
+    c.movq(xmm0, rax);
+    EmitX87Push(c);
+    return true;
+}
+
+/// FXCH st(i): swap ST(0) and ST(i). Default i=1.
+bool EmitFxch(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              Xbyak::CodeGenerator& c) {
+    int i = 1;
+    if (insn.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[0].reg.value >= ZYDIS_REGISTER_ST0 && ops[0].reg.value <= ZYDIS_REGISTER_ST7)
+        i = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+    if (i == 0) return true;   // no-op
+    EmitX87RegAddr(c, r8, 0);
+    c.movsd(xmm0, ptr[r8]);
+    EmitX87RegAddr(c, r10, i);
+    c.movsd(xmm1, ptr[r10]);
+    c.movsd(ptr[r8], xmm1);
+    c.movsd(ptr[r10], xmm0);
+    return true;
+}
+
+/// x87 compare. FCOMI/FUCOMI(/P) -> EFLAGS ZF/PF/CF; FCOM/FUCOM(/P/PP) ->
+/// x87 condition codes C3/C2/C0 in fpu_sw_cc. Comparison is ST(0) vs other.
+/// We use the host's native UCOMISD which sets EFLAGS exactly as the x87
+/// FCOMI would; for the cc forms we read those EFLAGS back and re-encode
+/// them into C3/C2/C0.
+bool EmitFpuCompare(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                    Xbyak::CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const bool to_eflags = (m == ZYDIS_MNEMONIC_FCOMI || m == ZYDIS_MNEMONIC_FUCOMI ||
+                            m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP);
+    const bool to_cc     = (m == ZYDIS_MNEMONIC_FCOM || m == ZYDIS_MNEMONIC_FCOMP ||
+                            m == ZYDIS_MNEMONIC_FCOMPP || m == ZYDIS_MNEMONIC_FUCOM ||
+                            m == ZYDIS_MNEMONIC_FUCOMP);
+    if (!to_eflags && !to_cc) return false;
+    const int npop = (m == ZYDIS_MNEMONIC_FCOMPP) ? 2 :
+                     (m == ZYDIS_MNEMONIC_FCOMIP || m == ZYDIS_MNEMONIC_FUCOMIP ||
+                      m == ZYDIS_MNEMONIC_FCOMP  || m == ZYDIS_MNEMONIC_FUCOMP) ? 1 : 0;
+
+    int other = 1;
+    if (insn.operand_count_visible == 2 && ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].reg.value >= ZYDIS_REGISTER_ST0 && ops[1].reg.value <= ZYDIS_REGISTER_ST7) {
+        other = ops[1].reg.value - ZYDIS_REGISTER_ST0;
+    } else if (insn.operand_count_visible == 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+               ops[0].reg.value >= ZYDIS_REGISTER_ST0 && ops[0].reg.value <= ZYDIS_REGISTER_ST7) {
+        other = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+    }
+
+    EmitX87RegAddr(c, r8, 0);
+    c.movsd(xmm0, ptr[r8]);              // ST0
+    EmitX87RegAddr(c, r10, other);
+    c.movsd(xmm1, ptr[r10]);            // other
+    // ucomisd xmm0, xmm1 sets ZF/PF/CF per the FCOMI mapping exactly.
+    c.ucomisd(xmm0, xmm1);
+
+    if (to_eflags) {
+        // Capture ZF/PF/CF immediately (before any flag-clobbering op) via
+        // setcc into bytes, then merge into guest rflags at the same bit
+        // positions (guest CF=0, PF=2, ZF=6 — matching x86).
+        c.setz(r8b);  c.movzx(r8d, r8b);    // ZF
+        c.setp(r9b);  c.movzx(r9d, r9b);    // PF
+        c.setc(r10b); c.movzx(r10d, r10b);  // CF
+        c.mov(rdx, qword[r13 + offsetof(GuestState, rflags)]);
+        c.mov(rax, ~((1ULL<<6)|(1ULL<<0)|(1ULL<<2)|(1ULL<<7)|(1ULL<<11)|(1ULL<<4)));
+        c.and_(rdx, rax);
+        c.shl(r8d, 6);                       // ZF -> bit6
+        c.shl(r9d, 2);                       // PF -> bit2
+        // r10d already CF at bit0
+        c.or_(rdx, r8);
+        c.or_(rdx, r9);
+        c.or_(rdx, r10);
+        c.mov(qword[r13 + offsetof(GuestState, rflags)], rdx);
+    } else {
+        // cc form: map ZF/PF/CF (host) -> C3(bit14)/C2(bit10)/C0(bit8).
+        // setz/setp/setc into bytes, then place.
+        c.setz(al);   c.movzx(eax, al);   // ZF -> eax bit0
+        c.setp(cl);   c.movzx(ecx, cl);   // PF -> ecx bit0
+        c.setc(dl);   c.movzx(edx, dl);   // CF -> edx bit0
+        c.shl(eax, 14);                   // C3
+        c.shl(ecx, 10);                   // C2
+        c.shl(edx, 8);                    // C0
+        c.or_(eax, ecx);
+        c.or_(eax, edx);
+        // merge into fpu_sw_cc, clearing old C3/C2/C1/C0.
+        c.movzx(ecx, word[r13 + offsetof(GuestState, fpu_sw_cc)]);
+        c.and_(ecx, ~((1<<14)|(1<<10)|(1<<9)|(1<<8)));
+        c.or_(ecx, eax);
+        c.mov(word[r13 + offsetof(GuestState, fpu_sw_cc)], cx);
+    }
+
+    for (int p = 0; p < npop; ++p) EmitX87PopDiscardValue(c);
+    return true;
+}
+
+/// FNSTSW ax/m16: status word = fpu_sw_cc | (fpu_top << 11).
+bool EmitFnstsw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                u64 next_rip, Xbyak::CodeGenerator& c) {
+    c.movzx(eax, word[r13 + offsetof(GuestState, fpu_sw_cc)]);
+    c.mov(ecx, dword[r13 + offsetof(GuestState, fpu_top)]);
+    c.shl(ecx, 11);
+    c.or_(eax, ecx);
+    c.and_(eax, 0xFFFF);
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        // AX = guest gpr[0] low 16; preserve bits 63:16.
+        c.mov(rdx, qword[r13 + GprOffset(0)]);
+        c.mov(rcx, ~0xFFFFULL);
+        c.and_(rdx, rcx);
+        c.movzx(rax, ax);
+        c.or_(rdx, rax);
+        c.mov(qword[r13 + GprOffset(0)], rdx);
+        return true;
+    }
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(word[rdx], ax);
+        return true;
+    }
+    return false;
+}
+
 /// FLDCW m16 — load the x87 control word. Our x87 model executes on
 /// host SSE2 doubles and does not honor the guest's precision-control
 /// or rounding-mode bits, so loading the control word has no observable
@@ -7831,6 +8045,31 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_FSUBP:  case ZYDIS_MNEMONIC_FSUBRP:
             case ZYDIS_MNEMONIC_FDIVP:  case ZYDIS_MNEMONIC_FDIVRP:
                 handled = EmitFpuArithPop(insn, ops, c);
+                break;
+            case ZYDIS_MNEMONIC_FADD:   case ZYDIS_MNEMONIC_FMUL:
+            case ZYDIS_MNEMONIC_FSUB:   case ZYDIS_MNEMONIC_FSUBR:
+            case ZYDIS_MNEMONIC_FDIV:   case ZYDIS_MNEMONIC_FDIVR:
+                handled = EmitFpuArith(insn, ops, next_rip, c);
+                break;
+            case ZYDIS_MNEMONIC_FCHS:   case ZYDIS_MNEMONIC_FABS:
+            case ZYDIS_MNEMONIC_FSQRT:
+                handled = EmitFpuUnary(insn, c);
+                break;
+            case ZYDIS_MNEMONIC_FLD1:   case ZYDIS_MNEMONIC_FLDZ:
+                handled = EmitFpuLoadConst(insn, c);
+                break;
+            case ZYDIS_MNEMONIC_FXCH:
+                handled = EmitFxch(insn, ops, c);
+                break;
+            case ZYDIS_MNEMONIC_FCOMI:  case ZYDIS_MNEMONIC_FUCOMI:
+            case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMIP:
+            case ZYDIS_MNEMONIC_FCOM:   case ZYDIS_MNEMONIC_FCOMP:
+            case ZYDIS_MNEMONIC_FCOMPP: case ZYDIS_MNEMONIC_FUCOM:
+            case ZYDIS_MNEMONIC_FUCOMP:
+                handled = EmitFpuCompare(insn, ops, c);
+                break;
+            case ZYDIS_MNEMONIC_FNSTSW:
+                handled = EmitFnstsw(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_FLDCW:
                 handled = EmitFldcw(insn, ops, next_rip, c);
