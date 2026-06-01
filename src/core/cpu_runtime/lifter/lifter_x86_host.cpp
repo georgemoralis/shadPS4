@@ -2571,12 +2571,20 @@ enum class ShiftKind { Shl, Shr, Sar };
 /// either an 8-bit immediate or the CL register.
 bool EmitShift64(const ZydisDecodedInstruction& insn,
                  const ZydisDecodedOperand* ops,
+                 u64 next_rip,
                  Xbyak::CodeGenerator& c,
                  ShiftKind kind) {
     if (insn.operand_width != 64) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-    if (dst_idx < 0) return false;
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int dst_idx = 0;
+    if (dst_mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> rdx
+        c.mov(r8, rdx);                            // stable value address
+    } else {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0) return false;
+    }
 
     // Load shift count into host cl.
     if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
@@ -2594,8 +2602,9 @@ bool EmitShift64(const ZydisDecodedInstruction& insn,
         return false;
     }
 
-    // Load destination value into rax.
-    c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+    // Load destination value into rax (register slot or memory).
+    if (dst_mem) c.mov(rax, qword[r8]);
+    else         c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
 
     // Round-trip rflags: load guest → host. Use rdx (not in use yet
     // and not aliased to cl).
@@ -2616,8 +2625,9 @@ bool EmitShift64(const ZydisDecodedInstruction& insn,
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    // Store the shifted value back.
-    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    // Store the shifted value back (register slot or memory).
+    if (dst_mem) c.mov(qword[r8], rax);
+    else         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
     return true;
 }
 
@@ -2637,12 +2647,23 @@ bool EmitShift64(const ZydisDecodedInstruction& insn,
 /// EmitFlagsFromBitwise wide-path is not.)
 bool EmitShift32(const ZydisDecodedInstruction& insn,
                  const ZydisDecodedOperand* ops,
+                 u64 next_rip,
                  Xbyak::CodeGenerator& c,
                  ShiftKind kind) {
     if (insn.operand_width != 32) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-    if (dst_idx < 0) return false;
+    // Destination: register or memory. For memory, compute the EA FIRST into a
+    // stable host reg (r8) so the flag round-trip / shift can't clobber it; the
+    // same address is reused for the read and write-back.
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int dst_idx = 0;
+    if (dst_mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> rdx
+        c.mov(r8, rdx);
+    } else {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0) return false;
+    }
 
     if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
         c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
@@ -2653,7 +2674,8 @@ bool EmitShift32(const ZydisDecodedInstruction& insn,
         return false;
     }
 
-    c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+    if (dst_mem) c.mov(eax, dword[r8]);
+    else         c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
 
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
     c.push(rdx);
@@ -2669,9 +2691,13 @@ bool EmitShift32(const ZydisDecodedInstruction& insn,
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    // Full-qword store so the host's 32-bit zero-extension is
-    // recorded in the guest GPR slot.
-    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    if (dst_mem) {
+        c.mov(dword[r8], eax);   // 32-bit memory store; adjacent bytes untouched
+    } else {
+        // Full-qword store so the host's 32-bit zero-extension is
+        // recorded in the guest GPR slot.
+        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    }
     return true;
 }
 
@@ -2683,13 +2709,21 @@ bool EmitShift32(const ZydisDecodedInstruction& insn,
 /// computes the narrow-width flags (including SF from the top bit of
 /// the 8/16-bit result) through the rflags round-trip.
 bool EmitShiftNarrow(const ZydisDecodedInstruction& insn,
-                     const ZydisDecodedOperand* ops,
-                     Xbyak::CodeGenerator& c,
-                     ShiftKind kind) {
+                 const ZydisDecodedOperand* ops,
+                 u64 next_rip,
+                 Xbyak::CodeGenerator& c,
+                 ShiftKind kind) {
     if (insn.operand_width != 8 && insn.operand_width != 16) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-    if (dst_idx < 0) return false;
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int dst_idx = 0;
+    if (dst_mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> rdx
+        c.mov(r8, rdx);
+    } else {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0) return false;
+    }
 
     if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
         c.mov(cl, static_cast<u8>(ops[1].imm.value.u & 0xFF));
@@ -2701,8 +2735,13 @@ bool EmitShiftNarrow(const ZydisDecodedInstruction& insn,
     }
 
     const bool is8 = (insn.operand_width == 8);
-    if (is8) c.mov(al, byte[r13 + GprOffset(dst_idx)]);
-    else     c.mov(ax, word[r13 + GprOffset(dst_idx)]);
+    if (dst_mem) {
+        if (is8) c.mov(al, byte[r8]);
+        else     c.mov(ax, word[r8]);
+    } else {
+        if (is8) c.mov(al, byte[r13 + GprOffset(dst_idx)]);
+        else     c.mov(ax, word[r13 + GprOffset(dst_idx)]);
+    }
 
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
     c.push(rdx);
@@ -2718,9 +2757,15 @@ bool EmitShiftNarrow(const ZydisDecodedInstruction& insn,
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    // Narrow store preserves the upper bits of the guest GPR slot.
-    if (is8) c.mov(byte[r13 + GprOffset(dst_idx)], al);
-    else     c.mov(word[r13 + GprOffset(dst_idx)], ax);
+    // Narrow store preserves surrounding bytes (memory) or the upper bits of
+    // the guest GPR slot (register).
+    if (dst_mem) {
+        if (is8) c.mov(byte[r8], al);
+        else     c.mov(word[r8], ax);
+    } else {
+        if (is8) c.mov(byte[r13 + GprOffset(dst_idx)], al);
+        else     c.mov(word[r13 + GprOffset(dst_idx)], ax);
+    }
     return true;
 }
 //
@@ -7853,24 +7898,24 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             // Shifts. All three use the same emit with a kind tag.
             case ZYDIS_MNEMONIC_SHL:
                 handled = (insn.operand_width == 32)
-                    ? EmitShift32(insn, ops, c, ShiftKind::Shl)
+                    ? EmitShift32(insn, ops, next_rip, c, ShiftKind::Shl)
                     : (insn.operand_width == 64)
-                        ? EmitShift64(insn, ops, c, ShiftKind::Shl)
-                        : EmitShiftNarrow(insn, ops, c, ShiftKind::Shl);
+                        ? EmitShift64(insn, ops, next_rip, c, ShiftKind::Shl)
+                        : EmitShiftNarrow(insn, ops, next_rip, c, ShiftKind::Shl);
                 break;
             case ZYDIS_MNEMONIC_SHR:
                 handled = (insn.operand_width == 32)
-                    ? EmitShift32(insn, ops, c, ShiftKind::Shr)
+                    ? EmitShift32(insn, ops, next_rip, c, ShiftKind::Shr)
                     : (insn.operand_width == 64)
-                        ? EmitShift64(insn, ops, c, ShiftKind::Shr)
-                        : EmitShiftNarrow(insn, ops, c, ShiftKind::Shr);
+                        ? EmitShift64(insn, ops, next_rip, c, ShiftKind::Shr)
+                        : EmitShiftNarrow(insn, ops, next_rip, c, ShiftKind::Shr);
                 break;
             case ZYDIS_MNEMONIC_SAR:
                 handled = (insn.operand_width == 32)
-                    ? EmitShift32(insn, ops, c, ShiftKind::Sar)
+                    ? EmitShift32(insn, ops, next_rip, c, ShiftKind::Sar)
                     : (insn.operand_width == 64)
-                        ? EmitShift64(insn, ops, c, ShiftKind::Sar)
-                        : EmitShiftNarrow(insn, ops, c, ShiftKind::Sar);
+                        ? EmitShift64(insn, ops, next_rip, c, ShiftKind::Sar)
+                        : EmitShiftNarrow(insn, ops, next_rip, c, ShiftKind::Sar);
                 break;
 
             // Rotates. Same shape as shifts.

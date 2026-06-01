@@ -780,9 +780,22 @@ bool EmitShift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     if (insn.operand_count_visible < 2) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int d = ZydisGprToIndex(ops[0].reg.value);
-    if (d < 0) return false;
+
+    // Destination is a register OR a memory operand. For the memory form, the
+    // value's effective address is computed FIRST into a callee-stable reg
+    // (x19) so the later count load / scratch use can't clobber it (EA compute
+    // uses x9/x11). The same address is reused for the read and the write-back.
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int d = 0;
+    const XReg vaddr = XReg(19);   // stable value address (mem form only)
+    if (dst_mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, /*next_rip*/0, c)) return false;  // -> kAddr (x11)
+        c.mov(vaddr, kAddr);
+    } else {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        d = ZydisGprToIndex(ops[0].reg.value);
+        if (d < 0) return false;
+    }
 
     const XReg val = XReg(14), cnt = XReg(15), res = kScratch2;  // x12
     const XReg t = XReg(13), oldfl = kScratch0, msk = kScratch1;
@@ -802,7 +815,14 @@ bool EmitShift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     }
 
     // Load value, truncated to width into val.
-    c.ldr(val, ptr(kState, GprOffset(d)));
+    if (dst_mem) {
+        if (w == 8)       c.ldrb(WReg(val.getIdx()), ptr(vaddr));
+        else if (w == 16) c.ldrh(WReg(val.getIdx()), ptr(vaddr));
+        else if (w == 32) c.ldr(WReg(val.getIdx()), ptr(vaddr));
+        else              c.ldr(val, ptr(vaddr));
+    } else {
+        c.ldr(val, ptr(kState, GprOffset(d)));
+    }
     if (w != 64) c.and_(val, val, wmask);
     if (kind == ShiftKind::Sar && w != 64) {
         // sign-extend the width-w value to 64 so asr fills correctly.
@@ -851,7 +871,13 @@ bool EmitShift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     }
 
     // Store result back at width (8/16 merge-preserve, 32 zero-extend, 64 full).
-    if (w == 64) {
+    if (dst_mem) {
+        // Memory: write exactly w bits at vaddr; adjacent bytes untouched.
+        if (w == 8)       c.strb(WReg(res.getIdx()), ptr(vaddr));
+        else if (w == 16) c.strh(WReg(res.getIdx()), ptr(vaddr));
+        else if (w == 32) c.str(WReg(res.getIdx()), ptr(vaddr));
+        else              c.str(res, ptr(vaddr));
+    } else if (w == 64) {
         c.str(res, ptr(kState, GprOffset(d)));
     } else if (w == 32) {
         c.mov(WReg(res.getIdx()), WReg(res.getIdx()));

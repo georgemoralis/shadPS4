@@ -16983,5 +16983,120 @@ TEST_F(CpuRuntimeTest, Idiv8_NegativeDividend) {
     EXPECT_EQ(ah, -2)  << "AH remainder: -100 % 7 = -2";
 }
 
+
+// ============================================================================
+// Memory-destination shifts (SHL/SHR/SAR [mem], imm|CL). Both lifters
+// previously rejected a memory operand 0 (register-only). These now load the
+// width-sized value from the effective address, shift, and store back in
+// place, leaving adjacent bytes untouched. Verified against native x86
+// execution and the arm64 emitter under QEMU.
+// Encodings: shl dword[rbx],imm = C1 /4 ib ; shl dword[rbx],cl = D3 /4 ;
+//   shr byte[rbx],1 = D0 /5 ; sar qword[rbx],imm = REX.W C1 /7 ib.
+// The target lives in the guest data area (CodePtr()+0x200); RBX points at it.
+// ============================================================================
+
+// SHL dword [rbx], 3 — in place; adjacent bytes preserved.
+TEST_F(CpuRuntimeTest, ShlMemDest_Dword_Imm) {
+    u8* target = mem.CodePtr() + 0x200;
+    for (int i = -4; i < 12; ++i) target[i] = 0xAA;  // sentinel surround
+    const u32 init = 0x11111111u;
+    std::memcpy(target, &init, 4);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // mov rbx, &target
+        0xc1, 0x23, 0x03,              // shl dword [rbx], 3
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 got; std::memcpy(&got, target, 4);
+    EXPECT_EQ(got, 0x88888888u) << "0x11111111 << 3";
+    EXPECT_EQ(static_cast<u8>(target[-1]), 0xAAu) << "byte below untouched";
+    EXPECT_EQ(static_cast<u8>(target[4]), 0xAAu)  << "byte above untouched";
+}
+
+// SHR byte [rbx], 1 — narrow, adjacent bytes preserved.
+TEST_F(CpuRuntimeTest, ShrMemDest_Byte_Imm) {
+    u8* target = mem.CodePtr() + 0x200;
+    for (int i = -4; i < 12; ++i) target[i] = 0xCC;
+    target[0] = 0xF0;
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xd0, 0x2b,                    // shr byte [rbx], 1
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(static_cast<u8>(target[0]), 0x78u) << "0xF0 >> 1 = 0x78";
+    EXPECT_EQ(static_cast<u8>(target[1]), 0xCCu) << "next byte untouched";
+    EXPECT_EQ(static_cast<u8>(target[-1]), 0xCCu) << "prev byte untouched";
+}
+
+// SAR qword [rbx], 2 — signed shift, full width.
+TEST_F(CpuRuntimeTest, SarMemDest_Qword_Imm) {
+    u8* target = mem.CodePtr() + 0x200;
+    const s64 init = -64;
+    std::memcpy(target, &init, 8);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0x48, 0xc1, 0x3b, 0x02,        // sar qword [rbx], 2
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    s64 got; std::memcpy(&got, target, 8);
+    EXPECT_EQ(got, -16LL) << "-64 >>arith 2 = -16";
+}
+
+// SHL dword [rbx], CL — count from CL register.
+TEST_F(CpuRuntimeTest, ShlMemDest_Dword_CL) {
+    u8* target = mem.CodePtr() + 0x200;
+    const u32 init = 1u;
+    std::memcpy(target, &init, 4);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // mov rbx, &target
+        0x48, 0xc7, 0xc1, 0x05, 0x00, 0x00, 0x00, // mov rcx, 5
+        0xd3, 0x23,                    // shl dword [rbx], cl
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 got; std::memcpy(&got, target, 4);
+    EXPECT_EQ(got, 32u) << "1 << 5 = 32";
+}
+
+// SHL dword [rbx], 1 sets CF/ZF appropriately: shift 0x80000000 << 1 -> 0,
+// CF = 1 (bit shifted out), ZF = 1 (result zero).
+TEST_F(CpuRuntimeTest, ShlMemDest_Flags) {
+    u8* target = mem.CodePtr() + 0x200;
+    const u32 init = 0x80000000u;
+    std::memcpy(target, &init, 4);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xd1, 0x23,                    // shl dword [rbx], 1
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 got; std::memcpy(&got, target, 4);
+    EXPECT_EQ(got, 0u) << "0x80000000 << 1 = 0 (32-bit)";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 0)) << "CF set (bit shifted out)";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set (result zero)";
+}
+
 } // namespace
 } // namespace Core::Runtime
