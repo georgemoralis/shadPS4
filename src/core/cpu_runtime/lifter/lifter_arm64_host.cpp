@@ -432,6 +432,7 @@ bool EmitMov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     if (insn.operand_count_visible != 2) return false;
 
     const u64 wmask = (w == 64) ? ~0ull : ((1ull << w) - 1);
+    const bool addr32 = (insn.address_width == 32);   // 0x67 prefix
 
     // Load the source VALUE (already width-masked for the narrow cases where it
     // matters on store) into kScratch0.
@@ -453,7 +454,7 @@ bool EmitMov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
             return true;
         }
         if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c, addr32)) return false;
             switch (w) {
                 case 8:  c.ldrb(WReg(9), ptr(kAddr)); break;
                 case 16: c.ldrh(WReg(9), ptr(kAddr)); break;
@@ -510,7 +511,7 @@ bool EmitMov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         // Now compute the destination address (EA clobbers x9=kScratch0!), so
         // stash the value in kScratch1 first.
         c.mov(kScratch1, kScratch0);
-        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> kAddr
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c, addr32)) return false;  // -> kAddr
         switch (w) {
             case 8:  c.strb(WReg(10), ptr(kAddr)); break;  // kScratch1 low byte
             case 16: c.strh(WReg(10), ptr(kAddr)); break;
