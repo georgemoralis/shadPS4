@@ -3480,6 +3480,242 @@ bool EmitVcomi(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
+// vcvtsi2ss / vcvtsi2sd — signed int (32 or 64-bit GPR or mem) -> scalar
+// single/double, merged into dst.low, with dst[127:32]/[127:64] from src1.
+// 3-op (dst, src1, intsrc) or folded 2-op (dst=src1, intsrc).
+bool EmitVcvtsi2(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTSI2SD);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    int s1; const ZydisDecodedOperand* isrc;
+    if (insn.operand_count_visible >= 3) {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        s1 = ZydisVecToIndex(ops[1].reg.value);
+        isrc = &ops[2];
+    } else {
+        s1 = dst;
+        isrc = &ops[1];
+    }
+    if (s1 < 0) return false;
+    const bool src64 = (isrc->size == 64);
+
+    // Load int -> x9, then scvtf into v0 (low element).
+    if (isrc->type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(isrc->reg.value);
+        if (gi < 0) return false;
+        c.ldr(kScratch0, ptr(kState, GprOffset(gi)));
+    } else if (isrc->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(isrc->mem, next_rip, c)) return false;
+        if (src64) c.ldr(kScratch0, ptr(kAddr));
+        else       c.ldr(WReg(9), ptr(kAddr));   // zero-ext; reinterpreted as signed below
+    } else {
+        return false;
+    }
+    if (sd) {
+        if (src64) c.scvtf(DReg(0), kScratch0);
+        else       c.scvtf(DReg(0), WReg(9));
+        c.str(DReg(0), ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 1)));
+        c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, 1)));
+    } else {
+        if (src64) c.scvtf(SReg(0), kScratch0);
+        else       c.scvtf(SReg(0), WReg(9));
+        c.fmov(WReg(9), SReg(0));                 // result lo32 -> x9 (zero-ext)
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 0)));
+        c.lsr(kScratch1, kScratch1, 32);
+        c.lsl(kScratch1, kScratch1, 32);          // src1.hi32 << 32
+        c.orr(kScratch0, kScratch1, kScratch0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+    }
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vcvttss2si / vcvttsd2si — scalar float/double -> signed int (32/64 GPR),
+// truncating toward zero. NaN and out-of-range -> INT_MIN / INT64_MIN. Result
+// zero-extends the destination GPR slot.
+bool EmitVcvtt2si(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  u64 next_rip, CodeGenerator& c) {
+    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTTSD2SI);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int gi = ZydisGprToIndex(ops[0].reg.value);
+    if (gi < 0) return false;
+    const bool dst64 = (ops[0].size == 64);
+
+    // Load scalar src -> v0.
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisVecToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        if (sd) c.ldr(DReg(0), ptr(kState, YmmChunkOffset(s, 0)));
+        else    c.ldr(SReg(0), ptr(kState, YmmChunkOffset(s, 0)));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        if (sd) c.ldr(DReg(0), ptr(kAddr));
+        else    c.ldr(SReg(0), ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    // Truncating convert -> x9.
+    if (dst64) {
+        if (sd) c.fcvtzs(kScratch0, DReg(0));
+        else    c.fcvtzs(kScratch0, SReg(0));
+    } else {
+        if (sd) c.fcvtzs(WReg(9), DReg(0));
+        else    c.fcvtzs(WReg(9), SReg(0));
+    }
+
+    // Indefinite fixup. x86 yields INT_MIN for NaN and any out-of-range; NEON
+    // saturates NaN->0 and +ovf->INT_MAX (only -ovf already gives INT_MIN).
+    // Correct: if NaN(src) OR result==INT_MAX -> force INT_MIN.
+    const XReg res = kScratch0, imin = XReg(10), imax = XReg(12);
+    if (dst64) { c.mov(imin, 0x8000000000000000ull); c.mov(imax, 0x7FFFFFFFFFFFFFFFull); }
+    else       { c.mov(imin, 0x80000000ull);         c.mov(imax, 0x7FFFFFFFull); }
+    // NaN mask: fcmeq(src,src) is all-ones when ordered, 0 when NaN.
+    const XReg nm = XReg(13);
+    if (sd) { c.fcmeq(DReg(1), DReg(0), DReg(0)); c.fmov(nm, DReg(1)); }
+    else    { c.fcmeq(SReg(1), SReg(0), SReg(0)); c.fmov(WReg(13), SReg(1)); }
+    // want_imin = (result==INT_MAX) || (nm==0  i.e. NaN)
+    {
+        Label setImin, doneFix;
+        if (!dst64) { c.and_(res, res, 0xFFFFFFFFull); }
+        c.cmp(res, imax);
+        c.b(EQ, setImin);
+        if (sd) c.cbz(nm, setImin); else c.cbz(WReg(13), setImin);
+        c.b(doneFix);
+        c.L(setImin);
+        c.mov(res, imin);
+        c.L(doneFix);
+    }
+
+    // Store zero-extended into the GPR slot.
+    if (dst64) {
+        c.str(res, ptr(kState, GprOffset(gi)));
+    } else {
+        c.and_(res, res, 0xFFFFFFFFull);
+        c.str(res, ptr(kState, GprOffset(gi)));
+    }
+    return true;
+}
+
+// vcvtss2sd / vcvtsd2ss — precision change of low element; dst upper from src1.
+bool EmitVcvtScalar(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                    u64 next_rip, CodeGenerator& c) {
+    const bool toDouble = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTSS2SD); // ss->sd
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+
+    // src2 low element.
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        if (s2 < 0) return false;
+        if (toDouble) c.ldr(SReg(0), ptr(kState, YmmChunkOffset(s2, 0)));
+        else          c.ldr(DReg(0), ptr(kState, YmmChunkOffset(s2, 0)));
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        if (toDouble) c.ldr(SReg(0), ptr(kAddr));
+        else          c.ldr(DReg(0), ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    if (toDouble) {
+        // ss -> sd: dst.q0 = (double)src2.f32 ; dst.q1 = src1.q1.
+        c.fcvt(DReg(1), SReg(0));
+        c.str(DReg(1), ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 1)));
+        c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, 1)));
+    } else {
+        // sd -> ss: dst.lo32 = (float)src2.f64 ; dst.hi32 = src1.hi32 ; q1=src1.q1.
+        c.fcvt(SReg(1), DReg(0));
+        c.fmov(WReg(9), SReg(1));
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 0)));
+        c.lsr(kScratch1, kScratch1, 32);
+        c.lsl(kScratch1, kScratch1, 32);
+        c.orr(kScratch0, kScratch1, kScratch0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+    }
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vcvtdq2ps — packed 4x int32 -> 4x float (signed). vcvttps2dq — packed 4x
+// float -> 4x int32, truncating; NaN/out-of-range -> INT_MIN (0x80000000).
+bool EmitVcvtPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                    u64 next_rip, CodeGenerator& c) {
+    const bool dq2ps = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTDQ2PS);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int s = ZydisVecToIndex(ops[1].reg.value);
+            if (s < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(s, chunk));
+            c.ldr(QReg(0), ptr(kScratch0));
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(0), ptr(kScratch0));
+        } else {
+            return false;
+        }
+        if (dq2ps) {
+            c.scvtf(VReg4S(0), VReg4S(0));
+        } else {
+            // fcvtzs saturates: NaN->0, +ovf->INT_MAX, -ovf->INT_MIN. x86 wants
+            // INT_MIN for all invalid. Detect NaN (v != v) and +INT_MAX result,
+            // force 0x80000000 there.
+            c.mov(VReg16B(3), VReg16B(0));               // keep original floats
+            c.fcvtzs(VReg4S(0), VReg4S(0));              // v0 = truncated ints (saturated)
+            // NaN mask: fcmeq(orig,orig) -> ~0 in ordered lanes, 0 in NaN lanes.
+            c.fcmeq(VReg4S(1), VReg4S(3), VReg4S(3));
+            // v2 = lanes where result == INT_MAX (positive saturation).
+            c.mov(WReg(9), 0x7FFFFFFF);
+            c.dup(VReg4S(2), WReg(9));
+            c.cmeq(VReg4S(2), VReg4S(0), VReg4S(2));
+            // invalid = (result==INT_MAX) OR NaN-lane. NaN-lane = ~v1.
+            c.not_(VReg16B(1), VReg16B(1));
+            c.orr(VReg16B(2), VReg16B(2), VReg16B(1));   // v2 = invalid mask
+            // v1 = INT_MIN lanes.
+            c.mov(WReg(9), 0x80000000);
+            c.dup(VReg4S(1), WReg(9));
+            // result = invalid ? INT_MIN : v0  ==  bsl(mask=v2, v1, v0).
+            c.bsl(VReg16B(2), VReg16B(1), VReg16B(0));
+            c.mov(VReg16B(0), VReg16B(2));
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(0), ptr(kScratch0));
+    }
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -3661,6 +3897,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VCOMISS:  case ZYDIS_MNEMONIC_VCOMISD:
         case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
             handled = EmitVcomi(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VCVTSI2SS: case ZYDIS_MNEMONIC_VCVTSI2SD:
+            handled = EmitVcvtsi2(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VCVTTSS2SI: case ZYDIS_MNEMONIC_VCVTTSD2SI:
+            handled = EmitVcvtt2si(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VCVTSS2SD: case ZYDIS_MNEMONIC_VCVTSD2SS:
+            handled = EmitVcvtScalar(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
+            handled = EmitVcvtPacked(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
