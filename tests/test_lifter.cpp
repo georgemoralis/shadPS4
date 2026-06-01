@@ -17098,5 +17098,144 @@ TEST_F(CpuRuntimeTest, ShlMemDest_Flags) {
     EXPECT_TRUE(r.state.rflags & (1ULL << 6)) << "ZF set (result zero)";
 }
 
+
+// ============================================================================
+// Memory-destination rotates (ROL/ROR [mem], imm|CL) and 8/16-bit register
+// rotates. Previously both lifters rejected a memory operand 0 for rotates,
+// and the x86 reference lifter additionally rejected 8/16-bit rotates entirely
+// (a divergence: arm64 handled them). These now load the width-sized value,
+// rotate, and store back in place (adjacent bytes untouched). Rotates affect
+// only CF and OF (and only when the masked count != 0). Verified against
+// native x86 execution and the arm64 emitter under QEMU.
+// Encodings: rol dword[rbx],imm = C1 /0 ib ; ror byte[rbx],1 = D0 /1 ;
+//   rol qword[rbx],imm = REX.W C1 /0 ib ; ror dword[rbx],cl = D3 /1 ;
+//   rol ax,imm = 66 C1 /0 ib ; ror bl,1 = D0 /1 (reg).
+// ============================================================================
+
+// ROL dword [rbx], 4 — in place; adjacent bytes preserved.
+TEST_F(CpuRuntimeTest, RolMemDest_Dword_Imm) {
+    u8* target = mem.CodePtr() + 0x200;
+    for (int i = -4; i < 12; ++i) target[i] = 0xAA;
+    const u32 init = 0x12345678u;
+    std::memcpy(target, &init, 4);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // mov rbx, &target
+        0xc1, 0x03, 0x04,              // rol dword [rbx], 4
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 got; std::memcpy(&got, target, 4);
+    EXPECT_EQ(got, 0x23456781u) << "rol 0x12345678 by 4";
+    EXPECT_EQ(static_cast<u8>(target[-1]), 0xAAu) << "byte below untouched";
+    EXPECT_EQ(static_cast<u8>(target[4]), 0xAAu)  << "byte above untouched";
+}
+
+// ROR byte [rbx], 1 — narrow mem; 0x01 ror 1 = 0x80.
+TEST_F(CpuRuntimeTest, RorMemDest_Byte_Imm) {
+    u8* target = mem.CodePtr() + 0x200;
+    for (int i = -4; i < 12; ++i) target[i] = 0xCC;
+    target[0] = 0x01;
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xd0, 0x0b,                    // ror byte [rbx], 1
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    EXPECT_EQ(static_cast<u8>(target[0]), 0x80u) << "ror 0x01 by 1 = 0x80";
+    EXPECT_EQ(static_cast<u8>(target[1]), 0xCCu) << "next byte untouched";
+    EXPECT_EQ(static_cast<u8>(target[-1]), 0xCCu) << "prev byte untouched";
+}
+
+// ROL qword [rbx], 8 — full width mem.
+TEST_F(CpuRuntimeTest, RolMemDest_Qword_Imm) {
+    u8* target = mem.CodePtr() + 0x200;
+    const u64 init = 0x0123456789ABCDEFull;
+    std::memcpy(target, &init, 8);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0x48, 0xc1, 0x03, 0x08,        // rol qword [rbx], 8
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u64 got; std::memcpy(&got, target, 8);
+    EXPECT_EQ(got, 0x23456789ABCDEF01ull) << "rol 0x0123456789ABCDEF by 8";
+}
+
+// ROR dword [rbx], CL — count from CL.
+TEST_F(CpuRuntimeTest, RorMemDest_Dword_CL) {
+    u8* target = mem.CodePtr() + 0x200;
+    const u32 init = 0x00000001u;
+    std::memcpy(target, &init, 4);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0x48, 0xc7, 0xc1, 0x04, 0x00, 0x00, 0x00, // mov rcx, 4
+        0xd3, 0x0b,                    // ror dword [rbx], cl
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 got; std::memcpy(&got, target, 4);
+    EXPECT_EQ(got, 0x10000000u) << "ror 1 by 4 (32-bit) = 0x10000000";
+}
+
+// 16-bit register rotate: ROL AX, 4 — exercises the formerly-x86-rejected
+// narrow rotate (arm64 handled it; x86 did not). Upper bits of RAX preserved.
+TEST_F(CpuRuntimeTest, RolReg_Word_ClosesNarrowGap) {
+    u8 program[] = {
+        0x48, 0xb8, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x1234
+        0x66, 0xc1, 0xc0, 0x04,        // rol ax, 4
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFFF, 0x2341u) << "rol 0x1234 by 4 (16-bit)";
+}
+
+// 8-bit register rotate: ROR BL, 1 — narrow gap, preserve upper bits.
+TEST_F(CpuRuntimeTest, RorReg_Byte_ClosesNarrowGap) {
+    u8 program[] = {
+        0x48, 0xc7, 0xc3, 0x01, 0x00, 0x00, 0x00, // mov rbx, 1
+        0xd0, 0xcb,                    // ror bl, 1
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[3] & 0xFF, 0x80u) << "ror 0x01 by 1 (8-bit) = 0x80";
+}
+
+// ROL dword [rbx], 1 sets CF = LSB of result. After rotating 0x80000000 left
+// by 1 -> 0x00000001, CF = 1 (the bit rotated out of the top into bit 0).
+TEST_F(CpuRuntimeTest, RolMemDest_Flags_CF) {
+    u8* target = mem.CodePtr() + 0x200;
+    const u32 init = 0x80000000u;
+    std::memcpy(target, &init, 4);
+
+    u8 program[] = {
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xd1, 0x03,                    // rol dword [rbx], 1
+        0xc3,
+    };
+    const u64 t = reinterpret_cast<u64>(target);
+    std::memcpy(&program[2], &t, 8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+
+    u32 got; std::memcpy(&got, target, 4);
+    EXPECT_EQ(got, 0x00000001u) << "rol 0x80000000 by 1 = 1";
+    EXPECT_TRUE(r.state.rflags & (1ULL << 0)) << "CF = bit rotated into LSB";
+}
+
 } // namespace
 } // namespace Core::Runtime

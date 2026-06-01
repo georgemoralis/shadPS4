@@ -2785,13 +2785,25 @@ enum class RotateKind { Rol, Ror };
 
 bool EmitRotate64(const ZydisDecodedInstruction& insn,
                   const ZydisDecodedOperand* ops,
+                  u64 next_rip,
                   Xbyak::CodeGenerator& c,
                   RotateKind kind) {
     const u32 w = insn.operand_width;
-    if (w != 64 && w != 32) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-    if (dst_idx < 0) return false;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+
+    // Destination: register or memory. For memory, compute the EA FIRST into a
+    // stable host reg (r8) so the flag round-trip can't clobber it; the same
+    // address serves the read and the write-back.
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int dst_idx = 0;
+    if (dst_mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> rdx
+        c.mov(r8, rdx);
+    } else {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        dst_idx = ZydisGprToIndex(ops[0].reg.value);
+        if (dst_idx < 0) return false;
+    }
 
     // Shift count from imm or guest CL — identical to EmitShift64.
     if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
@@ -2803,30 +2815,48 @@ bool EmitRotate64(const ZydisDecodedInstruction& insn,
         return false;
     }
 
-    c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+    // Load the destination value into rax at the operand width.
+    if (dst_mem) {
+        if (w == 8)       c.mov(al, byte[r8]);
+        else if (w == 16) c.mov(ax, word[r8]);
+        else if (w == 32) c.mov(eax, dword[r8]);
+        else              c.mov(rax, qword[r8]);
+    } else {
+        if (w == 8)       c.mov(al, byte[r13 + GprOffset(dst_idx)]);
+        else if (w == 16) c.mov(ax, word[r13 + GprOffset(dst_idx)]);
+        else if (w == 32) c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
+        else              c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
+    }
 
     // Round-trip flags via host.
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
     c.push(rdx);
     c.popfq();
 
-    if (w == 64) {
-        switch (kind) {
-            case RotateKind::Rol: c.rol(rax, cl); break;
-            case RotateKind::Ror: c.ror(rax, cl); break;
-        }
-    } else {
-        switch (kind) {
-            case RotateKind::Rol: c.rol(eax, cl); break;  // zero-extends rax
-            case RotateKind::Ror: c.ror(eax, cl); break;
-        }
+    switch (w) {
+        case 8:  if (kind == RotateKind::Rol) c.rol(al, cl);  else c.ror(al, cl);  break;
+        case 16: if (kind == RotateKind::Rol) c.rol(ax, cl);  else c.ror(ax, cl);  break;
+        case 32: if (kind == RotateKind::Rol) c.rol(eax, cl); else c.ror(eax, cl); break;  // zero-extends rax
+        default: if (kind == RotateKind::Rol) c.rol(rax, cl); else c.ror(rax, cl); break;
     }
 
     c.pushfq();
     c.pop(rdx);
     c.mov(qword[r13 + Offsets::Rflags], rdx);
 
-    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    // Store back. Memory: width-sized store (adjacent bytes untouched).
+    // Register: 8/16 preserve the upper GPR bits; 32/64 store the full qword
+    // (the 32-bit rotate already zero-extended rax).
+    if (dst_mem) {
+        if (w == 8)       c.mov(byte[r8], al);
+        else if (w == 16) c.mov(word[r8], ax);
+        else if (w == 32) c.mov(dword[r8], eax);
+        else              c.mov(qword[r8], rax);
+    } else {
+        if (w == 8)       c.mov(byte[r13 + GprOffset(dst_idx)], al);
+        else if (w == 16) c.mov(word[r13 + GprOffset(dst_idx)], ax);
+        else              c.mov(qword[r13 + GprOffset(dst_idx)], rax);
+    }
     return true;
 }
 
@@ -7919,8 +7949,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 break;
 
             // Rotates. Same shape as shifts.
-            case ZYDIS_MNEMONIC_ROL: handled = EmitRotate64(insn, ops, c, RotateKind::Rol); break;
-            case ZYDIS_MNEMONIC_ROR: handled = EmitRotate64(insn, ops, c, RotateKind::Ror); break;
+            case ZYDIS_MNEMONIC_ROL: handled = EmitRotate64(insn, ops, next_rip, c, RotateKind::Rol); break;
+            case ZYDIS_MNEMONIC_ROR: handled = EmitRotate64(insn, ops, next_rip, c, RotateKind::Ror); break;
 
             // Multiplication. EmitImul dispatches by operand_count_visible.
             case ZYDIS_MNEMONIC_IMUL: handled = EmitImul(insn, ops, next_rip, c); break;

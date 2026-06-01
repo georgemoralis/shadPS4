@@ -962,9 +962,22 @@ bool EmitRotate(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     if (insn.operand_count_visible < 2) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int d = ZydisGprToIndex(ops[0].reg.value);
-    if (d < 0) return false;
+
+    // Destination is a register OR memory. For memory, compute the EA FIRST
+    // into a callee-stable reg (x19; saved by the gateway, never relied on
+    // across the dispatch loop) so the count load / scratch use can't clobber
+    // it. The same address serves the read and the write-back.
+    const bool dst_mem = (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int d = 0;
+    const XReg vaddr = XReg(19);
+    if (dst_mem) {
+        if (!EmitEffectiveAddress(ops[0].mem, /*next_rip*/0, c)) return false;  // -> kAddr
+        c.mov(vaddr, kAddr);
+    } else {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        d = ZydisGprToIndex(ops[0].reg.value);
+        if (d < 0) return false;
+    }
 
     const XReg val = XReg(14), cnt = XReg(15), res = kScratch2;  // x12
     const XReg t = XReg(13), oldfl = kScratch0, msk = kScratch1;
@@ -983,8 +996,15 @@ bool EmitRotate(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
         return false;
     }
 
-    // Load value truncated to width.
-    c.ldr(val, ptr(kState, GprOffset(d)));
+    // Load value truncated to width (register slot or memory).
+    if (dst_mem) {
+        if (w == 8)       c.ldrb(WReg(val.getIdx()), ptr(vaddr));
+        else if (w == 16) c.ldrh(WReg(val.getIdx()), ptr(vaddr));
+        else if (w == 32) c.ldr(WReg(val.getIdx()), ptr(vaddr));
+        else              c.ldr(val, ptr(vaddr));
+    } else {
+        c.ldr(val, ptr(kState, GprOffset(d)));
+    }
     if (w != 64) c.and_(val, val, wmask);
 
     // Compute rotated result into res.
@@ -1042,7 +1062,13 @@ bool EmitRotate(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     }
 
     // Store result back at width (preserve upper bits for narrow).
-    if (w == 64) {
+    if (dst_mem) {
+        c.and_(res, res, wmask);
+        if (w == 8)       c.strb(WReg(res.getIdx()), ptr(vaddr));
+        else if (w == 16) c.strh(WReg(res.getIdx()), ptr(vaddr));
+        else if (w == 32) c.str(WReg(res.getIdx()), ptr(vaddr));
+        else              c.str(res, ptr(vaddr));
+    } else if (w == 64) {
         c.str(res, ptr(kState, GprOffset(d)));
     } else if (w == 32) {
         c.str(res, ptr(kState, GprOffset(d)));   // already zero-extended
