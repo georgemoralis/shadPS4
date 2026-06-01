@@ -16379,6 +16379,14 @@ TEST_F(CpuRuntimeTest, DiagnosticsHooks_DoNotPerturbExecution) {
 
 // add dword[ebx], eax  (67 01 03): the store-back must land at the truncated
 // address, and the value must be the 32-bit sum.
+// NOTE: these five tests exercise 32-bit memory-operand integer ALU with the
+// 0x67 address-size override. The arm64 lifter implements that form (and the
+// addr32 truncation); the x86 reference lifter deliberately handles these
+// integer ALU mem-forms only at 64-bit width and does not model addr32, so
+// the tests are gated to the non-x86 (arm64) backend. Mirrors runtime.cpp's
+// ARCH_X86_64/__x86_64__/_M_X64 detection.
+#if !defined(ARCH_X86_64) && !defined(__x86_64__) && !defined(_M_X64)
+
 TEST_F(CpuRuntimeTest, Addr32_AddMemDest_TruncatesBaseAndAdds) {
     u8* low = MapLowScratch();
     if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
@@ -16507,6 +16515,8 @@ TEST_F(CpuRuntimeTest, Addr64_AddMemDest_NotTruncated) {
 }
 
 
+
+#endif  // arm64-only addr32 ALU tests
 
 // ============================================================================
 // High-byte register (AH/CH/DH/BH) as an operand of OR / XOR / ADD / SUB and
