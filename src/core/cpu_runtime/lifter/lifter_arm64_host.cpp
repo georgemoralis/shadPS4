@@ -1855,6 +1855,7 @@ bool EmitAlu(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     }
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    const bool addr32 = (insn.address_width == 32);   // 0x67 prefix
     if (insn.operand_count_visible != 2) return false;
 
     const XReg vLhs = XReg(14);
@@ -1879,7 +1880,7 @@ bool EmitAlu(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     // ---- Gather lhs (dst operand value) and rhs (src operand value). ----
     if (dst_mem) {
         // dst is memory: compute its address first, keep it in vAddr, load lhs.
-        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;  // -> x11
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c, addr32)) return false;  // -> x11
         c.mov(vAddr, kAddr);
         width_load(vLhs, vAddr);
         // src is register or immediate (src_mem excluded above).
@@ -1899,7 +1900,7 @@ bool EmitAlu(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
         if (d < 0) return false;
         if (src_mem) {
             // Load rhs from memory first (EA clobbers x9/x11), then lhs.
-            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c, addr32)) return false;
             c.mov(vAddr, kAddr);
             width_load(vRhs, vAddr);
             c.ldr(vLhs, ptr(kState, GprOffset(d)));
@@ -2519,6 +2520,7 @@ bool EmitCmp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     if (insn.operand_count_visible != 2) return false;
+    const bool addr32 = (insn.address_width == 32);   // 0x67 prefix
 
     // Load lhs (ops[0]) into kScratch0, rhs (ops[1]) into kScratch1.
     auto load_operand = [&](const ZydisDecodedOperand& op, const XReg& dstreg) -> bool {
@@ -2539,7 +2541,7 @@ bool EmitCmp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
             return true;
         }
         if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            if (!EmitEffectiveAddress(op.mem, next_rip, c)) return false;  // -> kAddr
+            if (!EmitEffectiveAddress(op.mem, next_rip, c, addr32)) return false;  // -> kAddr
             c.ldr(dstreg, ptr(kAddr));
             return true;
         }
@@ -2575,6 +2577,7 @@ bool EmitTest(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     if (insn.operand_count_visible != 2) return false;
+    const bool addr32 = (insn.address_width == 32);   // 0x67 prefix
 
     auto load_operand = [&](const ZydisDecodedOperand& op, const XReg& dstreg) -> bool {
         if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
@@ -2594,7 +2597,7 @@ bool EmitTest(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
             return true;
         }
         if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            if (!EmitEffectiveAddress(op.mem, next_rip, c)) return false;
+            if (!EmitEffectiveAddress(op.mem, next_rip, c, addr32)) return false;
             c.ldr(dstreg, ptr(kAddr));
             return true;
         }

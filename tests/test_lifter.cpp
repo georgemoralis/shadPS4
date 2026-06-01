@@ -10290,10 +10290,36 @@ TEST_F(CpuRuntimeTest, FaultDiagnostics_ClearedAfterRun) {
 // the test self-skips rather than giving a false failure).
 static u8* MapLowScratch() {
 #if !defined(_WIN32)
-    void* p = ::mmap(reinterpret_cast<void*>(0x20000000ull), 4096,
+    constexpr uintptr_t kLowAddr = 0x20000000ull;
+    // Prefer MAP_FIXED_NOREPLACE (Linux 4.17+): it places the page at exactly
+    // kLowAddr when that range is free, and fails cleanly otherwise — without
+    // silently relocating to a high address the way a bare hint does. This is
+    // what lets the addr32 / absolute-disp32 tests actually run on CI hosts
+    // whose default mmap base sits above 4 GiB (a plain hint there gets ignored
+    // and the page lands high, so the test skips). The runtime never reserves
+    // this range (GuestMemory and the gateway both mmap with a NULL hint), so
+    // kLowAddr is normally free.
+#if defined(MAP_FIXED_NOREPLACE)
+    {
+        void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED) {
+            if (reinterpret_cast<uintptr_t>(p) == kLowAddr) {
+                return static_cast<u8*>(p);
+            }
+            // Kernel ignored the flag (older kernel mis-reporting support) and
+            // placed it elsewhere — discard and fall through to the hint path.
+            ::munmap(p, 4096);
+        }
+    }
+#endif
+    // Fallback for kernels without MAP_FIXED_NOREPLACE: hinted mmap, accepted
+    // only if it actually landed sub-4GiB at the required address.
+    void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096,
                      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    if (reinterpret_cast<uintptr_t>(p) >= 0x100000000ull) { ::munmap(p, 4096); return nullptr; }
+    if (reinterpret_cast<uintptr_t>(p) != kLowAddr) { ::munmap(p, 4096); return nullptr; }
     return static_cast<u8*>(p);
 #else
     return nullptr;
@@ -16334,6 +16360,293 @@ TEST_F(CpuRuntimeTest, DiagnosticsHooks_DoNotPerturbExecution) {
     EXPECT_EQ(r.state.gpr[0], 15ULL) << "5+4+3+2+1, unaffected by diagnostics hooks";
     EXPECT_EQ(r.state.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
 }
+
+
+// ============================================================================
+// addr32 (0x67 address-size override) on ADD / SUB / CMP / TEST with a memory
+// operand. The 0x67 prefix truncates the computed effective address to 32
+// bits, so a base register whose upper 32 bits hold garbage must still resolve
+// to the intended sub-4GiB address. EmitMov and EmitIncDec already threaded
+// the addr32 flag into EmitEffectiveAddress; EmitAlu/EmitCmp/EmitTest did not,
+// so a 0x67-prefixed `add/sub [ebx],eax` or `cmp/test [ebx],eax` with garbage
+// in EBX's upper half computed a wild 64-bit pointer. These tests pin the
+// truncation for each of those four emitters.
+//
+// Each needs a real page below 4 GiB (MapLowScratch maps 0x20000000); on hosts
+// whose default mmap base sits above 4 GiB (e.g. macOS __PAGEZERO) the page is
+// unavailable and the test self-skips, exactly like the existing Addr32_* set.
+// ============================================================================
+
+// add dword[ebx], eax  (67 01 03): the store-back must land at the truncated
+// address, and the value must be the 32-bit sum.
+TEST_F(CpuRuntimeTest, Addr32_AddMemDest_TruncatesBaseAndAdds) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    u8* target = low + 0x40;
+    *reinterpret_cast<u32*>(target) = 0x1000;
+
+    const u8 program[] = {0x67, 0x01, 0x03, 0xc3}; // add [ebx], eax ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // RBX low32 = target; upper32 = garbage that addr32 must mask away.
+    st.gpr[3] = (0xDEADBEEFull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+    st.gpr[0] = 0x0234; // eax
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x1234u)
+        << "add wrote the 32-bit sum at the truncated address";
+#if !defined(_WIN32)
+    ::munmap(low, 4096);
+#endif
+}
+
+// sub dword[ebx], eax  (67 29 03): order matters ([mem] - eax), truncated addr.
+TEST_F(CpuRuntimeTest, Addr32_SubMemDest_TruncatesBaseAndSubtracts) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    u8* target = low + 0x80;
+    *reinterpret_cast<u32*>(target) = 0x5555;
+
+    const u8 program[] = {0x67, 0x29, 0x03, 0xc3}; // sub [ebx], eax ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = (0xCAFEF00Dull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+    st.gpr[0] = 0x0055;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x5500u)
+        << "sub wrote [mem]-eax at the truncated address";
+#if !defined(_WIN32)
+    ::munmap(low, 4096);
+#endif
+}
+
+// cmp dword[ebx], eax  (67 39 03): equal operands set ZF; memory unchanged.
+// The compare must read from the truncated address, not the garbage pointer.
+TEST_F(CpuRuntimeTest, Addr32_CmpMemDest_TruncatesBaseAndSetsZf) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    u8* target = low + 0xC0;
+    *reinterpret_cast<u32*>(target) = 0xABCD;
+
+    const u8 program[] = {0x67, 0x39, 0x03, 0xc3}; // cmp [ebx], eax ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = (0x99999999ull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+    st.gpr[0] = 0xABCD; // equal -> ZF
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: [mem]==eax after truncation";
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0xABCDu) << "cmp must not write memory";
+#if !defined(_WIN32)
+    ::munmap(low, 4096);
+#endif
+}
+
+// test dword[ebx], eax  (67 85 03): non-zero AND clears ZF; truncated addr.
+TEST_F(CpuRuntimeTest, Addr32_TestMemDest_TruncatesBaseAndSetsFlags) {
+    u8* low = MapLowScratch();
+    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    u8* target = low + 0x100;
+    *reinterpret_cast<u32*>(target) = 0x00FF00FF;
+
+    const u8 program[] = {0x67, 0x85, 0x03, 0xc3}; // test [ebx], eax ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = (0x12345678ull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
+    st.gpr[0] = 0x0000000F; // 0x000000FF & 0x0000000F = 0x0F -> nonzero, ZF=0
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear: AND is nonzero at truncated addr";
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x00FF00FFu) << "test must not write memory";
+#if !defined(_WIN32)
+    ::munmap(low, 4096);
+#endif
+}
+
+// Regression guard: a NON-0x67 64-bit `add [rbx], eax` must NOT truncate; the
+// full 64-bit base is used. Mirrors Addr64_NotTruncated for the ALU path.
+TEST_F(CpuRuntimeTest, Addr64_AddMemDest_NotTruncated) {
+    u8* target = mem.CodePtr() + 0x100;
+    *reinterpret_cast<u32*>(target) = 0x1000;
+
+    const u8 program[] = {0x01, 0x03, 0xc3}; // add [rbx], eax (no 0x67) ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(target); // full 64-bit pointer
+    st.gpr[0] = 0x0234;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x1234u)
+        << "64-bit address used in full (no truncation)";
+}
+
+
+
+// ============================================================================
+// High-byte register (AH/CH/DH/BH) as an operand of OR / XOR / ADD / SUB and
+// of INC / DEC. A high-byte register is bits 15:8 of its parent (AH->RAX,
+// CH->RCX, DH->RDX, BH->RBX); ZydisGprToIndex rejects these, so the lifter
+// routes them through HighByteParent + ubfx(.,8,8) on read and a masked merge
+// on write-back. EmitAlu (both operands), EmitCmp/EmitTest (already sampled by
+// And8/Test8), and EmitIncDec all implement this. The original suite only
+// exercised And8/Test8; these guard the remaining ALU mnemonics and inc/dec
+// so the high-byte plumbing can't silently regress for them.
+//
+// Parent-slot map: AH->gpr[0], CH->gpr[1], DH->gpr[2], BH->gpr[3]. Each test
+// seeds the parent with distinct upper/lower markers and asserts only bits
+// 15:8 change (read or write), leaving bits 63:16 and 7:0 intact.
+// ============================================================================
+
+// or ch, al  (08 c5): ch |= al. ModRM c5 = reg(al=0) -> rm(ch). 08 is OR r/m8,r8.
+TEST_F(CpuRuntimeTest, Or8_HighByteDst_LowByteSrc) {
+    const u8 program[] = {0x08, 0xc5, 0xc3}; // or ch, al ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0x1122334455'0F'66ULL; // RCX: ch=0x0F, cl=0x66, upper markers
+    st.gpr[0] = 0xF0ULL;               // al = 0xF0
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ((st.gpr[1] >> 8) & 0xFFu, 0xFFu) << "ch = 0x0F | 0xF0 = 0xFF";
+    EXPECT_EQ(st.gpr[1] & 0xFFu, 0x66u) << "cl (bits 7:0) preserved";
+    EXPECT_EQ(st.gpr[1] >> 16, 0x1122334455ULL) << "bits 63:16 preserved";
+    EXPECT_FALSE(st.rflags & (1ULL << 11)) << "OF cleared by OR";
+    EXPECT_FALSE(st.rflags & (1ULL << 0)) << "CF cleared by OR";
+}
+
+// xor dh, dh  (30 f6): dh ^= dh -> 0. High-byte dst AND src on the same reg.
+TEST_F(CpuRuntimeTest, Xor8_HighByte_SelfZeroes) {
+    const u8 program[] = {0x30, 0xf6, 0xc3}; // xor dh, dh ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[2] = 0xAABBCCDDEE'7F'99ULL; // RDX: dh=0x7F, dl=0x99
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ((st.gpr[2] >> 8) & 0xFFu, 0x00u) << "dh ^ dh = 0";
+    EXPECT_EQ(st.gpr[2] & 0xFFu, 0x99u) << "dl preserved";
+    EXPECT_EQ(st.gpr[2] >> 16, 0xAABBCCDDEEULL) << "bits 63:16 preserved";
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: result 0";
+}
+
+// add bh, cl  (00 cf): bh += cl. High-byte dst, low-byte src (verified under QEMU).
+TEST_F(CpuRuntimeTest, Add8_HighByteDst_LowByteSrc) {
+    const u8 program[] = {0x00, 0xcf, 0xc3}; // add bh, cl ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = 0xDEADBEEF12'20'34ULL; // RBX: bh=0x20, bl=0x34
+    st.gpr[1] = 0xCAFE000000'00'05ULL; // RCX: cl=0x05
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ((st.gpr[3] >> 8) & 0xFFu, 0x25u) << "bh = 0x20 + 0x05 = 0x25";
+    EXPECT_EQ(st.gpr[3] & 0xFFu, 0x34u) << "bl preserved";
+    EXPECT_EQ(st.gpr[3] >> 16, 0xDEADBEEF12ULL) << "bits 63:16 preserved";
+}
+
+// sub ah, ch  (28 ec): ah -= ch. BOTH operands are high-byte registers.
+// ModRM ec = reg(ch=5)->rm(ah=4); 28 is SUB r/m8, r8.
+TEST_F(CpuRuntimeTest, Sub8_HighByteDst_HighByteSrc) {
+    const u8 program[] = {0x28, 0xec, 0xc3}; // sub ah, ch ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // AH=0x50, AL=0xAA, upper markers = 0x1122334455
+    st.gpr[0] = 0x1122334455'50'AAULL;
+    st.gpr[1] = 0x66778899AA'30'BBULL; // RCX: ch=0x30
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ((st.gpr[0] >> 8) & 0xFFu, 0x20u) << "ah = 0x50 - 0x30 = 0x20";
+    EXPECT_EQ(st.gpr[0] & 0xFFu, 0xAAu) << "al preserved";
+    EXPECT_EQ(st.gpr[0] >> 16, 0x1122334455ULL) << "bits 63:16 preserved";
+    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear (0x20 != 0)";
+    EXPECT_FALSE(st.rflags & (1ULL << 0)) << "CF clear (0x50 >= 0x30, no borrow)";
+}
+
+// inc dh  (fe c6): dh += 1. ModRM c6 = /0 (inc) on rm(dh=6). FE /0 is INC r/m8.
+TEST_F(CpuRuntimeTest, Inc8_HighByte_PreservesParent) {
+    const u8 program[] = {0xfe, 0xc6, 0xc3}; // inc dh ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[2] = 0xAABBCCDDEE'7F'99ULL; // RDX: dh=0x7F, dl=0x99
+    st.rflags = 0x2 | 0x1;              // CF pre-set; INC must preserve it
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ((st.gpr[2] >> 8) & 0xFFu, 0x80u) << "dh = 0x7F + 1 = 0x80";
+    EXPECT_EQ(st.gpr[2] & 0xFFu, 0x99u) << "dl preserved";
+    EXPECT_EQ(st.gpr[2] >> 16, 0xAABBCCDDEEULL) << "bits 63:16 preserved";
+    EXPECT_EQ(st.rflags & 0x1ULL, 0x1ULL) << "CF preserved (INC does not touch CF)";
+    EXPECT_TRUE(st.rflags & (1ULL << 7)) << "SF set: 0x80 has bit 7";
+    EXPECT_TRUE(st.rflags & (1ULL << 11)) << "OF set: 0x7F->0x80 signed overflow";
+}
+
+// dec bh  (fe cf): bh -= 1, from 0x01 -> 0x00 sets ZF; parent preserved.
+TEST_F(CpuRuntimeTest, Dec8_HighByte_ToZero_SetsZf) {
+    const u8 program[] = {0xfe, 0xcf, 0xc3}; // dec bh ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = 0x123456789A'01'BCULL; // RBX: bh=0x01, bl=0xBC
+    st.rflags = 0x2; // CF clear
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ((st.gpr[3] >> 8) & 0xFFu, 0x00u) << "bh = 0x01 - 1 = 0x00";
+    EXPECT_EQ(st.gpr[3] & 0xFFu, 0xBCu) << "bl preserved";
+    EXPECT_EQ(st.gpr[3] >> 16, 0x123456789AULL) << "bits 63:16 preserved";
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set: dh result 0";
+}
+
 
 } // namespace
 } // namespace Core::Runtime
