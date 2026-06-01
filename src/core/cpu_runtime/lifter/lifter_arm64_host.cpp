@@ -4078,6 +4078,200 @@ bool EmitVmovdup(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     return true;
 }
 
+// vpsrad/vpsrld dst, src, imm8 — per-dword arithmetic/logical right shift. The
+// x86 shift count saturates: for SRA, count>=32 acts as 31 (sign-fill); for
+// SRL, count>=32 yields 0. NEON sshr/ushr take 1..32, so we clamp.
+bool EmitVpshift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    const bool arith = (insn.mnemonic == ZYDIS_MNEMONIC_VPSRAD);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int src = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || src < 0) return false;
+    int cnt = static_cast<int>(ops[2].imm.value.u) & 0xFF;
+
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        c.add(kScratch0, kState, YmmChunkOffset(src, chunk));
+        c.ldr(QReg(0), ptr(kScratch0));
+        if (arith) {
+            int s = cnt; if (s > 31) s = 31; if (s < 1) s = 0;
+            if (s == 0) { /* no shift */ }
+            else c.sshr(VReg4S(0), VReg4S(0), s);
+        } else {
+            if (cnt >= 32) {
+                c.eor(VReg16B(0), VReg16B(0), VReg16B(0));  // all zero
+            } else if (cnt >= 1) {
+                c.ushr(VReg4S(0), VReg4S(0), cnt);
+            }
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(0), ptr(kScratch0));
+    }
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+// vpslldq/vpsrldq dst, src, imm8 — whole-128-bit BYTE shift (not per-element),
+// zero-filled. NEON ext concatenates two regs and slices a 16-byte window:
+//   ext(d, lo, hi, idx) = bytes [idx .. idx+15] of (lo:hi).
+// Right shift by n bytes: window starting at byte n of (src:zero) -> ext(src,0,n).
+// Left shift by n bytes: window starting at byte (16-n) of (zero:src).
+bool EmitVpsxldq(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    const bool left = (insn.mnemonic == ZYDIS_MNEMONIC_VPSLLDQ);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int src = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || src < 0) return false;
+    int n = static_cast<int>(ops[2].imm.value.u) & 0xFF;
+    if (n > 15) n = 16;  // shift out everything
+
+    c.add(kScratch0, kState, YmmChunkOffset(src, 0));
+    c.ldr(QReg(0), ptr(kScratch0));      // v0 = src
+    c.eor(VReg16B(1), VReg16B(1), VReg16B(1));  // v1 = 0
+
+    if (n == 16) {
+        c.eor(VReg16B(0), VReg16B(0), VReg16B(0));   // all shifted out
+    } else if (n == 0) {
+        // no-op
+    } else if (left) {
+        // left by n: result = (zero:src) window at byte (16-n).
+        // ext(d, v1=zero, v0=src, 16-n).
+        c.ext(VReg16B(0), VReg16B(1), VReg16B(0), 16 - n);
+    } else {
+        // right by n: result = (src:zero) window at byte n.
+        c.ext(VReg16B(0), VReg16B(0), VReg16B(1), n);
+    }
+    c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+    c.str(QReg(0), ptr(kScratch0));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vblendps dst,src1,src2,imm4 (per-dword) / vpblendw dst,src1,src2,imm8
+// (per-word) — for each element, mask bit picks src2 (1) or src1 (0). imm is
+// compile-time, so build the result by element copies into a temp.
+bool EmitVblend(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                u64 next_rip, CodeGenerator& c) {
+    const bool word = (insn.mnemonic == ZYDIS_MNEMONIC_VPBLENDW);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+    const int imm = static_cast<int>(ops[3].imm.value.u) & 0xFF;
+
+    // src1 -> v0, src2 -> v1.
+    c.add(kScratch0, kState, YmmChunkOffset(s1, 0));
+    c.ldr(QReg(0), ptr(kScratch0));
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        if (s2 < 0) return false;
+        c.add(kScratch0, kState, YmmChunkOffset(s2, 0));
+        c.ldr(QReg(1), ptr(kScratch0));
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        c.ldr(QReg(1), ptr(kAddr));
+    } else {
+        return false;
+    }
+    // Result builds in v0: for each set mask bit copy element from v1 (src2).
+    if (word) {
+        for (int i = 0; i < 8; ++i)
+            if ((imm >> i) & 1) c.ins(VReg8H(0)[i], VReg8H(1)[i]);
+    } else {
+        for (int i = 0; i < 4; ++i)
+            if ((imm >> i) & 1) c.ins(VReg4S(0)[i], VReg4S(1)[i]);
+    }
+    c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+    c.str(QReg(0), ptr(kScratch0));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vblendvps dst,src1,src2,mask — per-dword select by the SIGN BIT of the mask
+// register's matching dword (mask reg is imm8[7:4]). Broadcast sign via
+// arithmetic shift >>31 to make a full-lane select mask, then bsl.
+bool EmitVblendvps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                   u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[2].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    const int s2  = ZydisVecToIndex(ops[2].reg.value);
+    if (dst < 0 || s1 < 0 || s2 < 0) return false;
+    // mask register is the 4th operand (is4 imm high nibble decoded by Zydis).
+    int mask_vec = -1;
+    if (insn.operand_count_visible >= 4 && ops[3].type == ZYDIS_OPERAND_TYPE_REGISTER)
+        mask_vec = ZydisVecToIndex(ops[3].reg.value);
+    if (mask_vec < 0) return false;
+
+    c.add(kScratch0, kState, YmmChunkOffset(s1, 0));
+    c.ldr(QReg(0), ptr(kScratch0));      // v0 = src1
+    c.add(kScratch0, kState, YmmChunkOffset(s2, 0));
+    c.ldr(QReg(1), ptr(kScratch0));      // v1 = src2
+    c.add(kScratch0, kState, YmmChunkOffset(mask_vec, 0));
+    c.ldr(QReg(2), ptr(kScratch0));      // v2 = mask
+    c.sshr(VReg4S(2), VReg4S(2), 31);    // broadcast sign bit per dword -> all-ones/all-zeros
+    // bsl(mask, src2, src1): where mask=1 pick src2(v1) else src1(v0).
+    c.bsl(VReg16B(2), VReg16B(1), VReg16B(0));
+    c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+    c.str(QReg(2), ptr(kScratch0));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vbroadcastss dst, m32/xmm — broadcast a single float to all lanes (4 for xmm,
+// 8 for ymm).
+bool EmitVbroadcastss(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                      u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+    const bool ymm = (ops[0].size == 256);
+
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.ldr(WReg(9), ptr(kAddr));
+        c.dup(VReg4S(0), WReg(9));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisVecToIndex(ops[1].reg.value);
+        if (src < 0) return false;
+        c.ldr(WReg(9), ptr(kState, YmmChunkOffset(src, 0)));
+        c.dup(VReg4S(0), WReg(9));
+    } else {
+        return false;
+    }
+    c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+    c.str(QReg(0), ptr(kScratch0));
+    if (ymm) {
+        c.add(kScratch0, kState, YmmChunkOffset(dst, 2));
+        c.str(QReg(0), ptr(kScratch0));
+    } else {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -4281,6 +4475,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitVmovFull(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VMOVSLDUP: case ZYDIS_MNEMONIC_VMOVSHDUP:
             handled = EmitVmovdup(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPSRAD: case ZYDIS_MNEMONIC_VPSRLD:
+            handled = EmitVpshift(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPSLLDQ: case ZYDIS_MNEMONIC_VPSRLDQ:
+            handled = EmitVpsxldq(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VBLENDPS: case ZYDIS_MNEMONIC_VPBLENDW:
+            handled = EmitVblend(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VBLENDVPS: handled = EmitVblendvps(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VBROADCASTSS: handled = EmitVbroadcastss(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
