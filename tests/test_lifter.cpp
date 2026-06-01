@@ -10290,10 +10290,36 @@ TEST_F(CpuRuntimeTest, FaultDiagnostics_ClearedAfterRun) {
 // the test self-skips rather than giving a false failure).
 static u8* MapLowScratch() {
 #if !defined(_WIN32)
-    void* p = ::mmap(reinterpret_cast<void*>(0x20000000ull), 4096,
+    constexpr uintptr_t kLowAddr = 0x20000000ull;
+    // Prefer MAP_FIXED_NOREPLACE (Linux 4.17+): it places the page at exactly
+    // kLowAddr when that range is free, and fails cleanly otherwise — without
+    // silently relocating to a high address the way a bare hint does. This is
+    // what lets the addr32 / absolute-disp32 tests actually run on CI hosts
+    // whose default mmap base sits above 4 GiB (a plain hint there gets ignored
+    // and the page lands high, so the test skips). The runtime never reserves
+    // this range (GuestMemory and the gateway both mmap with a NULL hint), so
+    // kLowAddr is normally free.
+#if defined(MAP_FIXED_NOREPLACE)
+    {
+        void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096,
+                         PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED) {
+            if (reinterpret_cast<uintptr_t>(p) == kLowAddr) {
+                return static_cast<u8*>(p);
+            }
+            // Kernel ignored the flag (older kernel mis-reporting support) and
+            // placed it elsewhere — discard and fall through to the hint path.
+            ::munmap(p, 4096);
+        }
+    }
+#endif
+    // Fallback for kernels without MAP_FIXED_NOREPLACE: hinted mmap, accepted
+    // only if it actually landed sub-4GiB at the required address.
+    void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096,
                      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (p == MAP_FAILED) return nullptr;
-    if (reinterpret_cast<uintptr_t>(p) >= 0x100000000ull) { ::munmap(p, 4096); return nullptr; }
+    if (reinterpret_cast<uintptr_t>(p) != kLowAddr) { ::munmap(p, 4096); return nullptr; }
     return static_cast<u8*>(p);
 #else
     return nullptr;
