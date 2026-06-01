@@ -3942,6 +3942,142 @@ bool EmitVextractf128(const ZydisDecodedInstruction& insn, const ZydisDecodedOpe
     return true;
 }
 
+// vmovq — move 64 bits between XMM.low and GPR/memory.
+//   xmm <- gpr/mem : write low 64, zero the rest of the YMM (chunks 1,2,3).
+//   gpr <- xmm     : write full 64 to the GPR slot.
+//   mem <- xmm     : store low 64 (8 bytes).
+bool EmitVmovq(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    const int d_vec = (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                          ? ZydisVecToIndex(ops[0].reg.value) : -1;
+    if (d_vec >= 0) {
+        // dst is XMM. src = gpr or mem.
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int gi = ZydisGprToIndex(ops[1].reg.value);
+            if (gi < 0) return false;
+            c.ldr(kScratch0, ptr(kState, GprOffset(gi)));
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+            c.ldr(kScratch0, ptr(kAddr));
+        } else {
+            return false;
+        }
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 0)));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 3)));
+        return true;
+    }
+    // dst is GPR or mem; src is XMM.
+    const int s_vec = ZydisVecToIndex(ops[1].reg.value);
+    if (s_vec < 0) return false;
+    c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s_vec, 0)));
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(ops[0].reg.value);
+        if (gi < 0) return false;
+        c.str(kScratch0, ptr(kState, GprOffset(gi)));
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.str(kScratch0, ptr(kAddr));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// vmovaps/vmovups/vmovdqa/vmovdqu/vmovntdqa — 128/256-bit move with the usual
+// VEX zeroing on a register/memory load into a register.
+//   reg <- reg : copy width, zero upper YMM (128-bit form).
+//   reg <- mem : load width, zero upper YMM.
+//   mem <- reg : store width.
+bool EmitVmovFull(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  u64 next_rip, CodeGenerator& c) {
+    const bool ymm = (ops[0].size == 256 || ops[1].size == 256);
+    const int nchunks = ymm ? 4 : 2;
+
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int dst = ZydisVecToIndex(ops[0].reg.value);
+        const int src = ZydisVecToIndex(ops[1].reg.value);
+        if (dst < 0 || src < 0) return false;
+        for (int ch = 0; ch < nchunks; ++ch) {
+            c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, ch)));
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, ch)));
+        }
+        if (!ymm) {
+            c.mov(kScratch0, 0);
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+        }
+        return true;
+    }
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        const int dst = ZydisVecToIndex(ops[0].reg.value);
+        if (dst < 0) return false;
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.mov(kScratch1, kAddr);
+        for (int ch = 0; ch < nchunks; ++ch) {
+            c.add(kScratch0, kScratch1, ch * 8);
+            c.ldr(kScratch2, ptr(kScratch0));
+            c.str(kScratch2, ptr(kState, YmmChunkOffset(dst, ch)));
+        }
+        if (!ymm) {
+            c.mov(kScratch0, 0);
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+        }
+        return true;
+    }
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisVecToIndex(ops[1].reg.value);
+        if (src < 0) return false;
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(kScratch1, kAddr);
+        for (int ch = 0; ch < nchunks; ++ch) {
+            c.ldr(kScratch2, ptr(kState, YmmChunkOffset(src, ch)));
+            c.add(kScratch0, kScratch1, ch * 8);
+            c.str(kScratch2, ptr(kScratch0));
+        }
+        return true;
+    }
+    return false;
+}
+
+// vmovsldup — dst even lanes duplicated: dst[0]=src[0],dst[1]=src[0],
+//   dst[2]=src[2],dst[3]=src[2]  ==  trn1(4S, src, src).
+// vmovshdup — odd lanes duplicated: dst[0]=src[1],dst[1]=src[1],
+//   dst[2]=src[3],dst[3]=src[3]  ==  trn2(4S, src, src). XMM zeroes upper.
+bool EmitVmovdup(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    const bool odd = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSHDUP);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisVecToIndex(ops[1].reg.value);
+        if (src < 0) return false;
+        c.add(kScratch0, kState, YmmChunkOffset(src, 0));
+        c.ldr(QReg(0), ptr(kScratch0));
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.ldr(QReg(0), ptr(kAddr));
+    } else {
+        return false;
+    }
+    if (odd) c.trn2(VReg4S(1), VReg4S(0), VReg4S(0));
+    else     c.trn1(VReg4S(1), VReg4S(0), VReg4S(0));
+    c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+    c.str(QReg(1), ptr(kScratch0));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -4138,6 +4274,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VINSERTPS:  handled = EmitVinsertps(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VINSERTF128:  handled = EmitVinsertf128(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VEXTRACTF128: handled = EmitVextractf128(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVQ:    handled = EmitVmovq(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVAPS: case ZYDIS_MNEMONIC_VMOVUPS:
+        case ZYDIS_MNEMONIC_VMOVDQA: case ZYDIS_MNEMONIC_VMOVDQU:
+        case ZYDIS_MNEMONIC_VMOVNTDQA:
+            handled = EmitVmovFull(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVSLDUP: case ZYDIS_MNEMONIC_VMOVSHDUP:
+            handled = EmitVmovdup(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
