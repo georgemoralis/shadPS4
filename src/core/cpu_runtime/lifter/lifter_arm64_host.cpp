@@ -4629,6 +4629,247 @@ bool EmitFnstcw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     return true;
 }
 
+// ============================================================================
+// x87 FPU — register-stack model. ST(i) = st[(fpu_top + i) & 7]. Each slot
+// holds a 64-bit double bit-pattern. Push: top=(top-1)&7 then write st[top],
+// set tag bit. Pop: clear tag bit, top=(top+1)&7. We compute slot addresses
+// into a callee-stable reg so the top-of-stack math never aliases the value.
+// ============================================================================
+
+// addr_reg = &st[(fpu_top + delta) & 7]. Uses w-scratch regs; clobbers x12,x13.
+static void EmitX87RegAddr(const XReg& addr_reg, int delta, CodeGenerator& c) {
+    c.ldr(WReg(12), ptr(kState, (u32)offsetof(GuestState, fpu_top)));
+    if (delta != 0) c.add(WReg(12), WReg(12), delta);
+    c.and_(WReg(12), WReg(12), 7);
+    c.add(addr_reg, kState, (u32)offsetof(GuestState, st));   // &st[0]
+    c.add(addr_reg, addr_reg, XReg(12), ShMod::LSL, 3);  // + idx*8
+}
+
+// Push: top=(top-1)&7; st[top] = DReg(0); set tag bit `top`.
+static void EmitX87Push(CodeGenerator& c) {
+    c.ldr(WReg(12), ptr(kState, (u32)offsetof(GuestState, fpu_top)));
+    c.sub(WReg(12), WReg(12), 1);
+    c.and_(WReg(12), WReg(12), 7);
+    c.str(WReg(12), ptr(kState, (u32)offsetof(GuestState, fpu_top)));
+    c.add(XReg(14), kState, (u32)offsetof(GuestState, st));
+    c.str(DReg(0), ptr(XReg(14), XReg(12), ShMod::LSL, 3));
+    // set tag bit `top`: tag |= (1 << top).
+    c.mov(WReg(13), 1);
+    c.lsl(WReg(13), WReg(13), WReg(12));
+    c.ldrh(WReg(14), ptr(kState, (u32)offsetof(GuestState, fpu_tag)));
+    c.orr(WReg(14), WReg(14), WReg(13));
+    c.strh(WReg(14), ptr(kState, (u32)offsetof(GuestState, fpu_tag)));
+}
+
+// Pop: clear tag bit `top`; top=(top+1)&7. Value already consumed by caller.
+static void EmitX87PopDiscard(CodeGenerator& c) {
+    c.ldr(WReg(12), ptr(kState, (u32)offsetof(GuestState, fpu_top)));
+    c.mov(WReg(13), 1);
+    c.lsl(WReg(13), WReg(13), WReg(12));
+    c.mvn(WReg(13), WReg(13));
+    c.ldrh(WReg(14), ptr(kState, (u32)offsetof(GuestState, fpu_tag)));
+    c.and_(WReg(14), WReg(14), WReg(13));
+    c.strh(WReg(14), ptr(kState, (u32)offsetof(GuestState, fpu_tag)));
+    c.add(WReg(12), WReg(12), 1);
+    c.and_(WReg(12), WReg(12), 7);
+    c.str(WReg(12), ptr(kState, (u32)offsetof(GuestState, fpu_top)));
+}
+
+// Convert the double in DReg(0) to 80-bit extended, writing 10 bytes to the
+// address in `dstAddr` (x11/kAddr). 80-bit: sign(1):exp(15):mantissa(64, with
+// explicit integer bit). Handles normal/zero; subnormals-as-double map fine.
+static void EmitDoubleToTbyte(const XReg& dstAddr, CodeGenerator& c) {
+    // x9 = double bits.
+    c.fmov(kScratch0, DReg(0));
+    const XReg sign = XReg(5), dexp = XReg(6), dmant = XReg(7), eexp = XReg(12), emant = XReg(13);
+    c.lsr(sign, kScratch0, 63);
+    c.lsl(sign, sign, 15);                        // sign in bit15 of the exp word
+    c.ubfx(dexp, kScratch0, 52, 11);              // 11-bit exponent
+    c.ubfx(dmant, kScratch0, 0, 52);              // 52-bit mantissa
+    Label zerocase, compose;
+    // zero (dexp==0 && dmant==0) -> emit zero exp+mant.
+    c.orr(eexp, dexp, dmant);
+    c.cbz(eexp, zerocase);
+    // normal: eexp = dexp - 1023 + 16383 ; emant = (1<<63) | (dmant << 11).
+    c.mov(eexp, 1023);
+    c.sub(eexp, dexp, eexp);
+    c.mov(dmant, 16383);
+    c.add(eexp, eexp, dmant);
+    c.and_(eexp, eexp, 0x7FFF);
+    c.ubfx(dmant, kScratch0, 0, 52);              // reload mantissa
+    c.lsl(emant, dmant, 11);
+    c.mov(dmant, 1);
+    c.lsl(dmant, dmant, 63);
+    c.orr(emant, emant, dmant);                   // explicit integer bit
+    c.b(compose);
+    c.L(zerocase);
+    c.mov(eexp, 0);
+    c.mov(emant, 0);
+    c.L(compose);
+    c.orr(sign, sign, eexp);                      // exp word = sign | eexp
+    c.str(emant, ptr(dstAddr));                   // bytes 0..7 = mantissa
+    c.strh(WReg(5), ptr(dstAddr, 8));             // bytes 8..9 = sign|exp
+}
+
+// Convert 80-bit extended at `srcAddr` to a double in DReg(0).
+static void EmitTbyteToDouble(const XReg& srcAddr, CodeGenerator& c) {
+    const XReg emant = XReg(5), expw = XReg(6), sign = XReg(7), dexp = XReg(12), dmant = XReg(13);
+    c.ldr(emant, ptr(srcAddr));                   // 64-bit mantissa
+    c.ldrh(WReg(6), ptr(srcAddr, 8));             // 16-bit sign|exp
+    c.lsr(sign, expw, 15);
+    c.and_(sign, sign, 1);
+    c.and_(expw, expw, 0x7FFF);
+    Label zero, done;
+    c.cbz(expw, zero);
+    // normal: dexp = eexp - 16383 + 1023 ; dmant = (emant >> 11) & 0xF_FFFF_FFFF_FFFF.
+    c.mov(dexp, 16383);
+    c.sub(dexp, expw, dexp);
+    c.mov(dmant, 1023);
+    c.add(dexp, dexp, dmant);
+    c.and_(dexp, dexp, 0x7FF);
+    c.lsr(dmant, emant, 11);
+    c.ubfx(dmant, dmant, 0, 52);
+    c.lsl(dexp, dexp, 52);
+    c.orr(dmant, dmant, dexp);
+    c.b(done);
+    c.L(zero);
+    c.mov(dmant, 0);
+    c.L(done);
+    c.lsl(sign, sign, 63);
+    c.orr(dmant, dmant, sign);
+    c.fmov(DReg(0), dmant);
+}
+
+// FLD — load float/double from memory and push; or register form `fld st(i)`
+// which pushes a copy of ST(i). Tbyte (m80) load handled here too.
+bool EmitFld(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+             u64 next_rip, CodeGenerator& c) {
+    // Register form: fld st(i) (D9 C0+i).
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        int i = 0;
+        if (ops[0].reg.value >= ZYDIS_REGISTER_ST0 && ops[0].reg.value <= ZYDIS_REGISTER_ST7)
+            i = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+        else return false;
+        // Read ST(i) BEFORE the push changes top (push decrements top, so the
+        // old ST(i) is at new offset i+1; read first into DReg(0)).
+        EmitX87RegAddr(XReg(11), i, c);
+        c.ldr(DReg(0), ptr(XReg(11)));
+        EmitX87Push(c);
+        return true;
+    }
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    const int w = ops[0].size;
+    if (w == 80) {
+        c.mov(kScratch1, kAddr);
+        EmitTbyteToDouble(kScratch1, c);          // -> DReg(0)
+    } else if (w == 32) {
+        c.ldr(SReg(0), ptr(kAddr));
+        c.fcvt(DReg(0), SReg(0));
+    } else {
+        c.ldr(DReg(0), ptr(kAddr));
+    }
+    EmitX87Push(c);
+    return true;
+}
+
+// FST / FSTP — store ST(0) to memory (narrowing to float for m32). FSTP pops.
+// Tbyte (m80) store handled here (always a pop form on x86).
+bool EmitFstOrFstp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                   u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    const bool pop = (insn.mnemonic == ZYDIS_MNEMONIC_FSTP);
+    const int w = ops[0].size;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    c.mov(kScratch1, kAddr);                      // stable dst addr
+    // Load ST(0) into DReg(0).
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.ldr(DReg(0), ptr(XReg(11)));
+    if (w == 80) {
+        EmitDoubleToTbyte(kScratch1, c);
+    } else if (w == 32) {
+        c.fcvt(SReg(1), DReg(0));
+        c.str(SReg(1), ptr(kScratch1));
+    } else {
+        c.str(DReg(0), ptr(kScratch1));
+    }
+    if (pop) EmitX87PopDiscard(c);
+    return true;
+}
+
+// FILD — load signed int (32/64) from memory, convert to double, push.
+bool EmitFild(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    const int w = ops[0].size;
+    if (w == 64) {
+        c.ldr(kScratch0, ptr(kAddr));
+        c.scvtf(DReg(0), kScratch0);
+    } else {
+        c.ldrsw(kScratch0, ptr(kAddr));           // sign-extend 32-bit
+        c.scvtf(DReg(0), kScratch0);
+    }
+    EmitX87Push(c);
+    return true;
+}
+
+// FISTP — convert ST(0) to signed int (32/64), store, pop. Round-to-nearest.
+bool EmitFistp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    c.mov(kScratch1, kAddr);
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.ldr(DReg(0), ptr(XReg(11)));
+    const int w = ops[0].size;
+    // Round to nearest even, then convert.
+    c.frintn(DReg(0), DReg(0));
+    if (w == 64) {
+        c.fcvtzs(kScratch0, DReg(0));
+        c.str(kScratch0, ptr(kScratch1));
+    } else {
+        c.fcvtzs(WReg(9), DReg(0));
+        c.str(WReg(9), ptr(kScratch1));
+    }
+    EmitX87PopDiscard(c);
+    return true;
+}
+
+// FADDP/FMULP/FSUBP/FSUBRP/FDIVP/FDIVRP st(i),st(0) — arithmetic with pop.
+//   FADDP : st(i)=st(i)+st(0)   FMULP : st(i)=st(i)*st(0)
+//   FSUBP : st(i)=st(i)-st(0)   FSUBRP: st(i)=st(0)-st(i)
+//   FDIVP : st(i)=st(i)/st(0)   FDIVRP: st(i)=st(0)/st(i)
+bool EmitX87ArithPop(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                     CodeGenerator& c) {
+    int i = 1;
+    if (insn.operand_count_visible >= 1 && ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[0].reg.value >= ZYDIS_REGISTER_ST0 && ops[0].reg.value <= ZYDIS_REGISTER_ST7)
+        i = ops[0].reg.value - ZYDIS_REGISTER_ST0;
+
+    // DReg(0) = st(0), DReg(1) = st(i).
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.mov(XReg(15), XReg(11));                     // stable &st(0)
+    c.ldr(DReg(0), ptr(XReg(15)));
+    EmitX87RegAddr(XReg(11), i, c);
+    c.mov(XReg(5), XReg(11));                      // stable &st(i)
+    c.ldr(DReg(1), ptr(XReg(5)));
+
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FADDP:  c.fadd(DReg(1), DReg(1), DReg(0)); break;
+        case ZYDIS_MNEMONIC_FMULP:  c.fmul(DReg(1), DReg(1), DReg(0)); break;
+        case ZYDIS_MNEMONIC_FSUBP:  c.fsub(DReg(1), DReg(1), DReg(0)); break;
+        case ZYDIS_MNEMONIC_FDIVP:  c.fdiv(DReg(1), DReg(1), DReg(0)); break;
+        case ZYDIS_MNEMONIC_FSUBRP: c.fsub(DReg(1), DReg(0), DReg(1)); break;  // st0 - sti
+        case ZYDIS_MNEMONIC_FDIVRP: c.fdiv(DReg(1), DReg(0), DReg(1)); break;  // st0 / sti
+        default: return false;
+    }
+    c.str(DReg(1), ptr(XReg(5)));                  // st(i) = result
+    EmitX87PopDiscard(c);
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -4896,6 +5137,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitMxcsr(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_FNSTCW: case ZYDIS_MNEMONIC_FLDCW:
             handled = EmitFnstcw(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FLD:   handled = EmitFld(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FST: case ZYDIS_MNEMONIC_FSTP:
+            handled = EmitFstOrFstp(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FILD:  handled = EmitFild(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FISTP: handled = EmitFistp(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FADDP: case ZYDIS_MNEMONIC_FMULP:
+        case ZYDIS_MNEMONIC_FSUBP: case ZYDIS_MNEMONIC_FSUBRP:
+        case ZYDIS_MNEMONIC_FDIVP: case ZYDIS_MNEMONIC_FDIVRP:
+            handled = EmitX87ArithPop(insn, ops, c); break;
         case ZYDIS_MNEMONIC_JMP:
             handled = EmitJmp(insn, ops, next_rip, c);
             if (handled) emitted_terminator = true;
