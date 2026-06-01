@@ -3716,6 +3716,232 @@ bool EmitVcvtPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
     return true;
 }
 
+// Lane extract to GPR or memory: vpextrd (dword), vpextrq (qword), vextractps
+// (dword, FP-typed but bit-identical to pextrd). imm = lane index. GPR dest
+// zero-extends. We slice directly out of the guest register file via GPR.
+bool EmitVpextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                u64 next_rip, CodeGenerator& c) {
+    const bool q = (insn.mnemonic == ZYDIS_MNEMONIC_VPEXTRQ);
+    // ops: [0]=dst (gpr or mem), [1]=src xmm, [2]=imm8 lane.
+    const int src = ZydisVecToIndex(ops[1].reg.value);
+    if (src < 0) return false;
+    const int lane = static_cast<int>(ops[2].imm.value.u) & (q ? 1 : 3);
+
+    if (q) {
+        // qword lane: chunk = lane (0 or 1).
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, lane)));
+    } else {
+        // dword lane: chunk = lane/2, within-chunk hi/lo by lane&1.
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, lane / 2)));
+        if (lane & 1) c.lsr(kScratch0, kScratch0, 32);
+        c.and_(kScratch0, kScratch0, 0xFFFFFFFFull);
+    }
+
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(ops[0].reg.value);
+        if (gi < 0) return false;
+        c.str(kScratch0, ptr(kState, GprOffset(gi)));   // zero-extended store
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        if (q) c.str(kScratch0, ptr(kAddr));
+        else   c.str(WReg(9), ptr(kAddr));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// vpinsrd dst, src1, r/m32, imm8 — copy src1's low 128 to dst, then replace the
+// dword lane (imm&3) with the 32-bit GPR/mem source. Upper 128 zeroed.
+bool EmitVpinsrd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+    const int lane = static_cast<int>(ops[3].imm.value.u) & 3;
+
+    // Load the 32-bit value -> w9 (zero-ext into x9).
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(ops[2].reg.value);
+        if (gi < 0) return false;
+        c.ldr(WReg(9), ptr(kState, GprOffset(gi)));
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        c.ldr(WReg(9), ptr(kAddr));
+    } else {
+        return false;
+    }
+    // Copy src1 chunk0/1 to dst, then patch the target chunk's half.
+    const int chunk = lane / 2;
+    // Load the src1 chunk holding the lane, merge in the new dword.
+    c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, chunk)));
+    if (lane & 1) {
+        // replace hi32: keep lo32 of src1 chunk, put value in hi32.
+        c.and_(kScratch1, kScratch1, 0xFFFFFFFFull);
+        c.lsl(kScratch0, kScratch0, 32);   // x9 (value) -> hi32
+        c.orr(kScratch1, kScratch1, kScratch0);
+    } else {
+        // replace lo32: keep hi32 of src1 chunk, put value in lo32.
+        c.lsr(kScratch1, kScratch1, 32);
+        c.lsl(kScratch1, kScratch1, 32);
+        c.and_(kScratch0, kScratch0, 0xFFFFFFFFull);
+        c.orr(kScratch1, kScratch1, kScratch0);
+    }
+    c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, chunk)));
+    // The other chunk of the low 128 comes straight from src1.
+    const int other = chunk ^ 1;
+    c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, other)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, other)));
+    // Zero upper 128.
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vinsertps dst, src1, src2/m32, imm8. imm: [7:6]=src dword select (reg form),
+// [5:4]=dst dword select, [3:0]=zero mask. dst = src1 with src2[sel] inserted
+// at dst[dsel], then lanes flagged in the zero mask are cleared. Upper 128 zero.
+// We build the 4 dwords in GPRs (x5..x8-ish via two 64-bit chunk regs) then store.
+bool EmitVinsertps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                   u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+    const int imm = static_cast<int>(ops[3].imm.value.u) & 0xFF;
+    const int src_sel = (imm >> 6) & 3;
+    const int dst_sel = (imm >> 4) & 3;
+    const int zmask   = imm & 0xF;
+
+    // Load the inserted dword -> w12.
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        if (s2 < 0) return false;
+        c.ldr(kScratch2, ptr(kState, YmmChunkOffset(s2, src_sel / 2)));
+        if (src_sel & 1) c.lsr(kScratch2, kScratch2, 32);
+        c.and_(kScratch2, kScratch2, 0xFFFFFFFFull);
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        c.ldr(WReg(12), ptr(kAddr));    // m32 (src select ignored for mem form)
+    } else {
+        return false;
+    }
+
+    // Load src1's two low chunks into x9 (chunk0) and x10 (chunk1).
+    c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, 0)));
+    c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 1)));
+
+    // Insert the dword (x12) at dst_sel. Each chunk holds two dwords.
+    auto patch = [&](int lane) {
+        const XReg ch = (lane / 2 == 0) ? kScratch0 : kScratch1;
+        if (lane & 1) {
+            c.and_(ch, ch, 0xFFFFFFFFull);
+            c.lsl(XReg(7), kScratch2, 32);
+            c.orr(ch, ch, XReg(7));
+        } else {
+            c.lsr(ch, ch, 32);
+            c.lsl(ch, ch, 32);
+            c.and_(XReg(7), kScratch2, 0xFFFFFFFFull);
+            c.orr(ch, ch, XReg(7));
+        }
+    };
+    patch(dst_sel);
+
+    // Apply zero mask: clear any of the 4 dwords whose zmask bit is set.
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!((zmask >> lane) & 1)) continue;
+        const XReg ch = (lane / 2 == 0) ? kScratch0 : kScratch1;
+        if (lane & 1) {
+            c.and_(ch, ch, 0xFFFFFFFFull);   // clear hi32
+        } else {
+            c.lsr(ch, ch, 32);
+            c.lsl(ch, ch, 32);               // clear lo32
+        }
+    }
+
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+    c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, 1)));
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vinsertf128 dst, src1(ymm), src2(xmm/m128), imm8 — dst = src1 (256), then the
+// 128-bit half selected by imm&1 is replaced by src2.
+bool EmitVinsertf128(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                     u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+    const int half = static_cast<int>(ops[3].imm.value.u) & 1;
+
+    // dst = src1 (all 4 chunks).
+    for (int ch = 0; ch < 4; ++ch) {
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, ch)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, ch)));
+    }
+    // Overwrite the chosen 128-half with src2 (xmm low 128, chunks 0,1).
+    const int base = half * 2;
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        if (s2 < 0) return false;
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s2, 0)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, base)));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s2, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, base + 1)));
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        c.ldr(kScratch0, ptr(kAddr));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, base)));
+        c.add(kScratch1, kAddr, 8);
+        c.ldr(kScratch0, ptr(kScratch1));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, base + 1)));
+    } else {
+        return false;
+    }
+    return true;
+}
+
+// vextractf128 dst(xmm/m128), src(ymm), imm8 — dst = src's 128-half (imm&1).
+bool EmitVextractf128(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                      u64 next_rip, CodeGenerator& c) {
+    const int src = ZydisVecToIndex(ops[1].reg.value);
+    if (src < 0) return false;
+    const int half = static_cast<int>(ops[2].imm.value.u) & 1;
+    const int base = half * 2;
+
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int dst = ZydisVecToIndex(ops[0].reg.value);
+        if (dst < 0) return false;
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, base)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, base + 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+        // xmm dst zeroes upper 128.
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.mov(kScratch1, kAddr);
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, base)));
+        c.str(kScratch0, ptr(kScratch1));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, base + 1)));
+        c.add(kScratch1, kScratch1, 8);
+        c.str(kScratch0, ptr(kScratch1));
+    } else {
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
@@ -3905,6 +4131,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitVcvtScalar(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
             handled = EmitVcvtPacked(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
+        case ZYDIS_MNEMONIC_VEXTRACTPS:
+            handled = EmitVpextr(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPINSRD:    handled = EmitVpinsrd(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VINSERTPS:  handled = EmitVinsertps(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VINSERTF128:  handled = EmitVinsertf128(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VEXTRACTF128: handled = EmitVextractf128(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
