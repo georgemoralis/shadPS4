@@ -389,6 +389,19 @@ void EmitMaterializeFlags(CodeGenerator& c) {
     // LOGIC: CF = OF = 0.
 
     c.L(doneCfOf);
+    // Preserve non-arithmetic control bits from the prior RFLAGS. The
+    // materializer only computes the six arithmetic flags
+    // (CF=0,PF=2,AF=4,ZF=6,SF=7,OF=11); every other bit — notably DF (bit 10),
+    // but also IF/TF/reserved — must survive. Without this, a SCAS/CMPS in a
+    // DF=1 context would clear DF and corrupt the next iteration's advance.
+    {
+        constexpr u64 kArithMask =
+            (1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11);
+        c.ldr(u, ptr(kState, Offsets::Rflags));
+        c.mov(t, ~kArithMask);
+        c.and_(u, u, t);          // u = old control bits (DF etc.)
+        c.orr(fl, fl, u);         // merge into freshly-computed arithmetic flags
+    }
     c.str(fl, ptr(kState, Offsets::Rflags));
 }
 
@@ -2865,12 +2878,258 @@ bool EmitStringOp(const ZydisDecodedInstruction& insn, u64 next_rip,
     return true;
 }
 
-} // namespace
+// ============================================================================
+// SSE/AVX scalar floating-point — foundation.
+//
+// Guest XMM/YMM live in GuestState::ymm (lane*4 + chunk, 8 bytes/chunk; XMM is
+// chunks 0,1; YMM upper is chunks 2,3). These VEX-encoded ops operate on the
+// low 32 (ss) or 64 (sd) bits, merge the rest of the low 128 from src1, and
+// zero the upper 128 (chunks 2,3). We shuffle bytes with GPR moves and run the
+// actual IEEE-754 math on NEON scalar regs (v0/v1), so host MXCSR rounding
+// gives exact results.
+// ============================================================================
 
-// ============================================================================
-// CompileBlock — same control structure as the x86 lifter, PLUS the
-// Apple-Silicon W^X bracketing and icache invalidation.
-// ============================================================================
+enum class VScalarOp { Add, Sub, Mul, Div, Sqrt, Min, Max };
+
+// vaddss/sd, vsubss/sd, vmulss/sd, vdivss/sd, vsqrtss/sd, vminss/sd, vmaxss/sd.
+// Forms: 3-op reg (dst, src1, src2-reg-or-mem). Sqrt is 2-op-ish but VEX still
+// carries src1 for the merge: vsqrtsd xmm0, xmm1, xmm2 -> low=sqrt(src2),
+// upper-of-low128 from src1. Single precision uses SReg, double uses DReg.
+bool EmitVScalarArith(const ZydisDecodedInstruction& insn,
+                      const ZydisDecodedOperand* ops, u64 next_rip,
+                      VScalarOp op, bool dbl, CodeGenerator& c) {
+    if (insn.operand_count_visible < 3) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+
+    // Load src2 low element into v1 (from reg lane or memory).
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        if (s2 < 0) return false;
+        if (dbl) c.ldr(DReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
+        else     c.ldr(SReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+        if (dbl) c.ldr(DReg(1), ptr(kAddr));
+        else     c.ldr(SReg(1), ptr(kAddr));
+    } else {
+        return false;
+    }
+
+    // Load src1 low element into v0 (the other arithmetic operand; for sqrt
+    // src1 only supplies the merge upper, but loading it is harmless).
+    if (dbl) c.ldr(DReg(0), ptr(kState, YmmChunkOffset(s1, 0)));
+    else     c.ldr(SReg(0), ptr(kState, YmmChunkOffset(s1, 0)));
+
+    // Compute low result into v0.
+    if (dbl) {
+        switch (op) {
+            case VScalarOp::Add:  c.fadd(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Sub:  c.fsub(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Mul:  c.fmul(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Div:  c.fdiv(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Min:  c.fmin(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Max:  c.fmax(DReg(0), DReg(0), DReg(1)); break;
+            case VScalarOp::Sqrt: c.fsqrt(DReg(0), DReg(1)); break;  // sqrt(src2)
+        }
+    } else {
+        switch (op) {
+            case VScalarOp::Add:  c.fadd(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Sub:  c.fsub(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Mul:  c.fmul(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Div:  c.fdiv(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Min:  c.fmin(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Max:  c.fmax(SReg(0), SReg(0), SReg(1)); break;
+            case VScalarOp::Sqrt: c.fsqrt(SReg(0), SReg(1)); break;
+        }
+    }
+
+    // Merge: dst.chunk0 = result-low merged with src1's other bits of chunk0
+    // (for ss, src1's high 32); dst.chunk1 = src1.chunk1; zero chunks 2,3.
+    if (dbl) {
+        // chunk0 = result (full 64); chunk1 = src1.chunk1.
+        c.str(DReg(0), ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+    } else {
+        // chunk0 = (src1.hi32 << 32) | result.lo32.
+        c.fmov(WReg(9), SReg(0));                           // w9 = result bits (zero-ext to x9)
+        c.mov(WReg(9), WReg(9));                            // ensure upper 32 of x9 zeroed
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 0)));
+        c.lsr(kScratch1, kScratch1, 32);
+        c.lsl(kScratch1, kScratch1, 32);                    // src1.hi32 << 32
+        c.orr(kScratch0, kScratch1, kScratch0);             // note: kScratch0=x9 holds result lo32
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+    }
+    c.mov(kScratch0, 0);
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    return true;
+}
+
+// vmovss / vmovsd — three forms: merge (3 reg), load (reg<-mem), store (mem<-reg).
+bool EmitVmovss(const ZydisDecodedInstruction& insn,
+                const ZydisDecodedOperand* ops, u64 next_rip, CodeGenerator& c) {
+    const bool ss = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSS);
+    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSD);
+    if (!ss && !sd) return false;
+
+    // Merge form: 3 visible register operands.
+    if (insn.operand_count_visible == 3 &&
+        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int dst = ZydisVecToIndex(ops[0].reg.value);
+        const int s1  = ZydisVecToIndex(ops[1].reg.value);
+        const int s2  = ZydisVecToIndex(ops[2].reg.value);
+        if (dst < 0 || s1 < 0 || s2 < 0) return false;
+        if (sd) {
+            c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s2, 0)));  // chunk0 = src2.chunk0
+            c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 1)));  // chunk1 = src1.chunk1
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+            c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, 1)));
+        } else {
+            c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, 0)));
+            c.lsr(kScratch1, kScratch1, 32);
+            c.lsl(kScratch1, kScratch1, 32);                       // src1.hi32 << 32
+            c.ldr(WReg(9), ptr(kState, YmmChunkOffset(s2, 0)));    // src2.lo32 (zero-ext x9)
+            c.orr(kScratch0, kScratch1, kScratch0);
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+            c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s1, 1)));
+            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+        }
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+        return true;
+    }
+
+    // Load: xmm <- [mem].
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        const int dst = ZydisVecToIndex(ops[0].reg.value);
+        if (dst < 0) return false;
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        if (sd) {
+            c.ldr(kScratch0, ptr(kAddr));
+        } else {
+            c.ldr(WReg(9), ptr(kAddr));   // zero-extends x9
+        }
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 0)));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+        return true;
+    }
+
+    // Store: [mem] <- xmm.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int src = ZydisVecToIndex(ops[1].reg.value);
+        if (src < 0) return false;
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        if (sd) {
+            c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, 0)));
+            c.str(kScratch0, ptr(kAddr));
+        } else {
+            c.ldr(WReg(9), ptr(kState, YmmChunkOffset(src, 0)));
+            c.str(WReg(9), ptr(kAddr));
+        }
+        return true;
+    }
+    return false;
+}
+
+// Packed vector ops on the full XMM (128) or YMM (256) width. Three families:
+//   FP arith (ps/pd): vaddps/vsubps/vmulps/vdivps/vminps/vmaxps + pd variants.
+//   int arith (d):    vpaddd/vpsubd/vpmulld.
+//   bitwise:          vandps/vorps/vxorps/vandnps + pd; vpand/vpor/vpxor/vpandn.
+// VEX rule: a 128-bit (XMM) op zeroes the upper 128 (chunks 2,3); a 256-bit op
+// writes all four chunks. src1/src2 are reg or (src2) memory.
+enum class VPackKind {
+    AddPS, SubPS, MulPS, DivPS, MinPS, MaxPS,
+    AddPD, SubPD, MulPD, DivPD, MinPD, MaxPD,
+    AddD, SubD, MulD,
+    And, Or, Xor, AndN,   // bitwise (operate on whole 128/256 regardless of element)
+};
+
+bool EmitVPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, VPackKind k, CodeGenerator& c) {
+    if (insn.operand_count_visible < 3) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;   // number of 128-bit halves to process
+
+    // Process each 128-bit half independently (YMM lanes don't cross for these).
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;   // chunk offset of this 128-bit half (0 or 2)
+        // Load src1 half -> q0, src2 half -> q1.
+        c.add(kScratch0, kState, YmmChunkOffset(s1, chunk));
+        c.ldr(QReg(0), ptr(kScratch0));
+        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int s2 = ZydisVecToIndex(ops[2].reg.value);
+            if (s2 < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(s2, chunk));
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);   // preserve base EA across halves
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else {
+            return false;
+        }
+
+        switch (k) {
+            case VPackKind::AddPS: c.fadd(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::SubPS: c.fsub(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::MulPS: c.fmul(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::DivPS: c.fdiv(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::MinPS: c.fmin(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::MaxPS: c.fmax(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::AddPD: c.fadd(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::SubPD: c.fsub(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::MulPD: c.fmul(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::DivPD: c.fdiv(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::MinPD: c.fmin(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::MaxPD: c.fmax(VReg2D(0), VReg2D(0), VReg2D(1)); break;
+            case VPackKind::AddD:  c.add(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::SubD:  c.sub(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::MulD:  c.mul(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            case VPackKind::And:   c.and_(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::Or:    c.orr(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::Xor:   c.eor(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            // ANDN = (~src1) & src2. NEON bic(d,n,m) = n & ~m -> bic(d, src2, src1).
+            case VPackKind::AndN:  c.bic(VReg16B(0), VReg16B(1), VReg16B(0)); break;
+        }
+
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(0), ptr(kScratch0));
+    }
+
+    if (!ymm) {
+        // VEX-128: zero upper 128 (chunks 2,3).
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+} // namespace
 Lifter::Lifter(CodeCache& code_cache) : code_cache_(code_cache) {
     LOG_INFO(Core, "Lifter (arm64 host) initialized");
 }
@@ -2989,6 +3248,45 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_DIV:
             handled = EmitDiv(insn, ops, c);
             break;
+        case ZYDIS_MNEMONIC_VADDSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Add, false, c); break;
+        case ZYDIS_MNEMONIC_VADDSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Add, true,  c); break;
+        case ZYDIS_MNEMONIC_VSUBSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Sub, false, c); break;
+        case ZYDIS_MNEMONIC_VSUBSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Sub, true,  c); break;
+        case ZYDIS_MNEMONIC_VMULSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Mul, false, c); break;
+        case ZYDIS_MNEMONIC_VMULSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Mul, true,  c); break;
+        case ZYDIS_MNEMONIC_VDIVSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Div, false, c); break;
+        case ZYDIS_MNEMONIC_VDIVSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Div, true,  c); break;
+        case ZYDIS_MNEMONIC_VMINSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Min, false, c); break;
+        case ZYDIS_MNEMONIC_VMINSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Min, true,  c); break;
+        case ZYDIS_MNEMONIC_VMAXSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Max, false, c); break;
+        case ZYDIS_MNEMONIC_VMAXSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Max, true,  c); break;
+        case ZYDIS_MNEMONIC_VSQRTSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Sqrt, false, c); break;
+        case ZYDIS_MNEMONIC_VSQRTSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Sqrt, true,  c); break;
+        case ZYDIS_MNEMONIC_VMOVSS:
+        case ZYDIS_MNEMONIC_VMOVSD: handled = EmitVmovss(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VADDPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddPS, c); break;
+        case ZYDIS_MNEMONIC_VSUBPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubPS, c); break;
+        case ZYDIS_MNEMONIC_VMULPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulPS, c); break;
+        case ZYDIS_MNEMONIC_VDIVPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::DivPS, c); break;
+        case ZYDIS_MNEMONIC_VMINPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinPS, c); break;
+        case ZYDIS_MNEMONIC_VMAXPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxPS, c); break;
+        case ZYDIS_MNEMONIC_VADDPD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddPD, c); break;
+        case ZYDIS_MNEMONIC_VSUBPD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubPD, c); break;
+        case ZYDIS_MNEMONIC_VMULPD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulPD, c); break;
+        case ZYDIS_MNEMONIC_VDIVPD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::DivPD, c); break;
+        case ZYDIS_MNEMONIC_VMINPD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinPD, c); break;
+        case ZYDIS_MNEMONIC_VMAXPD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxPD, c); break;
+        case ZYDIS_MNEMONIC_VPADDD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddD, c); break;
+        case ZYDIS_MNEMONIC_VPSUBD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubD, c); break;
+        case ZYDIS_MNEMONIC_VPMULLD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulD, c); break;
+        case ZYDIS_MNEMONIC_VANDPS: case ZYDIS_MNEMONIC_VANDPD:
+        case ZYDIS_MNEMONIC_VPAND:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::And, c); break;
+        case ZYDIS_MNEMONIC_VORPS:  case ZYDIS_MNEMONIC_VORPD:
+        case ZYDIS_MNEMONIC_VPOR:   handled = EmitVPacked(insn, ops, next_rip, VPackKind::Or, c); break;
+        case ZYDIS_MNEMONIC_VXORPS: case ZYDIS_MNEMONIC_VXORPD:
+        case ZYDIS_MNEMONIC_VPXOR:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::Xor, c); break;
+        case ZYDIS_MNEMONIC_VANDNPS: case ZYDIS_MNEMONIC_VANDNPD:
+        case ZYDIS_MNEMONIC_VPANDN:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::AndN, c); break;
         case ZYDIS_MNEMONIC_CLD:
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
