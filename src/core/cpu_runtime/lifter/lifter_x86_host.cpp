@@ -3096,12 +3096,35 @@ bool EmitXgetbv(const ZydisDecodedInstruction& insn, Xbyak::CodeGenerator& c) {
 //   CQO  : RAX → RDX:RAX (sign-extension of RAX into RDX)
 // =============================================================================
 
+bool EmitCbw(Xbyak::CodeGenerator& c) {
+    // AL -> AX: sign-extend the low byte of guest RAX into AH, preserving
+    // RAX bits 63:16. CBW writes only the 16-bit AX, so we read AL, run the
+    // native cbw, and store back ONLY the 16-bit word — the in-memory upper
+    // 48 bits are untouched. (Unlike CWDE/CDQE, this must not blow away the
+    // high bits with a qword store.)
+    c.mov(al, byte[r13 + GprOffset(0)]);
+    c.cbw();
+    c.mov(word[r13 + GprOffset(0)], ax);
+    return true;
+}
+
 bool EmitCwde(Xbyak::CodeGenerator& c) {
     // Load low 16 of guest RAX into host AX, sign-extend to EAX,
     // store qword (upper 32 of rax is naturally zero after CWDE).
     c.mov(ax, word[r13 + GprOffset(0)]);
     c.cwde();
     c.mov(qword[r13 + GprOffset(0)], rax);
+    return true;
+}
+
+bool EmitCwd(Xbyak::CodeGenerator& c) {
+    // AX -> DX:AX: sign-extend AX's bit15 into DX, preserving RDX bits 63:16
+    // and leaving RAX untouched. CWD writes only the 16-bit DX, so we load AX,
+    // run native cwd, and store back ONLY the 16-bit DX word — the in-memory
+    // upper 48 bits of RDX are preserved.
+    c.mov(ax, word[r13 + GprOffset(0)]);
+    c.cwd();
+    c.mov(word[r13 + GprOffset(2)], dx);
     return true;
 }
 
@@ -7587,8 +7610,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_VPMOVZXDQ: handled = EmitVpmovzxdq(insn, ops, next_rip, c); break;
 
             // Sign-extension family. No operands; operate on RAX/RDX.
+            case ZYDIS_MNEMONIC_CBW:  handled = EmitCbw(c);  break;
             case ZYDIS_MNEMONIC_CWDE: handled = EmitCwde(c); break;
             case ZYDIS_MNEMONIC_CDQE: handled = EmitCdqe(c); break;
+            case ZYDIS_MNEMONIC_CWD:  handled = EmitCwd(c);  break;
             case ZYDIS_MNEMONIC_CDQ:  handled = EmitCdq(c);  break;
             case ZYDIS_MNEMONIC_CQO:  handled = EmitCqo(c);  break;
 
