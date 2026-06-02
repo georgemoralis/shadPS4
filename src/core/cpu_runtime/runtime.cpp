@@ -10,17 +10,6 @@
 #include <cstring>
 #include <type_traits>
 
-// Platform headers for IsGuestPointer's host-module check (GetModuleHandleEx on
-// Windows, dladdr on POSIX). MUST be included at file scope, never inside the
-// Core::Runtime namespace below — <windows.h> drags in the Win32/COM headers,
-// and if those are parsed inside a namespace their types (e.g. _GUID/IID) bind
-// as Core::Runtime::_GUID and break the SDK's own COM template methods.
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
-
 #include "common/assert.h"
 #include "common/arch.h"
 #include "common/logging/log.h"
@@ -33,6 +22,17 @@
 
 #ifdef ARCH_X86_64
 #include <Zydis/Zydis.h>
+#endif
+
+// Platform headers for IsGuestPointer's host-module query. These MUST be at
+// file scope: when included inside `namespace Core::Runtime` they bind Win32/COM
+// types like _GUID/IID into the namespace, breaking QueryInterface/Resolve.
+// (Previously this was masked because windows.h was pulled in earlier at global
+// scope in the monolithic TU; as a standalone library it no longer is.)
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
 #endif
 
 namespace Core::Runtime {
@@ -592,6 +592,13 @@ void* DispatcherTrampoline(GuestState* state) {
             // Pop guest return address.
             state->rip = guest_return_addr;
             state->gpr[kGuestRsp] = guest_rsp + 8;
+
+            // Diagnostics: a block entered by returning from an HLE bridge call
+            // is reached inside this loop, NOT via a fresh DispatchOne entry, so
+            // the boundary snapshot taken at function entry (cur_rip) missed it.
+            // Record the boundary here too so the value-origin ring stays
+            // complete across HLE calls. No-op unless diagnostics are compiled in.
+            Diagnostics::RecordBlockBoundary(state, state->rip);
             continue;
         }
 

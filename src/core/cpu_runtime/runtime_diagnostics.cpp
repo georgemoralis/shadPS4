@@ -233,15 +233,82 @@ void CheckHleReturn(std::string_view name, u64 host_fn, u64 rax) {
     }
 }
 
+// The block that actually faults. Reached via a jump-table/dispatch path;
+// it executes `mov eax,[rdx]` with a poisoned guest rdx (a small non-pointer
+// like 0x6), so the load dereferences unmapped low memory. The earlier
+// 0x800274c09 target entered with clean registers, so it was upstream of the
+// damage; this is the block where the bad value is first *used*.
+constexpr u64 kFaultBlockRip = 0x8002f05e2ull;
+
+// The faulting load is `mov eax,[r15+0xc]`: its base is guest r15 (GuestState
+// offset 0x78 = index 15), and the crash shows r15 = 0x3f (a small integer, not
+// a pointer) producing data_addr 0x4b. r15 — NOT rdx — is the corrupted base.
+// (An earlier revision watched rdx, the host scratch reg the EA helper computes
+// into; that is unrelated to the guest base and produced a misleading origin.)
+constexpr int kBaseIdx = 15;
+
+// A "plausible guest pointer" is anything that could legitimately be loaded
+// from: dmem (top dword 0x1/0x2), code/heap (0x8), or the anon stack window.
+// The faulting rdx values (0x6, 0x3f, 0x0) are none of these — they are
+// small integers that were never meant to be an address. We treat
+// "about to deref a non-pointer" as the trap condition rather than reusing
+// IsCorruptGuestValue, whose gap-pointer test (top dword 0x3..0x7) does NOT
+// match a small integer like 0x6 and so would never fire here.
+bool IsImplausiblePointer(u64 v) {
+    const u64 top = v >> 32;
+    const bool dmem      = (top == 0x1 || top == 0x2);
+    const bool code_heap = (top == 0x8);
+    const bool anon_stack = (v >= 0x7ef000000ull && v < 0x800000000ull);
+    return !(dmem || code_heap || anon_stack);
+}
+
 void MaybeDumpPreBlock(GuestState* state) {
     static thread_local bool dumped = false;
-    if (!dumped && state->rip == 0x800274c09ull) {
-        dumped = true;
-        LOG_ERROR(Core,
-                  "[RAXTRACE] about to enter faulting block 0x800274c09; guest GPRs:");
-        for (int i = 0; i < 16; ++i) {
-            LOG_ERROR(Core, "[RAXTRACE]   {} = {:#x}", kGprNames[i], state->gpr[i]);
+    if (dumped || state->rip != kFaultBlockRip) {
+        return;
+    }
+
+    // Only treat this as THE event when r15 is actually unusable. The block is
+    // entered cleanly (valid r15) many times before the faulting entry; if we
+    // consumed the one-shot on the first clean visit we'd suppress the crash
+    // dump. So gate the one-shot on the bad value, and on clean visits fall
+    // through silently without setting `dumped`.
+    const u64 bad = state->gpr[kBaseIdx];
+    if (!IsImplausiblePointer(bad)) {
+        return;
+    }
+    dumped = true;
+
+    LOG_ERROR(Core,
+              "[RAXTRACE] about to enter faulting block {:#x}; guest GPRs:",
+              kFaultBlockRip);
+    for (int i = 0; i < 16; ++i) {
+        LOG_ERROR(Core, "[RAXTRACE]   {} = {:#x}", kGprNames[i], state->gpr[i]);
+    }
+
+    // Walk the snapshot ring backward to find the block that last changed r15
+    // from a plausible pointer to the current bad value. snaps[].rip labels the
+    // block ABOUT to run at that boundary, and snaps[].gpr[] is the prior
+    // block's *output* — so the rip recorded at the last-good boundary names
+    // the producer.
+    const u32 live = (g_snap_pos < (u32)kSnapDepth) ? g_snap_pos
+                                                    : (u32)kSnapDepth;
+    bool seen_bad_run = false;
+    for (u32 k = 1; k <= live; ++k) {
+        const u32 slot = (g_snap_pos - k) % kSnapDepth;
+        if (!g_snaps[slot].valid) break;
+        const u64 v = g_snaps[slot].gpr[kBaseIdx];
+        if (v == bad) {
+            seen_bad_run = true;
+            continue;
         }
+        if (seen_bad_run) {
+            LOG_ERROR(Core,
+                      "[GPRSNAP] r15 VALUE-ORIGIN: block {:#x} changed it "
+                      "from {:#x} -> {:#x} before faulting block {:#x}",
+                      g_snaps[slot].rip, v, bad, kFaultBlockRip);
+        }
+        break;
     }
 }
 
@@ -356,21 +423,34 @@ void OnBlockCompiled(u64 guest_rip, const void* host_ptr, u64 emitted_size) {
     // General dev tooling: full per-instruction disassembly, env-gated.
     DumpCompiledBlockDisasm(guest_rip, host_ptr, emitted_size);
 
-    // Investigation-specific: raw host-byte dump for the bit-33 corruption
-    // loop blocks only.
+    // Investigation-specific: raw host-byte dump for the blocks under active
+    // investigation. The 0x800274c** / 0x800302f60 set is from the earlier
+    // bit-33 corruption loop; 0x8002f04d0 is the r15-corruption producer (writes
+    // r15 = 0x3f in the function prologue) and 0x8002f05e2 is the faulting block
+    // that dereferences it. The prologue turned out faithful (r15 = incoming rcx),
+    // so 0x80030e680 — the CALLER block that ends in the `call` and computes the
+    // rcx arg — is added to catch where rcx becomes 0x3f.
     if (guest_rip != 0x800274c00ull && guest_rip != 0x800274c09ull &&
-        guest_rip != 0x800274caeull && guest_rip != 0x800302f60ull) {
+        guest_rip != 0x800274caeull && guest_rip != 0x800302f60ull &&
+        guest_rip != 0x8002f04d0ull && guest_rip != 0x8002f05e2ull &&
+        guest_rip != 0x80030e680ull) {
         return;
     }
     static thread_local u64 dumped_mask = 0;
     const int slot = (guest_rip == 0x800274c00ull) ? 0
                    : (guest_rip == 0x800274c09ull) ? 1
-                   : (guest_rip == 0x800274caeull) ? 2 : 3;
+                   : (guest_rip == 0x800274caeull) ? 2
+                   : (guest_rip == 0x800302f60ull) ? 3
+                   : (guest_rip == 0x8002f04d0ull) ? 4
+                   : (guest_rip == 0x8002f05e2ull) ? 5 : 6;
     if (dumped_mask & (1ull << slot)) {
         return;
     }
     dumped_mask |= (1ull << slot);
-    constexpr u64 kMaxDump = 256;
+    // 768 bytes covers the largest blocks under investigation (the caller block
+    // is 506 host bytes); the hex buffer scales with this constant. A spdlog line
+    // of ~2.3 KB is fine for a one-shot diagnostic dump.
+    constexpr u64 kMaxDump = 768;
     const u64 n = (emitted_size > kMaxDump) ? kMaxDump : emitted_size;
     const u8* p = reinterpret_cast<const u8*>(host_ptr);
     const char* digits = "0123456789abcdef";
