@@ -17706,10 +17706,11 @@ TEST_F(CpuRuntimeTest, Vpsllw_RegCount_BroadcastsScalar) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 = ymm[4..7]; xmm2 = ymm[8..11] (4 u64 chunks per vector register).
     st.ymm[4] = (0x0004ULL << 48) | (0x0003ULL << 32) | (0x0002ULL << 16) | 0x0001ULL;
-    // xmm2 low 64 = 3 (shift count); upper bits must be ignored.
-    st.ymm[6] = 3;
-    st.ymm[7] = 0xFFFFFFFFFFFFFFFFULL;
+    // xmm2 low 64 = 3 (shift count); upper 64 bits must be ignored.
+    st.ymm[8] = 3;
+    st.ymm[9] = 0xFFFFFFFFFFFFFFFFULL;
 
     Runtime rt;
     rt.Run(st);
@@ -17771,11 +17772,12 @@ TEST_F(CpuRuntimeTest, Vpsraw_CountAtOrAboveWidth_SignFill) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 = ymm[4..7]; xmm2 = ymm[8..11].
     // lanes: [0x8000 neg, 0x0001 pos, 0xFFFF neg, 0x7000 pos]
     st.ymm[4] = (0x7000ULL << 48) | (0xFFFFULL << 32) | (0x0001ULL << 16) | 0x8000ULL;
     st.ymm[5] = 0;
-    st.ymm[6] = 20;  // count >= 16
-    st.ymm[7] = 0;
+    st.ymm[8] = 20;  // xmm2 low 64 = count >= 16
+    st.ymm[9] = 0;
 
     Runtime rt;
     rt.Run(st);
