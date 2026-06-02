@@ -657,11 +657,20 @@ bool EmitMovzx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
     // Load zero-extended source into kScratch0 (ldrb/ldrh/uxt zero-extend).
     if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int s = ZydisGprToIndex(ops[1].reg.value);
-        if (s < 0) return false;
-        c.ldr(kScratch0, ptr(kState, GprOffset(s)));
-        if (src_size == 8) c.uxtb(kScratch0, kScratch0);
-        else               c.uxth(kScratch0, kScratch0);
+        const int hb = HighByteParent(ops[1].reg.value);
+        if (hb >= 0) {
+            // High-byte source (AH/CH/DH/BH): the byte is bits 15:8 of the
+            // parent GPR. Load parent, shift down 8, zero-extend the byte.
+            c.ldr(kScratch0, ptr(kState, GprOffset(hb)));
+            c.lsr(kScratch0, kScratch0, 8);
+            c.uxtb(kScratch0, kScratch0);
+        } else {
+            const int s = ZydisGprToIndex(ops[1].reg.value);
+            if (s < 0) return false;
+            c.ldr(kScratch0, ptr(kState, GprOffset(s)));
+            if (src_size == 8) c.uxtb(kScratch0, kScratch0);
+            else               c.uxth(kScratch0, kScratch0);
+        }
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
         if (src_size == 8) c.ldrb(WReg(9), ptr(kAddr));   // zero-extends to X
@@ -702,9 +711,17 @@ bool EmitMovsx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
     // Load the raw source bits into kScratch0 (low byte/word significant).
     if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int s = ZydisGprToIndex(ops[1].reg.value);
-        if (s < 0) return false;
-        c.ldr(kScratch0, ptr(kState, GprOffset(s)));
+        const int hb = HighByteParent(ops[1].reg.value);
+        if (hb >= 0) {
+            // High-byte source (AH/CH/DH/BH): move bits 15:8 of the parent
+            // into the low byte so the sxtb below sign-extends from bit 7.
+            c.ldr(kScratch0, ptr(kState, GprOffset(hb)));
+            c.lsr(kScratch0, kScratch0, 8);
+        } else {
+            const int s = ZydisGprToIndex(ops[1].reg.value);
+            if (s < 0) return false;
+            c.ldr(kScratch0, ptr(kState, GprOffset(s)));
+        }
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
         if (src_size == 8) c.ldrb(WReg(9), ptr(kAddr));

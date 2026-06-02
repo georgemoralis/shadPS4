@@ -17587,5 +17587,76 @@ TEST_F(CpuRuntimeTest, X87_Fcmovnb_MovesWhenNotBelow) {
     EXPECT_EQ(res, 3.0) << "fcmovnb moved because CF=0";
 }
 
+
+// ============================================================================
+// MOVZX / MOVSX with a HIGH-BYTE source register (AH/CH/DH/BH). The byte comes
+// from bits 15:8 of the parent GPR, not bits 7:0. The register-index helper
+// returns -1 for high-byte regs, so both lifters previously rejected e.g.
+// `movzx eax, bh` -> unsupported (observed in a real title). Now handled by
+// resolving the high-byte parent and extracting the correct byte.
+// Encodings: movzx r32,bh = 0F B6 C7 ; movzx r32,ah = 0F B6 CC ;
+//   movsx r32,bh = 0F BE C7 ; movsx r32,ch = 0F BE D5.
+// Verified against native x86 and the arm64 emitter under QEMU. (Note: a REX
+// prefix can't encode AH/CH/DH/BH, so 64-bit destinations don't arise.)
+// ============================================================================
+
+// MOVZX EAX, BH: BH = bits 15:8 of RBX. Set RBX so BH = 0xFF.
+TEST_F(CpuRuntimeTest, Movzx_HighByteSource_BH) {
+    u8 program[] = {
+        0x48, 0xbb, 0x56, 0xFF, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, // mov rbx, 0x12'34FF'56
+        0x0f, 0xb6, 0xc7,              // movzx eax, bh  (bh = 0xFF)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0xFFull) << "movzx eax,bh zero-extends BH=0xFF";
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "EAX result zero-extends RAX";
+}
+
+// MOVZX ECX, AH: AH = bits 15:8 of RAX. Set RAX so AH = 0x7F.
+TEST_F(CpuRuntimeTest, Movzx_HighByteSource_AH) {
+    u8 program[] = {
+        0x48, 0xb8, 0x00, 0x7F, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rax, 0x7F00
+        0x0f, 0xb6, 0xcc,              // movzx ecx, ah  (ah = 0x7F)
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1], 0x7Full) << "movzx ecx,ah extracts AH=0x7F";
+}
+
+// MOVSX EAX, BH: BH = 0xFF (-1) sign-extends to 0xFFFFFFFF.
+TEST_F(CpuRuntimeTest, Movsx_HighByteSource_BH_Negative) {
+    u8 program[] = {
+        0x48, 0xbb, 0x56, 0xFF, 0x34, 0x12, 0x00, 0x00, 0x00, 0x00, // rbx, BH=0xFF
+        0x0f, 0xbe, 0xc7,              // movsx eax, bh
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] & 0xFFFFFFFFull, 0xFFFFFFFFull) << "movsx eax,bh sign-extends 0xFF -> 0xFFFFFFFF";
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0u) << "32-bit dst zero-extends upper RAX";
+}
+
+// MOVSX EDX, CH: CH = 0x80 (-128) sign-extends to 0xFFFFFF80.
+TEST_F(CpuRuntimeTest, Movsx_HighByteSource_CH) {
+    u8 program[] = {
+        0x48, 0xb9, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // mov rcx, 0x8000 -> CH=0x80
+        0x0f, 0xbe, 0xd5,              // movsx edx, ch
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[2] & 0xFFFFFFFFull, 0xFFFFFF80ull) << "movsx edx,ch sign-extends 0x80 -> 0xFFFFFF80";
+}
+
+// Sanity: a high-byte source does NOT pick up the low byte. RAX low byte is
+// 0x11 but AH is 0x22; movzx must read 0x22.
+TEST_F(CpuRuntimeTest, Movzx_HighByte_NotLowByte) {
+    u8 program[] = {
+        0x48, 0xb8, 0x11, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // rax: AL=0x11, AH=0x22
+        0x0f, 0xb6, 0xc4,              // movzx eax, ah
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x22ull) << "movzx eax,ah reads AH (0x22), not AL (0x11)";
+}
+
 } // namespace
 } // namespace Core::Runtime

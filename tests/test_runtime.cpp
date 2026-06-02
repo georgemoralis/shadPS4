@@ -1456,5 +1456,42 @@ TEST_F(CpuRuntimeTest, HleBridge_IntReturn_UnaffectedByXmmWriteback) {
 }
 
 
+
+// ----------------------------------------------------------------------------
+// Dense block does not overflow the host code buffer. A long straight-line run
+// of flag-setting ALU ops expands to far more host bytes than guest bytes (each
+// add materializes flags). Under the old 4 KiB host-size cap with no per-insn
+// guard, the x86 lifter overran the Xbyak CodeGenerator buffer and Xbyak threw
+// ERR_CODE_IS_TOO_BIG mid-compile (surfacing on Windows as a C++ exception
+// 0xe06d7363 followed by an access violation). The fix enlarges the cap to
+// 16 KiB and adds a per-instruction size guard that ends the block early with a
+// clean BlockEnd fallthrough, matching the arm64 lifter. Here we compile a
+// block big enough to have overflowed the old cap; surviving compilation and
+// producing the right sum proves the guard/cap fix holds.
+//   xor rax,rax; mov rbx,1; (add rax,rbx) x N; ret   -> rax = N
+// ----------------------------------------------------------------------------
+TEST_F(CpuRuntimeTest, Dense_Block_DoesNotOverflowHostBuffer) {
+    constexpr int kAdds = 300;  // ~900 guest bytes of adds; >4 KiB host bytes
+    std::vector<u8> program;
+    // xor rax, rax
+    program.insert(program.end(), {0x48, 0x31, 0xc0});
+    // mov rbx, 1
+    program.insert(program.end(), {0x48, 0xc7, 0xc3, 0x01, 0x00, 0x00, 0x00});
+    // add rax, rbx  (x kAdds)
+    for (int i = 0; i < kAdds; ++i) {
+        program.insert(program.end(), {0x48, 0x01, 0xd8});
+    }
+    program.push_back(0xc3);  // ret
+
+    const auto r = RunProgram(program.data(), program.size(), mem);
+
+    // If the block exceeded the host-size cap it ends early at BlockEnd; the
+    // dispatcher then recompiles from the next RIP and continues, so the final
+    // accumulated value is still kAdds regardless of how many sub-blocks it took.
+    EXPECT_EQ(r.state.gpr[0], static_cast<u64>(kAdds))
+        << "all adds executed across however many sub-blocks the cap produced";
+    EXPECT_EQ(r.state.gpr[3], 1ULL) << "rbx held the addend";
+}
+
 } // namespace
 } // namespace Core::Runtime

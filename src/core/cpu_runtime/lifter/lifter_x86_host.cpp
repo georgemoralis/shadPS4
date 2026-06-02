@@ -22,8 +22,12 @@ namespace {
 // ============================================================================
 
 /// Maximum bytes emitted per block before we force a fallthrough.
-/// Keeps compile time bounded for runaway code.
-constexpr u64 BLOCK_HOST_SIZE_CAP = 4096;
+/// Keeps compile time bounded for runaway code. Must be large enough
+/// that a full BLOCK_GUEST_SIZE_CAP of dense SSE/AVX guest code (each
+/// vector op can expand to many host bytes) fits with margin; 4 KiB was
+/// too small and let Xbyak throw ERR_CODE_IS_TOO_BIG mid-block. Matches
+/// the arm64 lifter's cap.
+constexpr u64 BLOCK_HOST_SIZE_CAP = 16384;
 
 /// Maximum guest bytes consumed per block before forcing a
 /// fallthrough. Pathologically long basic blocks are bad for
@@ -2349,11 +2353,15 @@ bool EmitMovzx(const ZydisDecodedInstruction& insn,
     if (src_size != 8 && src_size != 16) return false;
 
     if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int src_idx = ZydisGprToIndex(ops[1].reg.value);
-        if (src_idx < 0) return false;
         if (src_size == 8) {
-            c.movzx(rax, byte[r13 + GprOffset(src_idx)]);
+            // 8-bit source may be a high-byte reg (AH/CH/DH/BH); use the byte
+            // offset helper, which accounts for the +1 of high-byte regs.
+            const int src_off = ZydisGpr8ToByteOffset(ops[1].reg.value);
+            if (src_off < 0) return false;
+            c.movzx(rax, byte[r13 + src_off]);
         } else {
+            const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+            if (src_idx < 0) return false;
             c.movzx(rax, word[r13 + GprOffset(src_idx)]);
         }
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
@@ -2409,13 +2417,16 @@ bool EmitMovsx(const ZydisDecodedInstruction& insn,
     // 32-bit case, which is exactly what a 32-bit write stores), and
     // rax holds the full 64-bit sign-extended value for the 64-bit case.
     if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int src_idx = ZydisGprToIndex(ops[1].reg.value);
-        if (src_idx < 0) return false;
         if (src_size == 8) {
-            if (dst_size == 16)      c.movsx(ax,  byte[r13 + GprOffset(src_idx)]);
-            else if (dst_size == 32) c.movsx(eax, byte[r13 + GprOffset(src_idx)]);
-            else                     c.movsx(rax, byte[r13 + GprOffset(src_idx)]);
+            // 8-bit source may be a high-byte reg (AH/CH/DH/BH).
+            const int src_off = ZydisGpr8ToByteOffset(ops[1].reg.value);
+            if (src_off < 0) return false;
+            if (dst_size == 16)      c.movsx(ax,  byte[r13 + src_off]);
+            else if (dst_size == 32) c.movsx(eax, byte[r13 + src_off]);
+            else                     c.movsx(rax, byte[r13 + src_off]);
         } else {  // src_size == 16
+            const int src_idx = ZydisGprToIndex(ops[1].reg.value);
+            if (src_idx < 0) return false;
             if (dst_size == 32)      c.movsx(eax, word[r13 + GprOffset(src_idx)]);
             else                     c.movsx(rax, word[r13 + GprOffset(src_idx)]);
         }
@@ -8396,6 +8407,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
 
         rip += insn.length;
         if (emitted_terminator) break;
+
+        // Stop before the next instruction if emitting it could overrun the
+        // host buffer. Vector ops (SSE/AVX) can expand to several hundred host
+        // bytes each, so the margin must comfortably cover one worst-case
+        // instruction plus the fall-through terminator emitted below. Without
+        // this guard a dense block overflowed the CodeGenerator buffer and
+        // Xbyak threw ERR_CODE_IS_TOO_BIG mid-compile. (Mirrors arm64.)
+        constexpr u64 HOST_SIZE_MARGIN = 1024;
+        if (c.getSize() + HOST_SIZE_MARGIN >= BLOCK_HOST_SIZE_CAP) break;
     }
 
     if (!emitted_terminator) {
