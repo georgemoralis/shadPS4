@@ -4565,15 +4565,39 @@ bool EmitFstOrFstp(const ZydisDecodedInstruction& insn,
                    const ZydisDecodedOperand* ops,
                    u64 next_rip,
                    Xbyak::CodeGenerator& c) {
+    const bool pop = (insn.mnemonic == ZYDIS_MNEMONIC_FSTP);
+
+    // Register form: FST ST(i) / FSTP ST(i) copies ST(0) into ST(i), then pops
+    // for FSTP. Zydis may present one visible ST operand (the dest) or two
+    // (dest + implicit ST0); take the destination from the first ST-register
+    // operand. FSTP ST(0) is the common "discard top" idiom.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        int di = -1;
+        for (int i = 0; i < insn.operand_count_visible; ++i) {
+            if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                ops[i].reg.value >= ZYDIS_REGISTER_ST0 &&
+                ops[i].reg.value <= ZYDIS_REGISTER_ST7) {
+                di = ops[i].reg.value - ZYDIS_REGISTER_ST0;
+                break;
+            }
+        }
+        if (di < 0) return false;
+        EmitX87RegAddr(c, r8, 0);          // r8 = &ST(0)
+        c.movsd(xmm0, ptr[r8]);
+        EmitX87RegAddr(c, r8, di);         // r8 = &ST(di)
+        c.movsd(ptr[r8], xmm0);            // ST(di) = ST(0) (self-copy if di==0)
+        if (pop) EmitX87PopDiscardValue(c);
+        return true;
+    }
+
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) {
-        return false;  // register form deferred to Group 2
+        return false;
     }
     // NOTE: Zydis reports operand_width==32 for ALL x87 memory operands
     // (dword and qword alike); the true access size is in ops[0].size.
     // Keying off operand_width would silently truncate every m64 form.
     const u32 w = ops[0].size;
     if (w != 32 && w != 64 && w != 80) return false;
-    const bool pop = (insn.mnemonic == ZYDIS_MNEMONIC_FSTP);
 
     // 80-bit extended-precision store (m80 / `fstp tbyte`). xbyak has no
     // m80 address form, and our guest x87 slots hold 64-bit doubles, so
@@ -4645,13 +4669,17 @@ bool EmitFistp(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                u64 next_rip,
                Xbyak::CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP) return false;
+    // FISTP rounds ST(0) per the current rounding mode (cvtsd2si follows
+    // MXCSR, default round-to-nearest); FISTTP (SSE3) always truncates toward
+    // zero (cvttsd2si). Both store m16/m32/m64 and pop.
+    const bool is_truncating = (insn.mnemonic == ZYDIS_MNEMONIC_FISTTP);
+    if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP && !is_truncating) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     // NOTE: Zydis reports operand_width==32 for ALL x87 memory operands
     // (dword and qword alike); the true access size is in ops[0].size.
     // Keying off operand_width would silently truncate every m64 form.
     const u32 w = ops[0].size;
-    if (w != 32 && w != 64) return false;
+    if (w != 16 && w != 32 && w != 64) return false;
 
     // Load ST(0) into xmm0 (address math uses rcx + r8).
     EmitX87RegAddr(c, r8, 0);
@@ -4659,12 +4687,17 @@ bool EmitFistp(const ZydisDecodedInstruction& insn,
 
     // Destination address (clobbers rax, writes rdx).
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-    if (w == 32) {
-        c.cvtsd2si(eax, xmm0);       // double -> 32-bit signed int
-        c.mov(dword[rdx], eax);
-    } else {
-        c.cvtsd2si(rax, xmm0);       // double -> 64-bit signed int
+    if (w == 64) {
+        if (is_truncating) c.cvttsd2si(rax, xmm0);   // double -> 64-bit signed, truncate
+        else               c.cvtsd2si(rax, xmm0);    // double -> 64-bit signed, round
         c.mov(qword[rdx], rax);
+    } else {
+        // 16- and 32-bit both convert to a 32-bit signed int; the store width
+        // differs (m16 writes a word, preserving adjacent bytes).
+        if (is_truncating) c.cvttsd2si(eax, xmm0);
+        else               c.cvtsd2si(eax, xmm0);
+        if (w == 16) c.mov(word[rdx], ax);
+        else         c.mov(dword[rdx], eax);
     }
 
     EmitX87PopDiscardValue(c);
@@ -4948,7 +4981,63 @@ bool EmitFnstsw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     return false;
 }
 
-/// FLDCW m16 — load the x87 control word. Our x87 model executes on
+/// x87 conditional move: FCMOVcc ST(0), ST(i). If the EFLAGS condition holds,
+/// copy ST(i) into ST(0); otherwise leave ST(0) unchanged. No pop, no flag
+/// change. Modeled on host SSE2 doubles: build the condition into a register,
+/// load both slots, and select with a host CMOVcc on integer GPRs holding the
+/// raw double bits (movsd<->gpr round-trip). Conditions use guest rflags
+/// CF=bit0, PF=bit2, ZF=bit6. Pairs with FCOMI/FUCOMI.
+bool EmitFcmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               Xbyak::CodeGenerator& c) {
+    int si = -1;
+    for (int i = insn.operand_count_visible - 1; i >= 0; --i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[i].reg.value >= ZYDIS_REGISTER_ST0 &&
+            ops[i].reg.value <= ZYDIS_REGISTER_ST7) {
+            si = ops[i].reg.value - ZYDIS_REGISTER_ST0;
+            break;
+        }
+    }
+    if (si < 0) return false;
+
+    // Compute the two stable slot addresses FIRST: EmitX87RegAddr clobbers rcx,
+    // which we use below for the condition, so addresses must precede it.
+    EmitX87RegAddr(c, r8, 0);          // r8 = &ST0
+    EmitX87RegAddr(c, r11, si);        // r11 = &ST(i)
+    c.mov(rax, qword[r8]);             // ST0 raw bits
+    c.mov(r9, qword[r11]);             // ST(i) raw bits
+
+    // Build CF/ZF/PF condition into rcx (1 = perform the move).
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.xor_(rcx, rcx);
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FCMOVB:   c.bt(rdx, 0); c.setc(cl); break;            // CF
+        case ZYDIS_MNEMONIC_FCMOVE:   c.bt(rdx, 6); c.setc(cl); break;            // ZF
+        case ZYDIS_MNEMONIC_FCMOVU:   c.bt(rdx, 2); c.setc(cl); break;            // PF
+        case ZYDIS_MNEMONIC_FCMOVNB:  c.bt(rdx, 0); c.setnc(cl); break;           // !CF
+        case ZYDIS_MNEMONIC_FCMOVNE:  c.bt(rdx, 6); c.setnc(cl); break;           // !ZF
+        case ZYDIS_MNEMONIC_FCMOVNU:  c.bt(rdx, 2); c.setnc(cl); break;           // !PF
+        case ZYDIS_MNEMONIC_FCMOVBE: {                                            // CF|ZF
+            c.mov(r10, rdx); c.shr(r10, 6); c.and_(r10, 1);   // ZF
+            c.mov(rcx, rdx); c.and_(rcx, 1);                  // CF
+            c.or_(rcx, r10); break;
+        }
+        case ZYDIS_MNEMONIC_FCMOVNBE: {                                           // !(CF|ZF)
+            c.mov(r10, rdx); c.shr(r10, 6); c.and_(r10, 1);
+            c.mov(rcx, rdx); c.and_(rcx, 1);
+            c.or_(rcx, r10); c.xor_(rcx, 1); break;
+        }
+        default: return false;
+    }
+    c.and_(rcx, 1);
+
+    // If cond != 0, rax := r9 (ST(i)); else keep ST0. Write back to ST0.
+    c.test(rcx, rcx);
+    c.cmovne(rax, r9);
+    c.mov(qword[r8], rax);
+    return true;
+}
+
 /// host SSE2 doubles and does not honor the guest's precision-control
 /// or rounding-mode bits, so loading the control word has no observable
 /// effect; we just consume the operand (compute its address for side
@@ -8217,6 +8306,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_FNSTSW:
                 handled = EmitFnstsw(insn, ops, next_rip, c);
                 break;
+            case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVE:
+            case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVU:
+            case ZYDIS_MNEMONIC_FCMOVNB: case ZYDIS_MNEMONIC_FCMOVNE:
+            case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNU:
+                handled = EmitFcmov(insn, ops, c);
+                break;
             case ZYDIS_MNEMONIC_FLDCW:
                 handled = EmitFldcw(insn, ops, next_rip, c);
                 break;
@@ -8231,6 +8326,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 handled = EmitFild(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_FISTP:
+            case ZYDIS_MNEMONIC_FISTTP:
                 handled = EmitFistp(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VPSHUFB:

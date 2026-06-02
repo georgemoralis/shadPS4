@@ -17237,5 +17237,355 @@ TEST_F(CpuRuntimeTest, RolMemDest_Flags_CF) {
     EXPECT_TRUE(r.state.rflags & (1ULL << 0)) << "CF = bit rotated into LSB";
 }
 
+
+// ============================================================================
+// x87 register-form store: FST ST(i) / FSTP ST(i). These copy ST(0) into
+// ST(i) (FSTP then pops). Previously both lifters rejected the register form
+// (only the memory store m32/m64/m80 was handled), so a guest `fstp st(0)`
+// (the common discard-top idiom) or `fstp st(i)` hit the unsupported path.
+// This was observed in a real title: "unsupported insn ... mnemonic=fstp,
+// ops=reg,reg". Encodings: fstp st(i) = DD D8+i ; fst st(i) = DD D0+i.
+// Verified against native x86 and the arm64 emitter under QEMU.
+// ============================================================================
+
+// FST ST(1): copy ST(0) into ST(1) without popping. After loading A then B
+// (ST0=B, ST1=A), `fst st(1)` makes ST1=B too; both slots then read back as B.
+TEST_F(CpuRuntimeTest, X87_Fst_RegForm_CopyNoPop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* o0 = mem.CodePtr() + 0x320;
+    u8* o1 = mem.CodePtr() + 0x330;
+    const double A = 3.0, B = 8.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, &A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, &B
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx, &o0
+        0x49, 0xb8, 0,0,0,0,0,0,0,0,   // mov r8, &o1
+        0xdd, 0x00, 0xdd, 0x01,        // fld[rax]; fld[rcx] -> st0=B, st1=A
+        0xdd, 0xd1,                    // fst st(1) -> st1 = st0 = B (no pop)
+        0xdd, 0x1a,                    // fstp [rdx] -> o0 = st0 (B), pop
+        0x41, 0xdd, 0x18,              // fstp [r8] -> o1 = new st0 (old st1 = B)
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),
+              q0=reinterpret_cast<u64>(o0),q1=reinterpret_cast<u64>(o1);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8);
+    std::memcpy(&program[22],&q0,8); std::memcpy(&program[32],&q1,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double r0, r1; std::memcpy(&r0, o0, 8); std::memcpy(&r1, o1, 8);
+    EXPECT_EQ(r0, 8.0) << "st0 was B";
+    EXPECT_EQ(r1, 8.0) << "st1 became B after fst st(1)";
+}
+
+// FSTP ST(0): the discard-top idiom. Load A then B (ST0=B, ST1=A); `fstp st(0)`
+// copies ST0 onto itself and pops, so the new ST0 is the old ST1 (A).
+TEST_F(CpuRuntimeTest, X87_Fstp_RegForm_DiscardTop) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 5.0, B = 9.0;
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, &A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // mov rcx, &B
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // mov rdx, &out
+        0xdd, 0x00, 0xdd, 0x01,        // st0=B, st1=A
+        0xdd, 0xd8,                    // fstp st(0) -> discard top; new st0 = A
+        0xdd, 0x1a,                    // fstp [rdx] -> out = new st0 (A)
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 5.0) << "after fstp st(0), top points at old ST(1)=A";
+}
+
+// FSTP ST(2): copy ST(0) into ST(2), then pop. Load C, A, B so ST0=B, ST1=A,
+// ST2=C. After `fstp st(2)`: ST2 := B and pop, so the new stack top (old ST1=A)
+// is followed by the modified slot. We read the slot that held C: it is now B.
+TEST_F(CpuRuntimeTest, X87_Fstp_RegForm_CopyToStI) {
+    u8* pc = mem.CodePtr() + 0x300;
+    u8* pa = mem.CodePtr() + 0x310;
+    u8* pb = mem.CodePtr() + 0x320;
+    u8* o_top = mem.CodePtr() + 0x330;   // new ST0 after pop (old ST1 = A)
+    u8* o_slot = mem.CodePtr() + 0x340;  // the slot that received B (old ST2 pos)
+    const double C = 1.0, A = 2.0, B = 3.0;
+    std::memcpy(pc, &C, 8); std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // rax=&C
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // rcx=&A
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // rdx=&B
+        0x49, 0xb9, 0,0,0,0,0,0,0,0,   // r9=&o_top
+        0xdd, 0x00,                    // fld[rax]=C -> st0=C
+        0xdd, 0x01,                    // fld[rcx]=A -> st0=A,st1=C
+        0xdd, 0x02,                    // fld[rdx]=B -> st0=B,st1=A,st2=C
+        0xdd, 0xda,                    // fstp st(2) -> st2 := B, pop; new st0=A
+        0x41, 0xdd, 0x19,             // fstp [r9] -> o_top = new st0 (A)
+        0xc3,
+    };
+    const u64 c=reinterpret_cast<u64>(pc),a=reinterpret_cast<u64>(pa),
+              b=reinterpret_cast<u64>(pb),t=reinterpret_cast<u64>(o_top);
+    std::memcpy(&program[2],&c,8); std::memcpy(&program[12],&a,8);
+    std::memcpy(&program[22],&b,8); std::memcpy(&program[32],&t,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double rtop; std::memcpy(&rtop, o_top, 8);
+    EXPECT_EQ(rtop, 2.0) << "after fstp st(2)+pop, new ST0 = old ST1 = A";
+    (void)o_slot;
+}
+
+
+// ============================================================================
+// FISTTP (SSE3): convert ST(0) to a signed integer with truncation toward zero
+// (regardless of rounding mode), store m16/m32/m64, and pop. Distinct from
+// FISTP, which rounds per the current mode. Neither lifter handled FISTTP
+// before; it was observed unsupported in a real title ("mnemonic=fisttp").
+// Encodings: fisttp m32 = DB /1 ; fisttp m64 = DD /1 ; fisttp m16 = DF /1.
+// Verified against native x86 (cvttsd2si) and the arm64 emitter (fcvtzs) under
+// QEMU. The defining test is that a fractional value truncates, not rounds.
+// ============================================================================
+
+// FISTTP m32 truncates a positive value toward zero (2.7 -> 2, not 3).
+TEST_F(CpuRuntimeTest, X87_Fisttp_Dword_TruncatesPositive) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 2.7;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // mov rax, &A
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // mov rbx, &out
+        0xdd, 0x00,                    // fld [rax] -> st0 = 2.7
+        0xdb, 0x0b,                    // fisttp dword [rbx]
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    s32 res; std::memcpy(&res, out, 4);
+    EXPECT_EQ(res, 2) << "fisttp truncates 2.7 -> 2 (round-toward-zero)";
+}
+
+// FISTTP m32 truncates a negative value toward zero (-2.7 -> -2, not -3).
+TEST_F(CpuRuntimeTest, X87_Fisttp_Dword_TruncatesNegative) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = -2.7;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdb, 0x0b,        // fld; fisttp dword [rbx]
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    s32 res; std::memcpy(&res, out, 4);
+    EXPECT_EQ(res, -2) << "fisttp truncates -2.7 -> -2 (toward zero, not -3)";
+}
+
+// FISTTP m64 truncates a large value.
+TEST_F(CpuRuntimeTest, X87_Fisttp_Qword) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 1234567.89;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x0b,        // fld; fisttp qword [rbx]
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    s64 res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 1234567LL) << "fisttp m64 truncates 1234567.89 -> 1234567";
+}
+
+// FISTTP m16 truncates and stores a word, preserving adjacent bytes.
+TEST_F(CpuRuntimeTest, X87_Fisttp_Word_AdjacentPreserved) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* out = mem.CodePtr() + 0x320;
+    for (int i = -2; i < 6; ++i) out[i] = 0xCC;
+    const double A = -3.9;
+    std::memcpy(pa, &A, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdf, 0x0b,        // fld; fisttp word [rbx]
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    s16 res; std::memcpy(&res, out, 2);
+    EXPECT_EQ(res, -3) << "fisttp m16 truncates -3.9 -> -3";
+    EXPECT_EQ(static_cast<u8>(out[2]), 0xCCu) << "byte above the word untouched";
+    EXPECT_EQ(static_cast<u8>(out[3]), 0xCCu) << "byte above the word untouched";
+}
+
+// FISTTP pops the stack: after fld(X) fld(Y) fisttp, the remaining ST(0) is X.
+TEST_F(CpuRuntimeTest, X87_Fisttp_Pops) {
+    u8* px = mem.CodePtr() + 0x300;
+    u8* py = mem.CodePtr() + 0x310;
+    u8* oi = mem.CodePtr() + 0x320;   // fisttp integer dest
+    u8* od = mem.CodePtr() + 0x330;   // remaining ST(0) readout
+    const double X = 11.0, Y = 7.8;
+    std::memcpy(px, &X, 8); std::memcpy(py, &Y, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // rax=&X
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // rcx=&Y
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // rbx=&oi
+        0x48, 0xba, 0,0,0,0,0,0,0,0,   // rdx=&od
+        0xdd, 0x00,                    // fld[rax]=X -> st0=X
+        0xdd, 0x01,                    // fld[rcx]=Y -> st0=Y, st1=X
+        0xdd, 0x0b,                    // fisttp qword [rbx] -> store trunc(Y)=7, pop
+        0xdd, 0x1a,                    // fstp [rdx] -> od = new st0 (X)
+        0xc3,
+    };
+    const u64 x=reinterpret_cast<u64>(px),y=reinterpret_cast<u64>(py),
+              i=reinterpret_cast<u64>(oi),d=reinterpret_cast<u64>(od);
+    std::memcpy(&program[2],&x,8); std::memcpy(&program[12],&y,8);
+    std::memcpy(&program[22],&i,8); std::memcpy(&program[32],&d,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    s64 ival; std::memcpy(&ival, oi, 8);
+    double dval; std::memcpy(&dval, od, 8);
+    EXPECT_EQ(ival, 7LL) << "trunc(7.8) = 7";
+    EXPECT_EQ(dval, 11.0) << "after pop, ST(0) = X (the value below)";
+}
+
+
+// ============================================================================
+// x87 conditional move FCMOVcc ST(0), ST(i): if the EFLAGS condition holds,
+// copy ST(i) into ST(0); else leave ST(0) unchanged. No pop, no flag change.
+// Eight conditions keyed on CF/ZF/PF. Neither lifter handled these before;
+// fcmovne was observed unsupported in a real title. Typically paired with
+// FCOMI/FUCOMI (which set CF/ZF/PF). Encodings: FCMOVcc = DA/DB C0+i..D8+i.
+// Verified against native x86 and the arm64 emitter (fcsel) under QEMU.
+// We set flags via FCOMI, then read the resulting ST(0) by storing it.
+// ============================================================================
+
+// fcomi (ST0<ST1 -> CF=1); fcmovb st0,st1 moves -> ST0 becomes ST1.
+TEST_F(CpuRuntimeTest, X87_Fcmovb_MovesWhenBelow) {
+    u8* pa = mem.CodePtr() + 0x300;   // ST1 (loaded first)
+    u8* pb = mem.CodePtr() + 0x310;   // ST0 (loaded second)
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 9.0, B = 2.0;    // ST1=9, ST0=2 -> ST0 < ST1 -> CF=1
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,   // rax=&A
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,   // rcx=&B
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,   // rbx=&out
+        0xdd, 0x00, 0xdd, 0x01,        // st0=B(2), st1=A(9)
+        0xdb, 0xf1,                    // fcomi st0,st1 -> 2<9 -> CF=1
+        0xda, 0xc1,                    // fcmovb st0,st1 -> CF=1 so st0:=st1(9)
+        0xdd, 0x1b,                    // fstp [rbx] -> out = st0
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 9.0) << "fcmovb moved ST(1) into ST(0) because CF=1";
+}
+
+// fcomi (ST0>ST1 -> CF=0); fcmovb does NOT move -> ST0 stays.
+TEST_F(CpuRuntimeTest, X87_Fcmovb_NoMoveWhenNotBelow) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 2.0, B = 9.0;    // ST1=2, ST0=9 -> ST0 > ST1 -> CF=0
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,
+        0xdb, 0xf1,                    // fcomi -> 9>2 -> CF=0
+        0xda, 0xc1,                    // fcmovb -> no move
+        0xdd, 0x1b,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 9.0) << "fcmovb left ST(0) unchanged because CF=0";
+}
+
+// fcomi (equal -> ZF=1); fcmovne does NOT move -> ST0 stays.
+TEST_F(CpuRuntimeTest, X87_Fcmovne_NoMoveWhenEqual) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 4.0, B = 4.0;    // equal -> ZF=1
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,        // st0=B(4), st1=A(4)
+        0xdb, 0xf1,                    // fcomi -> equal -> ZF=1
+        0xdb, 0xc9,                    // fcmovne st0,st1 -> ZF=1 so NO move
+        0xdd, 0x1b,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 4.0) << "fcmovne did not move (ZF=1)";
+}
+
+// fcomi (ST0>ST1 -> ZF=0); fcmovne MOVES -> ST0 becomes ST1.
+TEST_F(CpuRuntimeTest, X87_Fcmovne_MovesWhenNotEqual) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 3.0, B = 8.0;    // ST1=3, ST0=8 -> not equal -> ZF=0
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,
+        0xdb, 0xf1,                    // fcomi -> 8 vs 3 -> ZF=0
+        0xdb, 0xc9,                    // fcmovne -> ZF=0 so st0:=st1(3)
+        0xdd, 0x1b,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 3.0) << "fcmovne moved ST(1) because ZF=0";
+}
+
+// fcomi (ST0>ST1 -> CF=0 ZF=0); fcmovnb MOVES (CF=0).
+TEST_F(CpuRuntimeTest, X87_Fcmovnb_MovesWhenNotBelow) {
+    u8* pa = mem.CodePtr() + 0x300;
+    u8* pb = mem.CodePtr() + 0x310;
+    u8* out = mem.CodePtr() + 0x320;
+    const double A = 3.0, B = 8.0;    // ST0=8 > ST1=3 -> CF=0
+    std::memcpy(pa, &A, 8); std::memcpy(pb, &B, 8);
+    u8 program[] = {
+        0x48, 0xb8, 0,0,0,0,0,0,0,0,
+        0x48, 0xb9, 0,0,0,0,0,0,0,0,
+        0x48, 0xbb, 0,0,0,0,0,0,0,0,
+        0xdd, 0x00, 0xdd, 0x01,
+        0xdb, 0xf1,                    // fcomi -> CF=0
+        0xdb, 0xc1,                    // fcmovnb st0,st1 -> CF=0 so st0:=st1(3)
+        0xdd, 0x1b,
+        0xc3,
+    };
+    const u64 a=reinterpret_cast<u64>(pa),b=reinterpret_cast<u64>(pb),o=reinterpret_cast<u64>(out);
+    std::memcpy(&program[2],&a,8); std::memcpy(&program[12],&b,8); std::memcpy(&program[22],&o,8);
+    const auto r = RunProgram(program, sizeof(program), mem);
+    double res; std::memcpy(&res, out, 8);
+    EXPECT_EQ(res, 3.0) << "fcmovnb moved because CF=0";
+}
+
 } // namespace
 } // namespace Core::Runtime

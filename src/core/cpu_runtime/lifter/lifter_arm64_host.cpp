@@ -5451,8 +5451,34 @@ bool EmitFld(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
 // Tbyte (m80) store handled here (always a pop form on x86).
 bool EmitFstOrFstp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                    u64 next_rip, CodeGenerator& c) {
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     const bool pop = (insn.mnemonic == ZYDIS_MNEMONIC_FSTP);
+
+    // Register form: FST ST(i) / FSTP ST(i) copies ST(0) into ST(i), then pops
+    // for FSTP. Zydis may present this with one visible ST operand (the dest)
+    // or two (dest + implicit ST0); locate the destination ST index from the
+    // first ST-register operand. FSTP ST(0) is the common "discard top" idiom.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        int di = -1;
+        for (int i = 0; i < insn.operand_count_visible; ++i) {
+            if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                ops[i].reg.value >= ZYDIS_REGISTER_ST0 &&
+                ops[i].reg.value <= ZYDIS_REGISTER_ST7) {
+                di = ops[i].reg.value - ZYDIS_REGISTER_ST0;
+                break;
+            }
+        }
+        if (di < 0) return false;
+        // Copy ST(0) -> ST(di). When di == 0 this is a self-copy (no-op aside
+        // from the pop), which is correct.
+        EmitX87RegAddr(XReg(11), 0, c);
+        c.ldr(DReg(0), ptr(XReg(11)));
+        EmitX87RegAddr(XReg(11), di, c);
+        c.str(DReg(0), ptr(XReg(11)));
+        if (pop) EmitX87PopDiscard(c);
+        return true;
+    }
+
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     const int w = ops[0].size;
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
     c.mov(kScratch1, kAddr);                      // stable dst addr
@@ -5491,18 +5517,27 @@ bool EmitFild(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
 // FISTP — convert ST(0) to signed int (32/64), store, pop. Round-to-nearest.
 bool EmitFistp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                u64 next_rip, CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP) return false;
+    // FISTP rounds ST(0) using the current rounding mode (modelled here as
+    // round-to-nearest-even) before the integer conversion; FISTTP (SSE3)
+    // always truncates toward zero regardless of the rounding mode. Both
+    // convert ST(0) to a signed integer, store m16/m32/m64, and pop.
+    const bool is_truncating = (insn.mnemonic == ZYDIS_MNEMONIC_FISTTP);
+    if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP && !is_truncating) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
     c.mov(kScratch1, kAddr);
     EmitX87RegAddr(XReg(11), 0, c);
     c.ldr(DReg(0), ptr(XReg(11)));
     const int w = ops[0].size;
-    // Round to nearest even, then convert.
-    c.frintn(DReg(0), DReg(0));
+    // FISTP: round to nearest even first. FISTTP: skip rounding (fcvtzs
+    // truncates toward zero on its own).
+    if (!is_truncating) c.frintn(DReg(0), DReg(0));
     if (w == 64) {
         c.fcvtzs(kScratch0, DReg(0));
         c.str(kScratch0, ptr(kScratch1));
+    } else if (w == 16) {
+        c.fcvtzs(WReg(9), DReg(0));
+        c.strh(WReg(9), ptr(kScratch1));
     } else {
         c.fcvtzs(WReg(9), DReg(0));
         c.str(WReg(9), ptr(kScratch1));
@@ -5769,6 +5804,59 @@ static bool EmitFnstsw(const ZydisDecodedInstruction& insn, const ZydisDecodedOp
         return true;
     }
     return false;
+}
+
+// x87 conditional move: FCMOVcc ST(0), ST(i). If the EFLAGS condition holds,
+// copy ST(i) into ST(0); otherwise leave ST(0) unchanged. No pop, no flag
+// change. Conditions (from guest rflags CF=bit0, PF=bit2, ZF=bit6):
+//   FCMOVB   CF=1        FCMOVNB   CF=0
+//   FCMOVE   ZF=1        FCMOVNE   ZF=0
+//   FCMOVBE  CF=1|ZF=1   FCMOVNBE  CF=0&ZF=0
+//   FCMOVU   PF=1        FCMOVNU   PF=0
+// These pair with FCOMI/FUCOMI, which set CF/ZF/PF.
+static bool EmitFcmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                      CodeGenerator& c) {
+    // Source ST index = the second ST-register operand (dest is ST0).
+    int si = -1;
+    for (int i = insn.operand_count_visible - 1; i >= 0; --i) {
+        if (ops[i].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            ops[i].reg.value >= ZYDIS_REGISTER_ST0 &&
+            ops[i].reg.value <= ZYDIS_REGISTER_ST7) {
+            si = ops[i].reg.value - ZYDIS_REGISTER_ST0;
+            break;
+        }
+    }
+    if (si < 0) return false;
+
+    // Build the condition into cond (1 = perform the move, 0 = leave ST0).
+    const XReg fl = kScratch0, cf = kScratch1, zf = kScratch2, pf = XReg(13), cond = XReg(14);
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.lsr(cf, fl, 0); c.and_(cf, cf, 1);          // CF
+    c.lsr(zf, fl, 6); c.and_(zf, zf, 1);          // ZF
+    c.lsr(pf, fl, 2); c.and_(pf, pf, 1);          // PF
+
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_FCMOVB:   c.mov(cond, cf); break;
+        case ZYDIS_MNEMONIC_FCMOVE:   c.mov(cond, zf); break;
+        case ZYDIS_MNEMONIC_FCMOVBE:  c.orr(cond, cf, zf); break;             // CF|ZF
+        case ZYDIS_MNEMONIC_FCMOVU:   c.mov(cond, pf); break;
+        case ZYDIS_MNEMONIC_FCMOVNB:  c.eor(cond, cf, 1); break;              // !CF
+        case ZYDIS_MNEMONIC_FCMOVNE:  c.eor(cond, zf, 1); break;              // !ZF
+        case ZYDIS_MNEMONIC_FCMOVNBE: c.orr(cond, cf, zf); c.eor(cond, cond, 1); break; // !(CF|ZF)
+        case ZYDIS_MNEMONIC_FCMOVNU:  c.eor(cond, pf, 1); break;              // !PF
+        default: return false;
+    }
+
+    // Load ST(0) and ST(i); csel picks the source when cond != 0.
+    EmitX87RegAddr(XReg(11), 0, c);
+    c.mov(XReg(15), XReg(11));                     // stable &ST0
+    c.ldr(DReg(0), ptr(XReg(15)));                 // current ST0
+    EmitX87RegAddr(XReg(11), si, c);
+    c.ldr(DReg(1), ptr(XReg(11)));                 // ST(i)
+    c.cmp(cond, 0);
+    c.fcsel(DReg(0), DReg(1), DReg(0), NE);        // cond!=0 ? ST(i) : ST0
+    c.str(DReg(0), ptr(XReg(15)));
+    return true;
 }
 
 } // namespace
@@ -6049,7 +6137,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_FST: case ZYDIS_MNEMONIC_FSTP:
             handled = EmitFstOrFstp(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_FILD:  handled = EmitFild(insn, ops, next_rip, c); break;
-        case ZYDIS_MNEMONIC_FISTP: handled = EmitFistp(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FISTP: case ZYDIS_MNEMONIC_FISTTP:
+            handled = EmitFistp(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_FADDP: case ZYDIS_MNEMONIC_FMULP:
         case ZYDIS_MNEMONIC_FSUBP: case ZYDIS_MNEMONIC_FSUBRP:
         case ZYDIS_MNEMONIC_FDIVP: case ZYDIS_MNEMONIC_FDIVRP:
@@ -6073,6 +6162,11 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitX87Compare(insn, ops, c); break;
         case ZYDIS_MNEMONIC_FNSTSW:
             handled = EmitFnstsw(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVE:
+        case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVU:
+        case ZYDIS_MNEMONIC_FCMOVNB: case ZYDIS_MNEMONIC_FCMOVNE:
+        case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNU:
+            handled = EmitFcmov(insn, ops, c); break;
         case ZYDIS_MNEMONIC_JMP:
             handled = EmitJmp(insn, ops, next_rip, c);
             if (handled) emitted_terminator = true;
