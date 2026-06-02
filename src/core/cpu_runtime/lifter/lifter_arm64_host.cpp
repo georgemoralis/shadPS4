@@ -4440,6 +4440,65 @@ bool EmitVextractf128(const ZydisDecodedInstruction& insn, const ZydisDecodedOpe
     return true;
 }
 
+// vmovd — move 32 bits between XMM.low and GPR/memory. AVX/VEX-encoded, so
+// every XMM-destination form zeros the rest of the YMM (bits 255:32).
+//   xmm <- gpr      : low 32 from GPR, zero bits 255:32.
+//   xmm <- mem      : low 32 from memory, zero bits 255:32.
+//   gpr <- xmm      : low 32 to GPR slot, zero-extended to 64.
+//   mem <- xmm      : store low 32 (4 bytes).
+// EA-clobber note: EmitEffectiveAddress clobbers x9 (kScratch0) and x11
+// (kAddr), so for the store form we compute the address first, then load the
+// value into a DIFFERENT register (kScratch1/x10) before storing.
+bool EmitVmovd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VMOVD) return false;
+
+    const int d_vec = (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                          ? ZydisVecToIndex(ops[0].reg.value) : -1;
+    if (d_vec >= 0) {
+        // dst is XMM. src = gpr or mem -> low 32 bits, rest of YMM zeroed.
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int gi = ZydisGprToIndex(ops[1].reg.value);
+            if (gi < 0) return false;
+            c.ldr(WReg(9), ptr(kState, GprOffset(gi)));   // 32-bit, zero-extends x9
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+            c.ldr(WReg(9), ptr(kAddr));                   // 32-bit load, zero-extends x9
+        } else {
+            return false;
+        }
+        // str of the full X reg writes 8 bytes: low 4 = value, high 4 = 0
+        // (the W-load above cleared bits 63:32 of x9). Then zero chunks 1..3.
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 0)));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 1)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(d_vec, 3)));
+        return true;
+    }
+
+    // dst is GPR or mem; src is XMM.
+    const int s_vec = ZydisVecToIndex(ops[1].reg.value);
+    if (s_vec < 0) return false;
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(ops[0].reg.value);
+        if (gi < 0) return false;
+        // 32-bit load zero-extends into x9; store full qword so the GPR slot
+        // gets the canonical 32-bit zero-extension.
+        c.ldr(WReg(9), ptr(kState, YmmChunkOffset(s_vec, 0)));
+        c.str(kScratch0, ptr(kState, GprOffset(gi)));
+        return true;
+    } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute EA first (clobbers x9/x11), THEN load the value into x10 so
+        // the address in kAddr survives.
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.ldr(WReg(10), ptr(kState, YmmChunkOffset(s_vec, 0)));
+        c.str(WReg(10), ptr(kAddr));                      // store exactly 4 bytes
+        return true;
+    }
+    return false;
+}
+
 // vmovq — move 64 bits between XMM.low and GPR/memory.
 //   xmm <- gpr/mem : write low 64, zero the rest of the YMM (chunks 1,2,3).
 //   gpr <- xmm     : write full 64 to the GPR slot.
@@ -4470,14 +4529,17 @@ bool EmitVmovq(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     // dst is GPR or mem; src is XMM.
     const int s_vec = ZydisVecToIndex(ops[1].reg.value);
     if (s_vec < 0) return false;
-    c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s_vec, 0)));
     if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int gi = ZydisGprToIndex(ops[0].reg.value);
         if (gi < 0) return false;
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s_vec, 0)));
         c.str(kScratch0, ptr(kState, GprOffset(gi)));
     } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        // Compute EA first (it clobbers x9/x11), THEN load the value into x10
+        // so the destination address in kAddr survives until the store.
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-        c.str(kScratch0, ptr(kAddr));
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s_vec, 0)));
+        c.str(kScratch1, ptr(kAddr));
     } else {
         return false;
     }
@@ -4576,40 +4638,118 @@ bool EmitVmovdup(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     return true;
 }
 
-// vpsrad/vpsrld dst, src, imm8 — per-dword arithmetic/logical right shift. The
-// x86 shift count saturates: for SRA, count>=32 acts as 31 (sign-fill); for
-// SRL, count>=32 yields 0. NEON sshr/ushr take 1..32, so we clamp.
+// Per-element packed shifts: VPSLLW/D/Q (left logical), VPSRLW/D/Q (right
+// logical), VPSRAW/D (right arithmetic; no VPSRAQ in the Jaguar set). The third
+// operand is either an imm8 or an xmm whose low 64 bits hold a single shift
+// count applied to every lane (NOT a per-lane count). x86 count saturation:
+//   SLL/SRL  count >= elem_width  -> all bits shifted out -> 0
+//   SRA      count >= elem_width  -> acts as (elem_width-1) -> sign-fill
+// Element-width-by-imm uses NEON shl/ushr/sshr directly (count is a literal in
+// 1..width-1; out-of-range handled in C++). Element-width-by-register uses
+// ushl/sshl with a per-lane signed amount we build by clamping the scalar count
+// and broadcasting it: positive = left, negative = right. ushl by >= width
+// zeroes (matches logical saturation); sshl with amount clamped to -(width-1)
+// sign-fills (matches arithmetic saturation). Verified on QEMU for W/D/Q.
 bool EmitVpshift(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                  u64 next_rip, CodeGenerator& c) {
-    const bool arith = (insn.mnemonic == ZYDIS_MNEMONIC_VPSRAD);
+    enum class Dir { Sll, Srl, Sra };
+    Dir dir; int width;  // element width in bits
+    switch (insn.mnemonic) {
+        case ZYDIS_MNEMONIC_VPSLLW: dir = Dir::Sll; width = 16; break;
+        case ZYDIS_MNEMONIC_VPSLLD: dir = Dir::Sll; width = 32; break;
+        case ZYDIS_MNEMONIC_VPSLLQ: dir = Dir::Sll; width = 64; break;
+        case ZYDIS_MNEMONIC_VPSRLW: dir = Dir::Srl; width = 16; break;
+        case ZYDIS_MNEMONIC_VPSRLD: dir = Dir::Srl; width = 32; break;
+        case ZYDIS_MNEMONIC_VPSRLQ: dir = Dir::Srl; width = 64; break;
+        case ZYDIS_MNEMONIC_VPSRAW: dir = Dir::Sra; width = 16; break;
+        case ZYDIS_MNEMONIC_VPSRAD: dir = Dir::Sra; width = 32; break;
+        default: return false;
+    }
+    if (insn.operand_count_visible != 3) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
         ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
     const int src = ZydisVecToIndex(ops[1].reg.value);
     if (dst < 0 || src < 0) return false;
-    int cnt = static_cast<int>(ops[2].imm.value.u) & 0xFF;
-
     const bool ymm = (ops[0].size == 256);
     const int nchunks = ymm ? 2 : 1;
 
-    for (int h = 0; h < nchunks; ++h) {
-        const int chunk = h * 2;
-        c.add(kScratch0, kState, YmmChunkOffset(src, chunk));
-        c.ldr(QReg(0), ptr(kScratch0));
-        if (arith) {
-            int s = cnt; if (s > 31) s = 31; if (s < 1) s = 0;
-            if (s == 0) { /* no shift */ }
-            else c.sshr(VReg4S(0), VReg4S(0), s);
-        } else {
-            if (cnt >= 32) {
-                c.eor(VReg16B(0), VReg16B(0), VReg16B(0));  // all zero
-            } else if (cnt >= 1) {
-                c.ushr(VReg4S(0), VReg4S(0), cnt);
+    // Apply the chosen NEON shift to v0 viewed at `width`. `byreg` selects the
+    // register (ushl/sshl on v1) vs immediate (shl/ushr/sshr) path. For the
+    // register path v1 must already hold the per-lane signed amount.
+    auto emit_shift = [&](bool byreg, int imm) {
+        if (byreg) {
+            if (dir == Dir::Sra) {
+                if (width == 16) c.sshl(VReg8H(0), VReg8H(0), VReg8H(1));
+                else             c.sshl(VReg4S(0), VReg4S(0), VReg4S(1));
+            } else {
+                if (width == 16)      c.ushl(VReg8H(0), VReg8H(0), VReg8H(1));
+                else if (width == 32) c.ushl(VReg4S(0), VReg4S(0), VReg4S(1));
+                else                  c.ushl(VReg2D(0), VReg2D(0), VReg2D(1));
             }
+            return;
         }
-        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
-        c.str(QReg(0), ptr(kScratch0));
+        // immediate path: imm already clamped/handled by caller for over-width.
+        if (dir == Dir::Sll) {
+            if (width == 16)      c.shl(VReg8H(0), VReg8H(0), imm);
+            else if (width == 32) c.shl(VReg4S(0), VReg4S(0), imm);
+            else                  c.shl(VReg2D(0), VReg2D(0), imm);
+        } else if (dir == Dir::Srl) {
+            if (width == 16)      c.ushr(VReg8H(0), VReg8H(0), imm);
+            else if (width == 32) c.ushr(VReg4S(0), VReg4S(0), imm);
+            else                  c.ushr(VReg2D(0), VReg2D(0), imm);
+        } else {  // Sra
+            if (width == 16) c.sshr(VReg8H(0), VReg8H(0), imm);
+            else             c.sshr(VReg4S(0), VReg4S(0), imm);
+        }
+    };
+
+    if (ops[2].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        const int cnt = static_cast<int>(ops[2].imm.value.u) & 0xFF;
+        for (int h = 0; h < nchunks; ++h) {
+            const int chunk = h * 2;
+            c.add(kScratch0, kState, YmmChunkOffset(src, chunk));
+            c.ldr(QReg(0), ptr(kScratch0));
+            if (dir == Dir::Sra) {
+                int s = cnt; if (s > width - 1) s = width - 1;
+                if (s >= 1) emit_shift(false, s);   // s==0 -> no-op
+            } else if (cnt >= width) {
+                c.eor(VReg16B(0), VReg16B(0), VReg16B(0));  // all bits out -> 0
+            } else if (cnt >= 1) {
+                emit_shift(false, cnt);
+            }
+            c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+            c.str(QReg(0), ptr(kScratch0));
+        }
+    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int cnt = ZydisVecToIndex(ops[2].reg.value);
+        if (cnt < 0) return false;
+        // Scalar count = low 64 bits of the count register. Clamp to the cap:
+        //   SLL/SRL cap = width   (>=width zeroes via ushl by >=width)
+        //   SRA     cap = width-1 (sign-fill)
+        // then build the signed per-lane amount (negate for right shifts) and
+        // broadcast it. x12 holds the count; x13 the cap.
+        const int cap = (dir == Dir::Sra) ? (width - 1) : width;
+        c.ldr(XReg(12), ptr(kState, YmmChunkOffset(cnt, 0)));  // low 64 bits
+        c.mov(XReg(13), cap);
+        c.cmp(XReg(12), XReg(13));
+        c.csel(XReg(12), XReg(12), XReg(13), LT);              // min(count, cap)
+        if (dir != Dir::Sll) c.neg(XReg(12), XReg(12));        // right = negative
+        if (width == 16)      c.dup(VReg8H(1), WReg(12));
+        else if (width == 32) c.dup(VReg4S(1), WReg(12));
+        else                  c.dup(VReg2D(1), XReg(12));
+        for (int h = 0; h < nchunks; ++h) {
+            const int chunk = h * 2;
+            c.add(kScratch0, kState, YmmChunkOffset(src, chunk));
+            c.ldr(QReg(0), ptr(kScratch0));
+            emit_shift(true, 0);
+            c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+            c.str(QReg(0), ptr(kScratch0));
+        }
+    } else {
+        return false;
     }
+
     if (!ymm) {
         c.mov(kScratch0, 0);
         c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
@@ -6075,6 +6215,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VINSERTPS:  handled = EmitVinsertps(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VINSERTF128:  handled = EmitVinsertf128(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VEXTRACTF128: handled = EmitVextractf128(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVD:    handled = EmitVmovd(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VMOVQ:    handled = EmitVmovq(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VMOVAPS: case ZYDIS_MNEMONIC_VMOVUPS:
         case ZYDIS_MNEMONIC_VMOVDQA: case ZYDIS_MNEMONIC_VMOVDQU:
@@ -6083,6 +6224,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VMOVSLDUP: case ZYDIS_MNEMONIC_VMOVSHDUP:
             handled = EmitVmovdup(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPSRAD: case ZYDIS_MNEMONIC_VPSRLD:
+        case ZYDIS_MNEMONIC_VPSLLW: case ZYDIS_MNEMONIC_VPSLLD:
+        case ZYDIS_MNEMONIC_VPSLLQ: case ZYDIS_MNEMONIC_VPSRLW:
+        case ZYDIS_MNEMONIC_VPSRLQ: case ZYDIS_MNEMONIC_VPSRAW:
             handled = EmitVpshift(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPSLLDQ: case ZYDIS_MNEMONIC_VPSRLDQ:
             handled = EmitVpsxldq(insn, ops, next_rip, c); break;

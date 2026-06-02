@@ -17658,5 +17658,271 @@ TEST_F(CpuRuntimeTest, Movzx_HighByte_NotLowByte) {
     EXPECT_EQ(r.state.gpr[0], 0x22ull) << "movzx eax,ah reads AH (0x22), not AL (0x11)";
 }
 
+
+// ============================================================================
+// Packed per-element shift family: VPSLLW/Q, VPSRLW/Q, VPSRAW (word/qword
+// element shifts). The dword forms VPSRAD/VPSRLD were already covered; these
+// pin down the word and qword element widths, the register-count form (count =
+// low 64 bits of an xmm, broadcast to all lanes), and x86's over-width
+// saturation (SLL/SRL >= width -> 0; SRA >= width -> sign-fill). Real title
+// crashed on vpsllw (ymm, reg count) before this family was lifted.
+// ============================================================================
+
+// VPSLLW imm8: each 16-bit lane left-shifted by 1.
+TEST_F(CpuRuntimeTest, Vpsllw_Imm_ShiftsWordLanes) {
+    // vpsllw xmm0, xmm1, 1  — c5 f9 71 f1 01
+    const u8 program[] = { 0xc5, 0xf9, 0x71, 0xf1, 0x01, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // xmm1 lanes: [0x0001, 0x00FF, 0x8000, 0x4000, ...low chunk]
+    st.ymm[4] = (0x4000ULL << 48) | (0x8000ULL << 32) | (0x00FFULL << 16) | 0x0001ULL;
+    st.ymm[5] = 0;
+    st.ymm[2] = 0xDEADBEEFDEADBEEFULL;  // dirty dst, must be overwritten + zeroed
+    st.ymm[3] = 0xDEADBEEFDEADBEEFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // <<1: 0x0001->0x0002, 0x00FF->0x01FE, 0x8000->0x0000 (carry out), 0x4000->0x8000
+    EXPECT_EQ(static_cast<u16>(st.ymm[0] & 0xFFFF), 0x0002u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 16) & 0xFFFF), 0x01FEu);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 32) & 0xFFFF), 0x0000u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 48) & 0xFFFF), 0x8000u);
+    EXPECT_EQ(st.ymm[2], 0ULL) << "xmm dst upper YMM half zeroed";
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// VPSLLW register count: shift amount is the low 64 bits of xmm2, applied to
+// every word lane. This is the form the real title used.
+TEST_F(CpuRuntimeTest, Vpsllw_RegCount_BroadcastsScalar) {
+    // vpsllw xmm0, xmm1, xmm2  — c5 f1 f1 c2
+    const u8 program[] = { 0xc5, 0xf1, 0xf1, 0xc2, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = (0x0004ULL << 48) | (0x0003ULL << 32) | (0x0002ULL << 16) | 0x0001ULL;
+    // xmm2 low 64 = 3 (shift count); upper bits must be ignored.
+    st.ymm[6] = 3;
+    st.ymm[7] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    // each lane <<3
+    EXPECT_EQ(static_cast<u16>(st.ymm[0] & 0xFFFF), 0x0008u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 16) & 0xFFFF), 0x0010u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 32) & 0xFFFF), 0x0018u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 48) & 0xFFFF), 0x0020u);
+}
+
+// VPSRAW arithmetic: negative word lanes sign-fill.
+TEST_F(CpuRuntimeTest, Vpsraw_NegativeWords_SignFill) {
+    // vpsraw xmm0, xmm1, 4  — c5 f9 71 e1 04
+    const u8 program[] = { 0xc5, 0xf9, 0x71, 0xe1, 0x04, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // lanes: [0x8000 (-32768), 0xFFF0 (-16), 0x0100 (256), 0x7FFF]
+    st.ymm[4] = (0x7FFFULL << 48) | (0x0100ULL << 32) | (0xFFF0ULL << 16) | 0x8000ULL;
+    st.ymm[5] = 0;
+
+    Runtime rt;
+    rt.Run(st);
+    //  -32768>>4 = -2048 = 0xF800 ; -16>>4 = -1 = 0xFFFF ; 256>>4 = 16 = 0x0010 ; 0x7FFF>>4 = 0x07FF
+    EXPECT_EQ(static_cast<u16>(st.ymm[0] & 0xFFFF), 0xF800u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 16) & 0xFFFF), 0xFFFFu);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 32) & 0xFFFF), 0x0010u);
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 48) & 0xFFFF), 0x07FFu);
+}
+
+// VPSLLW over-width (count >= 16) zeroes every lane (logical saturation).
+TEST_F(CpuRuntimeTest, Vpsllw_CountAtOrAboveWidth_Zeroes) {
+    // vpsllw xmm0, xmm1, 16  — c5 f9 71 f1 10
+    const u8 program[] = { 0xc5, 0xf9, 0x71, 0xf1, 0x10, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x1111222233334444ULL;
+    st.ymm[5] = 0;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0ULL) << "shift >= element width clears all lanes";
+}
+
+// VPSRAW over-width (count >= 16) sign-fills: negative -> all-ones, else 0.
+TEST_F(CpuRuntimeTest, Vpsraw_CountAtOrAboveWidth_SignFill) {
+    // vpsraw xmm0, xmm1, xmm2  — c5 f1 e1 c2   (reg count = 20)
+    const u8 program[] = { 0xc5, 0xf1, 0xe1, 0xc2, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // lanes: [0x8000 neg, 0x0001 pos, 0xFFFF neg, 0x7000 pos]
+    st.ymm[4] = (0x7000ULL << 48) | (0xFFFFULL << 32) | (0x0001ULL << 16) | 0x8000ULL;
+    st.ymm[5] = 0;
+    st.ymm[6] = 20;  // count >= 16
+    st.ymm[7] = 0;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(static_cast<u16>(st.ymm[0] & 0xFFFF), 0xFFFFu)       << "neg -> all-ones";
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 16) & 0xFFFF), 0x0000u) << "pos -> 0";
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 32) & 0xFFFF), 0xFFFFu) << "neg -> all-ones";
+    EXPECT_EQ(static_cast<u16>((st.ymm[0] >> 48) & 0xFFFF), 0x0000u) << "pos -> 0";
+}
+
+// VPSLLQ / VPSRLQ: 64-bit element shifts.
+TEST_F(CpuRuntimeTest, Vpsllq_Vpsrlq_QwordLanes) {
+    // vpsllq xmm0, xmm1, 1  — c5 f9 73 f1 01
+    const u8 program[] = { 0xc5, 0xf9, 0x73, 0xf1, 0x01, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.ymm[4] = 0x8000000000000001ULL;  // lane0
+    st.ymm[5] = 0x0000000000000002ULL;  // lane1
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x0000000000000002ULL) << "0x8...01 <<1 drops top bit, lsb*2";
+    EXPECT_EQ(st.ymm[1], 0x0000000000000004ULL) << "2 <<1 = 4";
+}
+
+// VPSLLW on a full 256-bit ymm with a register count -- the exact crash shape
+// (ymm dst/src1, xmm count). All 16 word lanes shift by the broadcast scalar.
+TEST_F(CpuRuntimeTest, Vpsllw_Ymm_RegCount_AllLanes) {
+    // vpsllw ymm0, ymm1, xmm2  — c5 f5 f1 c2
+    const u8 program[] = { 0xc5, 0xf5, 0xf1, 0xc2, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // ymm1: all four 64-bit chunks = 0x0001000100010001 (every word lane = 1)
+    st.ymm[4] = st.ymm[5] = st.ymm[6] = st.ymm[7] = 0x0001000100010001ULL;
+    // NOTE: ymm2 = count reg overlaps ymm[8..11]; low 64 bits = shift count 2.
+    st.ymm[8] = 2;
+    st.ymm[9] = 0;
+
+    Runtime rt;
+    rt.Run(st);
+    // every word lane: 1 << 2 = 4 -> 0x0004 in all 16 lanes -> 0x0004000400040004 per chunk
+    EXPECT_EQ(st.ymm[0], 0x0004000400040004ULL) << "chunk0 lanes <<2";
+    EXPECT_EQ(st.ymm[1], 0x0004000400040004ULL) << "chunk1";
+    EXPECT_EQ(st.ymm[2], 0x0004000400040004ULL) << "chunk2 (upper 128 preserved for ymm op)";
+    EXPECT_EQ(st.ymm[3], 0x0004000400040004ULL) << "chunk3";
+}
+
+
+// ============================================================================
+// VMOVD — 32-bit move between the low dword of an XMM and a GPR or memory.
+// All forms are VEX-encoded, so any XMM-destination form must zero bits 255:32
+// of the destination YMM. The arm64 port had no vmovd handling at all (the x86
+// reference had only the reg<->reg forms), and a real title hit `vmovd xmm,
+// m32` (memory load), so these pin down all four operand forms on both lifters.
+// ============================================================================
+
+// vmovd xmm0, [rbx] — load 32 bits from memory into low dword, zero the rest.
+TEST_F(CpuRuntimeTest, Vmovd_XmmFromMem_LoadsAndZeroExtendsYmm) {
+    const u8 program[] = { 0xc5, 0xf9, 0x6e, 0x03, 0xc3 };  // vmovd xmm0,[rbx]; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* data_slot = mem.StackTop() - 32;
+    *reinterpret_cast<u32*>(data_slot) = 0xCAFEF00Du;
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(data_slot);  // rbx -> data slot
+    // Dirty the whole destination YMM to prove it gets zeroed.
+    st.ymm[0] = 0xAAAAAAAAAAAAAAAAULL;
+    st.ymm[1] = 0xBBBBBBBBBBBBBBBBULL;
+    st.ymm[2] = 0xCCCCCCCCCCCCCCCCULL;
+    st.ymm[3] = 0xDDDDDDDDDDDDDDDDULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x00000000CAFEF00DULL) << "low dword loaded, bits 63:32 zeroed";
+    EXPECT_EQ(st.ymm[1], 0ULL);
+    EXPECT_EQ(st.ymm[2], 0ULL);
+    EXPECT_EQ(st.ymm[3], 0ULL);
+}
+
+// vmovd [rbx], xmm0 — store the low dword to memory (exactly 4 bytes).
+TEST_F(CpuRuntimeTest, Vmovd_MemFromXmm_StoresFourBytes) {
+    const u8 program[] = { 0xc5, 0xf9, 0x7e, 0x03, 0xc3 };  // vmovd [rbx],xmm0; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* data_slot = mem.StackTop() - 32;
+    // Pre-fill 8 bytes; only the low 4 must change.
+    *reinterpret_cast<u64*>(data_slot) = 0xEEEEEEEEEEEEEEEEULL;
+
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(data_slot);
+    st.ymm[0] = 0x1111222212345678ULL;  // low dword = 0x12345678
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u64*>(data_slot), 0xEEEEEEEE12345678ULL)
+        << "only the low 4 bytes overwritten; high 4 bytes preserved";
+}
+
+// vmovd xmm0, ecx — low dword from GPR, zero the rest of the YMM.
+TEST_F(CpuRuntimeTest, Vmovd_XmmFromGpr_ZeroExtendsYmm) {
+    const u8 program[] = { 0xc5, 0xf9, 0x6e, 0xc1, 0xc3 };  // vmovd xmm0,ecx; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0x9999000043218765ULL;  // rcx: only low 32 (0x43218765) should move
+    st.ymm[0] = 0xFFFFFFFFFFFFFFFFULL;
+    st.ymm[1] = 0xFFFFFFFFFFFFFFFFULL;
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.ymm[0], 0x0000000043218765ULL) << "low 32 of rcx, upper bits zeroed";
+    EXPECT_EQ(st.ymm[1], 0ULL);
+}
+
+// vmovd ecx, xmm0 — low dword to GPR, zero-extended to 64 bits.
+TEST_F(CpuRuntimeTest, Vmovd_GprFromXmm_ZeroExtendsTo64) {
+    const u8 program[] = { 0xc5, 0xf9, 0x7e, 0xc1, 0xc3 };  // vmovd ecx,xmm0; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = 0xFFFFFFFFFFFFFFFFULL;       // rcx starts all-ones
+    st.ymm[0] = 0x12345678DEADBEEFULL;       // xmm0 low dword = 0xDEADBEEF
+
+    Runtime rt;
+    rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0x00000000DEADBEEFULL) << "low dword of xmm0, zero-extended";
+}
+
 } // namespace
 } // namespace Core::Runtime
