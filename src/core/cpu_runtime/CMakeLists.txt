@@ -23,8 +23,8 @@
 # (see runtime_diagnostics.h), so there is zero hot-path cost in normal builds.
 # Turn on only for targeted debugging:  -DSHADPS4_RUNTIME_DIAGNOSTICS=ON
 option(SHADPS4_RUNTIME_DIAGNOSTICS
-    "Build the JIT runtime corruption-investigation diagnostics (RAXTRACE / \
-GPRSNAP / block dumps). Off by default; adds hot-path tracing when on." OFF)
+    "Build the JIT runtime corruption-investigation diagnostics (RAXTRACE / GPRSNAP / block dumps). Off by default; adds hot-path tracing when on."
+    OFF)
 
 # Architecture-independent runtime sources — always compiled.
 set(CPU_RUNTIME_COMMON_SRCS
@@ -80,13 +80,36 @@ if (SHADPS4_RUNTIME_DIAGNOSTICS)
     target_compile_definitions(cpu_runtime PUBLIC SHADPS4_RUNTIME_DIAGNOSTICS)
 endif()
 
+# Windows: <windows.h> (pulled in by runtime.cpp for the host-module check)
+# defines min()/max() function-like macros and a pile of legacy cruft. The
+# min/max macros wreck std::numeric_limits<T>::max() in the robin_map headers
+# included by block_cache.h. The top-level CMakeLists defines these globally
+# via add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN), but that call
+# happens AFTER this subdirectory is add_subdirectory()'d, so the directory-
+# scope definition is not inherited here — we must set it on the target
+# directly. (PRIVATE: only this library's TUs include <windows.h>.)
+if (WIN32)
+    target_compile_definitions(cpu_runtime PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # Zydis (guest x86 decoder) is needed by every configuration — the lifter
 # decodes guest x86 regardless of host arch, and the runtime's block
 # disassembler and signal-fault decoder use it too. The code-generation
 # assembler is the only arch-dependent dependency.
+#
+# The header-only deps below are needed to COMPILE this library's sources but
+# are not exposed by its public headers (runtime.h / guest_state.h only pull
+# <memory> + common/types.h), so PRIVATE is correct:
+#   - tsl::robin_map   : block_cache.h's cache map
+#   - spdlog + fmt     : pulled transitively via common/logging/log.h (LOG_*)
+# When these files were compiled directly into the shadps4 target they
+# inherited its include set; as a standalone library they must be linked here.
 target_link_libraries(cpu_runtime PRIVATE
     Zydis::Zydis
     ${CPU_RUNTIME_BACKEND_LIB}
+    tsl::robin_map
+    spdlog::spdlog
+    fmt::fmt
 )
 
 # Headers are resolved via the project-wide `include_directories(src)` set in

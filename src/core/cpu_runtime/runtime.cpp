@@ -10,6 +10,17 @@
 #include <cstring>
 #include <type_traits>
 
+// Platform headers for IsGuestPointer's host-module check (GetModuleHandleEx on
+// Windows, dladdr on POSIX). MUST be included at file scope, never inside the
+// Core::Runtime namespace below — <windows.h> drags in the Win32/COM headers,
+// and if those are parsed inside a namespace their types (e.g. _GUID/IID) bind
+// as Core::Runtime::_GUID and break the SDK's own COM template methods.
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+
 #include "common/assert.h"
 #include "common/arch.h"
 #include "common/logging/log.h"
@@ -1046,12 +1057,6 @@ u64 Runtime::InvokeGuestCallback(VAddr guest_fn,
 // this negative "not a host module" inference. That test must be callable
 // from the fault path without taking locks (this can run in a signal/fault
 // context), so it depends on a lock-free range query being available.
-
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
 
 bool Runtime::IsGuestPointer(const void* ptr) noexcept {
     if (ptr == nullptr) {

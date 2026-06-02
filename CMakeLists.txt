@@ -993,35 +993,19 @@ endif()
 # handlers, and HLE callbacks still go through native execution.
 # See RFC and README for the follow-up PR 1.5 sequence.
 # ============================================================================
+# ============================================================================
+# CPU runtime (experimental native-execution JIT) backend
+# ----------------------------------------------------------------------------
+# The runtime backend lives in its own static library (src/core/cpu_runtime),
+# which owns its source list, its host code-gen backend selection (x86 / arm64),
+# the SHADPS4_RUNTIME_DIAGNOSTICS option + define, and its Zydis/xbyak linkage.
+# We add it here and link it into shadps4 below, rather than duplicating the
+# file list into CORE — the duplication previously let the two lists drift
+# (e.g. runtime_diagnostics.cpp was added to the library but missing here,
+# which broke the diagnostics build). One source of truth now.
+# ============================================================================
 if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
-    set(CORE ${CORE}
-             src/core/cpu_runtime/block_cache.cpp
-             src/core/cpu_runtime/block_cache.h
-             src/core/cpu_runtime/code_cache.cpp
-             src/core/cpu_runtime/code_cache.h
-             src/core/cpu_runtime/guest_state.h
-             src/core/cpu_runtime/hle_registry.cpp
-             src/core/cpu_runtime/hle_registry.h
-             src/core/cpu_runtime/runtime.cpp
-             src/core/cpu_runtime/runtime.h
-             src/core/cpu_runtime/gateway/gateway.h
-             src/core/cpu_runtime/lifter/lifter.h)
-
-    if (ARCHITECTURE STREQUAL "x86_64")
-        set(CORE ${CORE}
-                 src/core/cpu_runtime/gateway/gateway_x86.cpp
-                 src/core/cpu_runtime/lifter/lifter_x86_host.cpp)
-    elseif (ARCHITECTURE STREQUAL "arm64")
-        # ARM64 (AArch64) host backend — macOS / Apple Silicon only.
-        # The lifter is currently a structural skeleton (a few
-        # representative emitters; most guest instructions take the
-        # unsupported-exit path). It compiles and links so the runtime
-        # can be exercised on real hardware; the full emitter port is
-        # follow-up work.
-        set(CORE ${CORE}
-                 src/core/cpu_runtime/gateway/gateway_arm64.cpp
-                 src/core/cpu_runtime/lifter/lifter_arm64_host.cpp)
-    endif()
+    add_subdirectory(src/core/cpu_runtime)
 endif()
 # ============================================================================
 # End of CPU runtime source list
@@ -1291,6 +1275,16 @@ target_link_libraries(shadps4 PRIVATE spdlog::spdlog)
 target_link_libraries(shadps4 PRIVATE magic_enum::magic_enum fmt::fmt toml11::toml11 tsl::robin_map Tracy::TracyClient RenderDoc::API FFmpeg::ffmpeg Dear_ImGui ImGuiFileDialog gcn half::half ZLIB::ZLIB PNG::PNG minimp3)
 target_link_libraries(shadps4 PRIVATE Boost::headers GPUOpen::VulkanMemoryAllocator LibAtrac9 sirit Vulkan::Headers xxHash::xxhash Zydis::Zydis glslang::glslang SDL3::SDL3 pugixml::pugixml)
 target_link_libraries(shadps4 PRIVATE stb::headers lfreist-hwinfo::hwinfo nlohmann_json::nlohmann_json miniz::miniz fdk-aac CLI11::CLI11 OpenAL::OpenAL Cpp_Httplib)
+
+# Link the experimental CPU runtime backend (its own static library, added via
+# add_subdirectory above). It transitively brings its Zydis + code-generator
+# (xbyak / xbyak_aarch64) link requirements, and — because the diagnostics
+# define is PUBLIC on that library — propagates SHADPS4_RUNTIME_DIAGNOSTICS to
+# anything here that includes its headers, keeping the header's prototype/stub
+# choice consistent with the library's out-of-line definitions.
+if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
+    target_link_libraries(shadps4 PRIVATE cpu_runtime)
+endif()
 
 # xbyak code generator linkage. On x86_64, cpu_patches.cpp always needs x86
 # xbyak (and so does the x86 runtime lifter), so link it for the whole
