@@ -620,37 +620,53 @@ void EmitClearArithFlags(Xbyak::CodeGenerator& c) {
 /// Compute flags for a subtract (SUB, CMP).
 /// Inputs:
 ///   rcx = lhs, rdx = rhs, rax = lhs - rhs
+/// `width` is the operand width in bits (8/16/32/64). ZF/SF/CF/OF are
+/// computed against that width: a 32-bit op's result is zero-extended in
+/// rax, so SF/OF must use bit (width-1), not bit 63, and unsigned CF must
+/// compare only the low `width` bits.
 /// Clobbers r8, r9, r10. Writes rflags.
-void EmitFlagsFromSubtract(Xbyak::CodeGenerator& c) {
+void EmitFlagsFromSubtract(Xbyak::CodeGenerator& c, u32 width = 64) {
     EmitClearArithFlags(c);
+    const int sign_bit = static_cast<int>(width) - 1;   // 7/15/31/63
+    // Mask of the low `width` bits (for width<64; 64 needs no mask).
+    const u64 wmask = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
 
-    // ZF: result == 0
-    c.test(rax, rax);
+    // ZF: low `width` bits of result == 0.
+    c.mov(r8, rax);
+    if (width < 64) { c.mov(r9, wmask); c.and_(r8, r9); }
+    c.test(r8, r8);
     c.setz(r8b);
     c.movzx(r8, r8b);
     c.shl(r8, 6);                       // ZF at bit 6
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // SF: result >> 63
+    // SF: bit (width-1) of result.
     c.mov(r8, rax);
-    c.shr(r8, 63);
+    c.shr(r8, sign_bit);
+    c.and_(r8, 1);
     c.shl(r8, 7);                       // SF at bit 7
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // CF for subtract: lhs < rhs (unsigned).
-    c.cmp(rcx, rdx);
+    // CF for subtract: lhs < rhs (unsigned), compared at operand width.
+    if (width < 64) {
+        c.mov(r8, rcx); c.mov(r9, wmask); c.and_(r8, r9);   // r8 = lhs & wmask
+        c.mov(r10, rdx); c.and_(r10, r9);                   // r10 = rhs & wmask
+        c.cmp(r8, r10);
+    } else {
+        c.cmp(rcx, rdx);
+    }
     c.setb(r8b);                        // setb = "set if below", unsigned <
     c.movzx(r8, r8b);
-    // CF is at bit 0; no shift needed.
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // OF for subtract: ((lhs ^ rhs) & (lhs ^ result)) >> 63
+    // OF for subtract: ((lhs ^ rhs) & (lhs ^ result)) at bit (width-1).
     c.mov(r8, rcx);
     c.xor_(r8, rdx);                    // r8 = lhs ^ rhs
     c.mov(r9, rcx);
     c.xor_(r9, rax);                    // r9 = lhs ^ result
     c.and_(r8, r9);
-    c.shr(r8, 63);
+    c.shr(r8, sign_bit);
+    c.and_(r8, 1);
     c.shl(r8, 11);                      // OF at bit 11
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
@@ -658,40 +674,51 @@ void EmitFlagsFromSubtract(Xbyak::CodeGenerator& c) {
     EmitWritePF(c);
 }
 
-/// Compute flags for an add (ADD).
-/// Inputs:
 ///   rcx = lhs, rdx = rhs, rax = lhs + rhs
+/// `width` is the operand width in bits; see EmitFlagsFromSubtract.
 /// Clobbers r8, r9, r10. Writes rflags.
-void EmitFlagsFromAdd(Xbyak::CodeGenerator& c) {
+void EmitFlagsFromAdd(Xbyak::CodeGenerator& c, u32 width = 64) {
     EmitClearArithFlags(c);
+    const int sign_bit = static_cast<int>(width) - 1;
+    const u64 wmask = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
 
-    // ZF: result == 0
-    c.test(rax, rax);
+    // ZF: low `width` bits of result == 0.
+    c.mov(r8, rax);
+    if (width < 64) { c.mov(r9, wmask); c.and_(r8, r9); }
+    c.test(r8, r8);
     c.setz(r8b);
     c.movzx(r8, r8b);
     c.shl(r8, 6);
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // SF: result >> 63
+    // SF: bit (width-1) of result.
     c.mov(r8, rax);
-    c.shr(r8, 63);
+    c.shr(r8, sign_bit);
+    c.and_(r8, 1);
     c.shl(r8, 7);
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // CF for add: result < lhs (unsigned add overflow).
-    c.cmp(rax, rcx);
+    // CF for add: low-`width` result < low-`width` lhs (unsigned wrap).
+    if (width < 64) {
+        c.mov(r8, rax); c.mov(r9, wmask); c.and_(r8, r9);   // r8 = res & wmask
+        c.mov(r10, rcx); c.and_(r10, r9);                   // r10 = lhs & wmask
+        c.cmp(r8, r10);
+    } else {
+        c.cmp(rax, rcx);
+    }
     c.setb(r8b);
     c.movzx(r8, r8b);
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // OF for add: (~(lhs ^ rhs) & (lhs ^ result)) >> 63
+    // OF for add: (~(lhs ^ rhs) & (lhs ^ result)) at bit (width-1).
     c.mov(r8, rcx);
     c.xor_(r8, rdx);                    // r8 = lhs ^ rhs
     c.not_(r8);                         // r8 = ~(lhs ^ rhs)
     c.mov(r9, rcx);
     c.xor_(r9, rax);                    // r9 = lhs ^ result
     c.and_(r8, r9);
-    c.shr(r8, 63);
+    c.shr(r8, sign_bit);
+    c.and_(r8, 1);
     c.shl(r8, 11);
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
@@ -702,20 +729,26 @@ void EmitFlagsFromAdd(Xbyak::CodeGenerator& c) {
 /// Compute flags for a bitwise op (AND, TEST, XOR, OR).
 /// Inputs: rax = result. (lhs and rhs unused — CF and OF are
 /// always 0 for bitwise ops per x86 spec.)
+/// `width` is the operand width in bits; SF/ZF are computed against it.
 /// Clobbers r8, r9. Writes rflags.
-void EmitFlagsFromBitwise(Xbyak::CodeGenerator& c) {
+void EmitFlagsFromBitwise(Xbyak::CodeGenerator& c, u32 width = 64) {
     EmitClearArithFlags(c);
+    const int sign_bit = static_cast<int>(width) - 1;
+    const u64 wmask = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
 
-    // ZF: result == 0
-    c.test(rax, rax);
+    // ZF: low `width` bits of result == 0.
+    c.mov(r8, rax);
+    if (width < 64) { c.mov(r9, wmask); c.and_(r8, r9); }
+    c.test(r8, r8);
     c.setz(r8b);
     c.movzx(r8, r8b);
     c.shl(r8, 6);
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
-    // SF: result >> 63
+    // SF: bit (width-1) of result.
     c.mov(r8, rax);
-    c.shr(r8, 63);
+    c.shr(r8, sign_bit);
+    c.and_(r8, 1);
     c.shl(r8, 7);
     c.or_(qword[r13 + Offsets::Rflags], r8);
 
@@ -1088,7 +1121,7 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
             // Flag helpers read rax; the 32-bit XOR already zeroed the
             // upper half, so ZF/SF/PF are computed against the full 64-bit
             // value, which matches the 32-bit-result semantics.
-            EmitFlagsFromBitwise(c);
+            EmitFlagsFromBitwise(c, 32);
             return true;
         }
 
@@ -1114,7 +1147,7 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
             c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
             c.xor_(eax, imm);                          // zero-extends rax
             c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-            EmitFlagsFromBitwise(c);
+            EmitFlagsFromBitwise(c, 32);
             return true;
         }
         return false;
@@ -1137,7 +1170,7 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
             c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
             c.xor_(eax, ecx);
             c.mov(qword[r13 + GprOffset(dst_idx)], rax);   // zero-extend
-            EmitFlagsFromBitwise(c);
+            EmitFlagsFromBitwise(c, 32);
             return true;
         }
         return false;
@@ -1190,7 +1223,7 @@ bool EmitBitwise32RegReg(const ZydisDecodedOperand& dst,
     c.mov(ecx, dword[r13 + GprOffset(src_idx)]);
     host_op(eax, ecx);                                  // 32-bit op zero-extends rax
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-    EmitFlagsFromBitwise(c);
+    EmitFlagsFromBitwise(c, 32);
     return true;
 }
 
@@ -1233,7 +1266,7 @@ bool EmitAnd(const ZydisDecodedInstruction& insn,
         c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
         c.and_(eax, imm);                          // 32-bit op zero-extends rax
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-        EmitFlagsFromBitwise(c);
+        EmitFlagsFromBitwise(c, 32);
         return true;
     }
 
@@ -1356,7 +1389,7 @@ bool EmitOr(const ZydisDecodedInstruction& insn,
             c.mov(ecx, static_cast<u32>(ops[1].imm.value.u & 0xFFFFFFFFu));
             c.or_(eax, ecx);
             c.mov(qword[r13 + GprOffset(dst_idx)], rax);  // zero-extend
-            EmitFlagsFromBitwise(c);
+            EmitFlagsFromBitwise(c, 32);
             return true;
         }
         // Memory source: `or r32, dword[mem]`.
@@ -1369,7 +1402,7 @@ bool EmitOr(const ZydisDecodedInstruction& insn,
             c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
             c.or_(eax, ecx);
             c.mov(qword[r13 + GprOffset(dst_idx)], rax);  // zero-extend
-            EmitFlagsFromBitwise(c);
+            EmitFlagsFromBitwise(c, 32);
             return true;
         }
         return EmitBitwise32RegReg(ops[0], ops[1], c,
@@ -1423,7 +1456,7 @@ bool EmitAndn(const ZydisDecodedInstruction& insn,
         // ZF reflects the low 32 and SF reflects bit 31 — the store above
         // already captured the architectural zero-extended value.
         c.movsxd(rax, eax);
-        EmitFlagsFromBitwise(c);
+        EmitFlagsFromBitwise(c, 32);
     }
     return true;
 }
