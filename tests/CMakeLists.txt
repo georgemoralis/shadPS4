@@ -424,7 +424,7 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
     # Two thin test executables, one per area. Each links the shared support
     # lib (which carries all the include dirs, definitions, compile features,
     # and library deps via its PUBLIC usage requirements) plus gtest_main.
-    foreach(area runtime lifter differential)
+    foreach(area runtime lifter differential concurrency)
         add_executable(shadps4_cpu_${area}_test test_${area}.cpp)
         target_link_libraries(shadps4_cpu_${area}_test PRIVATE
             shadps4_cpu_runtime_test_support
