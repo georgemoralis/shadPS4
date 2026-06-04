@@ -2363,8 +2363,10 @@ bool EmitIdiv(const ZydisDecodedInstruction& insn,
 /// host XADD so flags and the exchange happen exactly per spec. 32-
 /// and 64-bit forms supported.
 ///
-/// Non-atomic form — LOCK is a correctness no-op for the single-
-/// threaded JIT, as with CMPXCHG.
+/// Note: this is the NON-LOCKED path. A LOCK-prefixed XADD is intercepted by
+/// the dispatcher and emitted atomically via EmitLockedRmw; this handler
+/// covers the unlocked form (and register-destination XADD, where LOCK is
+/// illegal).
 bool EmitXadd(const ZydisDecodedInstruction& insn,
               const ZydisDecodedOperand* ops,
               u64 next_rip,
@@ -2510,9 +2512,11 @@ bool EmitXchg(const ZydisDecodedInstruction& insn,
 /// register or memory; the accumulator and result writebacks go to the
 /// guest slots. 32- and 64-bit forms supported (the boot path uses 32).
 ///
-/// Note: this is the non-atomic form. The PS4 titles we target are
-/// effectively single-threaded through the JIT, so the LOCK prefix
-/// (atomicity) is a no-op for correctness here; we ignore it.
+/// Note: this is the NON-LOCKED path. A LOCK-prefixed CMPXCHG never reaches
+/// here — the dispatcher routes it to EmitLockedRmw, which emits a real atomic
+/// host CMPXCHG against guest memory (guest threads run concurrently on
+/// parallel host threads over shared memory). This handler covers the
+/// unlocked form and the register-destination form (where LOCK is illegal).
 bool EmitCmpxchg(const ZydisDecodedInstruction& insn,
                  const ZydisDecodedOperand* ops,
                  u64 next_rip,
