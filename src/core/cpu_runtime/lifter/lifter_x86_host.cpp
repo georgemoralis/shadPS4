@@ -221,8 +221,7 @@ using namespace Xbyak::util;
 /// supported (e.g. segment override, non-GPR base).
 bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
                           u64 next_rip,
-                          Xbyak::CodeGenerator& c,
-                          bool addr32 = false) {
+                          Xbyak::CodeGenerator& c) {
     // Segment overrides. DS/SS/CS/ES are flat (base 0) in long mode and need
     // no adjustment. FS/GS carry a guest-visible base used for TLS: the
     // effective address is seg_base + (base + index*scale + disp), where the
@@ -305,20 +304,7 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
         }
     }
 
-    // Address-size override (0x67 prefix): the effective address is
-    // computed in 32-bit arithmetic — base and index are read as 32-bit
-    // (upper 32 ignored) and the whole sum wraps at 2^32. Because
-    // (a+b) mod 2^32 == ((a mod 2^32)+(b mod 2^32)) mod 2^32, masking the
-    // final sum to 32 bits is equivalent to masking each term first. This
-    // is what lets `mov [ebx], eax` reach a sub-4GiB address even when the
-    // upper 32 bits of RBX hold garbage.
-    if (addr32) {
-        c.mov(eax, edx);   // zero-extend low 32 of rdx into rax
-        c.mov(rdx, rax);   // rdx = (address & 0xFFFFFFFF)
-    }
-
-    // Add the FS/GS segment base last: after any addr32 masking (the 64-bit
-    // base must not be clipped to 32 bits) and after the index/disp math.
+    // Add the FS/GS segment base last, after the index/disp math.
     if (seg_base_off >= 0) {
         c.add(rdx, qword[r13 + seg_base_off]);
     }
@@ -440,8 +426,7 @@ bool EmitMov32(const ZydisDecodedInstruction& insn,
     // ----- Memory destination -----
     if (dst.type == ZYDIS_OPERAND_TYPE_MEMORY) {
         // Compute effective address into rdx.
-        if (!EmitEffectiveAddress(dst.mem, next_rip, c,
-                                  insn.address_width == 32)) return false;
+        if (!EmitEffectiveAddress(dst.mem, next_rip, c)) return false;
 
         if (src.type == ZYDIS_OPERAND_TYPE_REGISTER) {
             const int src_idx = ZydisGprToIndex(src.reg.value);
@@ -481,8 +466,7 @@ bool EmitMov32(const ZydisDecodedInstruction& insn,
     }
 
     if (src.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (!EmitEffectiveAddress(src.mem, next_rip, c,
-                                  insn.address_width == 32)) return false;
+        if (!EmitEffectiveAddress(src.mem, next_rip, c)) return false;
         // 32-bit load zero-extends rax. Store full 64.
         c.mov(eax, dword[rdx]);
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
@@ -8357,7 +8341,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
 
         // Dispatch on mnemonic.
         bool handled = false;
-        switch (insn.mnemonic) {
+        // Address-size override (0x67) is unsupported. In 64-bit mode it
+        // truncates effective-address computation to 32 bits; PS4 (LP64) code
+        // never emits it. Rather than mask inconsistently across the ~100
+        // EmitEffectiveAddress call sites, reject it uniformly here so any such
+        // op bails as UnsupportedInstruction (visible in the log) instead of
+        // being silently mis-addressed.
+        if (insn.address_width == 32) {
+            // handled stays false -> falls through to the unsupported path.
+        } else switch (insn.mnemonic) {
             case ZYDIS_MNEMONIC_MOV: // basic
                 if (insn.operand_width == 64) {
                     handled = EmitMov(insn, ops, next_rip, c);
