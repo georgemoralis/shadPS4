@@ -592,7 +592,7 @@ TEST_F(DiffTest, Corner_Arithmetic) {
     for (const auto& op : ops) {
         for (u64 a : kCorner)
             for (u64 b : kCorner)
-                for (u64 cf : {0ULL, diff::CF}) { // carry-in for adc/sbb
+                for (u64 cf : {u64{0}, diff::CF}) { // carry-in for adc/sbb
                     Expect(op.name, op.bytes, inGpr({{0, a}, {1, b}}, cf),
                            op.gpr_mask, op.flag_mask);
                     if (::testing::Test::HasFatalFailure()) return;
