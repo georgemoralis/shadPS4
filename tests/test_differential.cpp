@@ -424,6 +424,18 @@ TEST_F(DiffTest, MemNegQword) {
     *reinterpret_cast<u64*>(arena.data_addr()) = 5;
     Expect("neg qword [rsi]", {0x48,0xF7,0x1E}, inGpr({{6, arena.data_addr()}}));
 }
+TEST_F(DiffTest, MemNegDword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0xFFFFFFFF00000007ULL;
+    Expect("neg dword [rsi]", {0xF7,0x1E}, inGpr({{6, arena.data_addr()}}));
+}
+TEST_F(DiffTest, MemNotQword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0x0F0F0F0F0F0F0F0FULL;
+    Expect("not qword [rsi]", {0x48,0xF7,0x16}, inGpr({{6, arena.data_addr()}}));
+}
+TEST_F(DiffTest, MemNotDword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0xAAAAAAAAAAAAAAAAULL;
+    Expect("not dword [rsi]", {0xF7,0x16}, inGpr({{6, arena.data_addr()}}));
+}
 TEST_F(DiffTest, MemShlQword) {
     *reinterpret_cast<u64*>(arena.data_addr()) = 0x1;
     Expect("shl qword [rsi],1", {0x48,0xD1,0x26}, inGpr({{6, arena.data_addr()}}));

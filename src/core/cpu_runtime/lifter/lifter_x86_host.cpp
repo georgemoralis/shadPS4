@@ -1626,7 +1626,22 @@ bool EmitPopcnt(const ZydisDecodedInstruction& insn,
 /// the binary narrow-arith ops use.
 bool EmitNot(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
+             u64 next_rip,
              Xbyak::CodeGenerator& c) {
+    // ---- Memory destination: not byte/word/dword/qword [mem]. NOT affects
+    //      no flags, so we just complement the operand in place at its width.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        const u32 w = insn.operand_width;
+        if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false; // rdx = &dst
+        switch (w) {
+            case 8:  c.not_(byte[rdx]);  break;
+            case 16: c.not_(word[rdx]);  break;
+            case 32: c.not_(dword[rdx]); break;
+            default: c.not_(qword[rdx]); break;
+        }
+        return true;
+    }
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0) return false;
@@ -1671,7 +1686,30 @@ bool EmitNot(const ZydisDecodedInstruction& insn,
 /// narrow-arith ops (ADD/SUB/...) use.
 bool EmitNeg(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
+             u64 next_rip,
              Xbyak::CodeGenerator& c) {
+    // ---- Memory destination: neg byte/word/dword/qword [mem]. NEG sets ALL
+    //      arithmetic flags (CF = src != 0), so let the host compute them: run
+    //      the width-sized neg in place and round-trip rflags around it.
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        const u32 w = insn.operand_width;
+        if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false; // rdx = &dst
+        c.mov(r10, rdx);                          // r10 = &dst (rdx reused below)
+        c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.push(rdx);
+        c.popfq();
+        switch (w) {
+            case 8:  c.neg(byte[r10]);  break;
+            case 16: c.neg(word[r10]);  break;
+            case 32: c.neg(dword[r10]); break;
+            default: c.neg(qword[r10]); break;
+        }
+        c.pushfq();
+        c.pop(rdx);
+        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        return true;
+    }
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int idx = ZydisGprToIndex(ops[0].reg.value);
     if (idx < 0) return false;
@@ -8472,8 +8510,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitOr(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_NOT:  handled = EmitNot(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_NEG:  handled = EmitNeg(insn, ops, c); break;
+            case ZYDIS_MNEMONIC_NOT:  handled = EmitNot(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_NEG:  handled = EmitNeg(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_INC:  handled = EmitInc(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_DEC:  handled = EmitDec(insn, ops, next_rip, c); break;
             case ZYDIS_MNEMONIC_BT:   handled = EmitBt(insn, ops, c); break;
