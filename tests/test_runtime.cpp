@@ -1129,12 +1129,16 @@ TEST_F(CpuRuntimeTest, ExitReason_BlockEnd_OnReturnToSentinel) {
 }
 
 // UnsupportedInstruction: an instruction the lifter does not handle stops the
-// run with the offending RIP preserved. (FS-segment-override load -- verified
-// elsewhere as unsupported.)
+// run with the offending RIP preserved. (BSR is the canonical unsupported
+// probe; fs:/gs: overrides are now lifted as TLS -- see test_lifter.cpp.)
 TEST_F(CpuRuntimeTest, ExitReason_Unsupported_StopsWithRipAtFault) {
+    // BSR (48 0f bd d8) is the canonical not-yet-supported instruction. fs:/gs:
+    // overrides are now lifted as TLS via fs_base/gs_base (see
+    // FsSegmentOverride_ResolvesViaFsBase in test_lifter.cpp), so they no longer
+    // trap and can't serve as the unsupported probe.
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x05,0,0,0, // mov rax, 5  (off 0)
-        0x64, 0x48, 0x8b, 0x09,        // mov rcx, fs:[rcx]  (off 7, unsupported)
+        0x48, 0xc7, 0xc0, 0x05,0,0,0, // mov rax, 5      (off 0)
+        0x48, 0x0f, 0xbd, 0xd8,        // bsr rbx, rax    (off 7, unsupported)
         0xc3,
     };
     const auto r = RunProgram(program, sizeof(program), mem);

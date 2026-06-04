@@ -16121,9 +16121,10 @@ TEST_F(CpuRuntimeTest, Addr_Sib32BitLoad_ZeroExtends) {
 //  (2) The two EmitEffectiveAddress paths distinct from base+index: RIP-
 //      relative ([rip+disp], constant-folded to next_rip+disp) and the plain
 //      absolute [disp32] form (no base, no index).
-//  (3) Rejection paths: a segment-override prefix (FS/GS) must NOT be
-//      miscompiled -- it must cleanly reach the UnsupportedInstruction exit
-//      with RIP pointing at the offending instruction.
+//  (3) Segment overrides: an FS/GS prefix on a memory operand resolves via
+//      the guest's fs_base/gs_base (TLS) -- fs:[disp] -> *(fs_base + disp) --
+//      rather than trapping. (cpu_patches is not applied in the JIT path, so
+//      the lifter models the segment base directly.)
 //
 // All encodings byte-verified. Reuses RunAddrTest from batch 4 for the
 // base-register-relative cases.
@@ -16299,18 +16300,19 @@ TEST_F(CpuRuntimeTest, Addr_AbsoluteDisp32_Loads) {
 }
 
 // ----------------------------------------------------------------------------
-// (3) Rejection: a segment-override prefix on a memory operand is not
-// supported and must reach the UnsupportedInstruction exit cleanly, with RIP
-// left at the offending instruction (so a host emulator could diagnose it),
-// rather than being silently miscompiled.
-//
-// Layout: a harmless MOV first (proves the block starts), then the FS-prefixed
-// load. The unsupported exit should report RIP at the FS instruction's offset.
+// (3) Segment overrides resolve via the guest fs_base/gs_base (TLS).
 // ----------------------------------------------------------------------------
-TEST_F(CpuRuntimeTest, Reject_FsSegmentOverride_UnsupportedExit) {
+// FS override now RESOLVES via the guest's fs_base (TLS) rather than exiting
+// Unsupported: fs:[disp] addresses *(fs_base + disp). The lifter folds
+// Offsets::FsBase into the effective address (cpu_patches is not applied in the
+// JIT path, so the lifter models the segment base directly). Point fs_base at a
+// scratch area and read a known value back through an FS-prefixed load.
+TEST_F(CpuRuntimeTest, FsSegmentOverride_ResolvesViaFsBase) {
+    alignas(64) u64 tls_area[8] = {};
+    tls_area[2] = 0x1122334455667788ULL;  // lives at fs_base + 0x10
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00, // mov rax, 7   (offset 0..6)
-        0x64, 0x48, 0x8b, 0x09,                    // mov rcx, fs:[rcx] (offset 7)
+        // mov rax, fs:[0x10]
+        0x64, 0x48, 0x8b, 0x04, 0x25, 0x10, 0x00, 0x00, 0x00,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -16320,18 +16322,26 @@ TEST_F(CpuRuntimeTest, Reject_FsSegmentOverride_UnsupportedExit) {
     const u64 base = reinterpret_cast<u64>(mem.CodePtr());
     st.rip = base;
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    // Run() refreshes fs_base from GetTcbBase(), but the test-support stub
+    // returns null, so the value set here is preserved.
+    st.fs_base = reinterpret_cast<u64>(tls_area);
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction));
-    EXPECT_EQ(st.rip, base + 7) << "RIP points at the FS-prefixed instruction";
-    EXPECT_EQ(st.gpr[0], 7u) << "the MOV before the unsupported insn ran";
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd))
+        << "fs: resolves via fs_base instead of trapping";
+    EXPECT_EQ(st.rip, kReturnSentinel);
+    EXPECT_EQ(st.gpr[0], 0x1122334455667788ULL)
+        << "mov rax, fs:[0x10] loaded *(fs_base + 0x10)";
 }
 
-// GS override: same expectation, different prefix byte (65).
-TEST_F(CpuRuntimeTest, Reject_GsSegmentOverride_UnsupportedExit) {
+// GS override: same as FS, resolved via gs_base. (PS4/FreeBSD uses fs for TLS;
+// gs is modeled for symmetry/completeness.)
+TEST_F(CpuRuntimeTest, GsSegmentOverride_ResolvesViaGsBase) {
+    alignas(64) u64 tls_area[8] = {};
+    tls_area[3] = 0x99AABBCCDDEEFF00ULL;  // lives at gs_base + 0x18
     const u8 program[] = {
-        0x48, 0xc7, 0xc0, 0x09, 0x00, 0x00, 0x00, // mov rax, 9
-        0x65, 0x48, 0x8b, 0x09,                    // mov rcx, gs:[rcx]
+        // mov rax, gs:[0x18]
+        0x65, 0x48, 0x8b, 0x04, 0x25, 0x18, 0x00, 0x00, 0x00,
         0xc3,
     };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
@@ -16341,11 +16351,13 @@ TEST_F(CpuRuntimeTest, Reject_GsSegmentOverride_UnsupportedExit) {
     const u64 base = reinterpret_cast<u64>(mem.CodePtr());
     st.rip = base;
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gs_base = reinterpret_cast<u64>(tls_area);
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction));
-    EXPECT_EQ(st.rip, base + 7) << "RIP points at the GS-prefixed instruction";
-    EXPECT_EQ(st.gpr[0], 9u);
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+    EXPECT_EQ(st.rip, kReturnSentinel);
+    EXPECT_EQ(st.gpr[0], 0x99AABBCCDDEEFF00ULL)
+        << "mov rax, gs:[0x18] loaded *(gs_base + 0x18)";
 }
 
 // ----------------------------------------------------------------------------
