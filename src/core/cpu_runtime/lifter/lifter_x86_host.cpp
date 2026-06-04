@@ -6211,6 +6211,24 @@ bool EmitPackedIntArith(const ZydisDecodedInstruction& insn,
         case ZYDIS_MNEMONIC_VPCMPGTD:
         case ZYDIS_MNEMONIC_VPCMPEQQ:
         case ZYDIS_MNEMONIC_VPCMPGTQ:
+        // Byte/word-width variants of the above (same template; the hardware
+        // supplies the per-element semantics).
+        case ZYDIS_MNEMONIC_VPADDB:
+        case ZYDIS_MNEMONIC_VPADDW:
+        case ZYDIS_MNEMONIC_VPSUBB:
+        case ZYDIS_MNEMONIC_VPSUBW:
+        case ZYDIS_MNEMONIC_VPMULLW:
+        case ZYDIS_MNEMONIC_VPMINUB:
+        case ZYDIS_MNEMONIC_VPMINSB:
+        case ZYDIS_MNEMONIC_VPMINUW:
+        case ZYDIS_MNEMONIC_VPMINSW:
+        case ZYDIS_MNEMONIC_VPMAXUB:
+        case ZYDIS_MNEMONIC_VPMAXSB:
+        case ZYDIS_MNEMONIC_VPMAXUW:
+        case ZYDIS_MNEMONIC_VPMAXSW:
+        case ZYDIS_MNEMONIC_VPCMPEQW:
+        case ZYDIS_MNEMONIC_VPCMPGTB:
+        case ZYDIS_MNEMONIC_VPCMPGTW:
             break;
         default: return false;
     }
@@ -6269,6 +6287,22 @@ bool EmitPackedIntArith(const ZydisDecodedInstruction& insn,
             case ZYDIS_MNEMONIC_VPCMPGTD: c.vpcmpgtd(ymm0, ymm0, ymm1); break;
             case ZYDIS_MNEMONIC_VPCMPEQQ: c.vpcmpeqq(ymm0, ymm0, ymm1); break;
             case ZYDIS_MNEMONIC_VPCMPGTQ: c.vpcmpgtq(ymm0, ymm0, ymm1); break;
+            case ZYDIS_MNEMONIC_VPADDB:   c.vpaddb(ymm0, ymm0, ymm1);   break;
+            case ZYDIS_MNEMONIC_VPADDW:   c.vpaddw(ymm0, ymm0, ymm1);   break;
+            case ZYDIS_MNEMONIC_VPSUBB:   c.vpsubb(ymm0, ymm0, ymm1);   break;
+            case ZYDIS_MNEMONIC_VPSUBW:   c.vpsubw(ymm0, ymm0, ymm1);   break;
+            case ZYDIS_MNEMONIC_VPMULLW:  c.vpmullw(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMINUB:  c.vpminub(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMINSB:  c.vpminsb(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMINUW:  c.vpminuw(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMINSW:  c.vpminsw(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXUB:  c.vpmaxub(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXSB:  c.vpmaxsb(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXUW:  c.vpmaxuw(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXSW:  c.vpmaxsw(ymm0, ymm0, ymm1);  break;
+            case ZYDIS_MNEMONIC_VPCMPEQW: c.vpcmpeqw(ymm0, ymm0, ymm1); break;
+            case ZYDIS_MNEMONIC_VPCMPGTB: c.vpcmpgtb(ymm0, ymm0, ymm1); break;
+            case ZYDIS_MNEMONIC_VPCMPGTW: c.vpcmpgtw(ymm0, ymm0, ymm1); break;
             default: return false;
         }
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], ymm0);
@@ -6288,6 +6322,22 @@ bool EmitPackedIntArith(const ZydisDecodedInstruction& insn,
             case ZYDIS_MNEMONIC_VPCMPGTD: c.vpcmpgtd(xmm0, xmm0, xmm1); break;
             case ZYDIS_MNEMONIC_VPCMPEQQ: c.vpcmpeqq(xmm0, xmm0, xmm1); break;
             case ZYDIS_MNEMONIC_VPCMPGTQ: c.vpcmpgtq(xmm0, xmm0, xmm1); break;
+            case ZYDIS_MNEMONIC_VPADDB:   c.vpaddb(xmm0, xmm0, xmm1);   break;
+            case ZYDIS_MNEMONIC_VPADDW:   c.vpaddw(xmm0, xmm0, xmm1);   break;
+            case ZYDIS_MNEMONIC_VPSUBB:   c.vpsubb(xmm0, xmm0, xmm1);   break;
+            case ZYDIS_MNEMONIC_VPSUBW:   c.vpsubw(xmm0, xmm0, xmm1);   break;
+            case ZYDIS_MNEMONIC_VPMULLW:  c.vpmullw(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMINUB:  c.vpminub(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMINSB:  c.vpminsb(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMINUW:  c.vpminuw(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMINSW:  c.vpminsw(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXUB:  c.vpmaxub(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXSB:  c.vpmaxsb(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXUW:  c.vpmaxuw(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPMAXSW:  c.vpmaxsw(xmm0, xmm0, xmm1);  break;
+            case ZYDIS_MNEMONIC_VPCMPEQW: c.vpcmpeqw(xmm0, xmm0, xmm1); break;
+            case ZYDIS_MNEMONIC_VPCMPGTB: c.vpcmpgtb(xmm0, xmm0, xmm1); break;
+            case ZYDIS_MNEMONIC_VPCMPGTW: c.vpcmpgtw(xmm0, xmm0, xmm1); break;
             default: return false;
         }
         c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], xmm0);
@@ -6685,7 +6735,38 @@ bool EmitVpmovzxdq(const ZydisDecodedInstruction& insn,
     return true;
 }
 
-/// VINSERTF128 / VEXTRACTF128 — 128-bit lane insert/extract within a YMM.
+/// VPMOVZXBD — zero-extend packed bytes to dwords. xmm: 4 bytes -> 4
+/// dwords; ymm: 8 bytes -> 8 dwords. mem source m32(xmm)/m64(ymm).
+bool EmitVpmovzxbd(const ZydisDecodedInstruction& insn,
+                   const ZydisDecodedOperand* ops,
+                   u64 next_rip,
+                   Xbyak::CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_VPMOVZXBD) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst_idx = ZydisVecToIndex(ops[0].reg.value);
+    if (dst_idx < 0) return false;
+    const bool ymm = (ops[0].size == 256);
+
+    if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s = ZydisVecToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(s, 0)]);
+        if (ymm) c.vpmovzxbd(ymm0, xmm1); else c.vpmovzxbd(xmm0, xmm1);
+    } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        if (ymm) c.vpmovzxbd(ymm0, qword[rdx]); else c.vpmovzxbd(xmm0, dword[rdx]);
+    } else {
+        return false;
+    }
+
+    if (ymm) {
+        c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], ymm0);
+    } else {
+        c.vmovdqu(ptr[r13 + YmmChunkOffset(dst_idx, 0)], xmm0);
+        ZeroUpperYmm(dst_idx, c);
+    }
+    return true;
+}
 ///   vinsertf128 ymm_dst, ymm_src1, xmm/m128 src2, imm8(lane)
 ///   vextractf128 xmm/m128 dst, ymm_src, imm8(lane)
 bool EmitVlane128(const ZydisDecodedInstruction& insn,
@@ -8577,6 +8658,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_PREFETCHW: handled = EmitPrefetch(insn, ops, c); break; // system
             case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, c); break; // system
             case ZYDIS_MNEMONIC_VPMOVZXDQ: handled = EmitVpmovzxdq(insn, ops, next_rip, c); break; // AVX
+            case ZYDIS_MNEMONIC_VPMOVZXBD: handled = EmitVpmovzxbd(insn, ops, next_rip, c); break; // AVX
 
             // Sign-extension family. No operands; operate on RAX/RDX.
             case ZYDIS_MNEMONIC_CBW:  handled = EmitCbw(c);  break; // basic
@@ -8744,6 +8826,22 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_VPCMPGTD: // AVX
             case ZYDIS_MNEMONIC_VPCMPEQQ: // AVX
             case ZYDIS_MNEMONIC_VPCMPGTQ: // AVX
+            case ZYDIS_MNEMONIC_VPADDB: // AVX
+            case ZYDIS_MNEMONIC_VPADDW: // AVX
+            case ZYDIS_MNEMONIC_VPSUBB: // AVX
+            case ZYDIS_MNEMONIC_VPSUBW: // AVX
+            case ZYDIS_MNEMONIC_VPMULLW: // AVX
+            case ZYDIS_MNEMONIC_VPMINUB: // AVX
+            case ZYDIS_MNEMONIC_VPMINSB: // AVX
+            case ZYDIS_MNEMONIC_VPMINUW: // AVX
+            case ZYDIS_MNEMONIC_VPMINSW: // AVX
+            case ZYDIS_MNEMONIC_VPMAXUB: // AVX
+            case ZYDIS_MNEMONIC_VPMAXSB: // AVX
+            case ZYDIS_MNEMONIC_VPMAXUW: // AVX
+            case ZYDIS_MNEMONIC_VPMAXSW: // AVX
+            case ZYDIS_MNEMONIC_VPCMPEQW: // AVX
+            case ZYDIS_MNEMONIC_VPCMPGTB: // AVX
+            case ZYDIS_MNEMONIC_VPCMPGTW: // AVX
                 handled = EmitPackedIntArith(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VUNPCKLPS: case ZYDIS_MNEMONIC_VUNPCKHPS: // AVX
