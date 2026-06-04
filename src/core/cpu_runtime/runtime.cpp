@@ -19,6 +19,8 @@
 #include "core/cpu_runtime/lifter/lifter.h"
 #include "core/cpu_runtime/hle_registry.h"
 #include "core/cpu_runtime/runtime_diagnostics.h"
+#include "core/signals.h"
+#include "core/tls.h"
 
 #ifdef ARCH_X86_64
 #include <Zydis/Zydis.h>
@@ -334,6 +336,19 @@ void* DispatcherTrampoline(GuestState* state) {
 
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
 
+    // Lazily pick up the guest TLS base once it exists. On the main thread the
+    // TCB is established during guest crt init (via an HLE call), which happens
+    // AFTER this GuestState was first entered in Run(), so fs_base may still be
+    // 0 at that point. Refresh it from the per-thread TCB while it's unset; once
+    // set it's stable for the life of the thread, so this is just a compare on
+    // the hot path thereafter. (Spawned pthreads already have a valid TCB at
+    // Run() entry via RunThread's InitializeTLS; this also covers them.)
+    if (state->fs_base == 0) {
+        if (auto* tcb = Core::GetTcbBase()) {
+            state->fs_base = reinterpret_cast<u64>(tcb);
+        }
+    }
+
     // Stuck-RIP watchdog. With diagnostics silenced on repeat entries
     // a real memset can run at hundreds of thousands of iterations
     // per second, so the threshold needs to accommodate genuinely
@@ -553,6 +568,24 @@ void* DispatcherTrampoline(GuestState* state) {
             // release-visible call is the LOG_WARNING above — so the
             // short-circuit was removed. Gating host calls on prior
             // registration is the wrong contract for a JIT bridge.)
+            // Diagnostics: log this HLE call (name + integer args) so we can
+            // spot a stub that receives an output-struct pointer it then fails
+            // to populate. No-op unless diagnostics are compiled in; budgeted so
+            // the boot path's HLE traffic can't flood the log.
+            Diagnostics::LogHleCall(
+                name, host_fn, guest_return_addr,
+                state->gpr[kSysvArg0], state->gpr[kSysvArg1],
+                state->gpr[kSysvArg2], state->gpr[kSysvArg3],
+                state->gpr[kSysvArg4], state->gpr[kSysvArg5]);
+
+            // Diagnostics: snapshot the SysV callee-saved GPRs before the host
+            // call so we can verify the callee preserved them. Plain struct copy
+            // from GuestState; cost is trivial and the whole thing compiles out
+            // in release (BridgeCalleeSaved + the check below are no-ops then).
+            const Diagnostics::BridgeCalleeSaved cs_before{
+                state->gpr[3],  state->gpr[5],  state->gpr[12],
+                state->gpr[13], state->gpr[14], state->gpr[15]};
+
             HostReturn ret = CallHostFromGuest(
                 host_fn,
                 state->gpr[kSysvArg0],   // RDI
@@ -577,6 +610,12 @@ void* DispatcherTrampoline(GuestState* state) {
             // RAX (a likely bad-pointer source). No-op unless diagnostics are
             // compiled in.
             Diagnostics::CheckHleReturn(name, host_fn, ret.rax);
+
+            // Diagnostics: verify the host callee preserved the SysV callee-saved
+            // registers in GuestState. Any divergence is a real runtime/ABI bug
+            // (not upstream guest divergence) and is logged with the offending
+            // register and before/after values. No-op unless diagnostics on.
+            Diagnostics::BridgeCheckCalleeSaved(name, host_fn, cs_before, state);
 
             // Post-return rax/xmm0 as TRACE detail. If a debug trace
             // shows the "call" line for a host_fn but never this "ret"
@@ -655,8 +694,62 @@ void Runtime::Run(GuestState& state) {
     tl_active_runtime = this;
     tl_current_guest_state = &state;
     LOG_TRACE(Core, "Run: R2 tls write ok");
+
+    // Make sure this thread has its dedicated exception-handler stack before we
+    // run any guest code, so a guest fault never has to allocate (or run the
+    // handler) on an exhausted guest stack. Idempotent per thread; no-op on
+    // non-Windows. (See signals.cpp for why this is needed.)
+    Core::EnsureVehStack();
+
+    // Point the guest's fs_base at this thread's TCB so the lifter's fs:/gs:
+    // (TLS) addressing resolves to real thread-local storage. RunThread installs
+    // the TCB via InitializeTLS/SetTcbBase before the first guest call, so
+    // GetTcbBase() is valid here. If TLS isn't set up on this thread yet (null),
+    // we leave fs_base as-is rather than pointing it at garbage. gs_base is left
+    // as-is (PS4/FreeBSD uses fs for TLS; gs is effectively unused).
+    if (auto* tcb = Core::GetTcbBase()) {
+        state.fs_base = reinterpret_cast<u64>(tcb);
+    }
+
+    // Windows stack-check disable while running on the guest stack.
+    //
+    // The JIT executes guest code with RSP pointing at a guest stack
+    // (high 0x103.../0x600... regions), NOT the host thread's stack. The
+    // Windows TEB still describes the *host* thread's stack bounds, and
+    // Windows uses TEB StackBase/StackLimit for guard-page / stack-overflow
+    // checking — including for the vectored exception handler, which runs on
+    // whatever stack is current when a fault occurs. So when guest JIT code
+    // faults and the VEH runs on the guest stack, Windows compares the guest
+    // RSP against the host bounds, sees it "out of range", and turns a normal
+    // guest fault into a spurious stack-overflow / guard violation that
+    // crashes the host (observed: a write fault inside the exception
+    // handler's own frames).
+    //
+    // The native backend's hand-written stack switch (threads/stack.S,
+    // _runOnAnotherStack) handles this by zeroing TEB StackBase/StackLimit
+    // for the duration it runs on the guest stack, which tells Windows "no
+    // bounds here" and disables the checks. The JIT path bypasses that asm,
+    // so we must replicate it. Save the current bounds, zero them for the
+    // guest-execution window, and restore on exit. This nests correctly
+    // across HLE->guest callbacks (each Run saves/restores its own locals),
+    // matching exactly what the native path does (it also runs HLE host code
+    // with bounds zeroed).
+#ifdef _WIN32
+    NT_TIB* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    void* const saved_stack_base = tib->StackBase;
+    void* const saved_stack_limit = tib->StackLimit;
+    tib->StackBase = nullptr;
+    tib->StackLimit = nullptr;
+#endif
+
     gateway_->Enter(state, &DispatcherTrampoline);
     LOG_TRACE(Core, "Run: R3 gateway returned");
+
+#ifdef _WIN32
+    tib->StackBase = saved_stack_base;
+    tib->StackLimit = saved_stack_limit;
+#endif
+
     tl_current_guest_state = saved_state;
     tl_active_runtime = saved_rt;
 }

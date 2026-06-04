@@ -9,6 +9,8 @@
 
 #include <string_view>
 #include <unordered_set>
+#include <cstddef>
+#include <cstdlib>
 
 #include "common/arch.h"
 #include "common/logging/log.h"
@@ -18,6 +20,30 @@
 
 #ifdef ARCH_X86_64
 #include <Zydis/Zydis.h>
+#endif
+
+#ifdef _WIN32
+#include <windows.h>
+// SEH-guarded 64-bit read. Returns true and sets *out if the address is mapped
+// and readable; returns false if the access would fault. Used by the field
+// watchpoint, whose target may be unmapped early in boot before the owning
+// object is allocated. clang-cl supports __try/__except.
+static bool SafeReadU64(unsigned long long addr, unsigned long long* out) {
+    __try {
+        *out = *reinterpret_cast<volatile unsigned long long*>(addr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+#else
+static bool SafeReadU64(unsigned long long addr, unsigned long long* out) {
+    // Non-Windows fallback: best-effort direct read (the target platform for
+    // this diagnostic is the Windows clang-cl build; other platforms simply do
+    // the plain read).
+    *out = *reinterpret_cast<volatile unsigned long long*>(addr);
+    return true;
+}
 #endif
 
 namespace Core::Runtime {
@@ -50,7 +76,7 @@ bool IsCorruptGuestValue(u64 v) {
 // crash. On any failure we log the reason and read nothing.
 void SafeDumpBlockCode(Runtime* rt, u64 block_rip, const void* hp,
                        const char* tag) {
-    constexpr int kWindow = 256;
+    constexpr int kWindow = 768;
     if (rt == nullptr || hp == nullptr) {
         return;
     }
@@ -100,7 +126,55 @@ thread_local u64 g_rip_ring[32] = {};
 thread_local u32 g_rip_ring_pos = 0;
 thread_local bool g_rip_ring_dumped = false;
 
+// Field-watchpoint -> corruption-check handoff. When the watchpoint observes the
+// tracked field being zeroed, it records the block that ran just before (the
+// writer) here; CheckRegisterCorruption (which has the Runtime* needed to look
+// up and hex-dump compiled host bytes) consumes it and dumps that block once.
+thread_local u64 g_watch_zeroing_block = 0;
+thread_local bool g_watch_dump_done = false;
+
+// Rolling window of the most recent HLE bridge calls on this thread. We don't
+// log them live (early-boot HLE traffic would flood); instead we keep the last
+// kHleRingDepth and dump them at the moment the fault block is about to run
+// (from MaybeDumpPreBlock), so the log shows exactly which stubs ran most
+// recently before the bad struct read. thread_local so the crash thread's
+// window isn't polluted by other threads' HLE traffic.
+struct HleCallRec {
+    char     name[64];
+    u64      host_fn;
+    u64      ret_to;
+    u64      args[6];   // rdi, rsi, rdx, rcx, r8, r9
+    bool     valid;
+};
+constexpr int kHleRingDepth = 32;
+thread_local HleCallRec g_hle_ring[kHleRingDepth] = {};
+thread_local u32 g_hle_ring_pos = 0;
+
+// Ring of recent caller(0x80030e680) invocations. We record every call's key
+// inputs and dump the window at the real fault, so the true failing invocation
+// is always captured regardless of dataflow-reconstruction error.
+struct FaultCallRec {
+    u64  r14;
+    u64  rax;
+    u64  rdx;
+    u64  base;
+    u64  predicted_r15;
+    u32  V;
+    bool base_ok;
+    bool valid;
+};
+constexpr int kFaultRingDepth = 16;
+thread_local FaultCallRec g_fault_ring[kFaultRingDepth] = {};
+thread_local u32 g_fault_ring_pos = 0;
+
 }  // namespace
+
+// Forward declaration: RecordBlockBoundary (below) calls DumpFaultStruct when it
+// sees the caller block. DumpFaultStruct is defined later in this Diagnostics
+// namespace (not the anonymous one — that's what previously caused an undefined-
+// symbol link error), after IsImplausiblePointer which it uses as a read guard.
+void DumpFaultStruct(GuestState* state);
+void DumpFaultRing();
 
 void AnnounceOnce(u64 first_rip) {
     static thread_local bool announced = false;
@@ -113,6 +187,41 @@ void AnnounceOnce(u64 first_rip) {
 }
 
 void RecordBlockBoundary(GuestState* state, u64 cur_rip) {
+    // Differential execution trace. When SHADPS4_TRACE=1, emit one compact line
+    // per block: the module-relative RIP plus all 16 GPRs, so the control-flow
+    // path and register evolution can be diffed against a reference run (e.g.
+    // mainline shadPS4). RIPs are normalized to module-relative (subtract the
+    // 0x800000000 load base) so they match across runs/ASLR. Bounded so a long
+    // session can't fill the disk; the first divergence from the reference is
+    // the bug. Gated + cached so the getenv cost is paid once per thread.
+    {
+        static thread_local int trace_on = -1;       // -1 = unknown, 0/1 cached
+        if (trace_on == -1) {
+            const char* e = std::getenv("SHADPS4_TRACE");
+            trace_on = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (trace_on == 1) {
+            static thread_local u64 trace_seq = 0;
+            static thread_local u64 trace_budget = 2000000;  // ~2M blocks cap
+            if (trace_budget > 0) {
+                --trace_budget;
+                constexpr u64 kModuleBase = 0x800000000ull;
+                const u64 rel = (cur_rip >= kModuleBase) ? (cur_rip - kModuleBase)
+                                                         : cur_rip;
+                const u64* g = state->gpr.data();
+                LOG_ERROR(Core,
+                    "TRACE {} {:#x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x} "
+                    "{:x} {:x} {:x} {:x} {:x} {:x} {:x} {:x}",
+                    trace_seq++, rel,
+                    g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7],
+                    g[8], g[9], g[10], g[11], g[12], g[13], g[14], g[15]);
+                if (trace_budget == 0) {
+                    LOG_ERROR(Core, "TRACE budget exhausted; tracing stopped");
+                }
+            }
+        }
+    }
+
     // Snapshot ring: record all 16 GPRs at this boundary.
     const u32 cur_slot = g_snap_pos % kSnapDepth;
     g_snaps[cur_slot].rip = cur_rip;
@@ -125,9 +234,147 @@ void RecordBlockBoundary(GuestState* state, u64 cur_rip) {
     // Block-RIP ring: record this entry.
     g_rip_ring[g_rip_ring_pos & 31] = cur_rip;
     g_rip_ring_pos++;
+
+    // Field write-watchpoint. The recurring null-deref faults on a load of
+    // [obj+0x18] that comes back 0; for this title the object is at guest
+    // 0x8016a2258, so the field is at 0x8016a2270. Guest memory is identity-
+    // mapped to host VAs (the lifter dereferences guest addresses directly),
+    // so we can read the field straight from this address. We poll it at every
+    // block boundary and log (a) the first observed value and (b) every change,
+    // with the block RIP that just ran. This reveals whether the field is never
+    // written (initializer skipped) or written-then-zeroed (lifecycle bug), and
+    // names the block that performs the last write before the fault. Env-gated
+    // (SHADPS4_WATCH=1) and cached so it costs nothing when off.
+    {
+        static thread_local int watch_on = -1;
+        if (watch_on == -1) {
+            // Default ON in diagnostic builds (this whole file only compiles
+            // when SHADPS4_RUNTIME_DIAGNOSTICS is set, so being here already
+            // means a deliberate debug build). SHADPS4_WATCH=0 disables it;
+            // anything else (including unset) leaves it on. This avoids losing
+            // a run to a forgotten environment export.
+            const char* e = std::getenv("SHADPS4_WATCH");
+            watch_on = (e && e[0] == '0') ? 0 : 1;
+        }
+        if (watch_on == 1) {
+            constexpr u64 kWatchAddr = 0x8016a2270ull;   // 0x8016a2258 + 0x18
+            static thread_local bool   wp_inited = false;
+            static thread_local u64    wp_last   = 0;
+            static thread_local u64    wp_hits   = 0;
+            static thread_local u64    wp_prev_rip = 0;  // block seen at the prior poll
+            // Read the field through a fault-guarded helper: early in boot the
+            // owning object may not be mapped yet, and an unguarded read would
+            // crash the diagnostic itself. If not yet readable, skip this poll
+            // (we'll pick it up once the page is live).
+            u64 cur = 0;
+            if (SafeReadU64(kWatchAddr, &cur)) {
+                if (!wp_inited) {
+                    wp_inited = true;
+                    wp_last = cur;
+                    LOG_ERROR(Core,
+                              "[WATCH] first readable [{:#x}] = {:#x} (at block {:#x})",
+                              kWatchAddr, cur, cur_rip);
+                } else if (cur != wp_last) {
+                    if (wp_hits < 256) {
+                        ++wp_hits;
+                        // The poll runs at each block entry, so the value read
+                        // now reflects everything the PREVIOUS block (wp_prev_rip)
+                        // did, including any HLE call it made. That previous block
+                        // is therefore the writer (or its callee is). We report
+                        // both the writer (prev) and the boundary we are at (cur).
+                        LOG_ERROR(Core,
+                                  "[WATCH] [{:#x}] changed {:#x} -> {:#x} "
+                                  "(writer block = {:#x}; observed at boundary {:#x})",
+                                  kWatchAddr, wp_last, cur, wp_prev_rip, cur_rip);
+                    }
+                    // On the zeroing transition, dump the recent block-RIP ring
+                    // so the exact one-block-wide gap and its predecessors are
+                    // visible, and flag the writer (previous) block so the
+                    // corruption check can hex-dump its host bytes.
+                    if (cur == 0 && wp_last != 0) {
+                        g_watch_zeroing_block = wp_prev_rip;
+                        LOG_ERROR(Core,
+                                  "[WATCH] block-RIP ring at zeroing (oldest first):");
+                        const u32 live = (g_rip_ring_pos < 32u) ? g_rip_ring_pos : 32u;
+                        for (u32 k = live; k >= 1; --k) {
+                            const u32 idx = (g_rip_ring_pos - k) & 31;
+                            LOG_ERROR(Core, "[WATCH]   block {:#x}", g_rip_ring[idx]);
+                        }
+                    }
+                    wp_last = cur;
+                }
+            }
+            wp_prev_rip = cur_rip;
+        }
+    }
+
+    // Keep recording 0x80030e680 invocations (turned out NOT to be the failing
+    // caller, but harmless to keep for context).
+    if (cur_rip == 0x80030e680ull) {
+        DumpFaultStruct(state);
+    }
+
+    // THE failing call: entry to the prologue 0x8002f04d0 with the bad incoming
+    // rcx (= guest gpr index 1) that the prologue copies into r15. r15 ends 0x3f,
+    // and the prologue does r15 = rcx, so rcx == 0x3f here identifies the exact
+    // failing invocation. Dump the recent block-RIP ring so the predecessor block
+    // (the REAL caller, which set rcx) is revealed, plus the incoming GPRs.
+    // One-shot.
+    if (cur_rip == 0x8002f04d0ull && state->gpr[1] == 0x3full) {
+        static thread_local bool caller_dumped = false;
+        if (!caller_dumped) {
+            caller_dumped = true;
+            LOG_ERROR(Core,
+                      "[CALLER] entering prologue 0x8002f04d0 with rcx=0x3f "
+                      "(-> r15). Incoming GPRs:");
+            for (int i = 0; i < 16; ++i) {
+                LOG_ERROR(Core, "[CALLER]   {} = {:#x}", kGprNames[i], state->gpr[i]);
+            }
+            LOG_ERROR(Core, "[CALLER] recent block sequence (newest last):");
+            // g_rip_ring_pos has already been incremented for this (current)
+            // entry; walk the last 16 entries oldest-first. The entry just before
+            // the current one (0x8002f04d0) is the real caller block.
+            for (int k = 16; k >= 1; --k) {
+                const u32 idx = (g_rip_ring_pos - (u32)k) & 31;
+                LOG_ERROR(Core, "[CALLER]   block {:#x}", g_rip_ring[idx]);
+            }
+
+            // The snapshot ring records all 16 GPRs at every boundary, so it
+            // already holds rcx (gpr[1]) at each recent block. Dump (rip, rcx)
+            // oldest-first so we can SEE the block at which rcx first became 0x3f
+            // — that block is the exact producer, no hand-reconstruction needed.
+            LOG_ERROR(Core, "[CALLER] rcx history at recent boundaries (rip : rcx):");
+            const u32 live = (g_snap_pos < (u32)kSnapDepth) ? g_snap_pos
+                                                            : (u32)kSnapDepth;
+            const u32 show = (live < 20u) ? live : 20u;
+            for (u32 k = show; k >= 1; --k) {
+                const u32 slot = (g_snap_pos - k) % kSnapDepth;
+                if (!g_snaps[slot].valid) continue;
+                LOG_ERROR(Core, "[CALLER]   {:#x} : rcx={:#x}",
+                          g_snaps[slot].rip, g_snaps[slot].gpr[1]);
+            }
+        }
+    }
 }
 
 void CheckRegisterCorruption(Runtime* rt, GuestState* state, u64 cur_rip) {
+    // Field-watchpoint handoff: if the watched field was just zeroed, dump the
+    // host bytes of the block that wrote it (we have Runtime* here, which the
+    // watchpoint in RecordBlockBoundary does not). One-shot.
+    if (!g_watch_dump_done && g_watch_zeroing_block != 0 && rt != nullptr) {
+        g_watch_dump_done = true;
+        const u64 writer = g_watch_zeroing_block;
+        LOG_ERROR(Core,
+                  "[WATCH] dumping host bytes of field-zeroing block {:#x}:",
+                  writer);
+        BlockCache& bc = const_cast<BlockCache&>(rt->GetBlockCache());
+        if (void* hp = bc.Lookup(writer)) {
+            SafeDumpBlockCode(rt, writer, hp, "WATCH");
+        } else {
+            LOG_ERROR(Core, "[WATCH]   block {:#x} not found in block cache", writer);
+        }
+    }
+
     // Gap detector: flag any GPR (except rsp/rbp) that has entered the
     // unmapped gap, naming the block after which it was first seen.
     for (int i = 0; i < 16; ++i) {
@@ -233,6 +480,117 @@ void CheckHleReturn(std::string_view name, u64 host_fn, u64 rax) {
     }
 }
 
+// Bridge ABI-integrity check. The HLE bridge calls a host C++ function that is
+// declared sysv_abi; per AMD64 SysV the callee MUST preserve RBX, RBP, R12,
+// R13, R14, R15. The guest's copies of those live in GuestState.gpr[] and the
+// bridge never touches them, so after the call they must be byte-identical to
+// before. If any differs, either (a) the host callee violated the ABI, (b) a
+// guest callback re-entered on this GuestState and its save/restore is wrong,
+// or (c) something else mutated GuestState across the call — all genuine
+// runtime bugs, not upstream guest divergence. We capture a 6-register snapshot
+// before the call (caller passes it in) and compare here, after.
+//
+// One-shot per distinct (name, register) so a hot call that legitimately... no:
+// there is no legitimate divergence. We report every distinct offending call
+// (capped) with the exact register, before/after values, and the HLE name, so a
+// real corruption is impossible to miss and easy to localize.
+// (BridgeCalleeSaved is declared in runtime_diagnostics.h so the bridge can
+// build the snapshot; we just define the checker here.)
+void BridgeCheckCalleeSaved(std::string_view name, u64 host_fn,
+                            const BridgeCalleeSaved& before,
+                            GuestState* state) {
+    if (state == nullptr) return;
+    static thread_local u32 reports = 0;
+    if (reports >= 64) return;
+
+    // GuestState gpr[] index mapping: RBX=3, RBP=5, R12=12, R13=13, R14=14, R15=15.
+    struct Chk { const char* nm; u64 was; u64 now; };
+    const Chk checks[] = {
+        {"rbx", before.rbx, state->gpr[3]},
+        {"rbp", before.rbp, state->gpr[5]},
+        {"r12", before.r12, state->gpr[12]},
+        {"r13", before.r13, state->gpr[13]},
+        {"r14", before.r14, state->gpr[14]},
+        {"r15", before.r15, state->gpr[15]},
+    };
+    for (const Chk& c : checks) {
+        if (c.was != c.now) {
+            ++reports;
+            LOG_ERROR(Core,
+                      "[BRIDGE-ABI] callee-saved {} CORRUPTED across HLE call "
+                      "'{}' (host={:#x}): {:#x} -> {:#x}",
+                      c.nm,
+                      name.empty() ? std::string_view{"<unregistered>"} : name,
+                      host_fn, c.was, c.now);
+            if (reports >= 64) {
+                LOG_ERROR(Core, "[BRIDGE-ABI] (further reports suppressed)");
+                break;
+            }
+        }
+    }
+}
+
+// Record an HLE bridge call into the rolling ring (name + the six SysV integer-
+// arg registers). We don't log live — early-boot HLE traffic would flood — but
+// keep the last kHleRingDepth and dump them at the fault point (DumpHleRing).
+// Hunting a stub that receives an output-struct pointer it never populates: the
+// guest later reads a stale field and computes the bad r15. rdi is arg0; the
+// struct base the faulting computation reads (r14+rax+0x38) is reachable from an
+// arg or from r14 itself.
+void LogHleCall(std::string_view name, u64 host_fn, u64 guest_return_addr,
+                u64 rdi, u64 rsi, u64 rdx, u64 rcx, u64 r8, u64 r9) {
+    HleCallRec& r = g_hle_ring[g_hle_ring_pos % kHleRingDepth];
+    // Copy the (possibly very long, NID-mangled) name into the fixed record,
+    // truncating safely. Empty name -> "<unregistered>".
+    std::string_view n = name.empty() ? std::string_view{"<unregistered>"} : name;
+    const size_t cap = sizeof(r.name) - 1;
+    const size_t len = (n.size() < cap) ? n.size() : cap;
+    for (size_t i = 0; i < len; ++i) r.name[i] = n[i];
+    r.name[len] = '\0';
+    r.host_fn = host_fn;
+    r.ret_to  = guest_return_addr;
+    r.args[0] = rdi; r.args[1] = rsi; r.args[2] = rdx;
+    r.args[3] = rcx; r.args[4] = r8;  r.args[5] = r9;
+    r.valid = true;
+    g_hle_ring_pos++;
+}
+
+// Dump the rolling HLE-call window oldest-first. Called from MaybeDumpPreBlock
+// when the fault block is about to run, so the log shows the stubs that ran most
+// recently before the bad struct read — the prime suspects for a stub that was
+// handed an output buffer it never populated.
+void DumpHleRing() {
+    const u32 live = (g_hle_ring_pos < (u32)kHleRingDepth) ? g_hle_ring_pos
+                                                           : (u32)kHleRingDepth;
+    LOG_ERROR(Core, "[HLECALL] last {} HLE calls before fault (oldest first):", live);
+    for (u32 k = live; k >= 1; --k) {
+        const u32 slot = (g_hle_ring_pos - k) % kHleRingDepth;
+        const HleCallRec& r = g_hle_ring[slot];
+        if (!r.valid) continue;
+        LOG_ERROR(Core,
+                  "[HLECALL]   {} host={:#x} ret_to={:#x} | rdi={:#x} rsi={:#x} "
+                  "rdx={:#x} rcx={:#x} r8={:#x} r9={:#x}",
+                  r.name, r.host_fn, r.ret_to,
+                  r.args[0], r.args[1], r.args[2], r.args[3], r.args[4], r.args[5]);
+    }
+}
+
+// Public fault-time dump: callable from the signal handler at the moment of an
+// unhandled fault. Unlike MaybeDumpPreBlock (gated on a hard-coded block-entry
+// RIP), this fires for ANY crash including mid-block faults, since the handler
+// always reaches it. Dumps the HLE-call window plus the recent block-RIP
+// sequence so we can see which stub ran last and the control-flow path into the
+// fault. Reads thread-local rings only — no allocation, handler-safe.
+void DumpHleRingNow() {
+    DumpHleRing();
+    const u32 live = (g_rip_ring_pos < 32u) ? g_rip_ring_pos : 32u;
+    LOG_ERROR(Core, "[HLECALL] recent block-RIP sequence before fault (oldest first):");
+    for (u32 k = live; k >= 1; --k) {
+        const u32 idx = (g_rip_ring_pos - k) & 31;
+        LOG_ERROR(Core, "[HLECALL]   block {:#x}", g_rip_ring[idx]);
+    }
+}
+
 // The block that actually faults. Reached via a jump-table/dispatch path;
 // it executes `mov eax,[rdx]` with a poisoned guest rdx (a small non-pointer
 // like 0x6), so the load dereferences unmapped low memory. The earlier
@@ -260,6 +618,77 @@ bool IsImplausiblePointer(u64 v) {
     const bool code_heap = (top == 0x8);
     const bool anon_stack = (v >= 0x7ef000000ull && v < 0x800000000ull);
     return !(dmem || code_heap || anon_stack);
+}
+
+// Dump the struct the caller block (0x80030e680) reads to compute r15. From its
+// disassembly: base = guest r14 + guest rax, then it reads fields at base+0x30,
+// +0x38 (the value V that feeds r15 = (V<<4)+rdx), +0x3c, +0x40, +0x44. We log
+// base and a window of dwords around those fields so we can see whether the
+// struct is populated or stale. Fires once. Guest memory is mapped in the
+// emulator's host address space, so a guest VA is directly dereferenceable IF
+// mapped; we guard with IsImplausiblePointer so the diagnostic can't itself
+// fault on an unmapped/garbage base. The read is best-effort: a plausible-looking
+// but actually-unmapped base could still fault, but the prior crash shows this
+// path's pointers are in mapped dmem/code, so the guard is adequate here.
+void DumpFaultStruct(GuestState* state) {
+    // Record every invocation's key inputs into a small ring, dumped at the real
+    // fault. The caller 0x80030e680 loops over a 0x30-stride array at r14 and, on
+    // the failing iteration, loads rcx = *(u32*)(r14 + rax + 0x60) (disassembly
+    // of 0x80030e680: rdx=r14+rax; rdx+=0x30; ... the field that feeds rcx is at
+    // element-relative +0x30, i.e. base+0x60 from the array start when rax=0x30).
+    // So record that field, not the earlier mis-identified +0x38.
+    const u64 r14 = state->gpr[14];
+    const u64 rax = state->gpr[0];
+    const u64 rdx = state->gpr[2];
+    const u64 base = r14 + rax;
+    const bool base_ok = !IsImplausiblePointer(base);
+    const u32 V = base_ok ? *reinterpret_cast<const volatile u32*>(base + 0x30) : 0xFFFFFFFFu;
+
+    FaultCallRec& r = g_fault_ring[g_fault_ring_pos % kFaultRingDepth];
+    r.r14 = r14; r.rax = rax; r.rdx = rdx; r.base = base;
+    r.base_ok = base_ok; r.V = V;
+    r.predicted_r15 = V;  // rcx = the loaded field directly (mov rcx, eax)
+    r.valid = true;
+    g_fault_ring_pos++;
+
+    // One-shot: dump the whole array region from r14 (several 0x30-byte elements)
+    // so we see element 0, element 1 (the failing one, field +0x30 => array+0x60),
+    // and context. r14 is the stable array base across iterations.
+    static thread_local bool array_dumped = false;
+    if (!array_dumped && !IsImplausiblePointer(r14)) {
+        array_dumped = true;
+        LOG_ERROR(Core, "[ARRAY] dump from r14={:#x} (0x30-stride elements):", r14);
+        for (int off = 0x0; off <= 0xC0; off += 0x4) {
+            const u32 w = *reinterpret_cast<const volatile u32*>(r14 + off);
+            const int elem = off / 0x30;
+            const int eoff = off % 0x30;
+            LOG_ERROR(Core, "[ARRAY]   [r14+{:#04x}] (elem{} +{:#04x}) = {:#010x}",
+                      off, elem, eoff, w);
+        }
+    }
+}
+
+void DumpFaultRing() {
+    const u32 live = (g_fault_ring_pos < (u32)kFaultRingDepth) ? g_fault_ring_pos
+                                                              : (u32)kFaultRingDepth;
+    LOG_ERROR(Core, "[STRUCT] last {} caller(0x80030e680) invocations (oldest first):",
+              live);
+    for (u32 k = live; k >= 1; --k) {
+        const u32 slot = (g_fault_ring_pos - k) % kFaultRingDepth;
+        const FaultCallRec& r = g_fault_ring[slot];
+        if (!r.valid) continue;
+        if (r.base_ok) {
+            LOG_ERROR(Core,
+                      "[STRUCT]   r14={:#x} rax={:#x} base={:#x} rdx={:#x} "
+                      "field=[base+0x30]={:#x} -> rcx(=r15)={:#x}",
+                      r.r14, r.rax, r.base, r.rdx, r.V, r.predicted_r15);
+        } else {
+            LOG_ERROR(Core,
+                      "[STRUCT]   r14={:#x} rax={:#x} base={:#x} rdx={:#x} "
+                      "(base implausible — not read)",
+                      r.r14, r.rax, r.base, r.rdx);
+        }
+    }
 }
 
 void MaybeDumpPreBlock(GuestState* state) {
@@ -310,6 +739,78 @@ void MaybeDumpPreBlock(GuestState* state) {
         }
         break;
     }
+    static thread_local bool dumped_guest_bytes = false;
+    if (!dumped_guest_bytes && state->rip == 0x8002f05e2ull) {
+        dumped_guest_bytes = true;
+        for (u64 rip : {0x8002f04d0ull, 0x8002f05e2ull, 0x80030e680ull}) {
+            const u8* p = reinterpret_cast<const u8*>(rip); // identity-mapped guest VA
+            char hex[48 * 3 + 1];
+            for (int k = 0; k < 48; ++k) {
+                static const char* d = "0123456789abcdef";
+                hex[k * 3 + 0] = d[(p[k] >> 4) & 0xF];
+                hex[k * 3 + 1] = d[p[k] & 0xF];
+                hex[k * 3 + 2] = ' ';
+            }
+            hex[48 * 3] = '\0';
+            LOG_ERROR(Core, "[GUESTBYTES] {:#x}: {}", rip, hex);
+        }
+    }
+    static thread_local bool dumped_loop = false;
+    if (!dumped_loop && state->rip == 0x80030e680ull) {
+        const u64 r14 = state->gpr[14]; // container base
+        const u64 rax = state->gpr[0];  // entry offset
+        const u8* entry = reinterpret_cast<const u8*>(r14 + rax);
+        if (*reinterpret_cast<const u32*>(entry + 0x38) == 0x3fu) { // the bad iteration
+            dumped_loop = true;
+            LOG_ERROR(Core, "[LOOP] r14={:#x} rax={:#x} rbp={:#x}", r14, rax, state->gpr[5]);
+            // the two loop-advance blocks + a re-dump of the lookup block
+            for (u64 rip : {0x80030e650ull, 0x80030e6c7ull, 0x80030e680ull}) {
+                const u8* p = reinterpret_cast<const u8*>(rip);
+                char hex[64 * 3 + 1];
+                static const char* d = "0123456789abcdef";
+                for (int k = 0; k < 64; ++k) {
+                    hex[k * 3] = d[(p[k] >> 4) & 0xF];
+                    hex[k * 3 + 1] = d[p[k] & 0xF];
+                    hex[k * 3 + 2] = ' ';
+                }
+                hex[64 * 3] = '\0';
+                LOG_ERROR(Core, "[LOOPBYTES] {:#x}: {}", rip, hex);
+            }
+            // the container entry the bad iteration is reading (96 bytes around it)
+            const u8* e = entry;
+            char hx[96 * 3 + 1];
+            static const char* d2 = "0123456789abcdef";
+            for (int k = 0; k < 96; ++k) {
+                hx[k * 3] = d2[(e[k] >> 4) & 0xF];
+                hx[k * 3 + 1] = d2[e[k] & 0xF];
+                hx[k * 3 + 2] = ' ';
+            }
+            hx[96 * 3] = '\0';
+            LOG_ERROR(Core, "[ENTRY] {:#x}: {}", (u64)entry, hx);
+        }
+    }
+    static thread_local bool dumped_302 = false;
+    if (!dumped_302 && state->rip == 0x800302f60ull) {
+        dumped_302 = true;
+        const u8* p = reinterpret_cast<const u8*>(0x800302f60ull);
+        char hex[96 * 3 + 1];
+        static const char* d = "0123456789abcdef";
+        for (int k = 0; k < 96; ++k) {
+            hex[k * 3] = d[(p[k] >> 4) & 0xF];
+            hex[k * 3 + 1] = d[p[k] & 0xF];
+            hex[k * 3 + 2] = ' ';
+        }
+        hex[96 * 3] = '\0';
+        LOG_ERROR(Core, "[GUESTBYTES] 0x800302f60: {}", hex);
+    }
+    // Dump the recent HLE-call window: a stub that was handed an output buffer
+    // it never populated is the prime suspect for the stale struct field the
+    // caller read to compute the bad r15.
+    DumpHleRing();
+
+    // Dump the recent caller(0x80030e680) invocations so we see the actual
+    // inputs (r14/rax/rdx/base/V) of the call that produced the bad r15.
+    DumpFaultRing();
 }
 
 #ifdef ARCH_X86_64
@@ -424,25 +925,16 @@ void OnBlockCompiled(u64 guest_rip, const void* host_ptr, u64 emitted_size) {
     DumpCompiledBlockDisasm(guest_rip, host_ptr, emitted_size);
 
     // Investigation-specific: raw host-byte dump for the blocks under active
-    // investigation. The 0x800274c** / 0x800302f60 set is from the earlier
-    // bit-33 corruption loop; 0x8002f04d0 is the r15-corruption producer (writes
-    // r15 = 0x3f in the function prologue) and 0x8002f05e2 is the faulting block
-    // that dereferences it. The prologue turned out faithful (r15 = incoming rcx),
-    // so 0x80030e680 — the CALLER block that ends in the `call` and computes the
-    // rcx arg — is added to catch where rcx becomes 0x3f.
-    if (guest_rip != 0x800274c00ull && guest_rip != 0x800274c09ull &&
-        guest_rip != 0x800274caeull && guest_rip != 0x800302f60ull &&
-        guest_rip != 0x8002f04d0ull && guest_rip != 0x8002f05e2ull &&
-        guest_rip != 0x80030e680ull) {
+    // investigation. Current target: the field-zeroing bug. The watchpoint
+    // showed [0x8016a2270] going 0x801698770 -> 0 right after block 0x8008adec0,
+    // and the fault is block 0x8008ae120 reading that now-null field. Dump both
+    // so we can read the lifted store (0x8008adec0) and the lifted deref
+    // (0x8008ae120) and decide mis-lift vs faithful-store-of-zero.
+    if (guest_rip != 0x8008adec0ull && guest_rip != 0x8008ae120ull) {
         return;
     }
     static thread_local u64 dumped_mask = 0;
-    const int slot = (guest_rip == 0x800274c00ull) ? 0
-                   : (guest_rip == 0x800274c09ull) ? 1
-                   : (guest_rip == 0x800274caeull) ? 2
-                   : (guest_rip == 0x800302f60ull) ? 3
-                   : (guest_rip == 0x8002f04d0ull) ? 4
-                   : (guest_rip == 0x8002f05e2ull) ? 5 : 6;
+    const int slot = (guest_rip == 0x8008adec0ull) ? 0 : 1;
     if (dumped_mask & (1ull << slot)) {
         return;
     }

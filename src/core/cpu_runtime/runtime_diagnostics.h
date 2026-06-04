@@ -60,6 +60,26 @@ void CheckRegisterCorruption(Runtime* rt, GuestState* state, u64 cur_rip);
 // value in the unmapped gap via RAX — a likely bad-pointer source. Fires once.
 void CheckHleReturn(std::string_view name, u64 host_fn, u64 rax);
 
+// Snapshot of the SysV callee-saved GPRs, captured by the HLE bridge just
+// before the host call and passed to BridgeCheckCalleeSaved just after.
+struct BridgeCalleeSaved {
+    u64 rbx, rbp, r12, r13, r14, r15;
+};
+
+// Verify the host HLE callee preserved the SysV callee-saved registers
+// (rbx/rbp/r12-r15) in GuestState. Any divergence is a real runtime/ABI bug
+// (host callee, guest-callback reentrancy, or GuestState mutation) and is
+// logged with the exact register, before/after values, and HLE name. Capped.
+void BridgeCheckCalleeSaved(std::string_view name, u64 host_fn,
+                            const BridgeCalleeSaved& before, GuestState* state);
+
+// Before an HLE bridge call, log the stub name and its six integer-arg registers
+// (SysV: rdi/rsi/rdx/rcx/r8/r9) at LOG_ERROR level so they survive in release-
+// style logging. This is the active hunt for a stub that receives an output-
+// struct pointer it then fails to populate. Gated to a budget so it can't flood.
+void LogHleCall(std::string_view name, u64 host_fn, u64 guest_return_addr,
+                u64 rdi, u64 rsi, u64 rdx, u64 rcx, u64 r8, u64 r9);
+
 // If the next block to enter is a specific block under investigation, dump all
 // guest GPRs at this safe point (one block before the fault handler sees them).
 // Fires once for the hard-coded target RIP.
@@ -71,14 +91,30 @@ void MaybeDumpPreBlock(GuestState* state);
 // RIP of interest.
 void OnBlockCompiled(u64 guest_rip, const void* host_ptr, u64 emitted_size);
 
+// Dump the rolling HLE-call ring and the recent block-RIP ring immediately,
+// regardless of fault address. Intended to be called from the signal handler
+// at the moment of an unhandled fault, so we capture the HLE-call window that
+// preceded ANY crash (works for mid-block faults where the block-entry hooks
+// never fire on the exact fault RIP). Safe to call from the handler: reads
+// thread-local rings only, no allocation.
+void DumpHleRingNow();
+
 #else  // !SHADPS4_RUNTIME_DIAGNOSTICS — all entry points compile to nothing.
 
 inline void AnnounceOnce(u64) {}
 inline void RecordBlockBoundary(GuestState*, u64) {}
 inline void CheckRegisterCorruption(Runtime*, GuestState*, u64) {}
 inline void CheckHleReturn(std::string_view, u64, u64) {}
+struct BridgeCalleeSaved {
+    u64 rbx, rbp, r12, r13, r14, r15;
+};
+inline void BridgeCheckCalleeSaved(std::string_view, u64,
+                                   const BridgeCalleeSaved&, GuestState*) {}
+inline void LogHleCall(std::string_view, u64, u64,
+                       u64, u64, u64, u64, u64, u64) {}
 inline void MaybeDumpPreBlock(GuestState*) {}
 inline void OnBlockCompiled(u64, const void*, u64) {}
+inline void DumpHleRingNow() {}
 
 #endif  // SHADPS4_RUNTIME_DIAGNOSTICS
 
