@@ -1080,7 +1080,7 @@ bool EmitRotate(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 
     // Store result back at width (preserve upper bits for narrow).
     if (dst_mem) {
-        c.and_(res, res, wmask);
+        if (w != 64) c.and_(res, res, wmask); // all-ones imm invalid on AArch64; qword rotate is already full-width
         if (w == 8)       c.strb(WReg(res.getIdx()), ptr(vaddr));
         else if (w == 16) c.strh(WReg(res.getIdx()), ptr(vaddr));
         else if (w == 32) c.str(WReg(res.getIdx()), ptr(vaddr));
