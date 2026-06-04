@@ -453,7 +453,7 @@ TEST_F(DiffTest, Fuzz_ShiftsByCL) {
 // DIV / IDIV with inputs constrained to never fault (rdx=0, non-zero divisor,
 // non-negative dividend below 2^63 for idiv). All flags undefined -> mask 0.
 TEST_F(DiffTest, Fuzz_Division) {
-    std::mt19937_64 rng(0xD1V1D3);
+    std::mt19937_64 rng(0xD1D1D3);
     for (int iter = 0; iter < 200; ++iter) {
         Context in;
         in.gpr[0] = rng();                  // dividend low (rax)
