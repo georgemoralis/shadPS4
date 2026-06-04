@@ -332,6 +332,7 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         stubs/common_stub.cpp
         stubs/scm_rev_stub.cpp
         stubs/sdl_stub.cpp
+        stubs/core_tls_signals_stub.cpp
     )
 
     if (ARCHITECTURE STREQUAL "x86_64")
