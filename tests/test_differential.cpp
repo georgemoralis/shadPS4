@@ -442,6 +442,184 @@ TEST_F(DiffTest, MemShlQword) {
 }
 
 // ============================================================================
+// Effective-address generation (EmitEffectiveAddress) — exercised through LEA,
+// which runs the full base+index*scale+disp computation into a GPR with no
+// memory access and no flags. That lets us compare the *computed address*
+// JIT-vs-native across every addressing form using arbitrary register values
+// (values that would fault if dereferenced are fine — LEA never dereferences).
+// Out of the oracle's scope and therefore excluded: RIP-relative (native runs
+// inline, so its rip differs), fs:/gs: (host segment base != guest fs_base),
+// and addr32 (the 0x67 path is currently unwired in the lifter).
+// ============================================================================
+
+// Encode `lea dst, [base + index*scale + disp]` with xbyak so the ModRM/SIB/REX
+// and minimal-disp selection are canonical (we are testing EmitEffectiveAddress,
+// not a hand-rolled encoder). Indices are guest GPR numbers (0=rax..15=r15);
+// base/index = -1 means absent. index must not be 4 (RSP is not encodable as a
+// SIB index). op32 -> 32-bit destination (low 32 bits, zero-extended).
+inline std::vector<u8> EncLea(int dst, int base, int index, int scale, s32 disp, bool op32) {
+    struct E : Xbyak::CodeGenerator {
+        E(int dst, int base, int index, int scale, s32 disp, bool op32) {
+            using namespace Xbyak::util;
+            static const Xbyak::Reg64 R[16] = {rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi,
+                                               r8,  r9,  r10, r11, r12, r13, r14, r15};
+            Xbyak::RegExp ea;
+            if (base >= 0 && index >= 0) ea = R[base] + R[index] * scale + disp;
+            else if (base >= 0)          ea = R[base] + disp;
+            else                         ea = R[index] * scale + disp;
+            if (op32) lea(R[dst].cvt32(), ptr[ea]);
+            else      lea(R[dst], ptr[ea]);
+        }
+    };
+    E e(dst, base, index, scale, disp, op32);
+    return std::vector<u8>(e.getCode(), e.getCode() + e.getSize());
+}
+
+// Encode `mov dst, [base + index*scale + disp]` (a real load through the EA).
+inline std::vector<u8> EncMovLoad(int dst, int base, int index, int scale, s32 disp) {
+    struct E : Xbyak::CodeGenerator {
+        E(int dst, int base, int index, int scale, s32 disp) {
+            using namespace Xbyak::util;
+            static const Xbyak::Reg64 R[16] = {rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi,
+                                               r8,  r9,  r10, r11, r12, r13, r14, r15};
+            Xbyak::RegExp ea;
+            if (base >= 0 && index >= 0) ea = R[base] + R[index] * scale + disp;
+            else if (base >= 0)          ea = R[base] + disp;
+            else                         ea = R[index] * scale + disp;
+            mov(R[dst], ptr[ea]);
+        }
+    };
+    E e(dst, base, index, scale, disp);
+    return std::vector<u8>(e.getCode(), e.getCode() + e.getSize());
+}
+
+// First GPR distinct from base/index (and not RSP, which the harness pins).
+inline int PickDst(int base, int index) {
+    for (int d = 0; d < 16; ++d)
+        if (d != base && d != index && d != 4) return d;
+    return 0;
+}
+
+// Every register as the BASE (covers REX.B and the SIB-special bases
+// rbp/rsp/r12/r13), with a fixed index/scale/disp.
+TEST_F(DiffTest, EA_EachBaseRegister) {
+    for (int base = 0; base < 16; ++base) {
+        const int index = 6; // rsi
+        const int dst = PickDst(base, index);
+        auto code = EncLea(dst, base, index, 2, 0x20, /*op32=*/false);
+        Context in;
+        in.gpr[base]  = 0x0000000100002000ULL + (u64)base * 0x101;
+        in.gpr[index] = 0x0000000000000033ULL;
+        char nm[48]; std::snprintf(nm, sizeof nm, "lea r%d,[r%d+rsi*2+0x20]", dst, base);
+        Expect(nm, code, in);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+}
+
+// Every register as the INDEX (covers REX.X and index==r12), with a fixed base.
+TEST_F(DiffTest, EA_EachIndexRegister) {
+    for (int index = 0; index < 16; ++index) {
+        if (index == 4) continue; // rsp not encodable as index
+        const int base = 3; // rbx
+        const int dst = PickDst(base, index);
+        auto code = EncLea(dst, base, index, 4, 0x10, /*op32=*/false);
+        Context in;
+        in.gpr[base]  = 0x0000000040000000ULL;
+        in.gpr[index] = 0x0000000000000007ULL + (u64)index;
+        char nm[48]; std::snprintf(nm, sizeof nm, "lea r%d,[rbx+r%d*4+0x10]", dst, index);
+        Expect(nm, code, in);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+}
+
+// All four scales, with and without a displacement.
+TEST_F(DiffTest, EA_Scales) {
+    for (int scale : {1, 2, 4, 8})
+        for (s32 disp : {0, 0x40}) {
+            auto code = EncLea(0, 1, 2, scale, disp, false); // lea rax,[rcx+rdx*scale+disp]
+            char nm[48]; std::snprintf(nm, sizeof nm, "lea rax,[rcx+rdx*%d%+d]", scale, disp);
+            Expect(nm, code, inGpr({{1, 0x1000}, {2, 0x9}}));
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+}
+
+// SIB / ModR/M special-encoding cases (rbp/rsp/r13/r12 base, no-base index,
+// base+index combinations that force a SIB byte).
+TEST_F(DiffTest, EA_SpecialEncodings) {
+    Expect("lea rax,[rbp]",         EncLea(0, 5, -1, 1, 0, false),   inGpr({{5, 0x2222}}));
+    Expect("lea rax,[rbp+0x10]",    EncLea(0, 5, -1, 1, 0x10, false),inGpr({{5, 0x2222}}));
+    Expect("lea rax,[rsp+0x100]",   EncLea(0, 4, -1, 1, 0x100, false), Context{}); // rsp pinned to stack_top
+    Expect("lea rax,[r13]",         EncLea(0, 13, -1, 1, 0, false),  inGpr({{13, 0x3000}}));
+    Expect("lea rax,[r13+0x10]",    EncLea(0, 13, -1, 1, 0x10, false), inGpr({{13, 0x3000}}));
+    Expect("lea rcx,[r12+rax*8]",   EncLea(1, 12, 0, 8, 0, false),   inGpr({{12, 0x4000}, {0, 5}}));
+    Expect("lea rcx,[rax*4]",       EncLea(1, -1, 0, 4, 0, false),   inGpr({{0, 0x11}}));
+    Expect("lea rdx,[rbp+rcx*8]",   EncLea(2, 5, 1, 8, 0, false),    inGpr({{5, 0x5000}, {1, 3}}));
+    Expect("lea rdx,[r8+r9*4-0x100]", EncLea(2, 8, 9, 4, -0x100, false), inGpr({{8, 0x10000}, {9, 4}}));
+}
+
+// Displacement edges: disp8/disp32 boundaries and sign-extension.
+TEST_F(DiffTest, EA_DispEdges) {
+    for (s32 disp : {0, 1, -1, 0x7F, 0x80, -0x80, -0x81, 0x7FFFFFFF,
+                     static_cast<s32>(0x80000000)}) {
+        auto code = EncLea(0, 1, -1, 1, disp, false); // lea rax,[rcx+disp]
+        char nm[48]; std::snprintf(nm, sizeof nm, "lea rax,[rcx%+d]", disp);
+        Expect(nm, code, inGpr({{1, 0x4000}}));
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+}
+
+// 32-bit destination: address math is full-width, but the result is written as
+// the low 32 bits zero-extended into the 64-bit slot.
+TEST_F(DiffTest, EA_Op32Dest) {
+    Expect("lea eax,[rcx+rdx*4+8]", EncLea(0, 1, 2, 4, 8, true),
+           inGpr({{1, 0xFFFFFFFF00001000ULL}, {2, 0x10}}));
+    Expect("lea eax,[r8+r9*2]",     EncLea(0, 8, 9, 2, 0, true),
+           inGpr({{8, 0xAAAAAAAA00000020ULL}, {9, 0x4}}));
+    Expect("lea ecx,[rax*8]",       EncLea(1, -1, 0, 8, 0, true),
+           inGpr({{0, 0x1234567800000003ULL}}));
+}
+
+// Random base/index/disp values exercise 64-bit address arithmetic and
+// wraparound. Each form is a fixed snippet (one compile, reused across inputs).
+TEST_F(DiffTest, EA_Fuzz) {
+    struct Form { const char* nm; std::vector<u8> code; int base, index; };
+    const std::vector<Form> forms = {
+        {"[rcx+rdx*4+0x10]", EncLea(0, 1, 2, 4, 0x10, false), 1, 2},
+        {"[rax+rbx*8]",      EncLea(2, 0, 3, 8, 0, false),    0, 3},
+        {"[r8+r9*2-0x40]",   EncLea(2, 8, 9, 2, -0x40, false), 8, 9},
+    };
+    std::mt19937_64 rng(0xEAEAEAEA);
+    for (const auto& f : forms)
+        for (int iter = 0; iter < 300; ++iter) {
+            Context in;
+            in.gpr[f.base]  = rng();
+            in.gpr[f.index] = rng();
+            Expect(f.nm, f.code, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+}
+
+// Confirm the computed EA actually drives a real memory access (not just LEA):
+// place a value at a base+index*scale+disp address inside the arena and load it.
+TEST_F(DiffTest, EA_DrivesMemoryAccess) {
+    const u64 base = arena.data_addr();
+    // mov rax, [rsi + rcx*4 + 0x40]  with the target seeded.
+    *reinterpret_cast<u64*>(base + 3 * 4 + 0x40) = 0xFEEDFACECAFEBEEFULL;
+    Expect("mov rax,[rsi+rcx*4+0x40]", EncMovLoad(0, 6, 1, 4, 0x40),
+           inGpr({{6, base}, {1, 3}}));
+
+    // mov rdx, [r8 + r9*8]  (REX base+index) with the target seeded.
+    *reinterpret_cast<u64*>(base + 5 * 8) = 0x0123456789ABCDEFULL;
+    Expect("mov rdx,[r8+r9*8]", EncMovLoad(2, 8, 9, 8, 0),
+           inGpr({{8, base}, {9, 5}}));
+
+    // mov rcx, [rbp + 0x18]  (rbp base special) with the target seeded.
+    *reinterpret_cast<u64*>(base + 0x18) = 0x1122334455667788ULL;
+    Expect("mov rcx,[rbp+0x18]", EncMovLoad(1, 5, -1, 1, 0x18),
+           inGpr({{5, base}}));
+}
+
+// ============================================================================
 // Randomized fuzz: for each snippet, many random GPR inputs.
 // ============================================================================
 struct FuzzOp { const char* name; std::vector<u8> bytes; u16 gpr_mask; u64 flag_mask; };
