@@ -2586,133 +2586,252 @@ bool EmitCmpxchg(const ZydisDecodedInstruction& insn,
 /// XADD, CMPXCHG. Anything else (BTS/BTR/BTC, CMPXCHG8B/16B) returns false and
 /// the caller falls back to the existing handler — same behavior as before,
 /// just not yet atomic.
-bool EmitLockedRmw(const ZydisDecodedInstruction& insn,
-                   const ZydisDecodedOperand* ops,
-                   u64 next_rip,
-                   Xbyak::CodeGenerator& c) {
-    if ((insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) == 0) return false;
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;   // LOCK ⇒ mem dest
+bool EmitLockedRmw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                   u64 next_rip, Xbyak::CodeGenerator& c) {
+    if ((insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) == 0)
+        return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY)
+        return false; // LOCK ⇒ mem dest
     const u32 w = insn.operand_width;
-    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (w != 8 && w != 16 && w != 32 && w != 64)
+        return false;
     const ZydisMnemonic m = insn.mnemonic;
 
     // Width-sized memory operand at the computed address (in r10).
-    auto mem  = [&]() -> Xbyak::Address {
-        switch (w) { case 8: return byte[r10]; case 16: return word[r10];
-                     case 32: return dword[r10]; default: return qword[r10]; } };
+    auto mem = [&]() -> Xbyak::Address {
+        switch (w) {
+        case 8:
+            return byte[r10];
+        case 16:
+            return word[r10];
+        case 32:
+            return dword[r10];
+        default:
+            return qword[r10];
+        }
+    };
     // Width-sized views of the rcx (source) and rax (accumulator) scratch regs.
     auto rcxw = [&]() -> Xbyak::Reg {
-        switch (w) { case 8: return cl; case 16: return cx; case 32: return ecx; default: return rcx; } };
+        switch (w) {
+        case 8:
+            return cl;
+        case 16:
+            return cx;
+        case 32:
+            return ecx;
+        default:
+            return rcx;
+        }
+    };
     auto raxw = [&]() -> Xbyak::Reg {
-        switch (w) { case 8: return al; case 16: return ax; case 32: return eax; default: return rax; } };
+        switch (w) {
+        case 8:
+            return al;
+        case 16:
+            return ax;
+        case 32:
+            return eax;
+        default:
+            return rax;
+        }
+    };
     // Byte offset of a GPR operand of width w in the register file (resolves
     // AH/CH/DH/BH for the 8-bit case). -1 on an unsupported register.
     auto gpr_off = [&](ZydisRegister r) -> int {
-        if (w == 8) return ZydisGpr8ToByteOffset(r);
+        if (w == 8)
+            return ZydisGpr8ToByteOffset(r);
         const int i = ZydisGprToIndex(r);
         return (i < 0) ? -1 : static_cast<int>(GprOffset(i));
     };
     auto load_rcx = [&](int off) {
-        switch (w) { case 8: c.mov(cl, byte[r13 + off]); break; case 16: c.mov(cx, word[r13 + off]); break;
-                     case 32: c.mov(ecx, dword[r13 + off]); break; default: c.mov(rcx, qword[r13 + off]); } };
+        switch (w) {
+        case 8:
+            c.mov(cl, byte[r13 + off]);
+            break;
+        case 16:
+            c.mov(cx, word[r13 + off]);
+            break;
+        case 32:
+            c.mov(ecx, dword[r13 + off]);
+            break;
+        default:
+            c.mov(rcx, qword[r13 + off]);
+        }
+    };
     auto load_rax = [&](int off) {
-        switch (w) { case 8: c.mov(al, byte[r13 + off]); break; case 16: c.mov(ax, word[r13 + off]); break;
-                     case 32: c.mov(eax, dword[r13 + off]); break; default: c.mov(rax, qword[r13 + off]); } };
+        switch (w) {
+        case 8:
+            c.mov(al, byte[r13 + off]);
+            break;
+        case 16:
+            c.mov(ax, word[r13 + off]);
+            break;
+        case 32:
+            c.mov(eax, dword[r13 + off]);
+            break;
+        default:
+            c.mov(rax, qword[r13 + off]);
+        }
+    };
     // Write back a result reg to a guest slot with the right width semantics
     // (8/16 preserve surrounding bits; 32 already zero-extended by the host op).
     auto store_rcx = [&](int off) {
-        switch (w) { case 8: c.mov(byte[r13 + off], cl); break; case 16: c.mov(word[r13 + off], cx); break;
-                     default: c.mov(qword[r13 + off], rcx); } };
+        switch (w) {
+        case 8:
+            c.mov(byte[r13 + off], cl);
+            break;
+        case 16:
+            c.mov(word[r13 + off], cx);
+            break;
+        default:
+            c.mov(qword[r13 + off], rcx);
+        }
+    };
     auto store_rax = [&](int off) {
-        switch (w) { case 8: c.mov(byte[r13 + off], al); break; case 16: c.mov(word[r13 + off], ax); break;
-                     default: c.mov(qword[r13 + off], rax); } };
+        switch (w) {
+        case 8:
+            c.mov(byte[r13 + off], al);
+            break;
+        case 16:
+            c.mov(word[r13 + off], ax);
+            break;
+        default:
+            c.mov(qword[r13 + off], rax);
+        }
+    };
     // Guest rflags <-> host, via r8 (keeps rax/rcx free for operands/results).
-    auto load_flags = [&] { c.mov(r8, qword[r13 + Offsets::Rflags]); c.push(r8); c.popfq(); };
-    auto save_flags = [&] { c.pushfq(); c.pop(r8); c.mov(qword[r13 + Offsets::Rflags], r8); };
+    auto load_flags = [&] {
+        c.mov(r8, qword[r13 + Offsets::Rflags]);
+        c.push(r8);
+        c.popfq();
+    };
+    auto save_flags = [&] {
+        c.pushfq();
+        c.pop(r8);
+        c.mov(qword[r13 + Offsets::Rflags], r8);
+    };
 
     // Effective address into r10 first (EmitEffectiveAddress returns rdx and
     // uses rax/rcx as scratch and perturbs host flags, so it must precede the
     // flag load below).
-    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
+        return false;
     c.mov(r10, rdx);
 
     switch (m) {
-        // ---- binary RMW: [mem] op= (reg | imm) ----
-        case ZYDIS_MNEMONIC_ADD: case ZYDIS_MNEMONIC_ADC:
-        case ZYDIS_MNEMONIC_SUB: case ZYDIS_MNEMONIC_SBB:
-        case ZYDIS_MNEMONIC_AND: case ZYDIS_MNEMONIC_OR:
-        case ZYDIS_MNEMONIC_XOR: {
-            const bool src_imm = (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
-            const u32 immv = src_imm ? static_cast<u32>(ops[1].imm.value.u) : 0;
-            if (!src_imm) {
-                if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-                const int so = gpr_off(ops[1].reg.value);
-                if (so < 0) return false;
-                load_rcx(so);
-            }
-            load_flags();
-#define LOCK_BIN(host) do { c.db(0xF0); \
-            if (src_imm) c.host(mem(), immv); else c.host(mem(), rcxw()); } while (0)
-            switch (m) {
-                case ZYDIS_MNEMONIC_ADD: LOCK_BIN(add); break;
-                case ZYDIS_MNEMONIC_ADC: LOCK_BIN(adc); break;
-                case ZYDIS_MNEMONIC_SUB: LOCK_BIN(sub); break;
-                case ZYDIS_MNEMONIC_SBB: LOCK_BIN(sbb); break;
-                case ZYDIS_MNEMONIC_AND: LOCK_BIN(and_); break;
-                case ZYDIS_MNEMONIC_OR:  LOCK_BIN(or_);  break;
-                case ZYDIS_MNEMONIC_XOR: LOCK_BIN(xor_); break;
-                default: return false;
-            }
-#undef LOCK_BIN
-            save_flags();
-            return true;
-        }
-
-        // ---- unary RMW ----
-        case ZYDIS_MNEMONIC_INC: case ZYDIS_MNEMONIC_DEC:
-        case ZYDIS_MNEMONIC_NEG: {
-            load_flags();                       // INC/DEC preserve CF; NEG sets all
-            c.db(0xF0);
-            if (m == ZYDIS_MNEMONIC_INC)      c.inc(mem());
-            else if (m == ZYDIS_MNEMONIC_DEC) c.dec(mem());
-            else                              c.neg(mem());
-            save_flags();
-            return true;
-        }
-        case ZYDIS_MNEMONIC_NOT: {
-            c.db(0xF0); c.not_(mem());          // NOT affects no flags
-            return true;
-        }
-
-        // ---- XADD: [mem] and reg exchange-add; reg receives old [mem] ----
-        case ZYDIS_MNEMONIC_XADD: {
-            if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-            const int ro = gpr_off(ops[1].reg.value);
-            if (ro < 0) return false;
-            load_rcx(ro);
-            load_flags();
-            c.db(0xF0); c.xadd(mem(), rcxw());  // rcx <- old [mem]; [mem] += rcx
-            save_flags();
-            store_rcx(ro);
-            return true;
-        }
-
-        // ---- CMPXCHG: compare RAX-accumulator with [mem]; swap or reload ----
-        case ZYDIS_MNEMONIC_CMPXCHG: {
-            if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    // ---- binary RMW: [mem] op= (reg | imm) ----
+    case ZYDIS_MNEMONIC_ADD:
+    case ZYDIS_MNEMONIC_ADC:
+    case ZYDIS_MNEMONIC_SUB:
+    case ZYDIS_MNEMONIC_SBB:
+    case ZYDIS_MNEMONIC_AND:
+    case ZYDIS_MNEMONIC_OR:
+    case ZYDIS_MNEMONIC_XOR: {
+        const bool src_imm = (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE);
+        const u32 immv = src_imm ? static_cast<u32>(ops[1].imm.value.u) : 0;
+        if (!src_imm) {
+            if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+                return false;
             const int so = gpr_off(ops[1].reg.value);
-            if (so < 0) return false;
-            load_rax(static_cast<int>(GprOffset(0)));   // accumulator = guest RAX
-            load_rcx(so);                                // source register
-            load_flags();
-            c.db(0xF0); c.cmpxchg(mem(), rcxw());        // implicit rax compare
-            save_flags();
-            store_rax(static_cast<int>(GprOffset(0)));   // rax updated on mismatch
-            return true;
+            if (so < 0)
+                return false;
+            load_rcx(so);
         }
-
+        load_flags();
+#define LOCK_BIN(host)                                                                             \
+    do {                                                                                           \
+        c.db(0xF0);                                                                                \
+        if (src_imm)                                                                               \
+            c.host(mem(), immv);                                                                   \
+        else                                                                                       \
+            c.host(mem(), rcxw());                                                                 \
+    } while (0)
+        switch (m) {
+        case ZYDIS_MNEMONIC_ADD:
+            LOCK_BIN(add);
+            break;
+        case ZYDIS_MNEMONIC_ADC:
+            LOCK_BIN(adc);
+            break;
+        case ZYDIS_MNEMONIC_SUB:
+            LOCK_BIN(sub);
+            break;
+        case ZYDIS_MNEMONIC_SBB:
+            LOCK_BIN(sbb);
+            break;
+        case ZYDIS_MNEMONIC_AND:
+            LOCK_BIN(and_);
+            break;
+        case ZYDIS_MNEMONIC_OR:
+            LOCK_BIN(or_);
+            break;
+        case ZYDIS_MNEMONIC_XOR:
+            LOCK_BIN(xor_);
+            break;
         default:
-            return false;   // not covered here — caller falls back to the per-op handler
+            return false;
+        }
+#undef LOCK_BIN
+        save_flags();
+        return true;
+    }
+
+    // ---- unary RMW ----
+    case ZYDIS_MNEMONIC_INC:
+    case ZYDIS_MNEMONIC_DEC:
+    case ZYDIS_MNEMONIC_NEG: {
+        load_flags(); // INC/DEC preserve CF; NEG sets all
+        c.db(0xF0);
+        if (m == ZYDIS_MNEMONIC_INC)
+            c.inc(mem());
+        else if (m == ZYDIS_MNEMONIC_DEC)
+            c.dec(mem());
+        else
+            c.neg(mem());
+        save_flags();
+        return true;
+    }
+    case ZYDIS_MNEMONIC_NOT: {
+        c.db(0xF0);
+        c.not_(mem()); // NOT affects no flags
+        return true;
+    }
+
+    // ---- XADD: [mem] and reg exchange-add; reg receives old [mem] ----
+    case ZYDIS_MNEMONIC_XADD: {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+            return false;
+        const int ro = gpr_off(ops[1].reg.value);
+        if (ro < 0)
+            return false;
+        load_rcx(ro);
+        load_flags();
+        c.db(0xF0);
+        c.xadd(mem(), rcxw()); // rcx <- old [mem]; [mem] += rcx
+        save_flags();
+        store_rcx(ro);
+        return true;
+    }
+
+    // ---- CMPXCHG: compare RAX-accumulator with [mem]; swap or reload ----
+    case ZYDIS_MNEMONIC_CMPXCHG: {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER)
+            return false;
+        const int so = gpr_off(ops[1].reg.value);
+        if (so < 0)
+            return false;
+        load_rax(static_cast<int>(GprOffset(0))); // accumulator = guest RAX
+        load_rcx(so);                             // source register
+        load_flags();
+        c.db(0xF0);
+        c.cmpxchg(mem(), rcxw()); // implicit rax compare
+        save_flags();
+        store_rax(static_cast<int>(GprOffset(0))); // rax updated on mismatch
+        return true;
+    }
+
+    default:
+        return false; // not covered here — caller falls back to the per-op handler
     }
 }
 // that bit, leaves other flags undefined per Intel SDM.
@@ -8912,8 +9031,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // EmitEffectiveAddress call sites, reject it uniformly here so any such
         // op bails as UnsupportedInstruction (visible in the log) instead of
         // being silently mis-addressed.
-        if ((insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 &&
-            insn.address_width != 32) {
+        if ((insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 && insn.address_width != 32) {
             // Atomic read-modify-write. A LOCK-prefixed memory op must be a
             // single atomic step (guest threads run on parallel host threads
             // over shared guest memory), not the load-op-store the per-op
@@ -8926,7 +9044,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             // Already emitted atomically above.
         } else if (insn.address_width == 32) {
             // handled stays false -> falls through to the unsupported path.
-        } else switch (insn.mnemonic) {
+        } else
+            switch (insn.mnemonic) {
             case ZYDIS_MNEMONIC_MOV: // basic
                 if (insn.operand_width == 64) {
                     handled = EmitMov(insn, ops, next_rip, c);
@@ -9513,7 +9632,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             default:
                 handled = false;
                 break;
-        }
+            }
 
         if (!handled) {
             // Operand-type accessor for the diagnostic. Maps Zydis

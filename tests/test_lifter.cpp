@@ -10319,8 +10319,7 @@ static u8* MapLowScratch() {
     // kLowAddr is normally free.
 #if defined(MAP_FIXED_NOREPLACE)
     {
-        void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096,
-                         PROT_READ | PROT_WRITE,
+        void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096, PROT_READ | PROT_WRITE,
                          MAP_PRIVATE | MAP_ANON | MAP_FIXED_NOREPLACE, -1, 0);
         if (p != MAP_FAILED) {
             if (reinterpret_cast<uintptr_t>(p) == kLowAddr) {
@@ -10334,10 +10333,14 @@ static u8* MapLowScratch() {
 #endif
     // Fallback for kernels without MAP_FIXED_NOREPLACE: hinted mmap, accepted
     // only if it actually landed sub-4GiB at the required address.
-    void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096,
-                     PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (p == MAP_FAILED) return nullptr;
-    if (reinterpret_cast<uintptr_t>(p) != kLowAddr) { ::munmap(p, 4096); return nullptr; }
+    void* p = ::mmap(reinterpret_cast<void*>(kLowAddr), 4096, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (p == MAP_FAILED)
+        return nullptr;
+    if (reinterpret_cast<uintptr_t>(p) != kLowAddr) {
+        ::munmap(p, 4096);
+        return nullptr;
+    }
     return static_cast<u8*>(p);
 #else
     return nullptr;
@@ -10358,13 +10361,14 @@ static u8* MapLowScratch() {
 // caller and a matching differential group.)
 TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_BaseForm) {
     u8* low = MapLowScratch();
-    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    if (low == nullptr)
+        GTEST_SKIP() << "no sub-4GiB mapping available";
     const u32 target_off = 0x40;
     u8* target = low + target_off;
     *reinterpret_cast<u32*>(target) = 0; // clear
 
     // mov [ebx], eax  — 67 89 03
-    const u8 program[] = { 0x67, 0x89, 0x03, 0xc3 };
+    const u8 program[] = {0x67, 0x89, 0x03, 0xc3};
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -10378,8 +10382,7 @@ TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_BaseForm) {
     rt.Run(st);
     EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction))
         << "0x67 address-size override must bail as UnsupportedInstruction";
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0u)
-        << "rejected addr32 op must not modify memory";
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0u) << "rejected addr32 op must not modify memory";
 #if !defined(_WIN32)
     ::munmap(low, 4096);
 #endif
@@ -10389,14 +10392,15 @@ TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_BaseForm) {
 // 0x67 prefix must bail as UnsupportedInstruction, not compute an address.
 TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_IndexForm) {
     u8* low = MapLowScratch();
-    if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
+    if (low == nullptr)
+        GTEST_SKIP() << "no sub-4GiB mapping available";
     const u32 base_low = static_cast<u32>(reinterpret_cast<uintptr_t>(low));
     const u32 idx = 5;
     u8* target = low + idx * 4;
     *reinterpret_cast<u32*>(target) = 0;
 
     // mov [ebx+ecx*4], eax  — 67 89 04 8b
-    const u8 program[] = { 0x67, 0x89, 0x04, 0x8b, 0xc3 };
+    const u8 program[] = {0x67, 0x89, 0x04, 0x8b, 0xc3};
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -10404,15 +10408,14 @@ TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_IndexForm) {
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
     st.gpr[3] = (0xCAFEF00Dull << 32) | base_low; // RBX: garbage upper
-    st.gpr[1] = (0x99999999ull << 32) | idx;        // RCX: garbage upper
+    st.gpr[1] = (0x99999999ull << 32) | idx;      // RCX: garbage upper
     st.gpr[0] = 0xABCDEF01;
 
     Runtime rt;
     rt.Run(st);
     EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction))
         << "0x67 address-size override must bail as UnsupportedInstruction";
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0u)
-        << "rejected addr32 op must not modify memory";
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0u) << "rejected addr32 op must not modify memory";
 #if !defined(_WIN32)
     ::munmap(low, 4096);
 #endif
