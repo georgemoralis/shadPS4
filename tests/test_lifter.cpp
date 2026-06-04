@@ -10284,17 +10284,23 @@ TEST_F(CpuRuntimeTest, FaultDiagnostics_ClearedAfterRun) {
 }
 
 // ============================================================================
-// 32-bit address-size override (0x67 prefix) — the effective address must
-// be computed modulo 2^32 and zero-extended to 64 bits. If the upper 32
-// bits of the base/index guest registers leak into the address, a load
-// or store targets a wild ~TiB host address instead of the intended
-// <4 GiB one. (This was the cause of an in-JIT-code access violation
-// whose fault address was (1 TiB ceiling + ~12 GiB): the low 32 bits
-// were the real target, the high bits leaked register garbage.)
+// 32-bit address-size override (0x67 prefix) — DELIBERATELY UNSUPPORTED.
 //
-// These tests plant a buffer below 4 GiB, load the base register with
-// GARBAGE in its upper 32 bits, and confirm the access hits the
-// truncated low address rather than faulting.
+// In 64-bit mode a 0x67 prefix would compute the effective address modulo
+// 2^32. PS4 (LP64) code never emits it. An earlier attempt to support it
+// truncated the address on some paths but not others (MOV masked; LEA and
+// ~100 other EmitEffectiveAddress callers did not), so a leaked upper-32-bit
+// register value sent a load/store to a wild ~TiB host address — the cause of
+// an in-JIT access violation whose fault address was (1 TiB ceiling + ~12 GiB):
+// the low 32 bits were the real target, the high bits were register garbage.
+// The inconsistent masking was removed in favor of rejecting 0x67 uniformly at
+// dispatch, which also eliminated that segfault.
+//
+// These tests therefore confirm a 0x67-prefixed memory op bails cleanly as
+// UnsupportedInstruction and leaves memory untouched — NOT that it truncates.
+// If a real title ever emits one, the bail log is the signal to implement it
+// properly (truncation plumbed through every EA caller, plus a differential
+// group); until then, refusing loudly beats mis-addressing silently.
 // ============================================================================
 
 // Helper: map a scratch page below 4 GiB so a 32-bit-truncated address
@@ -10340,10 +10346,20 @@ static u8* MapLowScratch() {
 
 // mov [ebx], eax with RBX = garbage_upper | low_addr. The store must
 // land at low_addr (upper 32 bits of RBX ignored), not fault.
-TEST_F(CpuRuntimeTest, Addr32_BaseUpperBitsIgnored) {
+// A 0x67 address-size override (32-bit addressing) is deliberately
+// unsupported. PS4 (LP64) code never emits it, and the lifter rejects it
+// uniformly at dispatch rather than half-implement 32-bit truncation across
+// every addressing path — an earlier inconsistent attempt (some paths masked,
+// most didn't) produced a memory-corruption segfault, so the masking was
+// removed in favor of a clean refusal. `mov [ebx], eax` with a 0x67 prefix
+// must therefore bail as UnsupportedInstruction and leave memory untouched.
+// (If a real title ever emits this, that bail log is the signal to implement
+// it properly, with truncation plumbed through every EmitEffectiveAddress
+// caller and a matching differential group.)
+TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_BaseForm) {
     u8* low = MapLowScratch();
     if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
-    const u32 target_off = 0x40; // write 0x40 bytes into the low page
+    const u32 target_off = 0x40;
     u8* target = low + target_off;
     *reinterpret_cast<u32*>(target) = 0; // clear
 
@@ -10355,25 +10371,25 @@ TEST_F(CpuRuntimeTest, Addr32_BaseUpperBitsIgnored) {
     GuestState st{};
     st.rip = reinterpret_cast<u64>(mem.CodePtr());
     st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
-    // RBX low32 = target address; upper32 = garbage that must be masked.
     st.gpr[3] = (0xDEADBEEFull << 32) | static_cast<u32>(reinterpret_cast<uintptr_t>(target));
-    st.gpr[0] = 0x12345678; // eax value to store
+    st.gpr[0] = 0x12345678;
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0x12345678u)
-        << "store landed at the 32-bit-truncated address";
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction))
+        << "0x67 address-size override must bail as UnsupportedInstruction";
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0u)
+        << "rejected addr32 op must not modify memory";
 #if !defined(_WIN32)
     ::munmap(low, 4096);
 #endif
 }
 
-// mov [ebx + ecx*4], eax with BOTH base and index carrying garbage
-// upper bits. The entire base+index*scale sum must wrap at 32 bits.
-TEST_F(CpuRuntimeTest, Addr32_BasePlusIndexTruncated) {
+// Same rejection for the base+index*scale form: `mov [ebx+ecx*4], eax` with a
+// 0x67 prefix must bail as UnsupportedInstruction, not compute an address.
+TEST_F(CpuRuntimeTest, Addr32_OverrideRejected_IndexForm) {
     u8* low = MapLowScratch();
     if (low == nullptr) GTEST_SKIP() << "no sub-4GiB mapping available";
-    // Effective low address = base_low + index_low*4.
     const u32 base_low = static_cast<u32>(reinterpret_cast<uintptr_t>(low));
     const u32 idx = 5;
     u8* target = low + idx * 4;
@@ -10393,8 +10409,10 @@ TEST_F(CpuRuntimeTest, Addr32_BasePlusIndexTruncated) {
 
     Runtime rt;
     rt.Run(st);
-    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0xABCDEF01u)
-        << "base+index*scale truncated to 32 bits before access";
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction))
+        << "0x67 address-size override must bail as UnsupportedInstruction";
+    EXPECT_EQ(*reinterpret_cast<u32*>(target), 0u)
+        << "rejected addr32 op must not modify memory";
 #if !defined(_WIN32)
     ::munmap(low, 4096);
 #endif
