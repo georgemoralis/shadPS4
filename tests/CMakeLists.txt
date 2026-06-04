@@ -424,11 +424,20 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
     # Two thin test executables, one per area. Each links the shared support
     # lib (which carries all the include dirs, definitions, compile features,
     # and library deps via its PUBLIC usage requirements) plus gtest_main.
+    #
+    # The concurrency test spawns host threads (std::thread); link an explicit
+    # threading library so it builds on toolchains where pthread is not folded
+    # into libc (the runtime itself uses no std::thread, so nothing else pulls
+    # it into the link). Threads::Threads is a harmless no-op for the other
+    # areas, and THREADS_PREFER_PTHREAD_FLAG applies -pthread at compile+link.
+    set(THREADS_PREFER_PTHREAD_FLAG ON)
+    find_package(Threads REQUIRED)
     foreach(area runtime lifter differential concurrency)
         add_executable(shadps4_cpu_${area}_test test_${area}.cpp)
         target_link_libraries(shadps4_cpu_${area}_test PRIVATE
             shadps4_cpu_runtime_test_support
-            GTest::gtest_main)
+            GTest::gtest_main
+            Threads::Threads)
         list(APPEND TEST_TARGETS shadps4_cpu_${area}_test)
         gtest_discover_tests(shadps4_cpu_${area}_test
             WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
