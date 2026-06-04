@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <vector>
 
@@ -90,17 +91,31 @@ private:
 
 class DiffTest : public ::testing::Test {
 protected:
-    void SetUp() override { ASSERT_TRUE(arena.valid()) << "arena alloc failed"; }
+    void SetUp() override {
+        ASSERT_TRUE(arena.valid()) << "arena alloc failed";
+        // Zero the data+stack region once. Done here (not in Expect) so a test
+        // may seed guest memory before calling Expect without it being wiped.
+        arena.clear_volatile();
+    }
 
     // Run `snippet` both ways from input `in`; assert GPRs/flags/memory agree.
     void Expect(const char* name, const std::vector<u8>& snippet, Context in,
                 u16 gpr_mask = 0xFFFF, u64 flag_mask = kStatusMask) {
         in.gpr[4] = arena.stack_top(); // both runs share this guest stack
 
-        arena.clear_volatile();
-        arena.save(); // pristine memory image
+        // The JIT caches compiled blocks by guest address, and every snippet is
+        // staged at the same guest address. A *different* snippet would hit the
+        // previous one's cached block, so recompile on a fresh Runtime whenever
+        // the snippet bytes change. This is cheap: it fires only on a snippet
+        // change (e.g. once per op in the fuzz loop), never per input.
+        if (snippet != last_snippet_) {
+            rt_ = std::make_unique<Core::Runtime::Runtime>();
+            last_snippet_ = snippet;
+        }
 
-        auto jit = diff::RunJit(rt, arena.code(), arena.code_addr(), snippet.data(),
+        arena.save(); // pristine memory image (whatever the test seeded)
+
+        auto jit = diff::RunJit(*rt_, arena.code(), arena.code_addr(), snippet.data(),
                                 snippet.size(), in);
         auto memJ = arena.capture();
 
@@ -124,7 +139,9 @@ protected:
     }
 
     Arena arena;
-    Core::Runtime::Runtime rt;
+    std::unique_ptr<Core::Runtime::Runtime> rt_ =
+        std::make_unique<Core::Runtime::Runtime>();
+    std::vector<u8> last_snippet_; // triggers a JIT reset when the snippet changes
 };
 
 // Convenience: status-flag subsets for per-op masking (the x86 spec leaves some
