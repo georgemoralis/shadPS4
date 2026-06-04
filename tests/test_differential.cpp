@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <random>
@@ -215,6 +216,139 @@ TEST_F(DiffTest, MemAddToMem) {
 TEST_F(DiffTest, PushPop) { Expect("push rax; pop rcx", {0x50,0x59}, inGpr({{0,0xCAFEF00DBEEF1234ULL}})); }
 
 // ============================================================================
+// Operand widths (8 / 16 / 32 / 64). The 32-bit forms ZERO-EXTEND the result
+// into the full 64-bit register; the 8/16-bit forms PRESERVE the upper bits.
+// Inputs carry high bits so both behaviours are actually exercised.
+// ============================================================================
+TEST_F(DiffTest, Add8)  { Expect("add al,cl",   {0x00,0xC8},      inGpr({{0,0xFFFFFFFFFFFFFF80ULL},{1,0xAAAAAAAAAAAAAA90ULL}})); }
+TEST_F(DiffTest, Add16) { Expect("add ax,cx",   {0x66,0x01,0xC8}, inGpr({{0,0xFFFFFFFFFFFF8000ULL},{1,0xAAAAAAAAAAAA9000ULL}})); }
+TEST_F(DiffTest, Add32) { Expect("add eax,ecx", {0x01,0xC8},      inGpr({{0,0xFFFFFFFF80000000ULL},{1,0x11111111A0000000ULL}})); } // zero-extends
+TEST_F(DiffTest, Sub32) { Expect("sub eax,ecx", {0x29,0xC8},      inGpr({{0,0xDEADBEEF00000003ULL},{1,0xCAFE000000000005ULL}})); }
+TEST_F(DiffTest, And32) { Expect("and eax,ecx", {0x21,0xC8},      inGpr({{0,0xFFFFFFFFF0F0F0F0ULL},{1,0x00000000FF00FF00ULL}})); }
+TEST_F(DiffTest, Xor32) { Expect("xor eax,ecx", {0x31,0xC8},      inGpr({{0,0xABCDEF12AAAA5555ULL},{1,0x000000005555AAAAULL}})); }
+TEST_F(DiffTest, Inc32) { Expect("inc ecx",     {0xFF,0xC1},      inGpr({{1,0xFFFFFFFFFFFFFFFFULL}})); } // -> 0 (zero-ext), CF preserved
+TEST_F(DiffTest, Dec16) { Expect("dec cx",      {0x66,0xFF,0xC9}, inGpr({{1,0xAAAAAAAAAAAA0000ULL}})); }
+TEST_F(DiffTest, Neg8)  { Expect("neg cl",      {0xF6,0xD9},      inGpr({{1,0xFFFFFFFFFFFFFF05ULL}})); }
+TEST_F(DiffTest, Imul32){ Expect("imul eax,ecx",{0x0F,0xAF,0xC1}, inGpr({{0,0x12345678ULL},{1,0x1000ULL}}), 0xFFFF, F_CF_OF); }
+TEST_F(DiffTest, Mov32) { Expect("mov eax,ecx", {0x89,0xC8},      inGpr({{0,0xFFFFFFFFFFFFFFFFULL},{1,0x00000000DEADBEEFULL}})); } // zero-extends rax
+
+// ============================================================================
+// CMOVcc — full 16-condition matrix, each across several flag seeds (cmov reads
+// flags, does not write them). cmovcc rdx,rbx with rdx != rbx so a (non-)move
+// is observable. This family caught a real scratch-clobber bug per the journal.
+// ============================================================================
+TEST_F(DiffTest, CmovccMatrix) {
+    const std::vector<u64> seeds = {0, diff::CF, diff::ZF, diff::SF, diff::OF, diff::PF,
+                                    diff::SF | diff::OF, diff::ZF | diff::SF, kStatusMask};
+    for (u8 cc = 0x40; cc <= 0x4F; ++cc) {
+        const std::vector<u8> snip = {0x48, 0x0F, cc, 0xD3}; // cmovcc rdx, rbx
+        for (u64 f : seeds) {
+            char nm[40];
+            std::snprintf(nm, sizeof nm, "cmov(0x%02x) flags=0x%03llx", cc,
+                          (unsigned long long)f);
+            Expect(nm, snip, inGpr({{2, 0xAAAAAAAAAAAAAAAAULL}, {3, 0xBBBBBBBBBBBBBBBBULL}}, f));
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+}
+
+// ============================================================================
+// SETcc — full 16-condition matrix. setcc al writes the low byte only; the
+// upper bits of rax must be preserved (input rax has them set).
+// ============================================================================
+TEST_F(DiffTest, SetccMatrix) {
+    const std::vector<u64> seeds = {0, diff::CF, diff::ZF, diff::SF, diff::OF, diff::PF,
+                                    diff::SF | diff::OF, diff::CF | diff::ZF, kStatusMask};
+    for (u8 cc = 0x90; cc <= 0x9F; ++cc) {
+        const std::vector<u8> snip = {0x0F, cc, 0xC0}; // setcc al
+        for (u64 f : seeds) {
+            char nm[40];
+            std::snprintf(nm, sizeof nm, "setcc(0x%02x) flags=0x%03llx", cc,
+                          (unsigned long long)f);
+            Expect(nm, snip, inGpr({{0, 0xFFFFFFFFFFFFFF00ULL}}, f));
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+}
+
+// ============================================================================
+// Shifts / rotates by immediate, including the count==0 edge (flags untouched)
+// and count>1 (OF undefined -> excluded). By-CL forms are fuzzed below.
+// ============================================================================
+TEST_F(DiffTest, ShlImm0)  { Expect("shl rax,0",  {0x48,0xC1,0xE0,0x00}, inGpr({{0,0x1234}}, diff::CF|diff::OF)); } // count 0: flags preserved
+TEST_F(DiffTest, ShrImm3)  { Expect("shr rax,3",  {0x48,0xC1,0xE8,0x03}, inGpr({{0,0xFF}}), 0xFFFF, F_NO_OF); }
+TEST_F(DiffTest, SarImm5)  { Expect("sar rax,5",  {0x48,0xC1,0xF8,0x05}, inGpr({{0,0x8000000000000000ULL}}), 0xFFFF, F_NO_OF); }
+TEST_F(DiffTest, RolImm7)  { Expect("rol rax,7",  {0x48,0xC1,0xC0,0x07}, inGpr({{0,0x8100000000000081ULL}}), 0xFFFF, diff::CF); } // count!=1: OF undef
+TEST_F(DiffTest, Shr32Imm) { Expect("shr eax,1",  {0xD1,0xE8},           inGpr({{0,0xFFFFFFFF00000003ULL}})); } // zero-extends, count 1
+
+// ============================================================================
+// MUL / IMUL one-operand (rdx:rax = rax * src). CF/OF defined; rest undefined.
+// ============================================================================
+TEST_F(DiffTest, Mul64)  { Expect("mul rcx",   {0x48,0xF7,0xE1}, inGpr({{0,0x100000001ULL},{1,0x100000001ULL}}), 0xFFFF, F_CF_OF); }
+TEST_F(DiffTest, Imul64) { Expect("imul rcx",  {0x48,0xF7,0xE9}, inGpr({{0,(u64)-3},{1,7}}),                    0xFFFF, F_CF_OF); }
+
+// DIV / IDIV — inputs constrained so they never fault (#DE): rdx=0 and a
+// non-zero divisor (and a non-negative dividend below 2^63 for idiv) guarantee
+// no divide-by-zero and no quotient overflow. All flags are undefined here.
+TEST_F(DiffTest, Div64)  { Expect("div rcx",   {0x48,0xF7,0xF1}, inGpr({{0,0xDEADBEEFCAFEULL},{2,0},{1,0x1000}}), 0xFFFF, 0); }
+TEST_F(DiffTest, Idiv64) { Expect("idiv rcx",  {0x48,0xF7,0xF9}, inGpr({{0,0x0123456789ABCDEULL},{2,0},{1,0x100}}), 0xFFFF, 0); }
+
+// ============================================================================
+// Sign-extend accumulator family (implicit operands, no flags).
+// ============================================================================
+TEST_F(DiffTest, Cdqe) { Expect("cdqe", {0x48,0x98}, inGpr({{0,0x00000000FFFFFFFFULL}})); } // eax(-1) -> rax(-1)
+TEST_F(DiffTest, Cqo)  { Expect("cqo",  {0x48,0x99}, inGpr({{0,0x8000000000000000ULL}})); } // rax<0 -> rdx=all ones
+TEST_F(DiffTest, Cdq)  { Expect("cdq",  {0x99},      inGpr({{0,0x00000000FF000000ULL}})); }
+
+// ============================================================================
+// BT — bit test sets CF from the selected bit; other flags undefined.
+// ============================================================================
+TEST_F(DiffTest, BtImm) { Expect("bt rax,63", {0x48,0x0F,0xBA,0xE0,0x3F}, inGpr({{0,0x8000000000000000ULL}}), 0xFFFF, diff::CF); }
+TEST_F(DiffTest, BtReg) { Expect("bt rax,rcx", {0x48,0x0F,0xA3,0xC8},     inGpr({{0,0x4},{1,2}}),              0xFFFF, diff::CF); }
+
+// ============================================================================
+// XCHG / XADD / CMPXCHG — register exchange and read-modify-write with flags.
+// CMPXCHG exercises the implicit RAX operand (a classic lifter pitfall).
+// ============================================================================
+TEST_F(DiffTest, Xchg)        { Expect("xchg rax,rcx", {0x48,0x87,0xC8}, inGpr({{0,0x1111},{1,0x2222}})); }
+TEST_F(DiffTest, Xadd)        { Expect("xadd rcx,rax", {0x48,0x0F,0xC1,0xC1}, inGpr({{0,5},{1,7}})); }
+TEST_F(DiffTest, CmpxchgEq)   { Expect("cmpxchg rcx,rdx (rax==rcx)", {0x48,0x0F,0xB1,0xD1}, inGpr({{0,9},{1,9},{2,0x42}})); }
+TEST_F(DiffTest, CmpxchgNeq)  { Expect("cmpxchg rcx,rdx (rax!=rcx)", {0x48,0x0F,0xB1,0xD1}, inGpr({{0,9},{1,8},{2,0x42}})); }
+
+// ============================================================================
+// POPCNT / LZCNT — compare the GPR result only (flag semantics are specialised
+// and not the focus here).
+// ============================================================================
+TEST_F(DiffTest, Popcnt) { Expect("popcnt rax,rcx", {0xF3,0x48,0x0F,0xB8,0xC1}, inGpr({{1,0xF0F0F0F0F0F0F0F0ULL}}), 0xFFFF, 0); }
+TEST_F(DiffTest, Lzcnt)  { Expect("lzcnt rax,rcx",  {0xF3,0x48,0x0F,0xBD,0xC1}, inGpr({{1,0x0000FF0000000000ULL}}), 0xFFFF, 0); }
+
+// ============================================================================
+// Multi-instruction basic blocks — exercise chaining, dependency, and flag
+// propagation across several lifted instructions (each ends in a full-flag op).
+// ============================================================================
+TEST_F(DiffTest, Block_AddSubAnd) {
+    Expect("add rax,rcx; sub rax,rdx; and rax,rbx",
+           {0x48,0x01,0xC8, 0x48,0x29,0xD0, 0x48,0x21,0xD8},
+           inGpr({{0,0xF00D},{1,0x1234},{2,0x99},{3,0xFFFF}}));
+}
+TEST_F(DiffTest, Block_MovShlAddNeg) {
+    Expect("mov rax,rcx; shl rax,3; add rax,rdx; neg rax",
+           {0x48,0x89,0xC8, 0x48,0xC1,0xE0,0x03, 0x48,0x01,0xD0, 0x48,0xF7,0xD8},
+           inGpr({{1,0x21},{2,0x7}}));
+}
+TEST_F(DiffTest, Block_ImulXorSub) {
+    Expect("imul rax,rcx; xor rax,rdx; sub rax,rbx",
+           {0x48,0x0F,0xAF,0xC1, 0x48,0x31,0xD0, 0x48,0x29,0xD8},
+           inGpr({{0,0x101},{1,0x3},{2,0xAAAA},{3,0x55}}));
+}
+TEST_F(DiffTest, Block_MemRoundTrip) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0x1000;
+    Expect("mov rdx,[rsi]; add rdx,rax; mov [rsi],rdx",
+           {0x48,0x8B,0x16, 0x48,0x01,0xC2, 0x48,0x89,0x16},
+           inGpr({{6, arena.data_addr()}, {0, 0x37}}));
+}
+
+// ============================================================================
 // Randomized fuzz: for each snippet, many random GPR inputs.
 // ============================================================================
 struct FuzzOp { const char* name; std::vector<u8> bytes; u16 gpr_mask; u64 flag_mask; };
@@ -241,6 +375,100 @@ TEST_F(DiffTest, Fuzz_Arithmetic) {
             Expect(op.name, op.bytes, in, op.gpr_mask, op.flag_mask);
             if (::testing::Test::HasFatalFailure()) return;
         }
+    }
+}
+
+// Flag-consuming ops (ADC/SBB read CF; CMOVcc/SETcc read the condition) driven
+// with RANDOM input flags so both taken and not-taken paths are exercised.
+TEST_F(DiffTest, Fuzz_FlagSensitive) {
+    const std::vector<FuzzOp> ops = {
+        {"adc rax,rcx",   {0x48,0x11,0xC8},      0xFFFF, F_ALL},
+        {"sbb rax,rcx",   {0x48,0x19,0xC8},      0xFFFF, F_ALL},
+        {"cmovz rdx,rbx", {0x48,0x0F,0x44,0xD3}, 0xFFFF, F_ALL}, // flags preserved
+        {"cmovs rdx,rbx", {0x48,0x0F,0x48,0xD3}, 0xFFFF, F_ALL},
+        {"cmovl rdx,rbx", {0x48,0x0F,0x4C,0xD3}, 0xFFFF, F_ALL},
+        {"setz al",       {0x0F,0x94,0xC0},      0xFFFF, F_ALL},
+        {"setl al",       {0x0F,0x9C,0xC0},      0xFFFF, F_ALL},
+    };
+    std::mt19937_64 rng(0x5EED1234);
+    for (const auto& op : ops) {
+        for (int iter = 0; iter < 200; ++iter) {
+            Context in;
+            for (int i = 0; i < 4; ++i) in.gpr[i] = rng();
+            in.rflags = rng() & kStatusMask;
+            Expect(op.name, op.bytes, in, op.gpr_mask, op.flag_mask);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+}
+
+// Non-64-bit widths: 32-bit results must zero-extend; 8/16-bit must preserve
+// the upper bits. Random inputs carry high bits to exercise both.
+TEST_F(DiffTest, Fuzz_Widths) {
+    const std::vector<FuzzOp> ops = {
+        {"add eax,ecx",  {0x01,0xC8},      0xFFFF, F_ALL},
+        {"sub eax,ecx",  {0x29,0xC8},      0xFFFF, F_ALL},
+        {"and eax,ecx",  {0x21,0xC8},      0xFFFF, F_ALL},
+        {"imul eax,ecx", {0x0F,0xAF,0xC1}, 0xFFFF, F_CF_OF},
+        {"add ax,cx",    {0x66,0x01,0xC8}, 0xFFFF, F_ALL},
+        {"add al,cl",    {0x00,0xC8},      0xFFFF, F_ALL},
+        {"mov eax,ecx",  {0x89,0xC8},      0xFFFF, F_ALL}, // mov: flags preserved
+    };
+    std::mt19937_64 rng(0xA11CE5EED);
+    for (const auto& op : ops) {
+        for (int iter = 0; iter < 200; ++iter) {
+            Context in;
+            in.gpr[0] = rng(); in.gpr[1] = rng();
+            in.rflags = rng() & kStatusMask;
+            Expect(op.name, op.bytes, in, op.gpr_mask, op.flag_mask);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+}
+
+// Shifts/rotates by CL: random count (incl. 0 and >63, masked to 6 bits). OF is
+// defined only for count==1, so it is excluded (F_NO_OF); the preserved flags
+// stay comparable across count==0 too.
+TEST_F(DiffTest, Fuzz_ShiftsByCL) {
+    const std::vector<FuzzOp> ops = {
+        {"shl rax,cl", {0x48,0xD3,0xE0}, 0xFFFF, F_NO_OF},
+        {"shr rax,cl", {0x48,0xD3,0xE8}, 0xFFFF, F_NO_OF},
+        {"sar rax,cl", {0x48,0xD3,0xF8}, 0xFFFF, F_NO_OF},
+        {"rol rax,cl", {0x48,0xD3,0xC0}, 0xFFFF, F_NO_OF},
+        {"ror rax,cl", {0x48,0xD3,0xC8}, 0xFFFF, F_NO_OF},
+    };
+    std::mt19937_64 rng(0xC1C1C1C1);
+    for (const auto& op : ops) {
+        for (int iter = 0; iter < 200; ++iter) {
+            Context in;
+            in.gpr[0] = rng();          // value
+            in.gpr[1] = rng() & 0xFF;   // cl = shift count (low byte of rcx)
+            in.rflags = rng() & kStatusMask;
+            Expect(op.name, op.bytes, in, op.gpr_mask, op.flag_mask);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+}
+
+// DIV / IDIV with inputs constrained to never fault (rdx=0, non-zero divisor,
+// non-negative dividend below 2^63 for idiv). All flags undefined -> mask 0.
+TEST_F(DiffTest, Fuzz_Division) {
+    std::mt19937_64 rng(0xD1V1D3);
+    for (int iter = 0; iter < 200; ++iter) {
+        Context in;
+        in.gpr[0] = rng();                  // dividend low (rax)
+        in.gpr[2] = 0;                      // rdx = 0 (high half) -> no overflow
+        in.gpr[1] = rng() | 1ULL;           // rcx divisor, guaranteed non-zero
+        Expect("div rcx", {0x48,0xF7,0xF1}, in, 0xFFFF, 0);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+    for (int iter = 0; iter < 200; ++iter) {
+        Context in;
+        in.gpr[0] = rng() & 0x7FFFFFFFFFFFFFFFULL; // dividend in [0, 2^63) -> no idiv overflow
+        in.gpr[2] = 0;
+        in.gpr[1] = rng() | 1ULL;
+        Expect("idiv rcx", {0x48,0xF7,0xF9}, in, 0xFFFF, 0);
+        if (::testing::Test::HasFatalFailure()) return;
     }
 }
 
