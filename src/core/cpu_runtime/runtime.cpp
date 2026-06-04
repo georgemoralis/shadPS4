@@ -19,6 +19,8 @@
 #include "core/cpu_runtime/lifter/lifter.h"
 #include "core/cpu_runtime/hle_registry.h"
 #include "core/cpu_runtime/runtime_diagnostics.h"
+#include "core/signals.h"
+#include "core/tls.h"
 
 #ifdef ARCH_X86_64
 #include <Zydis/Zydis.h>
@@ -655,6 +657,24 @@ void Runtime::Run(GuestState& state) {
     tl_active_runtime = this;
     tl_current_guest_state = &state;
     LOG_TRACE(Core, "Run: R2 tls write ok");
+
+    // Per-thread setup before entering JIT execution:
+    //  (1) Ensure this thread has its dedicated VEH exception-handler stack, so
+    //      a guest fault never has to run the handler on an exhausted guest
+    //      stack. Idempotent per thread; no-op off-Windows (POSIX uses an
+    //      alternate signal stack via SA_ONSTACK). See signals.cpp.
+    //  (2) Point the guest's fs_base at this thread's TCB so the lifter's
+    //      fs:/gs: (TLS) addressing resolves to real thread-local storage.
+    //      RunThread installs the TCB via InitializeTLS/SetTcbBase before the
+    //      first guest call, so GetTcbBase() is valid here. If TLS isn't set up
+    //      on this thread yet (null) we leave fs_base as-is rather than point it
+    //      at garbage. gs_base is left as-is (PS4/FreeBSD uses fs for TLS; gs is
+    //      effectively unused).
+    Core::EnsureVehStack();
+    if (auto* tcb = Core::GetTcbBase()) {
+        state.fs_base = reinterpret_cast<u64>(tcb);
+    }
+
     gateway_->Enter(state, &DispatcherTrampoline);
     LOG_TRACE(Core, "Run: R3 gateway returned");
     tl_current_guest_state = saved_state;

@@ -223,15 +223,25 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
                           u64 next_rip,
                           Xbyak::CodeGenerator& c,
                           bool addr32 = false) {
-    // Segment overrides other than the standard DS/SS aren't
-    // supported. shadPS4 guest code rarely uses FS/GS, and when it
-    // does it's for TLS via specific helper sequences we'd lift
-    // specially. CS/ES are flat in long mode.
-    if (mem.segment != ZYDIS_REGISTER_DS &&
-        mem.segment != ZYDIS_REGISTER_SS &&
-        mem.segment != ZYDIS_REGISTER_CS &&
-        mem.segment != ZYDIS_REGISTER_ES) {
-        return false;
+    // Segment overrides. DS/SS/CS/ES are flat (base 0) in long mode and need
+    // no adjustment. FS/GS carry a guest-visible base used for TLS: the
+    // effective address is seg_base + (base + index*scale + disp), where the
+    // guest's fs_base/gs_base live in GuestState (fs_base is the thread's TCB,
+    // installed by InitializeTLS/SetTcbBase). We compute the rest of the
+    // address as usual and add the segment base at the end. The native backend
+    // handles fs:/gs: by patching the guest code (cpu_patches); the JIT models
+    // the segment bases directly, so it needs no patching and this also covers
+    // the stack-canary (fs:[0x28]) and TCB (fs:[0]) accesses generically.
+    int seg_base_off = -1;
+    if (mem.segment == ZYDIS_REGISTER_FS) {
+        seg_base_off = static_cast<int>(Offsets::FsBase);
+    } else if (mem.segment == ZYDIS_REGISTER_GS) {
+        seg_base_off = static_cast<int>(Offsets::GsBase);
+    } else if (mem.segment != ZYDIS_REGISTER_DS &&
+               mem.segment != ZYDIS_REGISTER_SS &&
+               mem.segment != ZYDIS_REGISTER_CS &&
+               mem.segment != ZYDIS_REGISTER_ES) {
+        return false;  // genuinely unsupported segment
     }
 
     const bool has_base = (mem.base != ZYDIS_REGISTER_NONE);
@@ -246,13 +256,18 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
     // We constant-fold this into a single mov.
     if (has_base && mem.base == ZYDIS_REGISTER_RIP) {
         if (has_index) return false;  // RIP-relative with index is not a thing
+        if (seg_base_off >= 0) return false;  // segment + RIP-relative: degenerate
         c.mov(rdx, static_cast<u64>(static_cast<s64>(next_rip) + disp));
         return true;
     }
 
-    // Plain [disp32] absolute (no base, no index).
+    // Plain [disp32] absolute (no base, no index). With a segment override this
+    // is the common TLS form (e.g. fs:[0], fs:[0x28]).
     if (!has_base && !has_index) {
         c.mov(rdx, static_cast<u64>(disp));
+        if (seg_base_off >= 0) {
+            c.add(rdx, qword[r13 + seg_base_off]);
+        }
         return true;
     }
 
@@ -300,6 +315,12 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
     if (addr32) {
         c.mov(eax, edx);   // zero-extend low 32 of rdx into rax
         c.mov(rdx, rax);   // rdx = (address & 0xFFFFFFFF)
+    }
+
+    // Add the FS/GS segment base last: after any addr32 masking (the 64-bit
+    // base must not be clipped to 32 bits) and after the index/disp math.
+    if (seg_base_off >= 0) {
+        c.add(rdx, qword[r13 + seg_base_off]);
     }
 
     return true;

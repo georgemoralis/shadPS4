@@ -36,7 +36,22 @@ namespace Core {
 
 #if defined(_WIN32)
 
-static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+// Windows invokes a vectored exception handler on whatever stack is current at
+// fault time. Under the JIT that is a guest stack (1MB pthread stacks with a
+// single guard page, or smaller malloc'd callback stacks); a fault while the
+// guest stack is deep leaves no room for the handler's own C++ frames, so the
+// handler itself faults writing its locals off the end of the mapped stack.
+// POSIX avoids this with SA_ONSTACK; Windows has no equivalent, so we allocate
+// a dedicated stack per thread (EnsureVehStack) and switch onto it via the
+// CallOnStack asm trampoline (stack.S) before running the real handler body.
+extern "C" long CallOnStack(void* stack_top, void* pexp, void* impl);
+
+static thread_local u8* g_veh_stack = nullptr;
+static thread_local void* g_veh_stack_top = nullptr;
+
+// The real handler body. Runs on the dedicated exception stack (or, for threads
+// that never entered the JIT, on the current stack).
+static LONG SignalHandlerImpl(EXCEPTION_POINTERS* pExp) noexcept {
     const auto* signals = Signals::Instance();
     DWORD code = 0;
     PVOID address = nullptr;
@@ -169,6 +184,37 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     Common::Log::Flush();
 
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+// Allocate this thread's dedicated exception stack, once. Called from the JIT
+// entry (Runtime::Run) in a NON-fault context where the stack is healthy, so
+// the allocation never runs on an already-exhausted stack in a fault context.
+// Idempotent per thread.
+void EnsureVehStack() {
+    if (g_veh_stack_top != nullptr) {
+        return;
+    }
+    // 512 KiB is generous for the handler (decoder + logging + ring dumps);
+    // committed up front so no guard-page growth is needed in a fault context.
+    constexpr SIZE_T kVehStackSize = 512 * 1024;
+    g_veh_stack = static_cast<u8*>(
+        VirtualAlloc(nullptr, kVehStackSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (g_veh_stack != nullptr) {
+        g_veh_stack_top = g_veh_stack + kVehStackSize;
+    }
+}
+
+// Registered VEH. Thin: switch to this thread's dedicated exception stack (if
+// allocated) and run the real handler there, so a deep/near-exhausted guest
+// stack at fault time can't starve the handler. Threads that never entered the
+// JIT have no dedicated stack and fall back to the current stack (a normal
+// large host thread stack), which is fine.
+static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+    void* const top = g_veh_stack_top;
+    if (top == nullptr) {
+        return SignalHandlerImpl(pExp);
+    }
+    return CallOnStack(top, pExp, reinterpret_cast<void*>(&SignalHandlerImpl));
 }
 
 #else

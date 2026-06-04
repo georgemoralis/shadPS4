@@ -22,6 +22,18 @@ using IllegalInstructionHandler = bool (*)(void* context);
 void SignalHandler(int sig, siginfo_t* info, void* raw_context);
 #endif
 
+// Ensure the calling thread has its dedicated vectored-exception-handler stack
+// allocated. On Windows the VEH runs on the faulting (guest) stack, which under
+// the JIT can be too deep/exhausted to host the handler's own frames; calling
+// this from the JIT entry (Runtime::Run) in a healthy-stack context pre-
+// allocates a dedicated stack the handler switches onto. Idempotent per thread.
+// No-op on non-Windows (POSIX uses an alternate signal stack via SA_ONSTACK).
+#ifdef _WIN32
+void EnsureVehStack();
+#else
+inline void EnsureVehStack() {}
+#endif
+
 /// Receives OS signals and dispatches to the appropriate handlers.
 class SignalDispatch {
 public:
