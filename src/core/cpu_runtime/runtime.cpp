@@ -336,13 +336,15 @@ void* DispatcherTrampoline(GuestState* state) {
 
     ASSERT_MSG(rt != nullptr, "Dispatcher called with no active runtime");
 
-    // Stuck-RIP watchdog. With diagnostics silenced on repeat entries
-    // a real memset can run at hundreds of thousands of iterations
-    // per second, so the threshold needs to accommodate genuinely
-    // long loops. A 16 MB region cleared 16 bytes at a time is ~1 M
-    // iterations — well within normal operation. Set the threshold
-    // at 10 M to catch only true infinite loops (no forward progress
-    // at all) rather than slow ones.
+    // Stuck-RIP watchdog: detect TRUE livelock — the same block re-entered
+    // with no forward progress at all. Progress is judged by the guest state
+    // changing (below): a long but advancing loop (memset, zero-fill, timeout
+    // poll) repeats the same RIP every iteration yet mutates a register each
+    // pass, so it keeps resetting the counter and never trips, no matter how
+    // many iterations it runs. The threshold then only has to ignore brief
+    // identical-state stutters; 10 M re-entries with byte-identical guest
+    // state is unambiguously a hang (a spin on a memory/sync condition that
+    // nothing is advancing), not a slow loop.
     //
     // The watchdog fires regardless of build flavor (it's a real fault
     // condition, not a trace), so it uses LOG_ERROR. It runs at most
@@ -351,17 +353,29 @@ void* DispatcherTrampoline(GuestState* state) {
     {
         static thread_local u64 last_rip = 0;
         static thread_local u64 same_rip_hits = 0;
-        if (cur_rip == last_rip) {
+        static thread_local std::array<u64, 16> last_gpr{};
+        static thread_local u64 last_rflags = 0;
+        // Forward progress = any change in the integer register file or flags
+        // between consecutive entries at the same block. A true spin reads
+        // memory and branches without mutating a register, so its state is
+        // identical every pass and the counter climbs; an advancing loop
+        // changes a counter/pointer and resets it.
+        const bool advanced =
+            (last_gpr != state->gpr) || (last_rflags != state->rflags);
+        if (cur_rip == last_rip && !advanced) {
             ++same_rip_hits;
         } else {
-            last_rip = cur_rip;
             same_rip_hits = 1;
         }
+        last_rip = cur_rip;
+        last_gpr = state->gpr;
+        last_rflags = state->rflags;
         constexpr u64 kStuckThreshold = 10'000'000;
         if (same_rip_hits == kStuckThreshold) {
             LOG_ERROR(Core,
-                      "Dispatcher: STUCK at {:#x} after {} re-entries; "
-                      "dumping guest GPRs and exiting fatally",
+                      "Dispatcher: STUCK at {:#x} after {} re-entries with "
+                      "no forward progress; dumping guest GPRs and exiting "
+                      "fatally",
                       cur_rip, same_rip_hits);
             static const char* const kGprNames[16] = {
                 "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
