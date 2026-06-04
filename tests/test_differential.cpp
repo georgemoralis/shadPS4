@@ -349,6 +349,87 @@ TEST_F(DiffTest, Block_MemRoundTrip) {
 }
 
 // ============================================================================
+// Extended registers r8..r15 — exercises REX.R / REX.B decoding, a common
+// lifter blind spot (the wrong bit silently aliases to a low register).
+// ============================================================================
+TEST_F(DiffTest, AddR8R9)   { Expect("add r8,r9",   {0x4D,0x01,0xC8}, inGpr({{8,0x7fffffffffffffffULL},{9,1}})); }
+TEST_F(DiffTest, SubR15R12) { Expect("sub r15,r12", {0x4D,0x29,0xE7}, inGpr({{15,3},{12,5}})); }
+TEST_F(DiffTest, XorR10R11) { Expect("xor r10,r11", {0x4D,0x31,0xDA}, inGpr({{10,0xF0F0},{11,0x0FF0}})); }
+TEST_F(DiffTest, ShlR13)    { Expect("shl r13,cl",  {0x49,0xD3,0xE5}, inGpr({{13,0x1},{1,8}}), 0xFFFF, F_NO_OF); }
+TEST_F(DiffTest, ImulR8R9)  { Expect("imul r8,r9",  {0x4D,0x0F,0xAF,0xC1}, inGpr({{8,7},{9,9}}), 0xFFFF, F_CF_OF); }
+TEST_F(DiffTest, MovR10Mem) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0xC0FFEEULL;
+    Expect("mov r10,[r11]", {0x4D,0x8B,0x13}, inGpr({{11, arena.data_addr()}}));
+}
+
+// ============================================================================
+// Addressing modes — base, base+disp, base+index*scale(+disp). SIB encodings
+// are where address-generation bugs concentrate.
+// ============================================================================
+TEST_F(DiffTest, LeaIndexScale8) { Expect("lea rax,[rcx+rdx*8]", {0x48,0x8D,0x04,0xD1}, inGpr({{1,0x1000},{2,3}})); }
+TEST_F(DiffTest, LeaDispOnly)    { Expect("lea rax,[rcx+0x40]",  {0x48,0x8D,0x41,0x40}, inGpr({{1,0x2000}})); }
+TEST_F(DiffTest, LeaNegDisp)     { Expect("lea rax,[rcx-8]",     {0x48,0x8D,0x41,0xF8}, inGpr({{1,0x2000}})); }
+TEST_F(DiffTest, MemLoadSib) {
+    const u64 base = arena.data_addr();
+    *reinterpret_cast<u64*>(base + 3 * 2 + 0x100) = 0x9999ULL;
+    // mov rax,[rcx+rdx*2+0x100]
+    Expect("mov rax,[rcx+rdx*2+0x100]", {0x48,0x8B,0x84,0x51,0x00,0x01,0x00,0x00},
+           inGpr({{1, base}, {2, 3}}));
+}
+TEST_F(DiffTest, MemStoreSibDisp8) {
+    const u64 base = arena.data_addr();
+    // mov [rcx+rdx*4+0x10], rax
+    Expect("mov [rcx+rdx*4+0x10],rax", {0x48,0x89,0x44,0x91,0x10},
+           inGpr({{1, base}, {2, 2}, {0, 0xDEADBEEFCAFEULL}}));
+}
+
+// ============================================================================
+// Immediate operand forms — imm8 sign-extended (0x83), imm32 (0x81), and the
+// sign-extended mov-imm32 (0xC7). Sign-extension of imm8/imm32 into 64 bits is
+// a frequent off-by-a-bug.
+// ============================================================================
+TEST_F(DiffTest, AddImm8Sext)  { Expect("add rax,-1",      {0x48,0x83,0xC0,0xFF}, inGpr({{0,0x100}})); }
+TEST_F(DiffTest, AndImm8)      { Expect("and rax,0x0F",    {0x48,0x83,0xE0,0x0F}, inGpr({{0,0xFF}})); }
+TEST_F(DiffTest, CmpImm8)      { Expect("cmp rax,5",       {0x48,0x83,0xF8,0x05}, inGpr({{0,5}})); }
+TEST_F(DiffTest, SubImm32)     { Expect("sub rax,0x12345", {0x48,0x81,0xE8,0x45,0x23,0x01,0x00}, inGpr({{0,0x20000}})); }
+TEST_F(DiffTest, MovImm32Sext) { Expect("mov rax,-100",    {0x48,0xC7,0xC0,0x9C,0xFF,0xFF,0xFF}, inGpr({{0,0}})); }
+TEST_F(DiffTest, TestImm32)    { Expect("test rax,0xFF00", {0x48,0xF7,0xC0,0x00,0xFF,0x00,0x00}, inGpr({{0,0xAB00}})); }
+
+// ============================================================================
+// Memory-operand widths + read-modify-write. Stores must touch exactly the
+// operand width (a too-wide store corrupts neighbours; caught by the memory
+// diff). RMW ops fold load+op+store and must set flags from the result.
+// ============================================================================
+TEST_F(DiffTest, MemStoreByte) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0xFFFFFFFFFFFFFFFFULL;
+    Expect("mov byte [rsi],cl", {0x88,0x0E}, inGpr({{6, arena.data_addr()}, {1, 0xAB}}));
+}
+TEST_F(DiffTest, MemStoreWord) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0xFFFFFFFFFFFFFFFFULL;
+    Expect("mov word [rsi],cx", {0x66,0x89,0x0E}, inGpr({{6, arena.data_addr()}, {1, 0x1234}}));
+}
+TEST_F(DiffTest, MemStoreDword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0xFFFFFFFFFFFFFFFFULL;
+    Expect("mov dword [rsi],ecx", {0x89,0x0E}, inGpr({{6, arena.data_addr()}, {1, 0x11223344}}));
+}
+TEST_F(DiffTest, MemLoadByteZx) {
+    *reinterpret_cast<u8*>(arena.data_addr()) = 0xFF;
+    Expect("movzx rax,byte [rsi]", {0x48,0x0F,0xB6,0x06}, inGpr({{6, arena.data_addr()}}));
+}
+TEST_F(DiffTest, MemIncQword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0x7fffffffffffffffULL;
+    Expect("inc qword [rsi]", {0x48,0xFF,0x06}, inGpr({{6, arena.data_addr()}}));
+}
+TEST_F(DiffTest, MemNegQword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 5;
+    Expect("neg qword [rsi]", {0x48,0xF7,0x1E}, inGpr({{6, arena.data_addr()}}));
+}
+TEST_F(DiffTest, MemShlQword) {
+    *reinterpret_cast<u64*>(arena.data_addr()) = 0x1;
+    Expect("shl qword [rsi],1", {0x48,0xD1,0x26}, inGpr({{6, arena.data_addr()}}));
+}
+
+// ============================================================================
 // Randomized fuzz: for each snippet, many random GPR inputs.
 // ============================================================================
 struct FuzzOp { const char* name; std::vector<u8> bytes; u16 gpr_mask; u64 flag_mask; };
@@ -469,6 +550,82 @@ TEST_F(DiffTest, Fuzz_Division) {
         in.gpr[1] = rng() | 1ULL;
         Expect("idiv rcx", {0x48,0xF7,0xF9}, in, 0xFFFF, 0);
         if (::testing::Test::HasFatalFailure()) return;
+    }
+}
+
+// Curated boundary values: zero, signed/unsigned extremes, power-of-two edges,
+// alternating bit patterns. Random64 almost never lands on these, yet they are
+// exactly where ZF/CF/OF/SF computation breaks (exact overflow, result==0,
+// neg(INT_MIN), etc.). Cross-product over the pool, both carry-in states.
+static const u64 kCorner[] = {
+    0, 1, 2, 0x7F, 0x80, 0xFF, 0x100,
+    0x7FFF, 0x8000, 0xFFFF, 0x10000,
+    0x7FFFFFFF, 0x80000000ULL, 0xFFFFFFFFULL, 0x100000000ULL,
+    0x7FFFFFFFFFFFFFFFULL, 0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL,
+    0x5555555555555555ULL, 0xAAAAAAAAAAAAAAAAULL,
+};
+
+TEST_F(DiffTest, Corner_Arithmetic) {
+    const std::vector<FuzzOp> ops = {
+        {"add rax,rcx",  {0x48,0x01,0xC8},      0xFFFF, F_ALL},
+        {"sub rax,rcx",  {0x48,0x29,0xC8},      0xFFFF, F_ALL},
+        {"adc rax,rcx",  {0x48,0x11,0xC8},      0xFFFF, F_ALL},
+        {"sbb rax,rcx",  {0x48,0x19,0xC8},      0xFFFF, F_ALL},
+        {"cmp rax,rcx",  {0x48,0x39,0xC8},      0xFFFF, F_ALL},
+        {"and rax,rcx",  {0x48,0x21,0xC8},      0xFFFF, F_ALL},
+        {"neg rax",      {0x48,0xF7,0xD8},      0xFFFF, F_ALL},
+        {"inc rax",      {0x48,0xFF,0xC0},      0xFFFF, F_ALL},
+        {"imul rax,rcx", {0x48,0x0F,0xAF,0xC1}, 0xFFFF, F_CF_OF},
+    };
+    for (const auto& op : ops) {
+        for (u64 a : kCorner)
+            for (u64 b : kCorner)
+                for (u64 cf : {0ULL, diff::CF}) { // carry-in for adc/sbb
+                    Expect(op.name, op.bytes, inGpr({{0, a}, {1, b}}, cf),
+                           op.gpr_mask, op.flag_mask);
+                    if (::testing::Test::HasFatalFailure()) return;
+                }
+    }
+}
+
+// Shift/rotate count edges: 64-bit shifts mask the count to 6 bits, so 64->0
+// (no-op, flags preserved) and 65->1; values straddle the sign bit.
+TEST_F(DiffTest, Corner_ShiftCounts) {
+    const u8 counts[] = {0, 1, 2, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65, 127, 200, 255};
+    const u64 vals[] = {0x1ULL, 0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL,
+                        0x123456789ABCDEF0ULL};
+    const std::vector<FuzzOp> ops = {
+        {"shl rax,cl", {0x48,0xD3,0xE0}, 0xFFFF, F_NO_OF},
+        {"shr rax,cl", {0x48,0xD3,0xE8}, 0xFFFF, F_NO_OF},
+        {"sar rax,cl", {0x48,0xD3,0xF8}, 0xFFFF, F_NO_OF},
+        {"rol rax,cl", {0x48,0xD3,0xC0}, 0xFFFF, F_NO_OF},
+        {"ror rax,cl", {0x48,0xD3,0xC8}, 0xFFFF, F_NO_OF},
+    };
+    for (const auto& op : ops)
+        for (u64 v : vals)
+            for (u8 c : counts) {
+                Expect(op.name, op.bytes, inGpr({{0, v}, {1, c}}), op.gpr_mask, op.flag_mask);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
+}
+
+// Extended-register fuzz: r8..r15 operands to shake out REX.R/REX.B handling.
+TEST_F(DiffTest, Fuzz_ExtendedRegs) {
+    const std::vector<FuzzOp> ops = {
+        {"add r8,r9",    {0x4D,0x01,0xC8},      0xFFFF, F_ALL},
+        {"sub r10,r11",  {0x4D,0x29,0xDA},      0xFFFF, F_ALL},
+        {"and r12,r13",  {0x4D,0x21,0xEC},      0xFFFF, F_ALL},
+        {"imul r14,r15", {0x4D,0x0F,0xAF,0xF7}, 0xFFFF, F_CF_OF},
+    };
+    std::mt19937_64 rng(0xE87E7DED);
+    for (const auto& op : ops) {
+        for (int iter = 0; iter < 200; ++iter) {
+            Context in;
+            for (int i = 8; i < 16; ++i) in.gpr[i] = rng();
+            in.rflags = rng() & kStatusMask;
+            Expect(op.name, op.bytes, in, op.gpr_mask, op.flag_mask);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
     }
 }
 
