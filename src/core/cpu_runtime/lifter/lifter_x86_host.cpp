@@ -8358,7 +8358,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // Dispatch on mnemonic.
         bool handled = false;
         switch (insn.mnemonic) {
-            case ZYDIS_MNEMONIC_MOV:
+            case ZYDIS_MNEMONIC_MOV: // basic
                 if (insn.operand_width == 64) {
                     handled = EmitMov(insn, ops, next_rip, c);
                 } else if (insn.operand_width == 32) {
@@ -8369,14 +8369,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitMov8(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_LEA:    handled = EmitLea(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_MOVSXD: handled = EmitMovsxd(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_MOVSX:  handled = EmitMovsx(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_ANDN:   handled = EmitAndn(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_BEXTR:  handled = EmitBextr(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_LZCNT:  handled = EmitLzcnt(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_POPCNT: handled = EmitPopcnt(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_ADD:
+            case ZYDIS_MNEMONIC_LEA:    handled = EmitLea(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_MOVSXD: handled = EmitMovsxd(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_MOVSX:  handled = EmitMovsx(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_ANDN:   handled = EmitAndn(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_BEXTR:  handled = EmitBextr(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_LZCNT:  handled = EmitLzcnt(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_POPCNT: handled = EmitPopcnt(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_ADD: // basic
                 // 64-bit goes through the wide eager-flag path.
                 // 32-bit takes the narrow round-trip path
                 // (now including the mem-dst form). 8- and 16-bit
@@ -8391,7 +8391,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitAdd(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_SUB:
+            case ZYDIS_MNEMONIC_SUB: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Sub);
                 } else if (insn.operand_width == 16) {
@@ -8402,7 +8402,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitSub(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_CMP:
+            case ZYDIS_MNEMONIC_CMP: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Cmp);
                 } else if (insn.operand_width == 16) {
@@ -8415,7 +8415,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 break;
 
             // Add/sub with carry input — multi-precision arithmetic.
-            case ZYDIS_MNEMONIC_ADC:
+            case ZYDIS_MNEMONIC_ADC: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Adc);
                 } else if (insn.operand_width == 16) {
@@ -8426,7 +8426,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitAdcSbb64(insn, ops, c, AdcSbbKind::Adc);
                 }
                 break;
-            case ZYDIS_MNEMONIC_SBB:
+            case ZYDIS_MNEMONIC_SBB: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Sbb);
                 } else if (insn.operand_width == 16) {
@@ -8437,36 +8437,36 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitAdcSbb64(insn, ops, c, AdcSbbKind::Sbb);
                 }
                 break;
-            case ZYDIS_MNEMONIC_VPUNPCKLQDQ:
-            case ZYDIS_MNEMONIC_VPUNPCKHQDQ:
-            case ZYDIS_MNEMONIC_VPUNPCKLDQ:
-            case ZYDIS_MNEMONIC_VPUNPCKHDQ:
-            case ZYDIS_MNEMONIC_VPUNPCKLWD:
-            case ZYDIS_MNEMONIC_VPUNPCKHWD:
-            case ZYDIS_MNEMONIC_VPUNPCKLBW:
-            case ZYDIS_MNEMONIC_VPUNPCKHBW:
+            case ZYDIS_MNEMONIC_VPUNPCKLQDQ: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKHQDQ: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKLDQ: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKHDQ: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKLWD: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKHWD: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKLBW: // AVX
+            case ZYDIS_MNEMONIC_VPUNPCKHBW: // AVX
                 handled = EmitVpunpck(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPHADDD:
+            case ZYDIS_MNEMONIC_VPHADDD: // AVX
                 handled = EmitVphaddd(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPSHUFD:
+            case ZYDIS_MNEMONIC_VPSHUFD: // AVX
                 handled = EmitVpshufd(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPSHUFLW:
-            case ZYDIS_MNEMONIC_VPSHUFHW:
+            case ZYDIS_MNEMONIC_VPSHUFLW: // AVX
+            case ZYDIS_MNEMONIC_VPSHUFHW: // AVX
                 handled = EmitVpshufd(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPERMILPS:
+            case ZYDIS_MNEMONIC_VPERMILPS: // AVX
                 handled = EmitVpermilps(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPERMILPD:
+            case ZYDIS_MNEMONIC_VPERMILPD: // AVX
                 handled = EmitVpermilps(insn, ops, next_rip, c);
                 break;
 
             // Function epilogue shorthand: mov rsp, rbp; pop rbp.
-            case ZYDIS_MNEMONIC_LEAVE: handled = EmitLeave(c); break;
-            case ZYDIS_MNEMONIC_TEST:
+            case ZYDIS_MNEMONIC_LEAVE: handled = EmitLeave(c); break; // basic
+            case ZYDIS_MNEMONIC_TEST: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Test);
                 } else if (insn.operand_width == 16) {
@@ -8477,7 +8477,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitTest(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_XOR:
+            case ZYDIS_MNEMONIC_XOR: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Xor);
                 } else if (insn.operand_width == 16) {
@@ -8488,7 +8488,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitXor(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_AND:
+            case ZYDIS_MNEMONIC_AND: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::And);
                 } else if (insn.operand_width == 16) {
@@ -8499,7 +8499,7 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitAnd(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_OR:
+            case ZYDIS_MNEMONIC_OR: // basic
                 if (insn.operand_width == 8) {
                     handled = EmitNarrowArith8(insn, ops, next_rip, c, NarrowArithKind::Or);
                 } else if (insn.operand_width == 16) {
@@ -8510,44 +8510,44 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                     handled = EmitOr(insn, ops, next_rip, c);
                 }
                 break;
-            case ZYDIS_MNEMONIC_NOT:  handled = EmitNot(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_NEG:  handled = EmitNeg(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_INC:  handled = EmitInc(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_DEC:  handled = EmitDec(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_BT:   handled = EmitBt(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_DIV:  handled = EmitDiv(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_IDIV: handled = EmitIdiv(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_CMPXCHG: handled = EmitCmpxchg(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_XADD:    handled = EmitXadd(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_XCHG:    handled = EmitXchg(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_NOT:  handled = EmitNot(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_NEG:  handled = EmitNeg(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_INC:  handled = EmitInc(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_DEC:  handled = EmitDec(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_BT:   handled = EmitBt(insn, ops, c); break; // basic
+            case ZYDIS_MNEMONIC_DIV:  handled = EmitDiv(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_IDIV: handled = EmitIdiv(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_CMPXCHG: handled = EmitCmpxchg(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_XADD:    handled = EmitXadd(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_XCHG:    handled = EmitXchg(insn, ops, next_rip, c); break; // basic
             // SETcc family — all 16 conditions route through EmitSetcc.
-            case ZYDIS_MNEMONIC_SETZ:  case ZYDIS_MNEMONIC_SETNZ:
-            case ZYDIS_MNEMONIC_SETS:  case ZYDIS_MNEMONIC_SETNS:
-            case ZYDIS_MNEMONIC_SETO:  case ZYDIS_MNEMONIC_SETNO:
-            case ZYDIS_MNEMONIC_SETP:  case ZYDIS_MNEMONIC_SETNP:
-            case ZYDIS_MNEMONIC_SETB:  case ZYDIS_MNEMONIC_SETNB:
-            case ZYDIS_MNEMONIC_SETBE: case ZYDIS_MNEMONIC_SETNBE:
-            case ZYDIS_MNEMONIC_SETL:  case ZYDIS_MNEMONIC_SETNL:
-            case ZYDIS_MNEMONIC_SETLE: case ZYDIS_MNEMONIC_SETNLE:
+            case ZYDIS_MNEMONIC_SETZ:  case ZYDIS_MNEMONIC_SETNZ: // basic
+            case ZYDIS_MNEMONIC_SETS:  case ZYDIS_MNEMONIC_SETNS: // basic
+            case ZYDIS_MNEMONIC_SETO:  case ZYDIS_MNEMONIC_SETNO: // basic
+            case ZYDIS_MNEMONIC_SETP:  case ZYDIS_MNEMONIC_SETNP: // basic
+            case ZYDIS_MNEMONIC_SETB:  case ZYDIS_MNEMONIC_SETNB: // basic
+            case ZYDIS_MNEMONIC_SETBE: case ZYDIS_MNEMONIC_SETNBE: // basic
+            case ZYDIS_MNEMONIC_SETL:  case ZYDIS_MNEMONIC_SETNL: // basic
+            case ZYDIS_MNEMONIC_SETLE: case ZYDIS_MNEMONIC_SETNLE: // basic
                 handled = EmitSetcc(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_MOVZX: handled = EmitMovzx(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_MOVZX: handled = EmitMovzx(insn, ops, next_rip, c); break; // basic
 
             // Shifts. All three use the same emit with a kind tag.
-            case ZYDIS_MNEMONIC_SHL:
+            case ZYDIS_MNEMONIC_SHL: // basic
                 handled = (insn.operand_width == 32)
                     ? EmitShift32(insn, ops, next_rip, c, ShiftKind::Shl)
                     : (insn.operand_width == 64)
                         ? EmitShift64(insn, ops, next_rip, c, ShiftKind::Shl)
                         : EmitShiftNarrow(insn, ops, next_rip, c, ShiftKind::Shl);
                 break;
-            case ZYDIS_MNEMONIC_SHR:
+            case ZYDIS_MNEMONIC_SHR: // basic
                 handled = (insn.operand_width == 32)
                     ? EmitShift32(insn, ops, next_rip, c, ShiftKind::Shr)
                     : (insn.operand_width == 64)
                         ? EmitShift64(insn, ops, next_rip, c, ShiftKind::Shr)
                         : EmitShiftNarrow(insn, ops, next_rip, c, ShiftKind::Shr);
                 break;
-            case ZYDIS_MNEMONIC_SAR:
+            case ZYDIS_MNEMONIC_SAR: // basic
                 handled = (insn.operand_width == 32)
                     ? EmitShift32(insn, ops, next_rip, c, ShiftKind::Sar)
                     : (insn.operand_width == 64)
@@ -8556,114 +8556,114 @@ void* Lifter::CompileBlock(u64 guest_rip) {
                 break;
 
             // Rotates. Same shape as shifts.
-            case ZYDIS_MNEMONIC_ROL: handled = EmitRotate64(insn, ops, next_rip, c, RotateKind::Rol); break;
-            case ZYDIS_MNEMONIC_ROR: handled = EmitRotate64(insn, ops, next_rip, c, RotateKind::Ror); break;
+            case ZYDIS_MNEMONIC_ROL: handled = EmitRotate64(insn, ops, next_rip, c, RotateKind::Rol); break; // basic
+            case ZYDIS_MNEMONIC_ROR: handled = EmitRotate64(insn, ops, next_rip, c, RotateKind::Ror); break; // basic
 
             // Multiplication. EmitImul dispatches by operand_count_visible.
-            case ZYDIS_MNEMONIC_IMUL: handled = EmitImul(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_MUL:  handled = EmitMul(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_BLSI: handled = EmitBlsi(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_BLSR: handled = EmitBlsr(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW:
-            case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ:
-            case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW:
-            case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_MOVSQ:
-            case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW:
-            case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_LODSQ:
-            case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW:
-            case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ:
-            case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW:
-            case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ:
+            case ZYDIS_MNEMONIC_IMUL: handled = EmitImul(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_MUL:  handled = EmitMul(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_BLSI: handled = EmitBlsi(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_BLSR: handled = EmitBlsr(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW: // string
+            case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ: // string
+            case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW: // string
+            case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_MOVSQ: // string
+            case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW: // string
+            case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_LODSQ: // string
+            case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW: // string
+            case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ: // string
+            case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: // string
+            case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ: // string
                 handled = EmitStringOp(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_CLD:
-            case ZYDIS_MNEMONIC_STD:  handled = EmitCldStd(insn, c); break;
-            case ZYDIS_MNEMONIC_PREFETCHNTA:
-            case ZYDIS_MNEMONIC_PREFETCHT0:
-            case ZYDIS_MNEMONIC_PREFETCHT1:
-            case ZYDIS_MNEMONIC_PREFETCHT2:
-            case ZYDIS_MNEMONIC_PREFETCHW: handled = EmitPrefetch(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, c); break;
-            case ZYDIS_MNEMONIC_VPMOVZXDQ: handled = EmitVpmovzxdq(insn, ops, next_rip, c); break;
+            case ZYDIS_MNEMONIC_CLD: // basic
+            case ZYDIS_MNEMONIC_STD:  handled = EmitCldStd(insn, c); break; // basic
+            case ZYDIS_MNEMONIC_PREFETCHNTA: // system
+            case ZYDIS_MNEMONIC_PREFETCHT0: // system
+            case ZYDIS_MNEMONIC_PREFETCHT1: // system
+            case ZYDIS_MNEMONIC_PREFETCHT2: // system
+            case ZYDIS_MNEMONIC_PREFETCHW: handled = EmitPrefetch(insn, ops, c); break; // system
+            case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, c); break; // system
+            case ZYDIS_MNEMONIC_VPMOVZXDQ: handled = EmitVpmovzxdq(insn, ops, next_rip, c); break; // AVX
 
             // Sign-extension family. No operands; operate on RAX/RDX.
-            case ZYDIS_MNEMONIC_CBW:  handled = EmitCbw(c);  break;
-            case ZYDIS_MNEMONIC_CWDE: handled = EmitCwde(c); break;
-            case ZYDIS_MNEMONIC_CDQE: handled = EmitCdqe(c); break;
-            case ZYDIS_MNEMONIC_CWD:  handled = EmitCwd(c);  break;
-            case ZYDIS_MNEMONIC_CDQ:  handled = EmitCdq(c);  break;
-            case ZYDIS_MNEMONIC_CQO:  handled = EmitCqo(c);  break;
+            case ZYDIS_MNEMONIC_CBW:  handled = EmitCbw(c);  break; // basic
+            case ZYDIS_MNEMONIC_CWDE: handled = EmitCwde(c); break; // basic
+            case ZYDIS_MNEMONIC_CDQE: handled = EmitCdqe(c); break; // basic
+            case ZYDIS_MNEMONIC_CWD:  handled = EmitCwd(c);  break; // basic
+            case ZYDIS_MNEMONIC_CDQ:  handled = EmitCdq(c);  break; // basic
+            case ZYDIS_MNEMONIC_CQO:  handled = EmitCqo(c);  break; // basic
 
             // Direct carry-flag manipulation.
-            case ZYDIS_MNEMONIC_STC: handled = EmitStc(c); break;
-            case ZYDIS_MNEMONIC_CLC: handled = EmitClc(c); break;
-            case ZYDIS_MNEMONIC_CMC: handled = EmitCmc(c); break;
+            case ZYDIS_MNEMONIC_STC: handled = EmitStc(c); break; // basic
+            case ZYDIS_MNEMONIC_CLC: handled = EmitClc(c); break; // basic
+            case ZYDIS_MNEMONIC_CMC: handled = EmitCmc(c); break; // basic
 
             // NOP — no semantic effect, just consume the bytes.
             // Common forms: 90 (1-byte), 66 90 (2-byte),
             // 0F 1F /0 (multi-byte padding). All decode as NOP.
-            case ZYDIS_MNEMONIC_NOP: handled = true; break;
+            case ZYDIS_MNEMONIC_NOP: handled = true; break; // basic
             // Memory-ordering fences. The JIT executes guest code on a
             // single host thread with no reordering across the emulated
             // boundary, so these have no observable effect — treat as
             // no-ops (consume the bytes, emit nothing).
-            case ZYDIS_MNEMONIC_SFENCE:
-            case ZYDIS_MNEMONIC_LFENCE:
-            case ZYDIS_MNEMONIC_MFENCE:
+            case ZYDIS_MNEMONIC_SFENCE: // system
+            case ZYDIS_MNEMONIC_LFENCE: // system
+            case ZYDIS_MNEMONIC_MFENCE: // system
                 handled = true; break;
 
             // All CMOVcc variants go through EmitCmov, which maps
             // the mnemonic to the matching Jcc condition encoding.
-            case ZYDIS_MNEMONIC_CMOVZ:
-            case ZYDIS_MNEMONIC_CMOVNZ:
-            case ZYDIS_MNEMONIC_CMOVS:
-            case ZYDIS_MNEMONIC_CMOVNS:
-            case ZYDIS_MNEMONIC_CMOVO:
-            case ZYDIS_MNEMONIC_CMOVNO:
-            case ZYDIS_MNEMONIC_CMOVP:
-            case ZYDIS_MNEMONIC_CMOVNP:
-            case ZYDIS_MNEMONIC_CMOVB:
-            case ZYDIS_MNEMONIC_CMOVNB:
-            case ZYDIS_MNEMONIC_CMOVBE:
-            case ZYDIS_MNEMONIC_CMOVNBE:
-            case ZYDIS_MNEMONIC_CMOVL:
-            case ZYDIS_MNEMONIC_CMOVNL:
-            case ZYDIS_MNEMONIC_CMOVLE:
-            case ZYDIS_MNEMONIC_CMOVNLE:
+            case ZYDIS_MNEMONIC_CMOVZ: // basic
+            case ZYDIS_MNEMONIC_CMOVNZ: // basic
+            case ZYDIS_MNEMONIC_CMOVS: // basic
+            case ZYDIS_MNEMONIC_CMOVNS: // basic
+            case ZYDIS_MNEMONIC_CMOVO: // basic
+            case ZYDIS_MNEMONIC_CMOVNO: // basic
+            case ZYDIS_MNEMONIC_CMOVP: // basic
+            case ZYDIS_MNEMONIC_CMOVNP: // basic
+            case ZYDIS_MNEMONIC_CMOVB: // basic
+            case ZYDIS_MNEMONIC_CMOVNB: // basic
+            case ZYDIS_MNEMONIC_CMOVBE: // basic
+            case ZYDIS_MNEMONIC_CMOVNBE: // basic
+            case ZYDIS_MNEMONIC_CMOVL: // basic
+            case ZYDIS_MNEMONIC_CMOVNL: // basic
+            case ZYDIS_MNEMONIC_CMOVLE: // basic
+            case ZYDIS_MNEMONIC_CMOVNLE: // basic
                 handled = EmitCmov(insn, ops, next_rip, c);
                 break;
 
-            case ZYDIS_MNEMONIC_PUSH: handled = EmitPush(insn, ops, next_rip, c); break;
-            case ZYDIS_MNEMONIC_POP:  handled = EmitPop(insn, ops, c); break;
-            case ZYDIS_MNEMONIC_RET:
+            case ZYDIS_MNEMONIC_PUSH: handled = EmitPush(insn, ops, next_rip, c); break; // basic
+            case ZYDIS_MNEMONIC_POP:  handled = EmitPop(insn, ops, c); break; // basic
+            case ZYDIS_MNEMONIC_RET: // control
                 handled = EmitRet(insn, ops, c);
                 if (handled) emitted_terminator = true;
                 break;
-            case ZYDIS_MNEMONIC_JMP:
+            case ZYDIS_MNEMONIC_JMP: // control
                 handled = EmitJmp(insn, ops, next_rip, c);
                 if (handled) emitted_terminator = true;
                 break;
-            case ZYDIS_MNEMONIC_CALL:
+            case ZYDIS_MNEMONIC_CALL: // control
                 handled = EmitCall(insn, ops, next_rip, c);
                 if (handled) emitted_terminator = true;
                 break;
             // All conditional jumps go through EmitJcc.
-            case ZYDIS_MNEMONIC_JZ:
-            case ZYDIS_MNEMONIC_JNZ:
-            case ZYDIS_MNEMONIC_JS:
-            case ZYDIS_MNEMONIC_JNS:
-            case ZYDIS_MNEMONIC_JO:
-            case ZYDIS_MNEMONIC_JNO:
-            case ZYDIS_MNEMONIC_JP:
-            case ZYDIS_MNEMONIC_JNP:
-            case ZYDIS_MNEMONIC_JB:
-            case ZYDIS_MNEMONIC_JNB:
-            case ZYDIS_MNEMONIC_JBE:
-            case ZYDIS_MNEMONIC_JNBE:
-            case ZYDIS_MNEMONIC_JL:
-            case ZYDIS_MNEMONIC_JNL:
-            case ZYDIS_MNEMONIC_JLE:
-            case ZYDIS_MNEMONIC_JNLE:
+            case ZYDIS_MNEMONIC_JZ: // control
+            case ZYDIS_MNEMONIC_JNZ: // control
+            case ZYDIS_MNEMONIC_JS: // control
+            case ZYDIS_MNEMONIC_JNS: // control
+            case ZYDIS_MNEMONIC_JO: // control
+            case ZYDIS_MNEMONIC_JNO: // control
+            case ZYDIS_MNEMONIC_JP: // control
+            case ZYDIS_MNEMONIC_JNP: // control
+            case ZYDIS_MNEMONIC_JB: // control
+            case ZYDIS_MNEMONIC_JNB: // control
+            case ZYDIS_MNEMONIC_JBE: // control
+            case ZYDIS_MNEMONIC_JNBE: // control
+            case ZYDIS_MNEMONIC_JL: // control
+            case ZYDIS_MNEMONIC_JNL: // control
+            case ZYDIS_MNEMONIC_JLE: // control
+            case ZYDIS_MNEMONIC_JNLE: // control
                 handled = EmitJcc(insn, ops, next_rip, c);
                 if (handled) emitted_terminator = true;
                 break;
@@ -8671,225 +8671,225 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             // AVX VEX-encoded 128/256-bit vector instructions. These
             // operate on GuestState::ymm[] via 64-bit GPR transfers
             // (see EmitVmovups / EmitVecBitXor for the design notes).
-            case ZYDIS_MNEMONIC_VMOVUPS:
-            case ZYDIS_MNEMONIC_VMOVUPD:
-            case ZYDIS_MNEMONIC_VMOVDQU:
-            case ZYDIS_MNEMONIC_VMOVDQA:
-            case ZYDIS_MNEMONIC_VMOVAPS:
-            case ZYDIS_MNEMONIC_VMOVAPD:
-            case ZYDIS_MNEMONIC_VMOVNTDQ:
-            case ZYDIS_MNEMONIC_VMOVNTDQA:
+            case ZYDIS_MNEMONIC_VMOVUPS: // AVX
+            case ZYDIS_MNEMONIC_VMOVUPD: // AVX
+            case ZYDIS_MNEMONIC_VMOVDQU: // AVX
+            case ZYDIS_MNEMONIC_VMOVDQA: // AVX
+            case ZYDIS_MNEMONIC_VMOVAPS: // AVX
+            case ZYDIS_MNEMONIC_VMOVAPD: // AVX
+            case ZYDIS_MNEMONIC_VMOVNTDQ: // AVX
+            case ZYDIS_MNEMONIC_VMOVNTDQA: // AVX
                 handled = EmitVmovups(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VXORPS: case ZYDIS_MNEMONIC_VXORPD:
-            case ZYDIS_MNEMONIC_VPXOR:
-            case ZYDIS_MNEMONIC_VANDPS: case ZYDIS_MNEMONIC_VANDPD:
-            case ZYDIS_MNEMONIC_VPAND:
-            case ZYDIS_MNEMONIC_VORPS:  case ZYDIS_MNEMONIC_VORPD:
-            case ZYDIS_MNEMONIC_VPOR:
-            case ZYDIS_MNEMONIC_VANDNPS: case ZYDIS_MNEMONIC_VANDNPD:
-            case ZYDIS_MNEMONIC_VPANDN:
+            case ZYDIS_MNEMONIC_VXORPS: case ZYDIS_MNEMONIC_VXORPD: // AVX
+            case ZYDIS_MNEMONIC_VPXOR: // AVX
+            case ZYDIS_MNEMONIC_VANDPS: case ZYDIS_MNEMONIC_VANDPD: // AVX
+            case ZYDIS_MNEMONIC_VPAND: // AVX
+            case ZYDIS_MNEMONIC_VORPS:  case ZYDIS_MNEMONIC_VORPD: // AVX
+            case ZYDIS_MNEMONIC_VPOR: // AVX
+            case ZYDIS_MNEMONIC_VANDNPS: case ZYDIS_MNEMONIC_VANDNPD: // AVX
+            case ZYDIS_MNEMONIC_VPANDN: // AVX
                 handled = EmitVecBitLogic(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VMOVD:
+            case ZYDIS_MNEMONIC_VMOVD: // AVX
                 handled = EmitVmovd(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VMOVQ:
-            case ZYDIS_MNEMONIC_MOVQ:
+            case ZYDIS_MNEMONIC_VMOVQ: // AVX
+            case ZYDIS_MNEMONIC_MOVQ: // SSE
                 handled = EmitVmovq(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VMOVSS:
-            case ZYDIS_MNEMONIC_VMOVSD:
+            case ZYDIS_MNEMONIC_VMOVSS: // AVX
+            case ZYDIS_MNEMONIC_VMOVSD: // AVX
                 handled = EmitVmovss(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VCVTSI2SS:
-            case ZYDIS_MNEMONIC_VCVTSI2SD:
+            case ZYDIS_MNEMONIC_VCVTSI2SS: // AVX
+            case ZYDIS_MNEMONIC_VCVTSI2SD: // AVX
                 handled = EmitVcvtsi2(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VCVTTSS2SI:
-            case ZYDIS_MNEMONIC_VCVTTSD2SI:
-            case ZYDIS_MNEMONIC_CVTTSS2SI:
-            case ZYDIS_MNEMONIC_CVTTSD2SI:
-            case ZYDIS_MNEMONIC_CVTSS2SI:
-            case ZYDIS_MNEMONIC_CVTSD2SI:
+            case ZYDIS_MNEMONIC_VCVTTSS2SI: // AVX
+            case ZYDIS_MNEMONIC_VCVTTSD2SI: // AVX
+            case ZYDIS_MNEMONIC_CVTTSS2SI: // SSE
+            case ZYDIS_MNEMONIC_CVTTSD2SI: // SSE
+            case ZYDIS_MNEMONIC_CVTSS2SI: // SSE
+            case ZYDIS_MNEMONIC_CVTSD2SI: // SSE
                 handled = EmitVcvtt2si(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
-            case ZYDIS_MNEMONIC_VCOMISS:  case ZYDIS_MNEMONIC_VCOMISD:
+            case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD: // AVX
+            case ZYDIS_MNEMONIC_VCOMISS:  case ZYDIS_MNEMONIC_VCOMISD: // AVX
                 handled = EmitFpCompare(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VCVTSS2SD:
-            case ZYDIS_MNEMONIC_VCVTSD2SS:
+            case ZYDIS_MNEMONIC_VCVTSS2SD: // AVX
+            case ZYDIS_MNEMONIC_VCVTSD2SS: // AVX
                 handled = EmitVcvtScalar(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VMULSS: case ZYDIS_MNEMONIC_VMULSD:
-            case ZYDIS_MNEMONIC_VADDSS: case ZYDIS_MNEMONIC_VADDSD:
-            case ZYDIS_MNEMONIC_VSUBSS: case ZYDIS_MNEMONIC_VSUBSD:
-            case ZYDIS_MNEMONIC_VDIVSS: case ZYDIS_MNEMONIC_VDIVSD:
-            case ZYDIS_MNEMONIC_VMINSS: case ZYDIS_MNEMONIC_VMINSD:
-            case ZYDIS_MNEMONIC_VMAXSS: case ZYDIS_MNEMONIC_VMAXSD:
+            case ZYDIS_MNEMONIC_VMULSS: case ZYDIS_MNEMONIC_VMULSD: // AVX
+            case ZYDIS_MNEMONIC_VADDSS: case ZYDIS_MNEMONIC_VADDSD: // AVX
+            case ZYDIS_MNEMONIC_VSUBSS: case ZYDIS_MNEMONIC_VSUBSD: // AVX
+            case ZYDIS_MNEMONIC_VDIVSS: case ZYDIS_MNEMONIC_VDIVSD: // AVX
+            case ZYDIS_MNEMONIC_VMINSS: case ZYDIS_MNEMONIC_VMINSD: // AVX
+            case ZYDIS_MNEMONIC_VMAXSS: case ZYDIS_MNEMONIC_VMAXSD: // AVX
                 handled = EmitScalarFpArith(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VMULPS: case ZYDIS_MNEMONIC_VMULPD:
-            case ZYDIS_MNEMONIC_VADDPS: case ZYDIS_MNEMONIC_VADDPD:
-            case ZYDIS_MNEMONIC_VSUBPS: case ZYDIS_MNEMONIC_VSUBPD:
-            case ZYDIS_MNEMONIC_VDIVPS: case ZYDIS_MNEMONIC_VDIVPD:
-            case ZYDIS_MNEMONIC_VMINPS: case ZYDIS_MNEMONIC_VMINPD:
-            case ZYDIS_MNEMONIC_VMAXPS: case ZYDIS_MNEMONIC_VMAXPD:
+            case ZYDIS_MNEMONIC_VMULPS: case ZYDIS_MNEMONIC_VMULPD: // AVX
+            case ZYDIS_MNEMONIC_VADDPS: case ZYDIS_MNEMONIC_VADDPD: // AVX
+            case ZYDIS_MNEMONIC_VSUBPS: case ZYDIS_MNEMONIC_VSUBPD: // AVX
+            case ZYDIS_MNEMONIC_VDIVPS: case ZYDIS_MNEMONIC_VDIVPD: // AVX
+            case ZYDIS_MNEMONIC_VMINPS: case ZYDIS_MNEMONIC_VMINPD: // AVX
+            case ZYDIS_MNEMONIC_VMAXPS: case ZYDIS_MNEMONIC_VMAXPD: // AVX
                 handled = EmitPackedFpArith(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPADDD:
-            case ZYDIS_MNEMONIC_VPSUBD:
-            case ZYDIS_MNEMONIC_VPADDQ:
-            case ZYDIS_MNEMONIC_VPSUBQ:
-            case ZYDIS_MNEMONIC_VPMULLD:
-            case ZYDIS_MNEMONIC_VPMULUDQ:
-            case ZYDIS_MNEMONIC_VPMINUD:
-            case ZYDIS_MNEMONIC_VPMINSD:
-            case ZYDIS_MNEMONIC_VPMAXUD:
-            case ZYDIS_MNEMONIC_VPMAXSD:
-            case ZYDIS_MNEMONIC_VPCMPEQD:
-            case ZYDIS_MNEMONIC_VPCMPGTD:
-            case ZYDIS_MNEMONIC_VPCMPEQQ:
-            case ZYDIS_MNEMONIC_VPCMPGTQ:
+            case ZYDIS_MNEMONIC_VPADDD: // AVX
+            case ZYDIS_MNEMONIC_VPSUBD: // AVX
+            case ZYDIS_MNEMONIC_VPADDQ: // AVX
+            case ZYDIS_MNEMONIC_VPSUBQ: // AVX
+            case ZYDIS_MNEMONIC_VPMULLD: // AVX
+            case ZYDIS_MNEMONIC_VPMULUDQ: // AVX
+            case ZYDIS_MNEMONIC_VPMINUD: // AVX
+            case ZYDIS_MNEMONIC_VPMINSD: // AVX
+            case ZYDIS_MNEMONIC_VPMAXUD: // AVX
+            case ZYDIS_MNEMONIC_VPMAXSD: // AVX
+            case ZYDIS_MNEMONIC_VPCMPEQD: // AVX
+            case ZYDIS_MNEMONIC_VPCMPGTD: // AVX
+            case ZYDIS_MNEMONIC_VPCMPEQQ: // AVX
+            case ZYDIS_MNEMONIC_VPCMPGTQ: // AVX
                 handled = EmitPackedIntArith(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VUNPCKLPS: case ZYDIS_MNEMONIC_VUNPCKHPS:
-            case ZYDIS_MNEMONIC_VUNPCKLPD: case ZYDIS_MNEMONIC_VUNPCKHPD:
-            case ZYDIS_MNEMONIC_VPACKUSDW:
-            case ZYDIS_MNEMONIC_VMOVLHPS:  case ZYDIS_MNEMONIC_VMOVHLPS:
-            case ZYDIS_MNEMONIC_VSQRTSD:
-            case ZYDIS_MNEMONIC_VSQRTSS:
+            case ZYDIS_MNEMONIC_VUNPCKLPS: case ZYDIS_MNEMONIC_VUNPCKHPS: // AVX
+            case ZYDIS_MNEMONIC_VUNPCKLPD: case ZYDIS_MNEMONIC_VUNPCKHPD: // AVX
+            case ZYDIS_MNEMONIC_VPACKUSDW: // AVX
+            case ZYDIS_MNEMONIC_VMOVLHPS:  case ZYDIS_MNEMONIC_VMOVHLPS: // AVX
+            case ZYDIS_MNEMONIC_VSQRTSD: // AVX
+            case ZYDIS_MNEMONIC_VSQRTSS: // AVX
                 handled = EmitVecHostStaged(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VSHUFPS: case ZYDIS_MNEMONIC_VBLENDPS:
-            case ZYDIS_MNEMONIC_VPBLENDW: case ZYDIS_MNEMONIC_VCMPPS:
-            case ZYDIS_MNEMONIC_VSHUFPD: case ZYDIS_MNEMONIC_VBLENDPD:
-            case ZYDIS_MNEMONIC_VPBLENDD:
+            case ZYDIS_MNEMONIC_VSHUFPS: case ZYDIS_MNEMONIC_VBLENDPS: // AVX
+            case ZYDIS_MNEMONIC_VPBLENDW: case ZYDIS_MNEMONIC_VCMPPS: // AVX
+            case ZYDIS_MNEMONIC_VSHUFPD: case ZYDIS_MNEMONIC_VBLENDPD: // AVX
+            case ZYDIS_MNEMONIC_VPBLENDD: // AVX
                 handled = EmitVecImm8(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
-            case ZYDIS_MNEMONIC_VEXTRACTPS: case ZYDIS_MNEMONIC_VPINSRD:
-            case ZYDIS_MNEMONIC_VPINSRW: case ZYDIS_MNEMONIC_VPINSRB:
+            case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ: // AVX
+            case ZYDIS_MNEMONIC_VEXTRACTPS: case ZYDIS_MNEMONIC_VPINSRD: // AVX
+            case ZYDIS_MNEMONIC_VPINSRW: case ZYDIS_MNEMONIC_VPINSRB: // AVX
                 handled = EmitLaneGpr(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VCMPSS:
+            case ZYDIS_MNEMONIC_VCMPSS: // AVX
                 handled = EmitVcmpss(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPSRAD: case ZYDIS_MNEMONIC_VPSRLD:
-            case ZYDIS_MNEMONIC_VPSLLDQ: case ZYDIS_MNEMONIC_VPSRLDQ:
-            case ZYDIS_MNEMONIC_VPSLLW: case ZYDIS_MNEMONIC_VPSLLD:
-            case ZYDIS_MNEMONIC_VPSLLQ: case ZYDIS_MNEMONIC_VPSRLW:
-            case ZYDIS_MNEMONIC_VPSRLQ: case ZYDIS_MNEMONIC_VPSRAW:
+            case ZYDIS_MNEMONIC_VPSRAD: case ZYDIS_MNEMONIC_VPSRLD: // AVX
+            case ZYDIS_MNEMONIC_VPSLLDQ: case ZYDIS_MNEMONIC_VPSRLDQ: // AVX
+            case ZYDIS_MNEMONIC_VPSLLW: case ZYDIS_MNEMONIC_VPSLLD: // AVX
+            case ZYDIS_MNEMONIC_VPSLLQ: case ZYDIS_MNEMONIC_VPSRLW: // AVX
+            case ZYDIS_MNEMONIC_VPSRLQ: case ZYDIS_MNEMONIC_VPSRAW: // AVX
                 handled = EmitVecShift(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
+            case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTTPS2DQ: // AVX
                 handled = EmitVecConvert(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VBROADCASTSS:
+            case ZYDIS_MNEMONIC_VBROADCASTSS: // AVX
                 handled = EmitVbroadcastss(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VINSERTF128: case ZYDIS_MNEMONIC_VEXTRACTF128:
+            case ZYDIS_MNEMONIC_VINSERTF128: case ZYDIS_MNEMONIC_VEXTRACTF128: // AVX
                 handled = EmitVlane128(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VBLENDVPS:
-            case ZYDIS_MNEMONIC_VBLENDVPD:
-            case ZYDIS_MNEMONIC_VPBLENDVB:
+            case ZYDIS_MNEMONIC_VBLENDVPS: // AVX
+            case ZYDIS_MNEMONIC_VBLENDVPD: // AVX
+            case ZYDIS_MNEMONIC_VPBLENDVB: // AVX
                 handled = EmitVblendvps(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VROUNDSS:
-            case ZYDIS_MNEMONIC_VROUNDSD:
+            case ZYDIS_MNEMONIC_VROUNDSS: // AVX
+            case ZYDIS_MNEMONIC_VROUNDSD: // AVX
                 handled = EmitVround(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VINSERTPS:
+            case ZYDIS_MNEMONIC_VINSERTPS: // AVX
                 handled = EmitVinsertps(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VMOVSLDUP:
-            case ZYDIS_MNEMONIC_VMOVSHDUP:
-            case ZYDIS_MNEMONIC_VMOVDDUP:
+            case ZYDIS_MNEMONIC_VMOVSLDUP: // AVX
+            case ZYDIS_MNEMONIC_VMOVSHDUP: // AVX
+            case ZYDIS_MNEMONIC_VMOVDDUP: // AVX
                 handled = EmitMovDup(insn, ops, next_rip, c);
                 break;
 
             // x87 FPU — Group 1: load/store.
-            case ZYDIS_MNEMONIC_FLD:
+            case ZYDIS_MNEMONIC_FLD: // x87
                 handled = EmitFld(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FST:
-            case ZYDIS_MNEMONIC_FSTP:
+            case ZYDIS_MNEMONIC_FST: // x87
+            case ZYDIS_MNEMONIC_FSTP: // x87
                 handled = EmitFstOrFstp(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FADDP:  case ZYDIS_MNEMONIC_FMULP:
-            case ZYDIS_MNEMONIC_FSUBP:  case ZYDIS_MNEMONIC_FSUBRP:
-            case ZYDIS_MNEMONIC_FDIVP:  case ZYDIS_MNEMONIC_FDIVRP:
+            case ZYDIS_MNEMONIC_FADDP:  case ZYDIS_MNEMONIC_FMULP: // x87
+            case ZYDIS_MNEMONIC_FSUBP:  case ZYDIS_MNEMONIC_FSUBRP: // x87
+            case ZYDIS_MNEMONIC_FDIVP:  case ZYDIS_MNEMONIC_FDIVRP: // x87
                 handled = EmitFpuArithPop(insn, ops, c);
                 break;
-            case ZYDIS_MNEMONIC_FADD:   case ZYDIS_MNEMONIC_FMUL:
-            case ZYDIS_MNEMONIC_FSUB:   case ZYDIS_MNEMONIC_FSUBR:
-            case ZYDIS_MNEMONIC_FDIV:   case ZYDIS_MNEMONIC_FDIVR:
+            case ZYDIS_MNEMONIC_FADD:   case ZYDIS_MNEMONIC_FMUL: // x87
+            case ZYDIS_MNEMONIC_FSUB:   case ZYDIS_MNEMONIC_FSUBR: // x87
+            case ZYDIS_MNEMONIC_FDIV:   case ZYDIS_MNEMONIC_FDIVR: // x87
                 handled = EmitFpuArith(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FCHS:   case ZYDIS_MNEMONIC_FABS:
-            case ZYDIS_MNEMONIC_FSQRT:
+            case ZYDIS_MNEMONIC_FCHS:   case ZYDIS_MNEMONIC_FABS: // x87
+            case ZYDIS_MNEMONIC_FSQRT: // x87
                 handled = EmitFpuUnary(insn, c);
                 break;
-            case ZYDIS_MNEMONIC_FLD1:   case ZYDIS_MNEMONIC_FLDZ:
+            case ZYDIS_MNEMONIC_FLD1:   case ZYDIS_MNEMONIC_FLDZ: // x87
                 handled = EmitFpuLoadConst(insn, c);
                 break;
-            case ZYDIS_MNEMONIC_FXCH:
+            case ZYDIS_MNEMONIC_FXCH: // x87
                 handled = EmitFxch(insn, ops, c);
                 break;
-            case ZYDIS_MNEMONIC_FCOMI:  case ZYDIS_MNEMONIC_FUCOMI:
-            case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMIP:
-            case ZYDIS_MNEMONIC_FCOM:   case ZYDIS_MNEMONIC_FCOMP:
-            case ZYDIS_MNEMONIC_FCOMPP: case ZYDIS_MNEMONIC_FUCOM:
-            case ZYDIS_MNEMONIC_FUCOMP:
+            case ZYDIS_MNEMONIC_FCOMI:  case ZYDIS_MNEMONIC_FUCOMI: // x87
+            case ZYDIS_MNEMONIC_FCOMIP: case ZYDIS_MNEMONIC_FUCOMIP: // x87
+            case ZYDIS_MNEMONIC_FCOM:   case ZYDIS_MNEMONIC_FCOMP: // x87
+            case ZYDIS_MNEMONIC_FCOMPP: case ZYDIS_MNEMONIC_FUCOM: // x87
+            case ZYDIS_MNEMONIC_FUCOMP: // x87
                 handled = EmitFpuCompare(insn, ops, c);
                 break;
-            case ZYDIS_MNEMONIC_FNSTSW:
+            case ZYDIS_MNEMONIC_FNSTSW: // x87
                 handled = EmitFnstsw(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVE:
-            case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVU:
-            case ZYDIS_MNEMONIC_FCMOVNB: case ZYDIS_MNEMONIC_FCMOVNE:
-            case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNU:
+            case ZYDIS_MNEMONIC_FCMOVB: case ZYDIS_MNEMONIC_FCMOVE: // x87
+            case ZYDIS_MNEMONIC_FCMOVBE: case ZYDIS_MNEMONIC_FCMOVU: // x87
+            case ZYDIS_MNEMONIC_FCMOVNB: case ZYDIS_MNEMONIC_FCMOVNE: // x87
+            case ZYDIS_MNEMONIC_FCMOVNBE: case ZYDIS_MNEMONIC_FCMOVNU: // x87
                 handled = EmitFcmov(insn, ops, c);
                 break;
-            case ZYDIS_MNEMONIC_FLDCW:
+            case ZYDIS_MNEMONIC_FLDCW: // x87
                 handled = EmitFldcw(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FNSTCW:
+            case ZYDIS_MNEMONIC_FNSTCW: // x87
                 handled = EmitFnstcw(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_STMXCSR:
-            case ZYDIS_MNEMONIC_LDMXCSR:
+            case ZYDIS_MNEMONIC_STMXCSR: // SSE
+            case ZYDIS_MNEMONIC_LDMXCSR: // SSE
                 handled = EmitMxcsr(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FILD:
+            case ZYDIS_MNEMONIC_FILD: // x87
                 handled = EmitFild(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_FISTP:
-            case ZYDIS_MNEMONIC_FISTTP:
+            case ZYDIS_MNEMONIC_FISTP: // x87
+            case ZYDIS_MNEMONIC_FISTTP: // x87
                 handled = EmitFistp(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPSHUFB:
+            case ZYDIS_MNEMONIC_VPSHUFB: // AVX
                 handled = EmitVpshufb(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPCMPEQB:
+            case ZYDIS_MNEMONIC_VPCMPEQB: // AVX
                 handled = EmitVpcmpeqb(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPTEST:
-            case ZYDIS_MNEMONIC_PTEST:
+            case ZYDIS_MNEMONIC_VPTEST: // AVX
+            case ZYDIS_MNEMONIC_PTEST: // SSE
                 handled = EmitVptest(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPCMPISTRI:
-            case ZYDIS_MNEMONIC_PCMPISTRI:
+            case ZYDIS_MNEMONIC_VPCMPISTRI: // AVX
+            case ZYDIS_MNEMONIC_PCMPISTRI: // SSE
                 handled = EmitVpcmpistri(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VPCMPISTRM:
-            case ZYDIS_MNEMONIC_PCMPISTRM:
+            case ZYDIS_MNEMONIC_VPCMPISTRM: // AVX
+            case ZYDIS_MNEMONIC_PCMPISTRM: // SSE
                 handled = EmitVpcmpistrm(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_CPUID:
+            case ZYDIS_MNEMONIC_CPUID: // system
                 handled = EmitCpuid(insn, ops, c);
                 break;
             default:
