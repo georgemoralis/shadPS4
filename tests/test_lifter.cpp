@@ -38,6 +38,7 @@
 #include "core/cpu_runtime/guest_state.h"
 #include "core/cpu_runtime/hle_registry.h"
 #include "core/cpu_runtime/runtime.h"
+#include "common/arch.h"
 
 // The test shim's common/types.h is a stripped-down stand-in for
 // upstream's. shadPS4 proper defines PS4_SYSV_ABI in common/types.h;
@@ -16327,11 +16328,21 @@ TEST_F(CpuRuntimeTest, FsSegmentOverride_ResolvesViaFsBase) {
     st.fs_base = reinterpret_cast<u64>(tls_area);
     Runtime rt;
     rt.Run(st);
+#ifdef ARCH_X86_64
+    // x86 lifter folds Offsets::FsBase into the effective address.
     EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd))
         << "fs: resolves via fs_base instead of trapping";
     EXPECT_EQ(st.rip, kReturnSentinel);
     EXPECT_EQ(st.gpr[0], 0x1122334455667788ULL)
         << "mov rax, fs:[0x10] loaded *(fs_base + 0x10)";
+#else
+    // The arm64 backend does not model fs:/gs: yet (segment-base folding is
+    // x86-only, as in the baseline), so the FS-prefixed load is unsupported and
+    // the block exits cleanly with RIP at the offending instruction.
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction))
+        << "arm64 backend does not fold segment bases";
+    EXPECT_EQ(st.rip, base) << "rip at the unsupported fs: instruction";
+#endif
 }
 
 // GS override: same as FS, resolved via gs_base. (PS4/FreeBSD uses fs for TLS;
@@ -16354,10 +16365,17 @@ TEST_F(CpuRuntimeTest, GsSegmentOverride_ResolvesViaGsBase) {
     st.gs_base = reinterpret_cast<u64>(tls_area);
     Runtime rt;
     rt.Run(st);
+#ifdef ARCH_X86_64
     EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
     EXPECT_EQ(st.rip, kReturnSentinel);
     EXPECT_EQ(st.gpr[0], 0x99AABBCCDDEEFF00ULL)
         << "mov rax, gs:[0x18] loaded *(gs_base + 0x18)";
+#else
+    // arm64 backend does not model fs:/gs: yet (x86-only fold).
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::UnsupportedInstruction))
+        << "arm64 backend does not fold segment bases";
+    EXPECT_EQ(st.rip, base) << "rip at the unsupported gs: instruction";
+#endif
 }
 
 // ----------------------------------------------------------------------------
