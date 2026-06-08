@@ -643,6 +643,32 @@ bool EmitNeg(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     return true;
 }
 
+// guest: bswap r32/r64 — reverse byte order of a register. Register-only, no
+// flags. Maps directly to AArch64 REV (Xd for 64-bit, Wd for 32-bit; a 32-bit
+// REV through the W view zero-extends into the guest slot, matching how x86
+// writes a 32-bit dest). The 16-bit form is architecturally undefined on x86,
+// so we decline it rather than emit something plausible-but-wrong.
+bool EmitBswap(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 /*next_rip*/, CodeGenerator& c) {
+    if (insn.mnemonic != ZYDIS_MNEMONIC_BSWAP) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+
+    if (w == 64) {
+        c.ldr(kScratch0, ptr(kState, GprOffset(d)));
+        c.rev(kScratch0, kScratch0);
+        c.str(kScratch0, ptr(kState, GprOffset(d)));
+    } else {
+        c.ldr(kWScratch0, ptr(kState, GprOffset(d)));  // low 32 bits
+        c.rev(kWScratch0, kWScratch0);                 // W-rev zero-extends x9
+        c.str(kScratch0, ptr(kState, GprOffset(d)));   // store zero-extended qword
+    }
+    return true;
+}
+
 // guest: movzx r, r/m8|r/m16 — zero-extend source into dest (16/32/64). No flags.
 bool EmitMovzx(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                u64 next_rip, CodeGenerator& c) {
@@ -3545,6 +3571,9 @@ enum class VPackKind {
     AddPS, SubPS, MulPS, DivPS, MinPS, MaxPS,
     AddPD, SubPD, MulPD, DivPD, MinPD, MaxPD,
     AddD, SubD, MulD,
+    AddB, AddW, AddQ, SubB, SubW, SubQ, MulW,    // integer add/sub b/w/q; integer mul w
+    MaxSB, MaxSW, MaxSD, MaxUB, MaxUW, MaxUD,     // packed signed/unsigned max (b/w/d)
+    MinSB, MinSW, MinSD, MinUB, MinUW, MinUD,     // packed signed/unsigned min (b/w/d)
     And, Or, Xor, AndN,   // bitwise (operate on whole 128/256 regardless of element)
 };
 
@@ -3618,6 +3647,32 @@ bool EmitVPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
             case VPackKind::AddD:  c.add(VReg4S(0), VReg4S(0), VReg4S(1)); break;
             case VPackKind::SubD:  c.sub(VReg4S(0), VReg4S(0), VReg4S(1)); break;
             case VPackKind::MulD:  c.mul(VReg4S(0), VReg4S(0), VReg4S(1)); break;
+            // Integer add/sub at the remaining element widths. NEON add/sub
+            // support .16b/.8h/.2d as well as the .4s above; these wrap modulo
+            // the element width exactly like x86 VPADD/VPSUB.
+            case VPackKind::AddB:  c.add(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::AddW:  c.add(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::AddQ:  c.add(VReg2D(0),  VReg2D(0),  VReg2D(1));  break;
+            case VPackKind::SubB:  c.sub(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::SubW:  c.sub(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::SubQ:  c.sub(VReg2D(0),  VReg2D(0),  VReg2D(1));  break;
+            // VPMULLW keeps the low 16 bits of each 16-bit product, which is
+            // exactly NEON's `mul .8h`.
+            case VPackKind::MulW:  c.mul(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            // Packed integer min/max. NEON s/u max/min cover .16b/.8h/.4s (there
+            // is no 64-bit form, and x86 has no byte/word/dword gap there).
+            case VPackKind::MaxSB: c.smax(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::MaxSW: c.smax(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::MaxSD: c.smax(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+            case VPackKind::MaxUB: c.umax(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::MaxUW: c.umax(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::MaxUD: c.umax(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+            case VPackKind::MinSB: c.smin(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::MinSW: c.smin(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::MinSD: c.smin(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+            case VPackKind::MinUB: c.umin(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::MinUW: c.umin(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::MinUD: c.umin(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
             case VPackKind::And:   c.and_(VReg16B(0), VReg16B(0), VReg16B(1)); break;
             case VPackKind::Or:    c.orr(VReg16B(0), VReg16B(0), VReg16B(1)); break;
             case VPackKind::Xor:   c.eor(VReg16B(0), VReg16B(0), VReg16B(1)); break;
@@ -3806,7 +3861,7 @@ bool EmitVShuffle(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 // Integer per-element compare: vpcmpeqb/eqd (equal), vpcmpgtd (signed >).
 // Each element becomes all-ones (true) or all-zeros (false). NEON cmeq/cmgt
 // have identical semantics. XMM zeroes upper 128; YMM per-lane.
-enum class VCmpIntKind { EqB, EqD, GtD };
+enum class VCmpIntKind { EqB, EqW, EqD, EqQ, GtB, GtW, GtD, GtQ };
 
 bool EmitVCmpInt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                  u64 next_rip, VCmpIntKind k, CodeGenerator& c) {
@@ -3840,8 +3895,13 @@ bool EmitVCmpInt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
         }
         switch (k) {
             case VCmpIntKind::EqB: c.cmeq(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VCmpIntKind::EqW: c.cmeq(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
             case VCmpIntKind::EqD: c.cmeq(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+            case VCmpIntKind::EqQ: c.cmeq(VReg2D(0),  VReg2D(0),  VReg2D(1));  break;
+            case VCmpIntKind::GtB: c.cmgt(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VCmpIntKind::GtW: c.cmgt(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
             case VCmpIntKind::GtD: c.cmgt(VReg4S(0),  VReg4S(0),  VReg4S(1));  break;
+            case VCmpIntKind::GtQ: c.cmgt(VReg2D(0),  VReg2D(0),  VReg2D(1));  break;
         }
         c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
         c.str(QReg(0), ptr(kScratch0));
@@ -6169,6 +6229,25 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPADDD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddD, c); break;
         case ZYDIS_MNEMONIC_VPSUBD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubD, c); break;
         case ZYDIS_MNEMONIC_VPMULLD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulD, c); break;
+        case ZYDIS_MNEMONIC_VPADDB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddB, c); break;
+        case ZYDIS_MNEMONIC_VPADDW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddW, c); break;
+        case ZYDIS_MNEMONIC_VPADDQ: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddQ, c); break;
+        case ZYDIS_MNEMONIC_VPSUBB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubB, c); break;
+        case ZYDIS_MNEMONIC_VPSUBW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubW, c); break;
+        case ZYDIS_MNEMONIC_VPSUBQ: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubQ, c); break;
+        case ZYDIS_MNEMONIC_VPMULLW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulW, c); break;
+        case ZYDIS_MNEMONIC_VPMAXSB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxSB, c); break;
+        case ZYDIS_MNEMONIC_VPMAXSW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxSW, c); break;
+        case ZYDIS_MNEMONIC_VPMAXSD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxSD, c); break;
+        case ZYDIS_MNEMONIC_VPMAXUB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxUB, c); break;
+        case ZYDIS_MNEMONIC_VPMAXUW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxUW, c); break;
+        case ZYDIS_MNEMONIC_VPMAXUD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MaxUD, c); break;
+        case ZYDIS_MNEMONIC_VPMINSB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinSB, c); break;
+        case ZYDIS_MNEMONIC_VPMINSW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinSW, c); break;
+        case ZYDIS_MNEMONIC_VPMINSD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinSD, c); break;
+        case ZYDIS_MNEMONIC_VPMINUB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinUB, c); break;
+        case ZYDIS_MNEMONIC_VPMINUW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinUW, c); break;
+        case ZYDIS_MNEMONIC_VPMINUD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MinUD, c); break;
         case ZYDIS_MNEMONIC_VANDPS: case ZYDIS_MNEMONIC_VANDPD:
         case ZYDIS_MNEMONIC_VPAND:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::And, c); break;
         case ZYDIS_MNEMONIC_VORPS:  case ZYDIS_MNEMONIC_VORPD:
@@ -6196,7 +6275,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPCMPEQB: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqB, c); break;
         case ZYDIS_MNEMONIC_VPCMPEQD: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqD, c); break;
         case ZYDIS_MNEMONIC_VPCMPGTD: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::GtD, c); break;
+        case ZYDIS_MNEMONIC_VPCMPEQW: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqW, c); break;
+        case ZYDIS_MNEMONIC_VPCMPEQQ: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqQ, c); break;
+        case ZYDIS_MNEMONIC_VPCMPGTB: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::GtB, c); break;
+        case ZYDIS_MNEMONIC_VPCMPGTW: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::GtW, c); break;
+        case ZYDIS_MNEMONIC_VPCMPGTQ: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::GtQ, c); break;
         case ZYDIS_MNEMONIC_VPTEST:   handled = EmitVptest(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_PTEST:    handled = EmitVptest(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_BSWAP:    handled = EmitBswap(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VCOMISS:  case ZYDIS_MNEMONIC_VCOMISD:
         case ZYDIS_MNEMONIC_VUCOMISS: case ZYDIS_MNEMONIC_VUCOMISD:
             handled = EmitVcomi(insn, ops, next_rip, c); break;
@@ -6220,6 +6306,8 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VMOVAPS: case ZYDIS_MNEMONIC_VMOVUPS:
         case ZYDIS_MNEMONIC_VMOVDQA: case ZYDIS_MNEMONIC_VMOVDQU:
         case ZYDIS_MNEMONIC_VMOVNTDQA:
+        case ZYDIS_MNEMONIC_VMOVAPD: case ZYDIS_MNEMONIC_VMOVUPD:
+        case ZYDIS_MNEMONIC_VMOVNTDQ:
             handled = EmitVmovFull(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VMOVSLDUP: case ZYDIS_MNEMONIC_VMOVSHDUP:
             handled = EmitVmovdup(insn, ops, next_rip, c); break;
