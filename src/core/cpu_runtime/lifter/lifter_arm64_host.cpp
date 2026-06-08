@@ -6126,11 +6126,16 @@ bool EmitPcmpistr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         c.str(kScratch0, ptr(kState, GprOffset(1)));
     }
     // Merge CF/ZF/SF/OF (helper already placed them at their rflags positions).
-    c.ldr(WReg(10), ptr(kSp, 20));
+    // Load the existing rflags into kScratch1 FIRST, then read the helper's flag
+    // word into a register distinct from kScratch1/kScratch2 — x11 (kAddr) is
+    // dead here in both operand paths. (A previous version loaded the flags into
+    // WReg(10), which aliases kScratch1, so the subsequent rflags load clobbered
+    // them and every flag came out zero.)
     c.ldr(kScratch1, ptr(kState, Offsets::Rflags));
+    c.ldr(WReg(11), ptr(kSp, 20));
     c.mov(kScratch2, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
     c.and_(kScratch1, kScratch1, kScratch2);
-    c.orr(kScratch1, kScratch1, XReg(10));
+    c.orr(kScratch1, kScratch1, XReg(11));
     c.str(kScratch1, ptr(kState, Offsets::Rflags));
 
     c.add(kSp, kSp, 48);

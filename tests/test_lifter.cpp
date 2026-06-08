@@ -18663,7 +18663,7 @@ TEST_F(CpuRuntimeTest, Arm64_Vmovmskps_ExtractsSignBits) {
     GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
     st.ymm[XmmChunk(1,0)]=0x80000000007fffffULL; st.ymm[XmmChunk(1,1)]=0xffffffff00000000ULL;
     Runtime rt; rt.Run(st);
-    EXPECT_EQ(st.gpr[0], 0x10ULL) << "sign mask of 4 floats";
+    EXPECT_EQ(st.gpr[0], 10ULL) << "sign mask of 4 floats";
 }
 
 TEST_F(CpuRuntimeTest, Arm64_Vmovmskpd_ExtractsSignBits) {
