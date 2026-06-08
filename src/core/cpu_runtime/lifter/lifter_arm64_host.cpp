@@ -2162,6 +2162,63 @@ bool EmitPopcnt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     return true;
 }
 
+// guest: tzcnt dst, src -> count trailing zero bits (= width if src==0).
+//   CF=(src==0); ZF=(result==0); SF/OF/PF/AF undefined (cleared CF/ZF only).
+//   Widths 32/64. trailing-zeros = clz(rbit(x)).
+bool EmitTzcnt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const XReg src = kScratch0, res = kScratch2;
+    if (!LoadSrcOperand(ops[1], w, src, c)) return false;
+    if (w == 32) {
+        c.rbit(WReg(res.getIdx()), WReg(src.getIdx()));
+        c.clz(WReg(res.getIdx()), WReg(res.getIdx()));
+        c.and_(res, res, 0xFFFFFFFFull);
+    } else {
+        c.rbit(res, src);
+        c.clz(res, res);
+    }
+    c.str(res, ptr(kState, GprOffset(d)));
+    const XReg fl = XReg(14), t = XReg(15);
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~((1ull<<0)|(1ull<<6)));
+    c.and_(fl, fl, t);
+    c.cmp(src, 0); c.cset(t, EQ); c.orr(fl, fl, t);                  // CF = src==0
+    c.cmp(res, 0); c.cset(t, EQ); c.lsl(t, t, 6); c.orr(fl, fl, t);  // ZF = result==0
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
+// guest: blsr dst, src -> reset lowest set bit: dst = src & (src - 1).
+//   CF=(src==0); ZF=(dst==0); SF=(dst sign); OF=0; AF/PF undefined. Widths 32/64.
+bool EmitBlsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    const u32 w = insn.operand_width;
+    if (w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d = ZydisGprToIndex(ops[0].reg.value);
+    if (d < 0) return false;
+    const XReg src = kScratch0, res = kScratch2;
+    if (!LoadSrcOperand(ops[1], w, src, c)) return false;
+    c.sub(res, src, 1);
+    c.and_(res, res, src);
+    if (w == 32) c.and_(res, res, 0xFFFFFFFFull);
+    c.str(res, ptr(kState, GprOffset(d)));
+    const XReg fl = XReg(14), t = XReg(15);
+    c.ldr(fl, ptr(kState, Offsets::Rflags));
+    c.mov(t, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+    c.and_(fl, fl, t);
+    c.cmp(src, 0); c.cset(t, EQ); c.orr(fl, fl, t);                  // CF = src==0
+    c.cmp(res, 0); c.cset(t, EQ); c.lsl(t, t, 6); c.orr(fl, fl, t);  // ZF = dst==0
+    c.ubfx(t, res, w - 1, 1); c.lsl(t, t, 7); c.orr(fl, fl, t);      // SF = dst sign
+    c.str(fl, ptr(kState, Offsets::Rflags));
+    return true;
+}
+
 // ----------------------------------------------------------------------------
 // UNIFIED ALU EMITTER (ADD / SUB / AND / OR / XOR).
 //
@@ -5720,6 +5777,195 @@ bool EmitVrecip(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     return true;
 }
 
+// vmovmskps/pd, vpmovmskb dst(gpr), src(xmm/ymm) — gather the sign bit of each
+// element into a GPR bitmask (bit i = sign of element i). elem_bits selects the
+// element width: 32 (ps), 64 (pd), 8 (byte). Per-lane umov + shift-or; the lane
+// count follows the source width (128 or 256).
+bool EmitMovmsk(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                int elem_bits, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int d   = ZydisGprToIndex(ops[0].reg.value);
+    const int src = ZydisVecToIndex(ops[1].reg.value);
+    if (d < 0 || src < 0) return false;
+    const int total_bits = (ops[1].size == 256) ? 256 : 128;
+    const int per_half = 128 / elem_bits;
+    const int nchunks = (total_bits == 256) ? 2 : 1;
+    const int signpos = elem_bits - 1;
+    const XReg result = XReg(13);
+
+    c.mov(result, 0);
+    for (int h = 0; h < nchunks; ++h) {
+        c.add(kScratch0, kState, YmmChunkOffset(src, h * 2));
+        c.ldr(QReg(0), ptr(kScratch0));
+        for (int j = 0; j < per_half; ++j) {
+            const int bit = h * per_half + j;
+            if (elem_bits == 64) {
+                c.umov(XReg(14), VReg2D(0)[j]);
+                c.lsr(XReg(14), XReg(14), signpos);
+            } else if (elem_bits == 32) {
+                c.umov(WReg(14), VReg4S(0)[j]);
+                c.lsr(WReg(14), WReg(14), signpos);
+            } else {
+                c.umov(WReg(14), VReg16B(0)[j]);
+                c.lsr(WReg(14), WReg(14), signpos);
+            }
+            if (bit == 0) {
+                c.orr(result, result, XReg(14));
+            } else {
+                c.lsl(XReg(14), XReg(14), bit);
+                c.orr(result, result, XReg(14));
+            }
+        }
+    }
+    c.str(result, ptr(kState, GprOffset(d)));   // zero-extended mask into dst GPR
+    return true;
+}
+
+// vshufpd dst, src1, src2, imm — per 128-bit lane: low double from src1 (bit
+// selects which of its two), high double from src2. For YMM the next imm bits
+// drive the high lane.
+bool EmitVshufpd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    if (dst < 0 || s1 < 0) return false;
+    const int imm = static_cast<int>(ops[3].imm.value.u) & 0xFF;
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        c.add(kScratch0, kState, YmmChunkOffset(s1, chunk));
+        c.ldr(QReg(0), ptr(kScratch0));
+        if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int s2 = ZydisVecToIndex(ops[2].reg.value);
+            if (s2 < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(s2, chunk));
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(1), ptr(kScratch0));
+        } else {
+            return false;
+        }
+        const int lo = (imm >> (2 * h + 0)) & 1;     // src1's double
+        const int hi = (imm >> (2 * h + 1)) & 1;     // src2's double
+        c.ins(VReg2D(2)[0], VReg2D(0)[lo]);
+        c.ins(VReg2D(2)[1], VReg2D(1)[hi]);
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(2), ptr(kScratch0));
+    }
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+// vpermilps/pd dst, src, imm8 — in-lane permute selected by imm, same imm per
+// 128-bit lane. PS: 4 floats by 2-bit fields; PD: 2 doubles by 1-bit fields
+// (bits [1:0] low lane, [3:2] high lane). Only the imm form is handled here; the
+// variable (vector-control) form is declined.
+bool EmitVpermil(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, bool dbl, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;  // variable form -> bail
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+    const int imm = static_cast<int>(ops[2].imm.value.u) & 0xFF;
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src = ZydisVecToIndex(ops[1].reg.value);
+            if (src < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(src, chunk));
+            c.ldr(QReg(0), ptr(kScratch0));
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(0), ptr(kScratch0));
+        } else {
+            return false;
+        }
+        if (dbl) {
+            const int s0 = (imm >> (2 * h + 0)) & 1;
+            const int s1 = (imm >> (2 * h + 1)) & 1;
+            c.ins(VReg2D(2)[0], VReg2D(0)[s0]);
+            c.ins(VReg2D(2)[1], VReg2D(0)[s1]);
+        } else {
+            for (int i = 0; i < 4; ++i)
+                c.ins(VReg4S(2)[i], VReg4S(0)[(imm >> (2 * i)) & 3]);  // same imm per lane
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(2), ptr(kScratch0));
+    }
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+// vpshuflw/vpshufhw dst, src, imm8 — shuffle the low (LW) or high (HW) four
+// words of each 128-bit lane by imm 2-bit fields; the other four words pass
+// through unchanged.
+bool EmitVpshufw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                 u64 next_rip, CodeGenerator& c) {
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+    const bool hi = (insn.mnemonic == ZYDIS_MNEMONIC_VPSHUFHW);
+    const int imm = static_cast<int>(ops[2].imm.value.u) & 0xFF;
+    const bool ymm = (ops[0].size == 256);
+    const int nchunks = ymm ? 2 : 1;
+    const int base = hi ? 4 : 0;   // which group of 4 words is shuffled
+
+    for (int h = 0; h < nchunks; ++h) {
+        const int chunk = h * 2;
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int src = ZydisVecToIndex(ops[1].reg.value);
+            if (src < 0) return false;
+            c.add(kScratch0, kState, YmmChunkOffset(src, chunk));
+            c.ldr(QReg(0), ptr(kScratch0));
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+            if (h == 0) {
+                if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+                c.mov(kScratch1, kAddr);
+            }
+            c.add(kScratch0, kScratch1, h * 16);
+            c.ldr(QReg(0), ptr(kScratch0));
+        } else {
+            return false;
+        }
+        c.mov(VReg16B(2), VReg16B(0));   // pass-through copy; overwrite the 4 shuffled words
+        for (int i = 0; i < 4; ++i)
+            c.ins(VReg8H(2)[base + i], VReg8H(0)[base + ((imm >> (2 * i)) & 3)]);
+        c.add(kScratch0, kState, YmmChunkOffset(dst, chunk));
+        c.str(QReg(2), ptr(kScratch0));
+    }
+    if (!ymm) {
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
 // vphaddd dst, src1, src2 — horizontal pairwise dword add. Result low half =
 // pairwise sums of src1, high half = pairwise sums of src2. NEON addp.
 bool EmitVphaddd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
@@ -6761,6 +7007,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_POPCNT:
             handled = EmitPopcnt(insn, ops, c);
             break;
+        case ZYDIS_MNEMONIC_TZCNT:
+            handled = EmitTzcnt(insn, ops, c);
+            break;
+        case ZYDIS_MNEMONIC_BLSR:
+            handled = EmitBlsr(insn, ops, c);
+            break;
         case ZYDIS_MNEMONIC_MUL:
             handled = EmitMul(insn, ops, c);
             break;
@@ -6847,6 +7099,14 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VMOVHLPS:    handled = EmitVUnpack(insn, ops, next_rip, VUnpackKind::MOVHLPS, c); break;
         case ZYDIS_MNEMONIC_VPSHUFD:
         case ZYDIS_MNEMONIC_VSHUFPS:     handled = EmitVShuffle(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VSHUFPD:     handled = EmitVshufpd(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPERMILPS:   handled = EmitVpermil(insn, ops, next_rip, false, c); break;
+        case ZYDIS_MNEMONIC_VPERMILPD:   handled = EmitVpermil(insn, ops, next_rip, true, c); break;
+        case ZYDIS_MNEMONIC_VPSHUFLW: case ZYDIS_MNEMONIC_VPSHUFHW:
+            handled = EmitVpshufw(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVMSKPS: handled = EmitMovmsk(insn, ops, 32, c); break;
+        case ZYDIS_MNEMONIC_VMOVMSKPD: handled = EmitMovmsk(insn, ops, 64, c); break;
+        case ZYDIS_MNEMONIC_VPMOVMSKB: handled = EmitMovmsk(insn, ops, 8, c); break;
         case ZYDIS_MNEMONIC_VPCMPEQB: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqB, c); break;
         case ZYDIS_MNEMONIC_VPCMPEQD: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::EqD, c); break;
         case ZYDIS_MNEMONIC_VPCMPGTD: handled = EmitVCmpInt(insn, ops, next_rip, VCmpIntKind::GtD, c); break;
