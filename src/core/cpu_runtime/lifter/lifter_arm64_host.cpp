@@ -6114,12 +6114,17 @@ bool EmitPcmpistr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
     c.ldr(XReg(30), ptr(kSp, 32));                          // restore link register
 
     if (ret_mask) {
-        // XMM0 (guest vec 0) low 128 = mask. Legacy PCMPISTRM leaves bits
-        // 255:128 unchanged, so the upper chunks are intentionally not touched.
+        // XMM0 (guest vec 0) low 128 = mask. The x86 backend zeroes ymm0's upper
+        // 128 bits for both the VEX and legacy SSE forms (see EmitVpcmpistrm in
+        // lifter_x86_host.cpp), so match that here for backend parity rather than
+        // preserving bits 255:128 as strict legacy-SSE semantics would.
         c.ldr(kScratch0, ptr(kSp, 0));
         c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 0)));
         c.ldr(kScratch0, ptr(kSp, 8));
         c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 1)));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 3)));
     } else {
         // ECX = index, zero-extended into RCX (gpr index 1).
         c.ldr(kWScratch0, ptr(kSp, 16));

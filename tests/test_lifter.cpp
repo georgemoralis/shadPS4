@@ -18756,14 +18756,15 @@ TEST_F(CpuRuntimeTest, Arm64_Pcmpistrm_EqualAnyMask) {
     GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
     st.ymm[XmmChunk(1,0)]=0x000000756f696561ULL; st.ymm[XmmChunk(1,1)]=0x0000000000000000ULL; // char set "aeiou"
     st.ymm[XmmChunk(2,0)]=0x7566697475616562ULL; st.ymm[XmmChunk(2,1)]=0x6f6e5f7961645f6cULL; // haystack
-    // PCMPISTRM is a legacy-SSE encoding: it writes XMM0 low-128 and leaves
-    // bits 255:128 unchanged. Pre-pollute the upper lane to confirm preservation.
+    // The x86 backend zeroes ymm0's upper 128 bits for PCMPISTRM (both VEX and
+    // legacy SSE forms); the arm64 backend matches that. Pre-pollute the upper
+    // lane to confirm it is actually cleared.
     st.ymm[XmmChunk(0,2)]=0xCAFEF00DCAFEF00DULL; st.ymm[XmmChunk(0,3)]=0xCAFEF00DCAFEF00DULL;
     Runtime rt; rt.Run(st);
     EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0xff00ff00ffffff00ULL) << "vowel positions, low 8 bytes";
     EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0xff000000ff000000ULL) << "vowel positions, high 8 bytes";
-    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0xCAFEF00DCAFEF00DULL) << "legacy SSE preserves bits 255:128";
-    EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0xCAFEF00DCAFEF00DULL);
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL) << "upper 128 zeroed (matches x86 backend)";
+    EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
     EXPECT_TRUE(st.rflags & (1ULL<<0))  << "CF";
     EXPECT_FALSE(st.rflags & (1ULL<<6))  << "ZF = operand2 has null";
     EXPECT_TRUE(st.rflags & (1ULL<<7))  << "SF = operand1 has null";
