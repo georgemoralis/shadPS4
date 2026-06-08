@@ -5966,6 +5966,172 @@ bool EmitVpshufw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     return true;
 }
 
+// --- PCMPISTRI / PCMPISTRM ---------------------------------------------------
+// SSE4.2 implicit-length packed string compare. There is no NEON analog, so the
+// lifter marshals the two 128-bit operands + imm8 to this portable routine and
+// calls it. The routine is validated bit-exact against x86 SSE4.2 hardware
+// across all four aggregation modes, both data formats, signed/unsigned, every
+// polarity, and both output selections (index/mask, incl. the expanded mask).
+// It writes the index (ISTRI), the mask (ISTRM), and the AFZSO flags — already
+// shifted into rflags bit positions — into the caller's output buffer.
+struct PcmpistrOut { u64 mask_lo; u64 mask_hi; u32 index; u32 flags; };
+
+inline bool PcmpElemZero(const u8* P, int i, int sz) {
+    return sz == 1 ? (P[i] == 0) : (P[2 * i] == 0 && P[2 * i + 1] == 0);
+}
+inline int PcmpElemVal(const u8* P, int i, int sz, int sgn) {
+    if (sz == 1) return sgn ? (int)(signed char)P[i] : (int)P[i];
+    u32 v = (u32)(P[2 * i] | (P[2 * i + 1] << 8));
+    return sgn ? (int)(short)(u16)v : (int)v;
+}
+
+// Called from JIT-emitted code via blr. AAPCS64: x28 (kState) and x25-x27 are
+// callee-saved, so the only register the emitted shim must preserve across the
+// call is the link register.
+void Pcmpistr_helper(const void* aptr, const void* bptr,
+                     u32 imm, u32 ret_mask, void* outptr) {
+    const u8* A = (const u8*)aptr;
+    const u8* B = (const u8*)bptr;
+    PcmpistrOut* out = (PcmpistrOut*)outptr;
+    const int sz  = (imm & 1) ? 2 : 1;
+    const int n   = (imm & 1) ? 8 : 16;
+    const int sgn = (imm >> 1) & 1;
+    const int agg = (imm >> 2) & 3;
+    const int pol = (imm >> 4) & 3;
+    const int sel = (imm >> 6) & 1;
+
+    int la = n, lb = n;   // implicit lengths: index of first null element
+    for (int i = 0; i < n; i++) { if (PcmpElemZero(A, i, sz)) { la = i; break; } }
+    for (int j = 0; j < n; j++) { if (PcmpElemZero(B, j, sz)) { lb = j; break; } }
+
+    int a[16], b[16];
+    for (int i = 0; i < n; i++) { a[i] = PcmpElemVal(A, i, sz, sgn); b[i] = PcmpElemVal(B, i, sz, sgn); }
+
+    int intres1 = 0;
+    for (int j = 0; j < n; j++) {
+        int r = 0;
+        switch (agg) {
+        case 0:  // equal any: b[j] equals any valid a[i]
+            for (int i = 0; i < n; i++)
+                r |= (((i < la) && (j < lb)) ? (a[i] == b[j]) : 0);
+            break;
+        case 1:  // ranges: b[j] within any valid pair [a[i], a[i+1]]
+            for (int i = 0; i + 1 < n; i += 2)
+                r |= ((((i < la) && (i + 1 < la)) && (j < lb))
+                          ? (b[j] >= a[i] && b[j] <= a[i + 1]) : 0);
+            break;
+        case 2: { // equal each (diagonal), with invalid-element override
+            int av = (j < la), bv = (j < lb);
+            r = (av && bv) ? (a[j] == b[j]) : ((!av && !bv) ? 1 : 0);
+            break; }
+        case 3: { // equal ordered (substring search at offset j)
+            r = 1;
+            for (int i = 0; i < n - j; i++) {
+                int av = (i < la), bv = (j + i < lb);
+                int cell = av ? (bv ? (a[i] == b[j + i]) : 0) : 1;
+                r &= cell;
+            }
+            break; }
+        }
+        intres1 |= (r & 1) << j;
+    }
+
+    const int mask_all = (n == 16) ? 0xFFFF : 0xFF;
+    if (pol == 1) intres1 = (~intres1) & mask_all;                       // negate all
+    else if (pol == 3) { int m = (lb >= n) ? mask_all : ((1 << lb) - 1); // negate up to lb
+                         intres1 = (intres1 ^ m) & mask_all; }
+
+    u32 flags = 0;
+    if (intres1 != 0) flags |= (1u << 0);   // CF = IntRes1 != 0
+    if (lb < n)       flags |= (1u << 6);   // ZF = operand2 had a null
+    if (la < n)       flags |= (1u << 7);   // SF = operand1 had a null
+    if (intres1 & 1)  flags |= (1u << 11);  // OF = IntRes1[0]
+    out->flags = flags;
+
+    int idx;
+    if (intres1 == 0) idx = n;
+    else if (sel == 0) { idx = 0; while (!((intres1 >> idx) & 1)) idx++; }   // least sig
+    else               { idx = n - 1; while (!((intres1 >> idx) & 1)) idx--; } // most sig
+    out->index = (u32)idx;
+
+    out->mask_lo = 0; out->mask_hi = 0;
+    if (ret_mask) {
+        if (sel == 0) {
+            out->mask_lo = (u64)(u32)intres1;                  // bit mask in low bits
+        } else {                                               // expanded element mask
+            u8 by[16]; for (int k = 0; k < 16; k++) by[k] = 0;
+            for (int j = 0; j < n; j++)
+                if ((intres1 >> j) & 1) {
+                    if (sz == 1) by[j] = 0xFF;
+                    else { by[2 * j] = 0xFF; by[2 * j + 1] = 0xFF; }
+                }
+            u64 lo = 0, hi = 0;
+            for (int k = 0; k < 8; k++) { lo |= (u64)by[k] << (8 * k); hi |= (u64)by[8 + k] << (8 * k); }
+            out->mask_lo = lo; out->mask_hi = hi;
+        }
+    }
+}
+
+// pcmpistri/pcmpistrm xmm1, xmm2/m128, imm8 — marshal to Pcmpistr_helper. The
+// out buffer and the link-register save live in a 48-byte host stack frame.
+bool EmitPcmpistr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  u64 next_rip, CodeGenerator& c) {
+    const bool ret_mask = (insn.mnemonic == ZYDIS_MNEMONIC_PCMPISTRM);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int a_idx = ZydisVecToIndex(ops[0].reg.value);
+    if (a_idx < 0) return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+    const u32 imm = (u32)(ops[2].imm.value.u & 0xFF);
+
+    // Resolve operand 2's address. For memory, compute the EA first (it clobbers
+    // x9-x11) and stash it in x12 before we build the call frame and args.
+    const bool b_mem = (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int b_idx = -1;
+    if (b_mem) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.mov(XReg(12), kAddr);
+    } else {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        b_idx = ZydisVecToIndex(ops[1].reg.value);
+        if (b_idx < 0) return false;
+    }
+
+    c.sub(sp, sp, 48);
+    c.str(XReg(30), ptr(sp, 32));                          // save link register
+    c.add(XReg(0), kState, YmmChunkOffset(a_idx, 0));      // x0 = &xmm1
+    if (b_mem) c.mov(XReg(1), XReg(12));                   // x1 = &operand2
+    else       c.add(XReg(1), kState, YmmChunkOffset(b_idx, 0));
+    c.mov(XReg(2), imm);                                   // x2 = imm8
+    c.mov(XReg(3), ret_mask ? 1 : 0);                      // x3 = ret_mask
+    c.add(XReg(4), sp, 0);                                 // x4 = &out
+    c.mov(XReg(9), reinterpret_cast<u64>(&Pcmpistr_helper));
+    c.blr(XReg(9));
+    c.ldr(XReg(30), ptr(sp, 32));                          // restore link register
+
+    if (ret_mask) {
+        // XMM0 (guest vec 0) low 128 = mask. Legacy PCMPISTRM leaves bits
+        // 255:128 unchanged, so the upper chunks are intentionally not touched.
+        c.ldr(kScratch0, ptr(sp, 0));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 0)));
+        c.ldr(kScratch0, ptr(sp, 8));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 1)));
+    } else {
+        // ECX = index, zero-extended into RCX (gpr index 1).
+        c.ldr(kWScratch0, ptr(sp, 16));
+        c.str(kScratch0, ptr(kState, GprOffset(1)));
+    }
+    // Merge CF/ZF/SF/OF (helper already placed them at their rflags positions).
+    c.ldr(WReg(10), ptr(sp, 20));
+    c.ldr(kScratch1, ptr(kState, Offsets::Rflags));
+    c.mov(kScratch2, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+    c.and_(kScratch1, kScratch1, kScratch2);
+    c.orr(kScratch1, kScratch1, XReg(10));
+    c.str(kScratch1, ptr(kState, Offsets::Rflags));
+
+    c.add(sp, sp, 48);
+    return true;
+}
+
 // vphaddd dst, src1, src2 — horizontal pairwise dword add. Result low half =
 // pairwise sums of src1, high half = pairwise sums of src2. NEON addp.
 bool EmitVphaddd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
@@ -7200,6 +7366,9 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         case ZYDIS_MNEMONIC_VPINSRB: case ZYDIS_MNEMONIC_VPINSRW:
             handled = EmitVpinsrBW(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPHADDD:   handled = EmitVphaddd(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_PCMPISTRI:
+        case ZYDIS_MNEMONIC_PCMPISTRM:
+            handled = EmitPcmpistr(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPSHUFB:   handled = EmitVpshufb(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPACKUSDW: handled = EmitVpackusdw(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPCMPISTRI:
