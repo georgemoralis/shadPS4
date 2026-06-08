@@ -128,6 +128,11 @@ const XReg kExitStub = XReg(25);  // fatal-exit stub (x86 r15 analog)
 const XReg kDispatchTop = XReg(26); // dispatcher-loop top (x86 r14 analog)
 const WReg kWScratch0 = WReg(9);  // 32-bit view of x9
 const WReg kWScratch3 = WReg(13); // 32-bit transient (flag_op write)
+// Host stack pointer. Register index 31 encodes SP (not XZR) in the add/sub
+// immediate and load/store base-register forms used below; xbyak_aarch64's
+// pre-instantiated `sp` object is a class member (not at namespace scope, per
+// the note above), so construct it by index to stay scope-independent.
+const XReg kSp = XReg(31);
 
 constexpr u32 GprOffset(int idx) {
     return static_cast<u32>(Offsets::Gpr + idx * 8);
@@ -6096,39 +6101,39 @@ bool EmitPcmpistr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         if (b_idx < 0) return false;
     }
 
-    c.sub(sp, sp, 48);
-    c.str(XReg(30), ptr(sp, 32));                          // save link register
+    c.sub(kSp, kSp, 48);
+    c.str(XReg(30), ptr(kSp, 32));                          // save link register
     c.add(XReg(0), kState, YmmChunkOffset(a_idx, 0));      // x0 = &xmm1
     if (b_mem) c.mov(XReg(1), XReg(12));                   // x1 = &operand2
     else       c.add(XReg(1), kState, YmmChunkOffset(b_idx, 0));
     c.mov(XReg(2), imm);                                   // x2 = imm8
     c.mov(XReg(3), ret_mask ? 1 : 0);                      // x3 = ret_mask
-    c.add(XReg(4), sp, 0);                                 // x4 = &out
+    c.add(XReg(4), kSp, 0);                                 // x4 = &out
     c.mov(XReg(9), reinterpret_cast<u64>(&Pcmpistr_helper));
     c.blr(XReg(9));
-    c.ldr(XReg(30), ptr(sp, 32));                          // restore link register
+    c.ldr(XReg(30), ptr(kSp, 32));                          // restore link register
 
     if (ret_mask) {
         // XMM0 (guest vec 0) low 128 = mask. Legacy PCMPISTRM leaves bits
         // 255:128 unchanged, so the upper chunks are intentionally not touched.
-        c.ldr(kScratch0, ptr(sp, 0));
+        c.ldr(kScratch0, ptr(kSp, 0));
         c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 0)));
-        c.ldr(kScratch0, ptr(sp, 8));
+        c.ldr(kScratch0, ptr(kSp, 8));
         c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 1)));
     } else {
         // ECX = index, zero-extended into RCX (gpr index 1).
-        c.ldr(kWScratch0, ptr(sp, 16));
+        c.ldr(kWScratch0, ptr(kSp, 16));
         c.str(kScratch0, ptr(kState, GprOffset(1)));
     }
     // Merge CF/ZF/SF/OF (helper already placed them at their rflags positions).
-    c.ldr(WReg(10), ptr(sp, 20));
+    c.ldr(WReg(10), ptr(kSp, 20));
     c.ldr(kScratch1, ptr(kState, Offsets::Rflags));
     c.mov(kScratch2, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
     c.and_(kScratch1, kScratch1, kScratch2);
     c.orr(kScratch1, kScratch1, XReg(10));
     c.str(kScratch1, ptr(kState, Offsets::Rflags));
 
-    c.add(sp, sp, 48);
+    c.add(kSp, kSp, 48);
     return true;
 }
 
