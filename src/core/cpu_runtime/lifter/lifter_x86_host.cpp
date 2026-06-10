@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib> // getenv (SHADPS4_LIFTER_TRACE gate)
 #include <Zydis/Zydis.h>
 #include <xbyak/xbyak.h>
 
@@ -683,7 +684,19 @@ constexpr u64 PF = 1ULL << 2;
 constexpr u64 ZF = 1ULL << 6;
 constexpr u64 SF = 1ULL << 7;
 constexpr u64 OF = 1ULL << 11;
+constexpr u64 AF = 1ULL << 4;
 constexpr u64 AllArith = CF | PF | ZF | SF | OF;
+// Mask applied to guest rflags before any popfq into the HOST flags
+// register. Only the six arithmetic flags may pass through: the guest can
+// legitimately carry DF=1 (after STD) -- and, in principle, TF/AC/NT -- in
+// state.rflags, and popfq'ing those into the host is catastrophic. A host
+// DF=1 leaking past the block boundary breaks the SysV "DF clear on call"
+// contract: glibc/MSVC memcpy (rep movsb) then runs BACKWARDS in the
+// dispatcher and every HLE call after it. TF would single-step-trap host
+// execution; AC would fault on any misaligned access. String ops never
+// consult host DF (they read state.rflags bit 10 directly), so masking
+// here loses nothing.
+constexpr u64 HostLoadMask = CF | PF | AF | ZF | SF | OF;
 }  // namespace RflagsBits
 
 /// Emit code that computes PF (parity of the low byte of rax) and
@@ -1646,7 +1659,10 @@ bool EmitLzcnt(const ZydisDecodedInstruction& insn,
         c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-        c.mov(rcx, qword[rdx]);
+        // Width-sized load: a qword read for a 32-bit operand over-reads 4
+        // bytes and can fault when the operand sits at the end of a mapping.
+        if (w == 32) c.mov(ecx, dword[rdx]);
+        else         c.mov(rcx, qword[rdx]);
     } else {
         return false;
     }
@@ -1654,8 +1670,17 @@ bool EmitLzcnt(const ZydisDecodedInstruction& insn,
     if (w == 32) c.lzcnt(eax, ecx);   // result zero-extends rax
     else         c.lzcnt(rax, rcx);
 
+    // Merge: arithmetic flags from the host op, everything else (DF and the
+    // other control bits) from the prior guest rflags. A wholesale store of
+    // host pushfq output would clear a guest DF=1 and import host IF etc.
     c.pushfq();
     c.pop(r8);
+    c.mov(r9, RflagsBits::HostLoadMask);
+    c.and_(r8, r9);
+    c.mov(r9, qword[r13 + Offsets::Rflags]);
+    c.mov(r10, ~RflagsBits::HostLoadMask);
+    c.and_(r9, r10);
+    c.or_(r8, r9);
     c.mov(qword[r13 + Offsets::Rflags], r8);
 
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
@@ -1683,7 +1708,10 @@ bool EmitTzcnt(const ZydisDecodedInstruction& insn,
         c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-        c.mov(rcx, qword[rdx]);
+        // Width-sized load: a qword read for a 32-bit operand over-reads 4
+        // bytes and can fault when the operand sits at the end of a mapping.
+        if (w == 32) c.mov(ecx, dword[rdx]);
+        else         c.mov(rcx, qword[rdx]);
     } else {
         return false;
     }
@@ -1691,8 +1719,17 @@ bool EmitTzcnt(const ZydisDecodedInstruction& insn,
     if (w == 32) c.tzcnt(eax, ecx);   // result zero-extends rax
     else         c.tzcnt(rax, rcx);
 
+    // Merge: arithmetic flags from the host op, everything else (DF and the
+    // other control bits) from the prior guest rflags. A wholesale store of
+    // host pushfq output would clear a guest DF=1 and import host IF etc.
     c.pushfq();
     c.pop(r8);
+    c.mov(r9, RflagsBits::HostLoadMask);
+    c.and_(r8, r9);
+    c.mov(r9, qword[r13 + Offsets::Rflags]);
+    c.mov(r10, ~RflagsBits::HostLoadMask);
+    c.and_(r9, r10);
+    c.or_(r8, r9);
     c.mov(qword[r13 + Offsets::Rflags], r8);
 
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
@@ -1718,7 +1755,10 @@ bool EmitPopcnt(const ZydisDecodedInstruction& insn,
         c.mov(rcx, qword[r13 + GprOffset(src_idx)]);
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-        c.mov(rcx, qword[rdx]);
+        // Width-sized load: a qword read for a 32-bit operand over-reads 4
+        // bytes and can fault when the operand sits at the end of a mapping.
+        if (w == 32) c.mov(ecx, dword[rdx]);
+        else         c.mov(rcx, qword[rdx]);
     } else {
         return false;
     }
@@ -1726,8 +1766,17 @@ bool EmitPopcnt(const ZydisDecodedInstruction& insn,
     if (w == 32) c.popcnt(eax, ecx);   // result zero-extends rax
     else         c.popcnt(rax, rcx);
 
+    // Merge: arithmetic flags from the host op, everything else (DF and the
+    // other control bits) from the prior guest rflags. A wholesale store of
+    // host pushfq output would clear a guest DF=1 and import host IF etc.
     c.pushfq();
     c.pop(r8);
+    c.mov(r9, RflagsBits::HostLoadMask);
+    c.and_(r8, r9);
+    c.mov(r9, qword[r13 + Offsets::Rflags]);
+    c.mov(r10, ~RflagsBits::HostLoadMask);
+    c.and_(r9, r10);
+    c.or_(r8, r9);
     c.mov(qword[r13 + Offsets::Rflags], r8);
 
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
@@ -1811,6 +1860,7 @@ bool EmitNeg(const ZydisDecodedInstruction& insn,
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false; // rdx = &dst
         c.mov(r10, rdx);                          // r10 = &dst (rdx reused below)
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
         switch (w) {
@@ -1849,6 +1899,7 @@ bool EmitNeg(const ZydisDecodedInstruction& insn,
     }
 
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -1905,6 +1956,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
         c.mov(r11, rdx);
         c.and_(r11, 0x1);                         // r11 = saved CF
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
         switch (w) {
@@ -1933,6 +1985,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
             if (off < 0) return false;
             c.mov(al, byte[r13 + off]);
             c.mov(rdx, qword[r13 + Offsets::Rflags]);
+            c.and_(rdx, RflagsBits::HostLoadMask);
             c.push(rdx); c.popfq();
             c.inc(al);
             c.pushfq(); c.pop(rdx);
@@ -1942,6 +1995,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
             if (idx < 0) return false;
             c.mov(ax, word[r13 + GprOffset(idx)]);
             c.mov(rdx, qword[r13 + Offsets::Rflags]);
+            c.and_(rdx, RflagsBits::HostLoadMask);
             c.push(rdx); c.popfq();
             c.inc(ax);
             c.pushfq(); c.pop(rdx);
@@ -1988,6 +2042,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
         // Round-trip guest rflags through host flags so the host
         // computes correct 32-bit-width flags (CF/OF/SF/ZF/PF/AF).
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
 
@@ -2032,6 +2087,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
         c.mov(r11, rdx);
         c.and_(r11, 0x1);                         // saved CF
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
         switch (w) {
@@ -2060,6 +2116,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
 
         c.mov(al, byte[r13 + byte_off]);
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
         c.dec(al);
@@ -2082,6 +2139,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
         if (idx16 < 0) return false;
         c.mov(ax, word[r13 + GprOffset(idx16)]);
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
         c.dec(ax);
@@ -2122,6 +2180,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
         c.mov(ecx, 1);
 
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
 
@@ -2262,7 +2321,10 @@ bool EmitDiv(const ZydisDecodedInstruction& insn,
         c.mov(r9, qword[r13 + GprOffset(d_idx)]);
     } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-        c.mov(r9, qword[rdx]);
+        // Width-sized read: an 8-byte load for `div dword [m]` over-reads
+        // past the operand and can fault at a mapping boundary.
+        if (w == 32) c.mov(r9d, dword[rdx]);
+        else         c.mov(r9,  qword[rdx]);
     } else {
         return false;
     }
@@ -2333,7 +2395,10 @@ bool EmitIdiv(const ZydisDecodedInstruction& insn,
         c.mov(r9, qword[r13 + GprOffset(d_idx)]);
     } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-        c.mov(r9, qword[rdx]);
+        // Width-sized read: an 8-byte load for `div dword [m]` over-reads
+        // past the operand and can fault at a mapping boundary.
+        if (w == 32) c.mov(r9d, dword[rdx]);
+        else         c.mov(r9,  qword[rdx]);
     } else {
         return false;
     }
@@ -2702,6 +2767,7 @@ bool EmitLockedRmw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
     // Guest rflags <-> host, via r8 (keeps rax/rcx free for operands/results).
     auto load_flags = [&] {
         c.mov(r8, qword[r13 + Offsets::Rflags]);
+        c.and_(r8, RflagsBits::HostLoadMask);
         c.push(r8);
         c.popfq();
     };
@@ -3204,6 +3270,7 @@ bool EmitShift64(const ZydisDecodedInstruction& insn,
     // Round-trip rflags: load guest → host. Use rdx (not in use yet
     // and not aliased to cl).
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -3273,6 +3340,7 @@ bool EmitShift32(const ZydisDecodedInstruction& insn,
     else         c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
 
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -3339,6 +3407,7 @@ bool EmitShiftNarrow(const ZydisDecodedInstruction& insn,
     }
 
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -3425,6 +3494,7 @@ bool EmitRotate64(const ZydisDecodedInstruction& insn,
 
     // Round-trip flags via host.
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -3506,6 +3576,7 @@ bool EmitImul1Op(const ZydisDecodedInstruction& insn,
 
     // Flag round-trip.
     c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.and_(r8, RflagsBits::HostLoadMask);
     c.push(r8);
     c.popfq();
 
@@ -3546,6 +3617,7 @@ bool EmitImul2Op(const ZydisDecodedInstruction& insn,
     c.mov(rax, qword[r13 + GprOffset(dst_idx)]);
 
     c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.and_(r8, RflagsBits::HostLoadMask);
     c.push(r8);
     c.popfq();
 
@@ -3601,6 +3673,7 @@ bool EmitImul3Op(const ZydisDecodedInstruction& insn,
     c.mov(rax, imm_val);  // xbyak picks 32-bit immediate form when possible
 
     c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.and_(r8, RflagsBits::HostLoadMask);
     c.push(r8);
     c.popfq();
 
@@ -3669,6 +3742,7 @@ bool EmitMul(const ZydisDecodedInstruction& insn,
 
     // Flag round-trip around the host op.
     c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.and_(r8, RflagsBits::HostLoadMask);
     c.push(r8);
     c.popfq();
 
@@ -4037,6 +4111,7 @@ bool EmitAdcSbb64(const ZydisDecodedInstruction& insn,
 
     // Round-trip flags so host CF is the same as guest CF.
     c.mov(r8, qword[r13 + Offsets::Rflags]);
+    c.and_(r8, RflagsBits::HostLoadMask);
     c.push(r8);
     c.popfq();
 
@@ -4128,6 +4203,7 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
         // Flag round-trip through the host CPU so it computes correct
         // 8-bit-width flags.
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
 
@@ -4185,6 +4261,7 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
 
     // Round-trip flags (so host computes narrow-width flags).
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -4249,6 +4326,7 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
         }
 
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
 
@@ -4295,6 +4373,7 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
     }
 
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -4391,6 +4470,7 @@ bool EmitNarrowArith32(const ZydisDecodedInstruction& insn,
         // if we need writeback; flag-only paths never needed to
         // keep it past this point).
         c.mov(rdx, qword[r13 + Offsets::Rflags]);
+        c.and_(rdx, RflagsBits::HostLoadMask);
         c.push(rdx);
         c.popfq();
 
@@ -4447,6 +4527,7 @@ bool EmitNarrowArith32(const ZydisDecodedInstruction& insn,
     // Round-trip guest rflags through host flags so the host CPU
     // computes correct 32-bit-width flags (CF/OF/SF/ZF/PF/AF).
     c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(rdx, RflagsBits::HostLoadMask);
     c.push(rdx);
     c.popfq();
 
@@ -4665,8 +4746,10 @@ bool EmitPop(const ZydisDecodedInstruction& insn,
 ///   2. Set state.rip to that scratch reg.
 ///   3. Add 8 to rsp_guest.
 ///   4. Set state.exit_reason to BlockEnd.
-///   5. Jump to gateway exit stub via r14. The test harness then
-///      inspects state.rip to see where the guest returned to.
+///   5. Jump to the gateway dispatch-loop top via r14 (normal block
+///      end; r15 is the FATAL exit stub). The dispatcher then resolves
+///      the popped return address — guest block, HLE bridge target, or
+///      the host-return sentinel.
 ///
 /// Note: rsp_guest is GPR[4] (RSP per AMD64 ABI).
 bool EmitRet(const ZydisDecodedInstruction& insn,
@@ -8744,14 +8827,17 @@ bool EmitStringOp(const ZydisDecodedInstruction& insn,
             c.mov(rax, rcx);
             c.sub(rax, rdx);
         }
-        EmitFlagsFromSubtract(c);
+        // Width matters: with the operands masked to esz bytes, a default
+        // 64-bit derivation computes SF/OF from bit 63 instead of bit
+        // esz*8-1 -- breaking signed jcc after SCASB/W/D.
+        EmitFlagsFromSubtract(c, static_cast<u32>(esz) * 8);
     } else { // Cmps
         // compare [RSI] - [RDI]; set flags.
         load_acc(rcx, r11);   // lhs = [RSI]
         load_acc(rdx, r10);   // rhs = [RDI]
         c.mov(rax, rcx);
         c.sub(rax, rdx);
-        EmitFlagsFromSubtract(c);
+        EmitFlagsFromSubtract(c, static_cast<u32>(esz) * 8);
     }
 
     // ---- Advance pointers per DF. ----
@@ -8956,9 +9042,21 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     // gateway via RtlAddFunctionTable on Windows. That's a separate
     // piece of work. Until then, JIT-dispatched-context code uses
     // fprintf for diagnostics.
-    std::fprintf(stderr, "[lifter] CompileBlock: guest_rip = 0x%llx\n",
-                 static_cast<unsigned long long>(guest_rip));
-    std::fflush(stderr);
+    // Per-block / per-instruction tracing is opt-in: two stderr writes plus
+    // a flush per decoded instruction is a heavy compile-time tax and a log
+    // firehose in release. The fprintf transport itself stays (see the SEH
+    // rationale above for why not LOG_*); only the volume is gated. The
+    // unsupported-instruction report further down remains UNCONDITIONAL --
+    // it is rare and is the primary porting signal.
+    static const bool lifter_trace = [] {
+        const char* e = std::getenv("SHADPS4_LIFTER_TRACE");
+        return e != nullptr && e[0] != '0';
+    }();
+    if (lifter_trace) {
+        std::fprintf(stderr, "[lifter] CompileBlock: guest_rip = 0x%llx\n",
+                     static_cast<unsigned long long>(guest_rip));
+        std::fflush(stderr);
+    }
 
     // Reserve a chunk of code cache for this block. We don't know
     // the final size yet; conservatively reserve the size cap and
@@ -8990,19 +9088,23 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         // safe-decode path that catches faults.
         ZydisDecodedInstruction insn;
         ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-        std::fprintf(stderr, "[lifter] about to decode at 0x%llx\n",
-                     static_cast<unsigned long long>(rip));
-        std::fflush(stderr);
+        if (lifter_trace) {
+            std::fprintf(stderr, "[lifter] about to decode at 0x%llx\n",
+                         static_cast<unsigned long long>(rip));
+            std::fflush(stderr);
+        }
         const auto status = ZydisDecoderDecodeFull(
             &decoder, reinterpret_cast<const void*>(rip), 15,
             &insn, ops);
-        std::fprintf(stderr, "[lifter] decoded at 0x%llx ok=%d mnemonic=%s\n",
-                     static_cast<unsigned long long>(rip),
-                     ZYAN_SUCCESS(status) ? 1 : 0,
-                     ZYAN_SUCCESS(status)
-                         ? ZydisMnemonicGetString(insn.mnemonic)
-                         : "(decode-failed)");
-        std::fflush(stderr);
+        if (lifter_trace) {
+            std::fprintf(stderr, "[lifter] decoded at 0x%llx ok=%d mnemonic=%s\n",
+                         static_cast<unsigned long long>(rip),
+                         ZYAN_SUCCESS(status) ? 1 : 0,
+                         ZYAN_SUCCESS(status)
+                             ? ZydisMnemonicGetString(insn.mnemonic)
+                             : "(decode-failed)");
+            std::fflush(stderr);
+        }
         if (!ZYAN_SUCCESS(status)) {
             std::fprintf(stderr, "[lifter] decode FAILED at 0x%llx\n",
                          static_cast<unsigned long long>(rip));
@@ -9266,6 +9368,12 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: // string
             case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ: // string
                 handled = EmitStringOp(insn, ops, next_rip, c);
+                // EmitStringOp emits its own exit (jmp r14 / r15): it IS the
+                // block terminator. Without this flag the loop kept decoding
+                // the bytes AFTER the string op -- dead host code at best,
+                // and at worst the decoder walks past the end of the function
+                // into unmapped guest memory and faults inside the compiler.
+                if (handled) emitted_terminator = true;
                 break;
             case ZYDIS_MNEMONIC_CLD: // basic
             case ZYDIS_MNEMONIC_STD:  handled = EmitCldStd(insn, c); break; // basic
@@ -9313,13 +9421,19 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             // Common forms: 90 (1-byte), 66 90 (2-byte),
             // 0F 1F /0 (multi-byte padding). All decode as NOP.
             case ZYDIS_MNEMONIC_NOP: handled = true; break; // basic
-            // Memory-ordering fences. The JIT executes guest code on a
-            // single host thread with no reordering across the emulated
-            // boundary, so these have no observable effect — treat as
-            // no-ops (consume the bytes, emit nothing).
+            // Memory-ordering fences. Guest threads run on parallel host
+            // threads over shared guest memory (same premise as the locked
+            // RMW path), so MFENCE must be preserved: even on a TSO host,
+            // dropping it loses guest StoreLoad ordering (Dekker-style
+            // lock-free code). SFENCE/LFENCE are no-ops here because every
+            // store we emit is an ordinary x86 store (the non-temporal
+            // VMOVNT* forms are lowered to plain moves) and TSO already
+            // gives StoreStore / LoadLoad ordering.
             case ZYDIS_MNEMONIC_SFENCE: // system
             case ZYDIS_MNEMONIC_LFENCE: // system
+                handled = true; break;
             case ZYDIS_MNEMONIC_MFENCE: // system
+                c.mfence();
                 handled = true; break;
 
             // All CMOVcc variants go through EmitCmov, which maps
@@ -9702,13 +9816,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     bytes_emitted_ += emitted;
     ++blocks_compiled_;
 
-    std::fprintf(stderr,
-                 "[lifter] compiled block 0x%llx -> %p (%llu guest bytes -> %llu host bytes)\n",
-                 static_cast<unsigned long long>(guest_rip),
-                 static_cast<void*>(code_buf),
-                 static_cast<unsigned long long>(rip - guest_rip),
-                 static_cast<unsigned long long>(emitted));
-    std::fflush(stderr);
+    if (lifter_trace) {
+        std::fprintf(stderr,
+                     "[lifter] compiled block 0x%llx -> %p (%llu guest bytes -> %llu host bytes)\n",
+                     static_cast<unsigned long long>(guest_rip),
+                     static_cast<void*>(code_buf),
+                     static_cast<unsigned long long>(rip - guest_rip),
+                     static_cast<unsigned long long>(emitted));
+        std::fflush(stderr);
+    }
 
     return code_buf;
 }

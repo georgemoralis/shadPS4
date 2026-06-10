@@ -139,13 +139,20 @@ public:
         stp(x25, x26, pre_ptr(sp, -16));
         stp(x27, x28, pre_ptr(sp, -16));
         stp(x29, x30, pre_ptr(sp, -16));            // FP, LR
+        // Establish the frame pointer HERE — pointing at the saved
+        // {x29, x30} pair — before pushing the d-regs below. The AAPCS64
+        // frame-chain convention is fp -> {prev_fp, lr}; setting x29 after
+        // the FP/SIMD pushes (as an earlier revision did) left it pointing
+        // at the saved d14/d15 pair, so any FP-chain walker (macOS sampling
+        // profilers, crash reporters) read double bit-patterns as the next
+        // frame pointer and chased garbage.
+        mov(x29, sp);
         // Callee-saved FP/SIMD: only the low 64 bits of v8..v15 (the d-regs)
         // are callee-saved. 4 pairs, 64 bytes.
         stp(d8, d9, pre_ptr(sp, -16));
         stp(d10, d11, pre_ptr(sp, -16));
         stp(d12, d13, pre_ptr(sp, -16));
         stp(d14, d15, pre_ptr(sp, -16));
-        mov(x29, sp); // frame pointer (points at the saved d14/d15 pair)
 
         // Normalize args into pinned registers.
         mov(rGuestState, x0); // state

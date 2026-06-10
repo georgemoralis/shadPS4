@@ -1645,7 +1645,7 @@ bool EmitImul(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
 //   w64: RDX:RAX / src -> RAX=quot, RDX=rem (true 128/64 via long division).
 // Divide-by-zero returns false (routes to unsupported-exit; no SIGFPE).
 bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-             CodeGenerator& c) {
+             u64 next_rip, CodeGenerator& c) {
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     const XReg src = kScratch1;
@@ -1655,6 +1655,10 @@ bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
     {
         Label ok;
         c.cbnz(src, ok);
+        // Pin state.rip to THIS instruction: without it the exit reports the
+        // stale block-entry RIP and the diagnostic points at the wrong insn.
+        c.mov(kScratch0, next_rip - insn.length);
+        c.str(kScratch0, ptr(kState, Offsets::Rip));
         c.mov(kWScratch0, static_cast<u32>(ExitReason::UnsupportedInstruction));
         c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
         c.br(kExitStub);
@@ -1781,7 +1785,7 @@ bool EmitDiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops
 // same unsigned long-division loop as EmitDiv, then re-applies the signs.
 // (Verified against x86 IDIV under QEMU for all sign combinations.)
 bool EmitIdiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-              CodeGenerator& c) {
+              u64 next_rip, CodeGenerator& c) {
     const u32 w = insn.operand_width;
     if (w != 8 && w != 16 && w != 32 && w != 64) return false;
     const XReg src = kScratch1;
@@ -1790,6 +1794,10 @@ bool EmitIdiv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
     {
         Label ok;
         c.cbnz(src, ok);
+        // Pin state.rip to THIS instruction: without it the exit reports the
+        // stale block-entry RIP and the diagnostic points at the wrong insn.
+        c.mov(kScratch0, next_rip - insn.length);
+        c.str(kScratch0, ptr(kState, Offsets::Rip));
         c.mov(kWScratch0, static_cast<u32>(ExitReason::UnsupportedInstruction));
         c.str(kWScratch0, ptr(kState, static_cast<u32>(offsetof(GuestState, exit_reason))));
         c.br(kExitStub);
@@ -7133,6 +7141,23 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         }
 
         const u64 next_rip = rip + insn.length;
+
+        // LOCK-prefixed RMW: guest atomics (lock add/or/xadd/cmpxchg, and
+        // implicitly-locked xchg-with-memory) require LSE atomics or an
+        // ldxr/stxr loop on this weakly-ordered host; the plain ldr/op/str
+        // the emitters below produce would be a silent data race against
+        // other guest threads. Until real atomics land, bail to the
+        // diagnosable unsupported exit instead of corrupting sync state.
+        if ((insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
+            (insn.mnemonic == ZYDIS_MNEMONIC_XCHG &&
+             (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ||
+              ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY))) {
+            ++unsupported_hits_;
+            EmitUnsupportedExit(rip, c);
+            emitted_terminator = true;
+            break;
+        }
+
         bool handled = false;
         switch (insn.mnemonic) {
         case ZYDIS_MNEMONIC_MOV:
@@ -7201,10 +7226,10 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             handled = EmitImul(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_DIV:
-            handled = EmitDiv(insn, ops, c);
+            handled = EmitDiv(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_IDIV:
-            handled = EmitIdiv(insn, ops, c);
+            handled = EmitIdiv(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_VADDSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Add, false, c); break;
         case ZYDIS_MNEMONIC_VADDSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Add, true,  c); break;
@@ -7427,10 +7452,17 @@ void* Lifter::CompileBlock(u64 guest_rip) {
             break;
         case ZYDIS_MNEMONIC_MFENCE: case ZYDIS_MNEMONIC_LFENCE:
         case ZYDIS_MNEMONIC_SFENCE:
+            // Guest fences carry real ordering on this weakly-ordered host:
+            // dropping them loses the TSO guarantees the guest was compiled
+            // against. dmb ish is the conservative lowering for all three
+            // (full barrier; subsumes the store-store / load-load subsets).
+            c.dmb(ISH);
+            handled = true;
+            break;
         case ZYDIS_MNEMONIC_PREFETCH:    case ZYDIS_MNEMONIC_PREFETCHNTA:
         case ZYDIS_MNEMONIC_PREFETCHT0:  case ZYDIS_MNEMONIC_PREFETCHT1:
         case ZYDIS_MNEMONIC_PREFETCHT2:  case ZYDIS_MNEMONIC_PREFETCHW:
-            handled = true;  // memory hints / fences: no-op for this model.
+            handled = true;  // memory hints: architecturally no-ops.
             break;
         case ZYDIS_MNEMONIC_CPUID:  handled = EmitCpuid(insn, ops, c); break;
         case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, ops, c); break;
@@ -7571,7 +7603,13 @@ void* Lifter::CompileBlock(u64 guest_rip) {
         rip += insn.length;
         if (emitted_terminator) break;
 
-        constexpr u64 HOST_SIZE_MARGIN = 256;
+        // Must comfortably cover ONE worst-case emitter plus the fallthrough
+        // terminator. The NEON/packed emitters routinely expand a single
+        // guest op to dozens of host instructions; 256 bytes was under the
+        // worst case, and an overflow throws Xbyak::Error through the
+        // gateway JIT frame (no unwind info -> process death). Matches the
+        // x86 lifter's margin.
+        constexpr u64 HOST_SIZE_MARGIN = 1024;
         if (c.getSize() + HOST_SIZE_MARGIN >= BLOCK_HOST_SIZE_CAP) break;
     }
 

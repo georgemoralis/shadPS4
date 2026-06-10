@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <atomic>
+
 #include "common/types.h"
 
 namespace Core::Runtime {
@@ -13,10 +15,12 @@ struct GuestState;
 /// Lifter: translates one guest basic block at a time into host code,
 /// emitting through the provided CodeCache.
 ///
-/// One Lifter instance per runtime. The lifter is not stateless — it
-/// holds an internal xbyak CodeGenerator and Zydis decoder context
-/// that get reused across compilations. Lifter calls are serialized
-/// externally (we don't compile blocks in parallel).
+/// One Lifter instance per runtime. CompileBlock is safe to call
+/// concurrently from multiple dispatching threads: the CodeGenerator and
+/// Zydis decoder are per-call locals, the code-cache reservation is an
+/// atomic bump, and the statistics counters below are atomics. (An earlier
+/// revision claimed external serialization and a member CodeGenerator;
+/// neither was true once multiple guest threads dispatched concurrently.)
 ///
 /// Per-host implementations:
 ///   lifter_x86_host.cpp   — x86_64 guest -> x86_64 host via xbyak
@@ -40,28 +44,32 @@ public:
     /// instruction at the start of the block, etc.).
     ///
     /// The compiled block updates GuestState as it executes; on
-    /// reaching its terminator, it jumps either to the dispatcher
-    /// (via r12) or to the exit stub (via r14, set by the gateway).
+    /// reaching its terminator it jumps to the dispatch-loop top via the
+    /// pinned r14 (x86) / x26 (arm64) for a normal block end, or to the
+    /// exit stub via r15 (x86) / x25 (arm64) for a fatal exit. (An earlier
+    /// comment swapped these; the gateway sources are authoritative.)
     void* CompileBlock(u64 guest_rip);
 
     /// Diagnostics: number of blocks compiled, number of bytes of
     /// host code emitted, number of unsupported-instruction
     /// terminations.
     [[nodiscard]] u64 BlocksCompiled() const noexcept {
-        return blocks_compiled_;
+        return blocks_compiled_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] u64 BytesEmitted() const noexcept {
-        return bytes_emitted_;
+        return bytes_emitted_.load(std::memory_order_relaxed);
     }
     [[nodiscard]] u64 UnsupportedHits() const noexcept {
-        return unsupported_hits_;
+        return unsupported_hits_.load(std::memory_order_relaxed);
     }
 
 private:
     CodeCache& code_cache_;
-    u64 blocks_compiled_ = 0;
-    u64 bytes_emitted_ = 0;
-    u64 unsupported_hits_ = 0;
+    // Relaxed atomics: diagnostics only, but plain u64 increments from
+    // concurrently dispatching guest threads were a data race (UB).
+    std::atomic<u64> blocks_compiled_{0};
+    std::atomic<u64> bytes_emitted_{0};
+    std::atomic<u64> unsupported_hits_{0};
 };
 
 } // namespace Core::Runtime

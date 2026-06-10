@@ -839,10 +839,20 @@ FaultContext DescribeFaultContext(const void* host_addr) noexcept {
             // sequence that produced the address and see where a stray bit
             // (e.g. bit 33) is introduced. Reading backwards within the
             // code cache is safe — it's all our own committed code.
-            for (int i = 0; i < 32; ++i) {
-                ctx.pre_fault_bytes[i] = hb[i - 32];
+            // The window must be clamped to the cache BASE: when the fault
+            // PC sits in the first 32 bytes of the cache (first compiled
+            // block), an unclamped hb[i - 32] reads before the mapping and
+            // faults inside the fault handler. Bytes are right-aligned in
+            // pre_fault_bytes so offline disassembly still ends at the PC.
+            {
+                const u8* cache_base = tl_active_runtime->GetCodeCache().Base();
+                const u64 avail_back = static_cast<u64>(hb - cache_base);
+                const int back = avail_back >= 32 ? 32 : static_cast<int>(avail_back);
+                for (int i = 0; i < back; ++i) {
+                    ctx.pre_fault_bytes[(32 - back) + i] = hb[i - back];
+                }
+                ctx.pre_byte_count = static_cast<u8>(back);
             }
-            ctx.pre_byte_count = 32;
 
             ZydisDecoder dec;
             if (ZYAN_SUCCESS(ZydisDecoderInit(&dec, ZYDIS_MACHINE_MODE_LONG_64,
@@ -901,6 +911,16 @@ GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
     ASSERT_MSG(guest_stack_top != nullptr, "CallGuest: null guest_stack_top");
 
     GuestState state{};
+
+    // FP control state must come up in the architectural reset values, not
+    // zero: mxcsr = 0x1F80 (round-to-nearest, all exceptions masked --
+    // mxcsr 0 means everything UNMASKED, and a guest stmxcsr/ldmxcsr fenv
+    // round-trip would faithfully propagate that), fpu_cw = 0x037F (the
+    // FNINIT default that guest_state.h documents and EmitFnstcw reports).
+    // fpu_tag = 0 is correct for the lifter's 1-bit "in use" model (all
+    // slots empty).
+    state.mxcsr = 0x1F80;
+    state.fpu_cw = 0x037F;
 
     // Align guest stack to 16, misalign by 8 (PS4_SYSV_ABI: caller's
     // stack pointer is 8-byte-misaligned at function entry, becoming
@@ -1002,11 +1022,13 @@ void Runtime::CallGuestOnCallerStack(GuestState& caller, VAddr guest_fn,
     // callback's RET exits the JIT cleanly. We align to 16 then push
     // (so the callback enters with the standard 8-misaligned RSP that
     // SysV ABI expects at function entry, post-push-return-address).
-    constexpr u64 kReturnSentinel = 0xCB'CB'CB'CB'00'00'00'00ULL;
+    // kHostReturnAddress is the single shared constant (guest_state.h);
+    // a duplicated local literal here previously risked silently diverging
+    // from the dispatcher's recognition check.
     u64 rsp = caller.gpr[4];
     rsp &= ~static_cast<u64>(0xF);
     rsp -= 8;
-    *reinterpret_cast<u64*>(rsp) = kReturnSentinel;
+    *reinterpret_cast<u64*>(rsp) = kHostReturnAddress;
     caller.gpr[4] = rsp;
 
     // Run the callback through the JIT on the caller's stack.
