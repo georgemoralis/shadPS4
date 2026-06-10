@@ -46,8 +46,39 @@ namespace Core {
 // CallOnStack asm trampoline (stack.S) before running the real handler body.
 extern "C" long CallOnStack(void* stack_top, void* pexp, void* impl);
 
-static thread_local u8* g_veh_stack = nullptr;
+// Hot lookup for the VEH: TRIVIAL thread_local only. The handler must never
+// touch a thread_local with a non-trivial constructor/destructor -- MSVC's
+// lazy first-touch registration for those is not async-safe, and a fault
+// context is the wrong place to run it. The owning object below is touched
+// exclusively from EnsureVehStack (a normal, non-fault context).
 static thread_local void* g_veh_stack_top = nullptr;
+
+// Owns the per-thread exception stack and returns it to the OS at thread
+// exit. Without this, every thread that ever entered the JIT leaked its
+// 512 KiB of COMMITTED stack -- unbounded for guests that churn short-lived
+// threads (job systems, audio workers): a thousand create/join cycles was
+// half a gigabyte of commit gone for good.
+//
+// Teardown ordering is the load-bearing detail: later TLS destructors, CRT
+// teardown, or detach hooks can still fault on this thread AFTER this
+// destructor runs, and the VEH fires for those. So we DISARM FIRST (null
+// the trivial hot pointer -- the handler then falls back to the current
+// stack, which is the shallow host stack at thread exit, exactly the
+// no-dedicated-stack path threads outside the JIT use) and only then
+// release the memory. A fault landing between the two steps runs on the
+// current stack; a fault during VirtualFree itself likewise. At no point
+// can the handler switch onto freed memory.
+struct VehStackOwner {
+    u8* base = nullptr;
+    ~VehStackOwner() {
+        g_veh_stack_top = nullptr; // disarm BEFORE free (see above)
+        if (base != nullptr) {
+            VirtualFree(base, 0, MEM_RELEASE);
+            base = nullptr;
+        }
+    }
+};
+static thread_local VehStackOwner g_veh_stack_owner;
 
 // The real handler body. Runs on the dedicated exception stack (or, for threads
 // that never entered the JIT, on the current stack).
@@ -188,8 +219,10 @@ static LONG SignalHandlerImpl(EXCEPTION_POINTERS* pExp) noexcept {
 
 // Allocate this thread's dedicated exception stack, once. Called from the JIT
 // entry (Runtime::Run) in a NON-fault context where the stack is healthy, so
-// the allocation never runs on an already-exhausted stack in a fault context.
-// Idempotent per thread.
+// the allocation never runs on an already-exhausted stack in a fault context
+// -- and, equally, so the non-trivial g_veh_stack_owner thread_local gets its
+// lazy first-touch initialization here rather than inside the VEH. Idempotent
+// per thread; the owner's destructor returns the stack at thread exit.
 void EnsureVehStack() {
     if (g_veh_stack_top != nullptr) {
         return;
@@ -197,10 +230,11 @@ void EnsureVehStack() {
     // 512 KiB is generous for the handler (decoder + logging + ring dumps);
     // committed up front so no guard-page growth is needed in a fault context.
     constexpr SIZE_T kVehStackSize = 512 * 1024;
-    g_veh_stack = static_cast<u8*>(
+    u8* base = static_cast<u8*>(
         VirtualAlloc(nullptr, kVehStackSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    if (g_veh_stack != nullptr) {
-        g_veh_stack_top = g_veh_stack + kVehStackSize;
+    if (base != nullptr) {
+        g_veh_stack_owner.base = base;
+        g_veh_stack_top = base + kVehStackSize;
     }
 }
 
