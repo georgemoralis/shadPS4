@@ -90,6 +90,21 @@ struct alignas(64) GuestState {
     // pause and return control to C++. Codes are in `ExitReason`.
     u32 exit_reason;
 
+    // First byte PAST the usable guest stack for this execution context
+    // (the raw guest_stack_top handed to CallGuest, before alignment), or 0
+    // when unknown. Consumed by the HLE bridge's stack-argument marshalling
+    // as the exact upper bound for its speculative reads: SysV stack args
+    // live in the caller's frame at [rsp+8..], which is mapped whenever the
+    // args exist -- the only address range a read can fault on is past the
+    // top of the stack mapping itself, and this field IS that boundary.
+    // Without it the bridge falls back to a same-page clamp, which zeroes
+    // legitimate 7th+ arguments whenever rsp lands in the top 72 bytes of
+    // any page (a 64-in-4096 nondeterministic argument-corruption bug).
+    // Inherited automatically by caller-stack callbacks (they reuse the
+    // caller's GuestState). NOT updated if the guest switches stacks
+    // (sceFiber / ucontext) -- the bridge documents that degradation.
+    u64 stack_top;
+
     // ---- Reserved / scratch ----
     // Available for backends that need a small amount of state-adjacent
     // scratch space (e.g. for save/restore around helper calls).

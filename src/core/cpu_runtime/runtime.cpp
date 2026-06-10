@@ -416,9 +416,11 @@ static_assert(std::is_same_v<decltype(HostReturn::xmm0), double>,
 ///     guest stack beyond the args (caller's spill area, padding).
 ///     The called HLE function ignores slots beyond its declared
 ///     arg count, so the extra reads are harmless. The only risk
-///     is reading past the end of the guest stack mapping; in
-///     practice guest stacks are megabytes deep and the 64-byte
-///     overscan is negligible.
+///     is reading past the end of the guest stack mapping; the
+///     reads are bounded by GuestState::stack_top (exact) when the
+///     state came through CallGuest, with a same-page clamp as the
+///     fallback for unknown / switched stacks -- see safe_read_qword
+///     in the bridge for the full bound-selection rationale.
 typedef HostReturn (*HostHleFn)(u64, u64, u64, u64, u64, u64,
                                 double, double, double, double,
                                 double, double, double, double,
@@ -637,33 +639,45 @@ void* DispatcherTrampoline(GuestState* state) {
             // Reading the guest stack (return address + spilled args) can
             // fault if guest_rsp sits near the top of a mapped page and the
             // next page is unmapped — the bridge would then crash inside the
-            // marshalling reads rather than in the called function. Guard the
-            // reads with a page bound: a qword is only dereferenced if its
-            // full 8 bytes lie within the same page as guest_rsp; otherwise it
-            // defaults to 0. The return address and SysV stack args are pushed
-            // immediately below RSP, so in practice they're always in-page and
-            // this never trips — it only protects the pathological boundary
-            // case. We use a page bound rather than a VMA query because the
-            // bridge runs from a JIT gateway frame where taking the memory
-            // manager's mutex is unsafe (same reason this path avoids spdlog).
+            // marshalling reads rather than in the called function.
             //
-            // RESIDUAL LIMITATION: the page bound proves the read stays within
-            // the *same page* as guest_rsp; it does NOT prove that page is
-            // mapped and readable. guest_rsp itself is necessarily mapped (the
-            // guest is executing on it), so a read at or just above it is safe
-            // in practice. But if guest stack mappings ever become fragmented
-            // such that guest_rsp's own page is partially unmapped, an in-page
-            // read could still fault. We accept this deliberately: a correct
-            // mapped/readable check would require a VMA/MM query, and taking
-            // the MM lock from this fault-adjacent, no-lock context risks
-            // turning a crash into a deadlock -- strictly worse than the rare
-            // fault this would prevent. If a lock-free "is this address mapped"
-            // query becomes available, this is the place to use it.
+            // BOUND SELECTION. SysV stack args live in the CALLER's frame at
+            // [rsp+8 ..]; whenever an argument actually exists there, that
+            // memory is mapped by construction (the caller wrote it). The
+            // only range a speculative read can fault on is PAST THE TOP OF
+            // THE STACK MAPPING -- reachable exactly when the callee takes
+            // fewer stack args than the 8 we read unconditionally AND the
+            // call sits in the outermost frames, within 72 bytes of the top.
+            //
+            //   - Preferred bound: state->stack_top, the true first-byte-
+            //     past-the-stack recorded by CallGuest. Exact: no fault is
+            //     possible at or below it, and no legitimate argument can
+            //     live above it. Used when nonzero and consistent with rsp.
+            //
+            //   - Fallback (stack_top == 0, or rsp above it -- e.g. the
+            //     guest switched stacks via sceFiber/ucontext, which we do
+            //     not track): the old same-page clamp. It can never fault
+            //     (rsp's own page is mapped: the guest is executing on it)
+            //     but it FALSE-ZEROES real 7th+ arguments whenever rsp
+            //     lands in the top 72 bytes of any page -- a 64-in-4096,
+            //     stack-depth-dependent argument-corruption heisenbug. That
+            //     is why the exact bound is preferred whenever available.
+            //
+            // A VMA/MM query would subsume both, but the bridge runs from a
+            // JIT gateway frame where taking the memory manager's mutex is
+            // unsafe (same reason this path avoids spdlog). If a LOCK-FREE
+            // "is this address mapped" query becomes available, this is the
+            // place to use it -- it would also cover switched stacks, where
+            // the exact bound degrades to no protection above the fiber's
+            // (unknown) top.
             constexpr u64 kPageSize = 0x1000;
-            const u64 rsp_page_end = (guest_rsp & ~(kPageSize - 1)) + kPageSize;
+            const u64 read_limit =
+                (state->stack_top != 0 && guest_rsp < state->stack_top)
+                    ? state->stack_top
+                    : (guest_rsp & ~(kPageSize - 1)) + kPageSize;
             const auto safe_read_qword = [&](u64 addr) -> u64 {
-                if (addr < guest_rsp || addr + sizeof(u64) > rsp_page_end) {
-                    // Below RSP or crossing the page boundary: don't touch it.
+                if (addr < guest_rsp || addr + sizeof(u64) > read_limit) {
+                    // Below RSP or past the bound: don't touch it.
                     return 0;
                 }
                 return *reinterpret_cast<const u64*>(addr);
@@ -705,9 +719,9 @@ void* DispatcherTrampoline(GuestState* state) {
             // If the guest's actual stack-arg count is < 8, the
             // extra reads pull whatever lives beyond the args. The
             // called HLE function ignores them per its declared
-            // signature. Each read is page-bounded (see safe_read_qword
-            // above): args past the end of guest_rsp's page default to 0
-            // rather than faulting the bridge.
+            // signature. Each read is bounded by safe_read_qword above
+            // (the recorded stack top when known, page clamp otherwise):
+            // slots past the bound default to 0 rather than faulting.
             const u64 s0 = safe_read_qword(guest_rsp + 1 * sizeof(u64));
             const u64 s1 = safe_read_qword(guest_rsp + 2 * sizeof(u64));
             const u64 s2 = safe_read_qword(guest_rsp + 3 * sizeof(u64));
@@ -1192,6 +1206,11 @@ GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
     // slots empty).
     state.mxcsr = 0x1F80;
     state.fpu_cw = 0x037F;
+
+    // Record the true top of this guest stack for the HLE bridge's
+    // stack-argument bound (see GuestState::stack_top). The raw, pre-
+    // alignment top: nothing above it is part of the allocation.
+    state.stack_top = reinterpret_cast<u64>(guest_stack_top);
 
     // Align guest stack to 16, misalign by 8 (PS4_SYSV_ABI: caller's
     // stack pointer is 8-byte-misaligned at function entry, becoming
