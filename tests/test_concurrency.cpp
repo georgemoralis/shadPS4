@@ -30,7 +30,11 @@
 #include "common/arch.h"
 #include "common/types.h"
 
-#ifdef ARCH_X86_64
+// Runs on BOTH host backends. The arm64 gate that used to wrap this file
+// existed because the arm64 lifter routed every LOCK-prefixed RMW to the
+// unsupported exit; since the LSE atomics landed (lock add lowers to
+// ldaddal), the contended-counter test below is exactly the cross-host
+// regression net those emitters need -- the guest bytes are x86 either way.
 
 #ifdef _WIN32
 #include <windows.h>
@@ -167,10 +171,4 @@ TEST(Concurrency, LockAddIsAtomic) {
         << "lost updates under contention: LOCK-prefixed add was not emitted atomically";
 }
 
-#else // !ARCH_X86_64
 
-TEST(Concurrency, LockAddIsAtomic) {
-    GTEST_SKIP() << "x86_64 host-JIT only";
-}
-
-#endif

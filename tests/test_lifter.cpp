@@ -13400,15 +13400,19 @@ TEST_F(CpuRuntimeTest, Vmovlhps_FloatPairs) {
 }
 
 // ============================================================================
-// FNSTCW / FLDCW — x87 control-word store / load (minimal model).
+// FNSTCW / FLDCW — x87 control-word store / load.
 //
-// Motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at an `fnstcw`
-// (D9 /7, length 3) in libc at guest 0x8075abcf2 (exit_reason=2) — the first
-// x87 instruction encountered. The runtime does not model the x87 control word
-// (FP goes through the SSE/MXCSR path), so FNSTCW stores the standard
-// post-FINIT control word 0x037F and FLDCW is a no-op. This lets the libc
-// float->int truncation idiom (fnstcw save / fldcw truncate / fistp / fldcw
-// restore) round-trip its saved word without faulting.
+// Originally motivated by CUSA02394 "WE ARE DOOMED", which exited the JIT at
+// an `fnstcw` (D9 /7) in libc — the first x87 instruction encountered. The
+// control word is now genuinely modelled in GuestState::fpu_cw (default =
+// the post-FNINIT 0x037F via the struct's member initializer): FLDCW loads
+// it, FNSTCW reports it, and FISTP consults its RC field (bits 11:10) for
+// rounding — on the x86 host via an MXCSR.RC transplant around the convert,
+// on arm64 via a 4-way frintn/m/p/z dispatch. That makes the full libc
+// float->int truncation idiom (fnstcw save / fldcw chop / fistp / fldcw
+// restore) behave architecturally, not just avoid faulting. PC and the
+// exception masks remain ignored by design (64-bit-double x87 model; no
+// x87 exceptions are ever raised).
 // ============================================================================
 
 // fnstcw word[rbx] stores 0x037F as a 16-bit value, not disturbing neighbors.
@@ -13431,12 +13435,20 @@ TEST_F(CpuRuntimeTest, Fnstcw_StoresDefaultControlWord) {
     EXPECT_EQ(slot[1], 0xBBBBu) << "16-bit store must not spill into next word";
 }
 
-// fldcw word[rbx] is a no-op: it must not fault and execution continues to ret.
-TEST_F(CpuRuntimeTest, Fldcw_IsNoOp) {
+// fldcw word[rbx] loads the control word into the modelled fpu_cw: a
+// subsequent fnstcw reads back the loaded value, not the FNINIT default.
+// (Replaces the old Fldcw_IsNoOp, which pinned the retired drop-the-value
+// model.) Guest GPRs stay untouched: the emitters use host-only scratch.
+TEST_F(CpuRuntimeTest, Fldcw_ObservableViaFnstcw) {
     u16* slot = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
-    *slot = 0x0C7F; // a truncating control word; ignored by our model
+    slot[0] = 0x0C7F; // a truncating control word to load
+    slot[1] = 0xAAAA; // fnstcw target, pre-poisoned
 
-    const u8 program[] = {0xd9, 0x2b, 0xc3}; // fldcw word[rbx] ; ret
+    const u8 program[] = {
+        0xd9, 0x2b,       // fldcw  word[rbx]
+        0xd9, 0x7b, 0x02, // fnstcw word[rbx+2]
+        0xc3,             // ret
+    };
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop() - 8;
     *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
@@ -13447,13 +13459,17 @@ TEST_F(CpuRuntimeTest, Fldcw_IsNoOp) {
     st.gpr[0] = 0x1234ULL; // rax untouched marker
 
     Runtime rt; rt.Run(st);
-    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd)) << "fldcw runs and reaches ret";
-    EXPECT_EQ(st.gpr[0], 0x1234ULL) << "fldcw has no observable register effect";
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd)) << "sequence completes";
+    EXPECT_EQ(slot[1], 0x0C7Fu) << "fnstcw reads back the word fldcw loaded";
+    EXPECT_EQ(st.fpu_cw, 0x0C7Fu) << "control word tracked in GuestState";
+    EXPECT_EQ(st.gpr[0], 0x1234ULL) << "fldcw/fnstcw have no guest register effect";
 }
 
-// The save/restore round-trip: fnstcw [save] ... fldcw [save]. After fnstcw the
-// saved word is 0x037F; the subsequent fldcw consumes it harmlessly. We model
-// the common sequence as: fnstcw [rbx] ; fldcw [rbx] ; ret.
+// The save/restore round-trip: fnstcw [save] ... fldcw [save]. With a
+// default-initialized state, fnstcw stores the FNINIT word 0x037F and the
+// fldcw restores that same value into fpu_cw — the identity round-trip a
+// guest's save/restore prologue performs. (Non-default ambient words are
+// covered by Fldcw_ObservableViaFnstcw above.)
 TEST_F(CpuRuntimeTest, Fnstcw_Fldcw_RoundTrips) {
     u16* save = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
     *save = 0x0000;
@@ -13475,6 +13491,106 @@ TEST_F(CpuRuntimeTest, Fnstcw_Fldcw_RoundTrips) {
     EXPECT_EQ(*save, 0x037Fu) << "fnstcw wrote the control word, fldcw left it intact";
     EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd)) << "sequence completes";
 }
+
+// fistp honors the control word's RC field: with RC=11 (truncate toward
+// zero) loaded via fldcw, converting 2.7 stores 2 — the classic pre-SSE
+// float->int cast idiom. The retired model always rounded to nearest
+// (would store 3 here): this is the regression test for the x86 host's
+// MXCSR.RC transplant and the arm64 host's frint* dispatch alike.
+TEST_F(CpuRuntimeTest, Fistp_HonorsControlWordTruncate) {
+    u16* cw = reinterpret_cast<u16*>(mem.CodePtr() + 0x100);
+    double* val = reinterpret_cast<double*>(mem.CodePtr() + 0x110);
+    s32* out = reinterpret_cast<s32*>(mem.CodePtr() + 0x120);
+    *cw = 0x0F7F;  // FNINIT word with RC=11 (chop)
+    *val = 2.7;
+    *out = -1;
+
+    const u8 program[] = {
+        0xd9, 0x2b, // fldcw word[rbx]
+        0xdd, 0x01, // fld   qword[rcx]
+        0xdb, 0x1a, // fistp dword[rdx]
+        0xc3,       // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(cw);
+    st.gpr[1] = reinterpret_cast<u64>(val);
+    st.gpr[2] = reinterpret_cast<u64>(out);
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd)) << "sequence completes";
+    EXPECT_EQ(*out, 2) << "RC=chop truncates 2.7 -> 2 (round-to-nearest would give 3)";
+}
+
+// DF set by STD must survive flag-writing instructions between the STD and
+// its consumer. Every pushfq-capturing emitter (shifts, adc, narrow arith,
+// the locked-RMW family) stores its result flags through an arith-only
+// merge; a wholesale store of host flags (the retired behavior) wrote host
+// DF=0 over the guest's DF=1, silently reversing the next rep movs.
+TEST_F(CpuRuntimeTest, Std_DfSurvivesFlagWritingOps) {
+    const u8 program[] = {
+        0xfd,             // std
+        0x48, 0xd1, 0xe0, // shl rax, 1   (pushfq round-trip path)
+        0xc3,             // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0x21;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd)) << "sequence completes";
+    EXPECT_EQ(st.gpr[0], 0x42u) << "shl executed";
+    EXPECT_NE(st.rflags & (1ULL << 10), 0u)
+        << "DF (set by std) must survive the shl's flag store";
+}
+
+#ifdef ARCH_X86_64
+// lock bts: atomic bit test-and-set via host passthrough. CF receives the
+// PRE-update bit value; the addressed bit is set afterwards. Run twice on
+// the same word to pin both CF polarities. x86-host only: the arm64
+// backend deliberately declines locked bit ops (bit-string addressing
+// needs a CAS loop there) and routes them to the unsupported exit — when
+// that lands, drop this gate.
+TEST_F(CpuRuntimeTest, LockBts_SetsBitAndReportsCF) {
+    u64* word = reinterpret_cast<u64*>(mem.CodePtr() + 0x100);
+    *word = 0;
+
+    const u8 program[] = {
+        0xf0, 0x48, 0x0f, 0xab, 0x03, // lock bts qword[rbx], rax
+        0xc3,                         // ret
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+
+    const auto run_once = [&](GuestState& st) {
+        u8* guest_rsp = mem.StackTop() - 8;
+        *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+        st.rip = reinterpret_cast<u64>(mem.CodePtr());
+        st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+        st.gpr[3] = reinterpret_cast<u64>(word);
+        st.gpr[0] = 5; // bit index
+        Runtime rt; rt.Run(st);
+        ASSERT_EQ(st.exit_reason, static_cast<u32>(ExitReason::BlockEnd));
+    };
+
+    GuestState first{};
+    run_once(first);
+    EXPECT_EQ(*word, 1ULL << 5) << "bit 5 set";
+    EXPECT_EQ(first.rflags & 0x1ULL, 0u) << "CF = pre-update bit (was clear)";
+
+    GuestState second{};
+    run_once(second);
+    EXPECT_EQ(*word, 1ULL << 5) << "bts of a set bit leaves it set";
+    EXPECT_EQ(second.rflags & 0x1ULL, 1u) << "CF = pre-update bit (was set)";
+}
+#endif // ARCH_X86_64
 
 // ============================================================================
 // STMXCSR / LDMXCSR — store / load the SSE control-and-status register.
@@ -17992,8 +18108,8 @@ TEST_F(CpuRuntimeTest, Vmovd_GprFromXmm_ZeroExtendsTo64) {
 // instruction on x86 hardware (incl. SSE4.2 for the PCMPISTR string ops).
 // Exceptions: VRCPPS/VRSQRTPS are fast estimates whose x86 (~12-bit) and arm64
 // (~8-bit) results differ by design, so those two assert a relative tolerance.
-// (Segment-prefixed FS/GS loads remain ARCH_X86_64-guarded above: segment-base
-// folding is not implemented on the arm64 backend.)
+// (Segment-prefixed FS/GS loads are likewise unguarded since the arm64
+// backend gained segment-base folding; see the FsSegmentOverride tests.)
 // ============================================================================
 
 TEST_F(CpuRuntimeTest, Arm64_Vpaddb_PackedByteAdd) {
