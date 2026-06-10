@@ -2593,6 +2593,304 @@ bool EmitCmpxchg(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     return true;
 }
 
+// ============================================================================
+// EmitLockedRmwA64 — guest atomics via LSE
+// ============================================================================
+//
+// Guest threads run on parallel host threads over shared guest memory, so a
+// LOCK-prefixed RMW (and the implicitly-locked XCHG-with-memory) must be one
+// atomic step with full x86-LOCK ordering. This backend targets Apple Silicon
+// exclusively (ARMv8.4+), so the LSE atomics are unconditionally available --
+// no ldxr/stxr fallback loop is needed. The acquire+release (*al) variants
+// are the correct strength mapping for x86 LOCK semantics (the same mapping
+// Rosetta/FEX use): a LOCK op is a full two-way fence on x86, and
+// load-acquire/store-release on the single accessed location plus the
+// program-order guarantees of the surrounding TSO-translated code give the
+// observable equivalent.
+//
+// Covered (widths 8/16/32/64 unless noted):
+//   ADD / SUB                  -> ldaddal (SUB negates the operand)
+//   AND / OR / XOR             -> ldclral (complement) / ldsetal / ldeoral
+//   INC / DEC      (32/64)     -> ldaddal +/-1, CF preserved by materializer
+//   XADD           (32/64)     -> ldaddal, reg receives old value
+//   CMPXCHG        (32/64)     -> casal, acc receives old value
+//   XCHG mem form              -> swpal, reg receives old value
+//
+// NOT covered -- returns false, routing to the diagnosable unsupported exit
+// (NEVER to the plain non-atomic emitters):
+//   ADC / SBB (need a flag-input CAS loop), NEG / NOT (no LSE op; CAS loop),
+//   BTS / BTR / BTC (bit-string addressing), CMPXCHG8B / CMPXCHG16B (needs
+//   caspal), 8/16-bit XADD/CMPXCHG, AH/CH/DH/BH operands. All are rare; add
+//   on first sighting in a real binary.
+//
+// Flags: every op stashes the lazy side-band as (lhs = OLD memory value,
+// rhs = operand, result = computed) with the operation width, then
+// materializes -- exactly matching the x86 semantics where LOCK-op flags are
+// derived from the pre-update memory value.
+//
+// Register budget: x15 = stable EA, x5 = operand value, x6 = old memory
+// value (LSE destination), x7 = transformed operand / CAS-new, x12/x13 =
+// transients. EmitMaterializeFlags clobbers x5..x7 and x9..x15, so all GPR
+// writebacks happen before it (it re-reads the side-band from memory).
+bool EmitLockedRmwA64(const ZydisDecodedInstruction& insn,
+                      const ZydisDecodedOperand* ops, u64 next_rip,
+                      CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const u32 w = insn.operand_width;
+    if (w != 8 && w != 16 && w != 32 && w != 64) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false; // LOCK => mem dst
+
+    const XReg addr = XReg(15);
+    const XReg val = XReg(5), old = XReg(6), op2 = XReg(7);
+    const WReg wval = WReg(5), wold = WReg(6), wop2 = WReg(7);
+
+    // Width-masked load of the source operand (register or immediate) into
+    // x5. High-byte registers (AH..BH) are not handled. Immediates arrive
+    // sign-extended from Zydis; mask to width so the side-band and the
+    // narrow LSE forms see the architectural operand.
+    auto load_src = [&](const ZydisDecodedOperand& op) -> bool {
+        if (op.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            if (HighByteParent(op.reg.value) >= 0) return false;
+            const int idx = ZydisGprToIndex(op.reg.value);
+            if (idx < 0) return false;
+            c.ldr(val, ptr(kState, GprOffset(idx)));
+        } else if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            c.mov(val, static_cast<u64>(op.imm.value.s));
+        } else {
+            return false;
+        }
+        if (w < 64) {
+            c.mov(op2, (1ull << w) - 1);
+            c.and_(val, val, op2);
+        }
+        return true;
+    };
+
+    // Width-dispatched LSE fetch-ops: result (old value) -> x6/w6.
+    auto lse_add = [&](const XReg& s) {
+        switch (w) {
+        case 8:  c.ldaddalb(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 16: c.ldaddalh(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 32: c.ldaddal(WReg(s.getIdx()), wold, ptr(addr)); break;
+        default: c.ldaddal(s, old, ptr(addr)); break;
+        }
+    };
+    auto lse_set = [&](const XReg& s) {
+        switch (w) {
+        case 8:  c.ldsetalb(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 16: c.ldsetalh(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 32: c.ldsetal(WReg(s.getIdx()), wold, ptr(addr)); break;
+        default: c.ldsetal(s, old, ptr(addr)); break;
+        }
+    };
+    auto lse_clr = [&](const XReg& s) {
+        switch (w) {
+        case 8:  c.ldclralb(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 16: c.ldclralh(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 32: c.ldclral(WReg(s.getIdx()), wold, ptr(addr)); break;
+        default: c.ldclral(s, old, ptr(addr)); break;
+        }
+    };
+    auto lse_eor = [&](const XReg& s) {
+        switch (w) {
+        case 8:  c.ldeoralb(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 16: c.ldeoralh(WReg(s.getIdx()), wold, ptr(addr)); break;
+        case 32: c.ldeoral(WReg(s.getIdx()), wold, ptr(addr)); break;
+        default: c.ldeoral(s, old, ptr(addr)); break;
+        }
+    };
+
+    // Invariant relied on below: the byte/half LSE forms ZERO-EXTEND the
+    // loaded old value into Wt, and any W-register write zero-extends into
+    // the X register -- so after every lse_* call, x6 (`old`) holds the
+    // width-masked old memory value with clean upper bits, no further
+    // masking needed.
+
+    // Side-band + materialize. lhs/rhs/result already in x-regs.
+    auto flags = [&](u32 flag_op, const XReg& lhs, const XReg& rhs,
+                     const XReg& result) {
+        c.str(lhs, ptr(kState, Offsets::FlagLhs));
+        c.str(rhs, ptr(kState, Offsets::FlagRhs));
+        c.str(result, ptr(kState, Offsets::FlagResult));
+        c.mov(kWScratch0, flag_op);
+        c.str(kWScratch0,
+              ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+        c.mov(kWScratch0, w);
+        c.str(kWScratch0,
+              ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
+        EmitMaterializeFlags(c);
+    };
+
+    // Effective address first (clobbers x9/x11), parked in x15.
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    c.mov(addr, kAddr);
+
+    switch (m) {
+    // ---- binary RMW: [mem] op= (reg | imm); flags from OLD value ----
+    case ZYDIS_MNEMONIC_ADD:
+    case ZYDIS_MNEMONIC_SUB: {
+        if (!load_src(ops[1])) return false;
+        if (m == ZYDIS_MNEMONIC_SUB) {
+            c.neg(op2, val);                  // memory receives old + (-val)
+            if (w < 64) {
+                c.mov(XReg(12), (1ull << w) - 1);
+                c.and_(op2, op2, XReg(12));   // narrow forms add low bits
+            }
+            lse_add(op2);
+        } else {
+            lse_add(val);
+        }
+        // result for flags: old +/- val at width.
+        if (m == ZYDIS_MNEMONIC_SUB) c.sub(XReg(12), old, val);
+        else                         c.add(XReg(12), old, val);
+        if (w < 64) {
+            c.mov(XReg(13), (1ull << w) - 1);
+            c.and_(XReg(12), XReg(12), XReg(13));
+        }
+        flags(m == ZYDIS_MNEMONIC_SUB ? FLAG_OP_SUB : FLAG_OP_ADD,
+              old, val, XReg(12));
+        return true;
+    }
+    case ZYDIS_MNEMONIC_AND:
+    case ZYDIS_MNEMONIC_OR:
+    case ZYDIS_MNEMONIC_XOR: {
+        if (!load_src(ops[1])) return false;
+        if (m == ZYDIS_MNEMONIC_AND) {
+            c.mvn(op2, val);                  // AND old,val == CLR old,~val
+            lse_clr(op2);
+            c.and_(XReg(12), old, val);
+        } else if (m == ZYDIS_MNEMONIC_OR) {
+            lse_set(val);
+            c.orr(XReg(12), old, val);
+        } else {
+            lse_eor(val);
+            c.eor(XReg(12), old, val);
+        }
+        if (w < 64) {
+            c.mov(XReg(13), (1ull << w) - 1);
+            c.and_(XReg(12), XReg(12), XReg(13));
+        }
+        flags(FLAG_OP_LOGIC, old, val, XReg(12));
+        return true;
+    }
+
+    // ---- unary RMW: INC/DEC (32/64); CF preserved by the materializer ----
+    case ZYDIS_MNEMONIC_INC:
+    case ZYDIS_MNEMONIC_DEC: {
+        if (w != 32 && w != 64) return false;
+        const bool inc = (m == ZYDIS_MNEMONIC_INC);
+        c.mov(val, 1);
+        if (inc) {
+            lse_add(val);
+            c.add(XReg(12), old, val);
+        } else {
+            c.mov(op2, static_cast<u64>(-1));
+            if (w == 32) {
+                c.mov(XReg(13), 0xFFFFFFFFull);
+                c.and_(op2, op2, XReg(13));
+            }
+            lse_add(op2);
+            c.sub(XReg(12), old, val);
+        }
+        if (w == 32) {
+            c.mov(XReg(13), 0xFFFFFFFFull);
+            c.and_(XReg(12), XReg(12), XReg(13));
+        }
+        flags(inc ? FLAG_OP_INC : FLAG_OP_DEC, old, val, XReg(12));
+        return true;
+    }
+
+    // ---- XADD: reg <- old [mem]; [mem] += reg; flags from OLD value ----
+    case ZYDIS_MNEMONIC_XADD: {
+        if (w != 32 && w != 64) return false;
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        if (HighByteParent(ops[1].reg.value) >= 0) return false;
+        const int reg = ZydisGprToIndex(ops[1].reg.value);
+        if (reg < 0) return false;
+        if (!load_src(ops[1])) return false;
+        lse_add(val);
+        // reg = old (32-bit zero-extends the slot; old is already
+        // zero-extended by the W-form write).
+        c.str(old, ptr(kState, GprOffset(reg)));
+        c.add(XReg(12), old, val);
+        if (w == 32) {
+            c.mov(XReg(13), 0xFFFFFFFFull);
+            c.and_(XReg(12), XReg(12), XReg(13));
+        }
+        flags(FLAG_OP_ADD, old, val, XReg(12));
+        return true;
+    }
+
+    // ---- CMPXCHG: casal; acc <- old; flags = CMP(acc, old) ----
+    case ZYDIS_MNEMONIC_CMPXCHG: {
+        if (w != 32 && w != 64) return false;
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        if (HighByteParent(ops[1].reg.value) >= 0) return false;
+        const int reg = ZydisGprToIndex(ops[1].reg.value);
+        if (reg < 0) return false;
+        constexpr int RAX_IDX = 0;
+
+        // x5 = expected (acc) -- casal overwrites it with the old value, so
+        // keep the original acc in x12 for the flag computation.
+        c.ldr(val, ptr(kState, GprOffset(RAX_IDX)));
+        c.ldr(op2, ptr(kState, GprOffset(reg)));   // desired/new
+        if (w == 32) {
+            c.mov(XReg(13), 0xFFFFFFFFull);
+            c.and_(val, val, XReg(13));
+            c.and_(op2, op2, XReg(13));
+        }
+        c.mov(XReg(12), val);                      // acc copy for flags
+        if (w == 32) c.casal(wval, wop2, ptr(addr));
+        else         c.casal(val, op2, ptr(addr));
+        // x5 now holds the OLD memory value (zero-extended for w32).
+        // Architectural acc writeback: on success old == acc (identity), on
+        // failure acc = old -- so an unconditional store of old is exact.
+        c.str(val, ptr(kState, GprOffset(RAX_IDX)));
+        // flags = CMP(acc_orig, old): lhs = x12, rhs = x5.
+        c.sub(XReg(13), XReg(12), val);
+        if (w == 32) {
+            c.mov(old, 0xFFFFFFFFull);             // x6 free as a mask reg here
+            c.and_(XReg(13), XReg(13), old);
+        }
+        flags(FLAG_OP_SUB, XReg(12), val, XReg(13));
+        return true;
+    }
+
+    // ---- XCHG with memory: implicitly locked; swpal; no flags ----
+    case ZYDIS_MNEMONIC_XCHG: {
+        // Zydis may order the operands either way; normalize to mem in
+        // ops[0] (guaranteed by the gate's mem check) and reg in ops[1].
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        if (HighByteParent(ops[1].reg.value) >= 0) return false;
+        const int reg = ZydisGprToIndex(ops[1].reg.value);
+        if (reg < 0) return false;
+        if (!load_src(ops[1])) return false;
+        switch (w) {
+        case 8:  c.swpalb(wval, wold, ptr(addr)); break;
+        case 16: c.swpalh(wval, wold, ptr(addr)); break;
+        case 32: c.swpal(wval, wold, ptr(addr)); break;
+        default: c.swpal(val, old, ptr(addr)); break;
+        }
+        // Register writeback with width semantics: 8/16 merge into the low
+        // bits preserving the rest of the slot; 32 zero-extends; 64 full.
+        if (w == 8 || w == 16) {
+            const u64 msk = (1ull << w) - 1;
+            c.ldr(XReg(12), ptr(kState, GprOffset(reg)));
+            c.mov(XReg(13), ~msk);
+            c.and_(XReg(12), XReg(12), XReg(13));
+            c.orr(XReg(12), XReg(12), old);        // old already zero-extended
+            c.str(XReg(12), ptr(kState, GprOffset(reg)));
+        } else {
+            c.str(old, ptr(kState, GprOffset(reg)));
+        }
+        return true;
+    }
+
+    default:
+        return false; // ADC/SBB/NEG/NOT/BTS/BTR/BTC/CMPXCHG8B/16B: gate.
+    }
+}
+
 // guest: ret (no-immediate form only).
 //   rip = [rsp]; rsp += 8; exit_reason = BlockEnd; br dispatch-top (normal).
 // Mirrors x86 EmitRet exactly. This is the NORMAL block terminator — it sets
@@ -2837,10 +3135,25 @@ bool EmitIncDec64(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
 // when the upper 32 bits of the base register hold garbage.
 bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem, u64 next_rip,
                           CodeGenerator& c, bool addr32) {
-    // Only flat segments (DS/SS/CS/ES). FS/GS would need TLS-base handling.
-    if (mem.segment != ZYDIS_REGISTER_DS && mem.segment != ZYDIS_REGISTER_SS &&
-        mem.segment != ZYDIS_REGISTER_CS && mem.segment != ZYDIS_REGISTER_ES) {
-        return false;
+    // Segment handling mirrors the x86 host lifter: DS/SS/CS/ES are flat
+    // (base 0) in long mode; FS/GS carry the guest-visible TLS bases that
+    // live in GuestState (fs_base = the thread's TCB, installed by Run()
+    // via GetTcbBase). The base is added LAST, after the addr32 truncation
+    // if any -- architecturally the linear address is seg_base + the
+    // (possibly 32-bit-truncated) effective address. This unblocks every
+    // TLS access on this backend: fs:[0] (TCB self-pointer) and fs:[0x28]
+    // (stack canary) previously took the fatal unsupported exit, which
+    // stopped any real guest function prologue cold.
+    int seg_base_off = -1;
+    if (mem.segment == ZYDIS_REGISTER_FS) {
+        seg_base_off = static_cast<int>(Offsets::FsBase);
+    } else if (mem.segment == ZYDIS_REGISTER_GS) {
+        seg_base_off = static_cast<int>(Offsets::GsBase);
+    } else if (mem.segment != ZYDIS_REGISTER_DS &&
+               mem.segment != ZYDIS_REGISTER_SS &&
+               mem.segment != ZYDIS_REGISTER_CS &&
+               mem.segment != ZYDIS_REGISTER_ES) {
+        return false;  // genuinely unsupported segment
     }
 
     const bool has_base = (mem.base != ZYDIS_REGISTER_NONE);
@@ -2852,13 +3165,19 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem, u64 next_rip,
     // RIP-relative: address = next_rip + disp, constant-folded.
     if (has_base && mem.base == ZYDIS_REGISTER_RIP) {
         if (has_index) return false;
+        if (seg_base_off >= 0) return false;  // segment + RIP-relative: degenerate
         c.mov(kAddr, static_cast<u64>(static_cast<s64>(next_rip) + disp));
         return true;
     }
 
-    // Plain [disp] absolute (no base, no index).
+    // Plain [disp] absolute (no base, no index). With a segment override
+    // this is the common TLS form (fs:[0], fs:[0x28]).
     if (!has_base && !has_index) {
         c.mov(kAddr, static_cast<u64>(disp));
+        if (seg_base_off >= 0) {
+            c.ldr(idx_scratch, ptr(kState, static_cast<u32>(seg_base_off)));
+            c.add(kAddr, kAddr, idx_scratch);
+        }
         return true;
     }
 
@@ -2899,6 +3218,14 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem, u64 next_rip,
         // 63:32 of the underlying X register. (There is no scalar uxtw in
         // this assembler; the W-move is the canonical equivalent.)
         c.mov(WReg(11), WReg(11));
+    }
+
+    // FS/GS base last, after the index/disp math and any addr32 truncation
+    // (the base is part of LINEAR address formation, applied to the already-
+    // truncated effective address).
+    if (seg_base_off >= 0) {
+        c.ldr(idx_scratch, ptr(kState, static_cast<u32>(seg_base_off)));
+        c.add(kAddr, kAddr, idx_scratch);
     }
     return true;
 }
@@ -7197,23 +7524,23 @@ void* Lifter::CompileBlock(u64 guest_rip) {
 
         const u64 next_rip = rip + insn.length;
 
-        // LOCK-prefixed RMW: guest atomics (lock add/or/xadd/cmpxchg, and
-        // implicitly-locked xchg-with-memory) require LSE atomics or an
-        // ldxr/stxr loop on this weakly-ordered host; the plain ldr/op/str
-        // the emitters below produce would be a silent data race against
-        // other guest threads. Until real atomics land, bail to the
-        // diagnosable unsupported exit instead of corrupting sync state.
-        if ((insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
+        // Guest atomics: LOCK-prefixed RMW and the implicitly-locked
+        // XCHG-with-memory route to the LSE emitter -- one atomic host op
+        // with acquire+release ordering, matching x86 LOCK semantics. Forms
+        // the LSE emitter declines (ADC/SBB, NEG/NOT, bit ops, CMPXCHG8B/
+        // 16B, high-byte operands) leave handled == false and take the
+        // generic unsupported exit below; they must NEVER fall into the
+        // plain emitters, whose ldr/op/str lowering is a silent data race
+        // against other guest threads.
+        bool handled = false;
+        const bool guest_atomic =
+            (insn.attributes & ZYDIS_ATTRIB_HAS_LOCK) != 0 ||
             (insn.mnemonic == ZYDIS_MNEMONIC_XCHG &&
              (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY ||
-              ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY))) {
-            ++unsupported_hits_;
-            EmitUnsupportedExit(rip, c);
-            emitted_terminator = true;
-            break;
-        }
-
-        bool handled = false;
+              ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY));
+        if (guest_atomic) {
+            handled = EmitLockedRmwA64(insn, ops, next_rip, c);
+        } else
         switch (insn.mnemonic) {
         case ZYDIS_MNEMONIC_MOV:
             handled = EmitMov(insn, ops, next_rip, c);
