@@ -7,6 +7,7 @@
 // release build links in nothing from here.
 #ifdef SHADPS4_RUNTIME_DIAGNOSTICS
 
+#include <cstring>
 #include <string_view>
 #include <unordered_set>
 #include <cstddef>
@@ -237,14 +238,13 @@ void RecordBlockBoundary(GuestState* state, u64 cur_rip) {
 
     // Field write-watchpoint. The recurring null-deref faults on a load of
     // [obj+0x18] that comes back 0; for this title the object is at guest
-    // 0x8016a2258, so the field is at 0x8016a2270. Guest memory is identity-
-    // mapped to host VAs (the lifter dereferences guest addresses directly),
-    // so we can read the field straight from this address. We poll it at every
-    // block boundary and log (a) the first observed value and (b) every change,
-    // with the block RIP that just ran. This reveals whether the field is never
-    // written (initializer skipped) or written-then-zeroed (lifecycle bug), and
-    // names the block that performs the last write before the fault. Env-gated
-    // (SHADPS4_WATCH=1) and cached so it costs nothing when off.
+    // Guest memory is identity-mapped to host VAs (the lifter dereferences
+    // guest addresses directly), so watched fields read straight from their
+    // guest addresses. Polled at every block boundary: first observed value
+    // plus every change, attributed to the block that ran just before the
+    // observing boundary. v6 watches the two RSDK records implicated by the
+    // [VERDICT] (see the slot table below); the original 0x8016a2270 lead is
+    // closed and retired. SHADPS4_WATCH=0 disables.
     {
         static thread_local int watch_on = -1;
         if (watch_on == -1) {
@@ -257,54 +257,75 @@ void RecordBlockBoundary(GuestState* state, u64 cur_rip) {
             watch_on = (e && e[0] == '0') ? 0 : 1;
         }
         if (watch_on == 1) {
-            constexpr u64 kWatchAddr = 0x8016a2270ull;   // 0x8016a2258 + 0x18
-            static thread_local bool   wp_inited = false;
-            static thread_local u64    wp_last   = 0;
-            static thread_local u64    wp_hits   = 0;
-            static thread_local u64    wp_prev_rip = 0;  // block seen at the prior poll
-            // Read the field through a fault-guarded helper: early in boot the
-            // owning object may not be mapped yet, and an unguarded read would
-            // crash the diagnostic itself. If not yet readable, skip this poll
-            // (we'll pick it up once the page is live).
-            u64 cur = 0;
-            if (SafeReadU64(kWatchAddr, &cur)) {
-                if (!wp_inited) {
-                    wp_inited = true;
-                    wp_last = cur;
+            // v6: multi-slot change logger. The v5 [VERDICT] proved the
+            // faulting argument is a faithful read of an UNINITIALIZED
+            // record in main-module static data: {id=0, q@+8=0, q@+0x10=0x3f}
+            // at blob(0x800655d10)+0x278, while its sibling record at
+            // blob+0x0 held a live heap pointer one loop iteration earlier.
+            // So the question is no longer "who corrupted a byte" but "who
+            // initializes these records, and why did entry1's init not run
+            // (or get diverted)". We watch BOTH records:
+            //   slots 0-2: the BROKEN record  (blob+0x278: id / qA / qB)
+            //   slots 3-5: the HEALTHY record (blob+0x000: id / qA / qB)
+            // When the healthy record's writer fires, its block RIP names
+            // the init function -- then the broken record either (a) shows
+            // a write too (writer found directly), or (b) never changes
+            // from its image/boot value, proving the init path skipped it,
+            // and the init function's own branches become the next focus.
+            // The original 0x8016a2270 watch is retired (that lead closed).
+            struct WatchSlot {
+                u64 addr;
+                const char* tag;
+                bool inited;
+                u64 last;
+                u64 prev_rip;
+                u32 hits;
+            };
+            static thread_local WatchSlot wp_slots[] = {
+                {0x800655f88ull, "broken.id ", false, 0, 0, 0},
+                {0x800655f90ull, "broken.qA ", false, 0, 0, 0},
+                {0x800655f98ull, "broken.qB ", false, 0, 0, 0},
+                {0x800655d10ull, "healthy.id", false, 0, 0, 0},
+                {0x800655d18ull, "healthy.qA", false, 0, 0, 0},
+                {0x800655d20ull, "healthy.qB", false, 0, 0, 0},
+            };
+            for (auto& s : wp_slots) {
+                u64 cur = 0;
+                if (!SafeReadU64(s.addr, &cur)) {
+                    continue; // not mapped yet; poll again next boundary
+                }
+                if (!s.inited) {
+                    s.inited = true;
+                    s.last = cur;
                     LOG_ERROR(Core,
-                              "[WATCH] first readable [{:#x}] = {:#x} (at block {:#x})",
-                              kWatchAddr, cur, cur_rip);
-                } else if (cur != wp_last) {
-                    if (wp_hits < 256) {
-                        ++wp_hits;
-                        // The poll runs at each block entry, so the value read
-                        // now reflects everything the PREVIOUS block (wp_prev_rip)
-                        // did, including any HLE call it made. That previous block
-                        // is therefore the writer (or its callee is). We report
-                        // both the writer (prev) and the boundary we are at (cur).
+                              "[WATCH] {} first readable [{:#x}] = {:#x} "
+                              "(at block {:#x})",
+                              s.tag, s.addr, cur, cur_rip);
+                } else if (cur != s.last) {
+                    if (s.hits < 256) {
+                        ++s.hits;
+                        // Poll runs at each block entry: the value now
+                        // reflects everything the PREVIOUS block (and any
+                        // HLE it called) did -- that block is the writer.
                         LOG_ERROR(Core,
-                                  "[WATCH] [{:#x}] changed {:#x} -> {:#x} "
-                                  "(writer block = {:#x}; observed at boundary {:#x})",
-                                  kWatchAddr, wp_last, cur, wp_prev_rip, cur_rip);
-                    }
-                    // On the zeroing transition, dump the recent block-RIP ring
-                    // so the exact one-block-wide gap and its predecessors are
-                    // visible, and flag the writer (previous) block so the
-                    // corruption check can hex-dump its host bytes.
-                    if (cur == 0 && wp_last != 0) {
-                        g_watch_zeroing_block = wp_prev_rip;
-                        LOG_ERROR(Core,
-                                  "[WATCH] block-RIP ring at zeroing (oldest first):");
-                        const u32 live = (g_rip_ring_pos < 32u) ? g_rip_ring_pos : 32u;
-                        for (u32 k = live; k >= 1; --k) {
-                            const u32 idx = (g_rip_ring_pos - k) & 31;
-                            LOG_ERROR(Core, "[WATCH]   block {:#x}", g_rip_ring[idx]);
+                                  "[WATCH] {} [{:#x}] changed {:#x} -> {:#x} "
+                                  "(writer block = {:#x}; observed at "
+                                  "boundary {:#x})",
+                                  s.tag, s.addr, s.last, cur, s.prev_rip,
+                                  cur_rip);
+                        // Queue the writer's host code for a one-shot dump
+                        // (reuses the existing zeroing-block dump machinery
+                        // in CheckRegisterCorruption). Any write to the
+                        // BROKEN record is the headline event; the healthy
+                        // record's first write identifies the init function.
+                        if (g_watch_zeroing_block == 0) {
+                            g_watch_zeroing_block = s.prev_rip;
                         }
                     }
-                    wp_last = cur;
+                    s.last = cur;
                 }
+                s.prev_rip = cur_rip;
             }
-            wp_prev_rip = cur_rip;
         }
     }
 
@@ -352,6 +373,69 @@ void RecordBlockBoundary(GuestState* state, u64 cur_rip) {
                 if (!g_snaps[slot].valid) continue;
                 LOG_ERROR(Core, "[CALLER]   {:#x} : rcx={:#x}",
                           g_snaps[slot].rip, g_snaps[slot].gpr[1]);
+            }
+
+            // v5 [VERDICT]: replay the caller's argument computation FROM
+            // MEMORY and compare against the actual rcx. The producer chain
+            // (caller block 0x80030e680, fully disassembled in the v4
+            // session) is:
+            //
+            //   off = dword[r14+rax+0x30]
+            //   blob = qword[rbp-0x68]
+            //   id  = word[blob+off]
+            //   ZF  = ((dword[r14+rax+0x3c] & id) == 0)
+            //   sel = blob + off + (ZF ? 0x10 : 8)        ; test/cmove
+            //   rdx = qword[sel]
+            //   idx = dword[r14+rax+0x38]
+            //   rcx_arg = (idx << 4) + rdx
+            //
+            // r14/rax/rbp are live and untouched through the caller's tail
+            // (verified against the v4 disassembly: no writes before the
+            // call), so every input is recomputable right here at the
+            // boundary. Outcomes:
+            //   replay == actual rcx (0x3f)  -> the selected qword GENUINELY
+            //       holds 0x3f: the JIT executed the selection faithfully
+            //       and the corruption is UPSTREAM in whoever wrote
+            //       blob+off+{8,0x10}. Next: point [WATCH] at that address.
+            //   replay != actual rcx         -> the data says a different
+            //       qword should have been picked: ZF was WRONG at runtime.
+            //       The only instructions between the flag-setting test and
+            //       the cmove are two LEAs -> audit EmitLea /
+            //       EmitNarrowArith32's flag store / EmitJccCondition.
+            // Both qwords are dumped either way so the record shape is
+            // visible (RSDK two-storage select: bit 15 of id picks).
+            {
+                const u64 r14v = state->gpr[14];
+                const u64 raxv = state->gpr[0];
+                const u64 rbpv = state->gpr[5];
+                const u64 base = r14v + raxv;
+                u32 off = 0, mask = 0, idx = 0;
+                u64 blob = 0;
+                std::memcpy(&off,  reinterpret_cast<const void*>(base + 0x30), 4);
+                std::memcpy(&mask, reinterpret_cast<const void*>(base + 0x3c), 4);
+                std::memcpy(&idx,  reinterpret_cast<const void*>(base + 0x38), 4);
+                std::memcpy(&blob, reinterpret_cast<const void*>(rbpv - 0x68), 8);
+                u16 id = 0;
+                u64 qa = 0, qb = 0;
+                if (blob != 0) {
+                    std::memcpy(&id, reinterpret_cast<const void*>(blob + off), 2);
+                    std::memcpy(&qa, reinterpret_cast<const void*>(blob + off + 8), 8);
+                    std::memcpy(&qb, reinterpret_cast<const void*>(blob + off + 0x10), 8);
+                }
+                const bool zf = ((mask & id) == 0);
+                const u64 sel = zf ? qb : qa;
+                const u64 replay = (static_cast<u64>(idx) << 4) + sel;
+                LOG_ERROR(Core,
+                          "[VERDICT] off={:#x} blob={:#x} id={:#x} mask={:#x} "
+                          "idx={:#x} q@+8={:#x} q@+0x10={:#x} zf(expected)={} "
+                          "sel={:#x} replay={:#x} actual_rcx={:#x} => {}",
+                          off, blob, id, mask, idx, qa, qb, zf, sel, replay,
+                          state->gpr[1],
+                          (replay == state->gpr[1])
+                              ? "FAITHFUL SELECTION - corrupt qword in memory; "
+                                "hunt the WRITER of the selected slot"
+                              : "SELECTION MISMATCH - ZF was wrong at runtime; "
+                                "audit test/lea/cmove emitters");
             }
         }
     }
@@ -647,7 +731,9 @@ void DumpFaultStruct(GuestState* state) {
     FaultCallRec& r = g_fault_ring[g_fault_ring_pos % kFaultRingDepth];
     r.r14 = r14; r.rax = rax; r.rdx = rdx; r.base = base;
     r.base_ok = base_ok; r.V = V;
-    r.predicted_r15 = V;  // rcx = the loaded field directly (mov rcx, eax)
+    r.predicted_r15 = V;  // v3 leftover; kept populated but no longer
+                          // reported -- the first-load value is NOT the
+                          // call argument (see the v4 note at the dump).
     r.valid = true;
     g_fault_ring_pos++;
 
@@ -678,10 +764,18 @@ void DumpFaultRing() {
         const FaultCallRec& r = g_fault_ring[slot];
         if (!r.valid) continue;
         if (r.base_ok) {
+            // v4 NOTE: "-> rcx(=r15)" was the v3 provenance hypothesis and
+            // is WRONG for this block. Disassembly shows rcx is rewritten
+            // at least twice after the first load within 45 bytes (lea/
+            // cmove at +0x17..+0x1c, mov ecx,[rcx] at +0x28), and the call
+            // argument's real producer is a 64-bit instruction in the
+            // block's tail (the known-good arg 0x211601cc4 exceeds 32
+            // bits; every rcx write in the old window was 32-bit). The
+            // value below is the FIRST-LOAD offset field only.
             LOG_ERROR(Core,
                       "[STRUCT]   r14={:#x} rax={:#x} base={:#x} rdx={:#x} "
-                      "field=[base+0x30]={:#x} -> rcx(=r15)={:#x}",
-                      r.r14, r.rax, r.base, r.rdx, r.V, r.predicted_r15);
+                      "first-load [base+0x30]={:#x} (NOT the call arg; see v4 note)",
+                      r.r14, r.rax, r.base, r.rdx, r.V);
         } else {
             LOG_ERROR(Core,
                       "[STRUCT]   r14={:#x} rax={:#x} base={:#x} rdx={:#x} "
@@ -742,17 +836,27 @@ void MaybeDumpPreBlock(GuestState* state) {
     static thread_local bool dumped_guest_bytes = false;
     if (!dumped_guest_bytes && state->rip == 0x8002f05e2ull) {
         dumped_guest_bytes = true;
+        // v4: the 48-byte window proved too small -- the caller block
+        // 0x80030e680's FINAL rcx producer (the instruction that built the
+        // corrupt 0x3f argument) lies past byte 45, as does its terminator.
+        // Every rcx write inside the old window was 32-bit, and the known-
+        // good argument 0x211601cc4 cannot come from a 32-bit load, so the
+        // producer is provably in the tail. Dump 0x150 bytes per block,
+        // chunked 48/line for log sanity; capstone the result offline.
+        constexpr int kWin = 0x150;
         for (u64 rip : {0x8002f04d0ull, 0x8002f05e2ull, 0x80030e680ull}) {
             const u8* p = reinterpret_cast<const u8*>(rip); // identity-mapped guest VA
-            char hex[48 * 3 + 1];
-            for (int k = 0; k < 48; ++k) {
-                static const char* d = "0123456789abcdef";
-                hex[k * 3 + 0] = d[(p[k] >> 4) & 0xF];
-                hex[k * 3 + 1] = d[p[k] & 0xF];
-                hex[k * 3 + 2] = ' ';
+            for (int base = 0; base < kWin; base += 48) {
+                char hex[48 * 3 + 1];
+                for (int k = 0; k < 48; ++k) {
+                    static const char* d = "0123456789abcdef";
+                    hex[k * 3 + 0] = d[(p[base + k] >> 4) & 0xF];
+                    hex[k * 3 + 1] = d[p[base + k] & 0xF];
+                    hex[k * 3 + 2] = ' ';
+                }
+                hex[48 * 3] = '\0';
+                LOG_ERROR(Core, "[GUESTBYTES] {:#x}+{:#x}: {}", rip, base, hex);
             }
-            hex[48 * 3] = '\0';
-            LOG_ERROR(Core, "[GUESTBYTES] {:#x}: {}", rip, hex);
         }
     }
     static thread_local bool dumped_loop = false;

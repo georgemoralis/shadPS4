@@ -349,7 +349,13 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
         # meantime.
         list(APPEND CPU_RUNTIME_TEST_SUPPORT_SRCS
             ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/gateway/gateway_arm64.cpp
-            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_arm64_host.cpp)
+            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/lifter/lifter_arm64_host.cpp
+            # The HLE-bridge call thunk runtime.cpp's CallHostFromGuest
+            # references on arm64. This support lib compiles runtime.cpp
+            # directly instead of linking the cpu_runtime library, so it
+            # must carry the .S itself (same reason as the diagnostics
+            # define above). Top-level project already enables ASM.
+            ${CMAKE_SOURCE_DIR}/src/core/cpu_runtime/hle_thunk_arm64.S)
     endif()
 
     add_library(shadps4_cpu_runtime_test_support STATIC
