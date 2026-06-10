@@ -6829,17 +6829,31 @@ bool EmitXgetbv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 }
 
 // stmxcsr m32 / ldmxcsr m32 — store/load the guest MXCSR field.
-// STMXCSR / LDMXCSR — round-trip through GuestState::mxcsr. KNOWN FIDELITY
-// GAP on this host: unlike the x86 backend (which applies a sanitized guest
-// MXCSR to the real host MXCSR, with the dispatcher swapping it out around
-// host C++ — see EmitMxcsr in lifter_x86_host.cpp and the rounding-swap
-// block in runtime.cpp), the value is recorded but NOT applied to FPCR, so
-// guest rounding-mode / FTZ changes do not affect the NEON instructions we
-// emit. The fix is mapping MXCSR.RC (14:13) -> FPCR.RMode (23:22) (note the
-// encodings DIFFER: x86 01=down/10=up vs ARM 10=down/01=up — the middle two
-// swap) and MXCSR.FTZ -> FPCR.FZ, with the same dispatcher swap discipline.
-// Deferred until the backend runs real FP workloads; FISTP above is exempt
-// from the gap because it dispatches on fpu_cw directly.
+// STMXCSR / LDMXCSR — guest SSE control/status register.
+//
+// STMXCSR reports GuestState::mxcsr (the guest's own last-written value;
+// status flags are not reflected from host FPSR — same fidelity stance as
+// the x86 backend's STMXCSR). LDMXCSR records the raw value AND applies a
+// sanitized FPCR image to the host, so the NEON instructions we emit run
+// under the guest's rounding mode and flush-to-zero from this point in the
+// block onward. The dispatcher mirrors the swap (restore default FPCR on
+// entry, re-apply before handing out a block) — see the rounding-swap
+// design block and SanitizeGuestMxcsrToFpcr in runtime.cpp, which this
+// emitted computation MUST stay bit-identical to.
+//
+// Mapping subtleties (full rationale in runtime.cpp):
+//   * RC -> RMode is a 2-BIT REVERSE (x86 01=down/10=up vs ARM 01=up/
+//     10=down): rmode = ((rc << 1) | (rc >> 1)) & 3.
+//   * FZ = FTZ | DAZ: ARM's FZ flushes inputs AND outputs, so the x86
+//     split is unexpressible; OR-ing is the consistent best effort.
+//   * Trap enables are never set; host default FPCR is 0.
+//
+// FISTP is unaffected either way — it dispatches on fpu_cw explicitly.
+// KNOWN RESIDUAL: emitters that lower x86 ops with current-rounding
+// semantics via mode-EXPLICIT A64 instructions (e.g. cvtsd2si via fcvtns)
+// do not yet consult FPCR; they need frinti-based lowerings to pick up the
+// guest mode. Tracked separately — this change makes the mode REACH the
+// hardware, which those lowerings can then honor.
 bool EmitMxcsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                u64 next_rip, CodeGenerator& c) {
     const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR);
@@ -6852,6 +6866,19 @@ bool EmitMxcsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     } else {
         c.ldr(WReg(9), ptr(kAddr));
         c.str(WReg(9), ptr(kState, off));
+        // Apply sanitized FPCR: rmode = bit-reversed RC at 23:22,
+        // FZ = (FTZ | DAZ) at 24. Bit-identical to runtime.cpp's
+        // SanitizeGuestMxcsrToFpcr.
+        c.ubfx(WReg(10), WReg(9), 13, 2);          // rc
+        c.lsl(WReg(11), WReg(10), 1);
+        c.orr(WReg(11), WReg(11), WReg(10), LSR, 1);
+        c.and_(WReg(11), WReg(11), 3);             // rmode = 2-bit reverse
+        c.lsl(WReg(11), WReg(11), 22);             // -> FPCR.RMode
+        c.ubfx(WReg(10), WReg(9), 15, 1);          // FTZ
+        c.ubfx(WReg(12), WReg(9), 6, 1);           // DAZ
+        c.orr(WReg(10), WReg(10), WReg(12));       // FZ
+        c.orr(XReg(11), XReg(11), XReg(10), LSL, 24);
+        c.msr(3, 3, 4, 4, 0, XReg(11));            // FPCR = S3_3_C4_C4_0
     }
     return true;
 }

@@ -60,6 +60,12 @@ elseif (ARCHITECTURE STREQUAL "arm64")
     set(CPU_RUNTIME_BACKEND_SRCS
         lifter/lifter_arm64_host.cpp
         gateway/gateway_arm64.cpp
+        # AAPCS call thunk for the HLE bridge: performs the unknown-return-
+        # type host call and captures BOTH x0 and d0 -- no C return type can
+        # (a mixed 16-byte composite returns in x0:x1). Replaces the unsound
+        # empty-asm register capture; see the header comment in the .S file.
+        # Assembled via the top-level project's ASM language enablement.
+        hle_thunk_arm64.S
     )
     set(CPU_RUNTIME_BACKEND_LIB xbyak_aarch64)
 else()

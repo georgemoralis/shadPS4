@@ -317,10 +317,25 @@ void ReleaseClaim() noexcept {
 // (bits 14:13), FTZ (15), DAZ (6) and forces all exception masks set; the
 // constants MUST match EmitMxcsr in lifter_x86_host.cpp.
 //
-// ARM64 host: not yet wired — the equivalent is mapping guest MXCSR.RC/FTZ
-// onto FPCR.RMode/FZ with the same swap discipline. Until then the arm64
-// backend records guest MXCSR writes without applying them (its pre-existing
-// behavior), which is a documented fidelity gap, not a regression.
+// ARM64 host: same discipline, mapped onto FPCR. Two mapping subtleties,
+// both load-bearing:
+//
+//   * RC -> RMode is a 2-BIT REVERSE, not a copy: x86 encodes 01=down,
+//     10=up; ARM encodes 01=up, 10=down (00=nearest and 11=zero agree).
+//     rmode = ((rc << 1) | (rc >> 1)) & 3 implements the swap branchlessly.
+//   * ARM's FZ has no exact image of the x86 FTZ/DAZ split: FZ=1 flushes
+//     denormal INPUTS AND OUTPUTS, so FTZ-only (flush outputs) and
+//     DAZ-only (flush inputs) are both unexpressible. We map
+//     FZ = FTZ | DAZ -- the consistent best-effort over-approximation;
+//     games overwhelmingly set both together, and the alternative
+//     (ignoring one) diverges on exactly the denormal cases games set
+//     these bits to avoid.
+//
+// FPCR trap-enable bits are never set (mirror of x86 forcing exception
+// masks), and the host default FPCR is 0 (RN, no flush, no traps), so the
+// gate "sanitized != default" is "computed FPCR != 0". The msr write costs
+// the same order as ldmxcsr and is gated identically -- zero cost for
+// guests that never touch MXCSR.
 
 #ifdef ARCH_X86_64
 constexpr u32 kHostDefaultMxcsr = 0x1F80;
@@ -344,6 +359,35 @@ inline void ApplyGuestRounding(const GuestState* state) noexcept {
     const u32 s = SanitizeGuestMxcsr(state->mxcsr);
     if (s != kHostDefaultMxcsr) {
         _mm_setcsr(s);
+    }
+}
+#elif defined(ARCH_ARM64)
+constexpr u64 kHostDefaultFpcr = 0; // RN, no flush-to-zero, no traps
+
+/// Guest MXCSR -> sanitized host FPCR image. MUST stay in sync with the
+/// FPCR computation the arm64 lifter emits inline at LDMXCSR (EmitMxcsr in
+/// lifter_arm64_host.cpp) -- both derive the same bits from the same field.
+inline u64 SanitizeGuestMxcsrToFpcr(u32 mxcsr) noexcept {
+    const u32 rc = (mxcsr >> 13) & 3;
+    const u64 rmode = ((rc << 1) | (rc >> 1)) & 3;     // 2-bit reverse
+    const u64 fz = ((mxcsr >> 15) | (mxcsr >> 6)) & 1; // FTZ | DAZ
+    return (rmode << 22) | (fz << 24);
+}
+
+inline void WriteFpcr(u64 v) noexcept {
+    __asm__ volatile("msr fpcr, %0" : : "r"(v));
+}
+
+inline void RestoreHostRounding(const GuestState* state) noexcept {
+    if (SanitizeGuestMxcsrToFpcr(state->mxcsr) != kHostDefaultFpcr) {
+        WriteFpcr(kHostDefaultFpcr);
+    }
+}
+
+inline void ApplyGuestRounding(const GuestState* state) noexcept {
+    const u64 f = SanitizeGuestMxcsrToFpcr(state->mxcsr);
+    if (f != kHostDefaultFpcr) {
+        WriteFpcr(f);
     }
 }
 #else
@@ -549,6 +593,22 @@ typedef HostReturn (*HostHleFn)(u64, u64, u64, u64, u64, u64,
                                 u64, u64, u64, u64, ...)
                               __attribute__((sysv_abi));
 
+#if defined(__aarch64__)
+/// AArch64 HLE call thunk (hle_thunk_arm64.S). Takes the real target as the
+/// FIRST argument (the thunk un-shifts the rest), performs the call, and
+/// returns {callee x0, callee d0 bits} as the AAPCS x0:x1 composite. The
+/// only ABI-sound way to recover both possible return registers from a
+/// callee of unknown return type on this architecture; see the .S file.
+extern "C" HostReturn CallHostThunkA64(u64 target,
+                                       u64 a0, u64 a1, u64 a2, u64 a3, u64 a4,
+                                       u64 a5,
+                                       double f0, double f1, double f2,
+                                       double f3, double f4, double f5,
+                                       double f6, double f7,
+                                       u64 s0, u64 s1, u64 s2, u64 s3,
+                                       u64 s4, u64 s5, u64 s6, u64 s7);
+#endif
+
 HostReturn CallHostFromGuest(VAddr host_fn,
                              u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5,
                              double f0, double f1, double f2, double f3,
@@ -564,33 +624,27 @@ HostReturn CallHostFromGuest(VAddr host_fn,
               f0, f1, f2, f3, f4, f5, f6, f7,
               s0, s1, s2, s3, s4, s5, s6, s7);
 #elif defined(__aarch64__)
-    // AArch64 AAPCS: the {u64; double} struct-return trick does NOT apply — a
-    // mixed aggregate returns in x0:x1 (both GPRs), not x0:d0, and the
-    // x86-only sysv_abi attribute is ignored here. Instead we let the compiler
-    // marshal all arguments via a normal typed call (AAPCS already routes the
-    // integer args to x0..x7/stack and the double args to d0..d7), then capture
-    // BOTH the integer return (x0) and the floating return (d0) — exactly the
-    // two registers a callee of unknown return type may have written.
+    // AArch64 AAPCS: the {u64; double} struct-return trick does NOT apply --
+    // a mixed 16-byte aggregate returns in x0:x1 (both GPRs), not x0:d0, so
+    // no C return type can capture both registers a callee of unknown return
+    // type may have written. An earlier revision called through a void-typed
+    // pointer and then read x0/d0 via register-asm locals fed by an EMPTY
+    // asm statement -- unsound: nothing ordered the asm against the call, so
+    // the compiler was free to schedule clobbering code between them (or
+    // hoist the asm). It worked by accident, per compiler, per flag set.
     //
-    // The call is made through a pointer typed to return void so the compiler
-    // emits a standard AAPCS call and arg setup; immediately afterward, inline
-    // asm reads x0 and d0 before any other code can clobber them.
-    using HostHleFnA64 = void (*)(u64, u64, u64, u64, u64, u64,
-                                  double, double, double, double,
-                                  double, double, double, double,
-                                  u64, u64, u64, u64, u64, u64, u64, u64);
-    auto fn = reinterpret_cast<HostHleFnA64>(host_fn);
-    fn(a0, a1, a2, a3, a4, a5,
-       f0, f1, f2, f3, f4, f5, f6, f7,
-       s0, s1, s2, s3, s4, s5, s6, s7);
-    HostReturn ret;
-    // Capture x0 (integer return) and d0 (floating return) post-call.
-    register u64 x0_val asm("x0");
-    register double d0_val asm("d0");
-    asm volatile("" : "=r"(x0_val), "=w"(d0_val));
-    ret.rax = x0_val;
-    ret.xmm0 = d0_val;
-    return ret;
+    // CallHostThunkA64 (hle_thunk_arm64.S) is the sound replacement: the
+    // compiler marshals all 22 arguments plus the prepended target under
+    // normal AAPCS rules, and the thunk itself shifts the integer args down
+    // one slot, performs the blr, and builds the {u64; double} return --
+    // callee's x0 stays in x0, one fmov moves d0's raw bits into x1, and
+    // AAPCS hands the composite back as exactly {callee x0, callee d0}.
+    // Full geometry and the (pre-existing) Apple-variadic limitation are
+    // documented in the .S file.
+    return CallHostThunkA64(host_fn,
+                            a0, a1, a2, a3, a4, a5,
+                            f0, f1, f2, f3, f4, f5, f6, f7,
+                            s0, s1, s2, s3, s4, s5, s6, s7);
 #else
 #error "CallHostFromGuest: unsupported host architecture"
 #endif
