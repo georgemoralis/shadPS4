@@ -6502,6 +6502,17 @@ bool EmitXgetbv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 }
 
 // stmxcsr m32 / ldmxcsr m32 — store/load the guest MXCSR field.
+// STMXCSR / LDMXCSR — round-trip through GuestState::mxcsr. KNOWN FIDELITY
+// GAP on this host: unlike the x86 backend (which applies a sanitized guest
+// MXCSR to the real host MXCSR, with the dispatcher swapping it out around
+// host C++ — see EmitMxcsr in lifter_x86_host.cpp and the rounding-swap
+// block in runtime.cpp), the value is recorded but NOT applied to FPCR, so
+// guest rounding-mode / FTZ changes do not affect the NEON instructions we
+// emit. The fix is mapping MXCSR.RC (14:13) -> FPCR.RMode (23:22) (note the
+// encodings DIFFER: x86 01=down/10=up vs ARM 10=down/01=up — the middle two
+// swap) and MXCSR.FTZ -> FPCR.FZ, with the same dispatcher swap discipline.
+// Deferred until the backend runs real FP workloads; FISTP above is exempt
+// from the gap because it dispatches on fpu_cw directly.
 bool EmitMxcsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                u64 next_rip, CodeGenerator& c) {
     const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR);
@@ -6520,13 +6531,26 @@ bool EmitMxcsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
 // fnstcw m16 — store the (fixed) x87 control word 0x037F. fldcw is a no-op in
 // our model (rounding/precision control not emulated).
+// FLDCW m16 / FNSTCW m16 — load/store the x87 control word, tracked in
+// GuestState::fpu_cw (CallGuest initializes it to the FNINIT default
+// 0x037F). FLDCW's RC field (bits 11:10) is consumed by EmitFistp below;
+// precision control and exception masks are ignored by design (the x87
+// registers are 64-bit doubles, and we never raise x87 exceptions). An
+// earlier revision dropped FLDCW and reported a hardcoded 0x037F from
+// FNSTCW — breaking both the truncation idiom (fldcw [chop]; fistp) and
+// the save/restore round-trip when the guest's ambient cw differed.
 bool EmitFnstcw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                 u64 next_rip, CodeGenerator& c) {
-    if (insn.mnemonic == ZYDIS_MNEMONIC_FLDCW) return true;  // no-op
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-    c.mov(WReg(9), 0x037Fu);
-    c.strh(WReg(9), ptr(kAddr));
+    const u32 cw_off = static_cast<u32>(offsetof(GuestState, fpu_cw));
+    if (insn.mnemonic == ZYDIS_MNEMONIC_FLDCW) {
+        c.ldrh(WReg(9), ptr(kAddr));
+        c.strh(WReg(9), ptr(kState, cw_off));
+    } else {
+        c.ldrh(WReg(9), ptr(kState, cw_off));
+        c.strh(WReg(9), ptr(kAddr));
+    }
     return true;
 }
 
@@ -6741,13 +6765,22 @@ bool EmitFild(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* op
     return true;
 }
 
-// FISTP — convert ST(0) to signed int (32/64), store, pop. Round-to-nearest.
+// FISTP — convert ST(0) to signed int (16/32/64), store, pop, rounding per
+// the x87 control word's RC field. FISTTP always truncates.
 bool EmitFistp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                u64 next_rip, CodeGenerator& c) {
-    // FISTP rounds ST(0) using the current rounding mode (modelled here as
-    // round-to-nearest-even) before the integer conversion; FISTTP (SSE3)
-    // always truncates toward zero regardless of the rounding mode. Both
-    // convert ST(0) to a signed integer, store m16/m32/m64, and pop.
+    // FISTP rounds ST(0) per fpu_cw.RC (bits 11:10) before the integer
+    // conversion; FISTTP (SSE3) always truncates regardless. AArch64 makes
+    // this pleasant: the four x87 RC modes map 1:1 onto dedicated round
+    // instructions — 00 nearest-even -> frintn, 01 toward -inf -> frintm,
+    // 10 toward +inf -> frintp, 11 toward zero -> frintz — so we dispatch
+    // on the RC value at runtime instead of swapping FPCR. (The RC=11 arm
+    // is technically redundant before fcvtzs, which truncates on its own,
+    // but keeping the explicit frintz makes the value in DReg(0) the
+    // architecturally rounded one in all four arms.) This is what makes
+    // the classic `fldcw [chop]; fistp; fldcw [restore]` idiom truncate
+    // instead of silently rounding to nearest, matching the x86 host's
+    // MXCSR-transplant fix.
     const bool is_truncating = (insn.mnemonic == ZYDIS_MNEMONIC_FISTTP);
     if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP && !is_truncating) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
@@ -6756,9 +6789,31 @@ bool EmitFistp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     EmitX87RegAddr(XReg(11), 0, c);
     c.ldr(DReg(0), ptr(XReg(11)));
     const int w = ops[0].size;
-    // FISTP: round to nearest even first. FISTTP: skip rounding (fcvtzs
-    // truncates toward zero on its own).
-    if (!is_truncating) c.frintn(DReg(0), DReg(0));
+    if (!is_truncating) {
+        // 4-way dispatch on fpu_cw.RC. WReg(12) is free: EmitX87RegAddr's
+        // x12/x13 use is already past, and the dest address is parked in
+        // kScratch1 (x10).
+        Label rc_down, rc_up, rc_chop, rc_done;
+        c.ldrh(WReg(12), ptr(kState, static_cast<u32>(offsetof(GuestState, fpu_cw))));
+        c.ubfx(WReg(12), WReg(12), 10, 2);       // RC field
+        c.cmp(WReg(12), 1);
+        c.b(EQ, rc_down);
+        c.cmp(WReg(12), 2);
+        c.b(EQ, rc_up);
+        c.cmp(WReg(12), 3);
+        c.b(EQ, rc_chop);
+        c.frintn(DReg(0), DReg(0));              // 00: nearest even
+        c.b(rc_done);
+        c.L(rc_down);
+        c.frintm(DReg(0), DReg(0));              // 01: toward -inf
+        c.b(rc_done);
+        c.L(rc_up);
+        c.frintp(DReg(0), DReg(0));              // 10: toward +inf
+        c.b(rc_done);
+        c.L(rc_chop);
+        c.frintz(DReg(0), DReg(0));              // 11: toward zero
+        c.L(rc_done);
+    }
     if (w == 64) {
         c.fcvtzs(kScratch0, DReg(0));
         c.str(kScratch0, ptr(kScratch1));

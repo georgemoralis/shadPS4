@@ -27,6 +27,7 @@
 
 #ifdef ARCH_X86_64
 #include <Zydis/Zydis.h>
+#include <xmmintrin.h> // _mm_getcsr/_mm_setcsr (guest-rounding swap)
 #endif
 
 // Platform headers for IsGuestPointer's host-module query. These MUST be at
@@ -201,6 +202,61 @@ void ReleaseClaim() noexcept {
         g_flush_cv.notify_all();
     }
 }
+
+// ============================================================================
+// Guest-rounding swap (x86 host)
+// ============================================================================
+//
+// Guest LDMXCSR applies a SANITIZED value to the host MXCSR inside JIT code
+// (see EmitMxcsr in the x86 lifter), so the SSE/AVX instructions we emit run
+// under the guest's rounding mode and FTZ/DAZ — but host C++ (the dispatcher,
+// the HLE bridge, every library call those make) must NEVER run under guest
+// rounding: RC != nearest or FTZ inside printf/maths-adjacent host code is a
+// recipe for untraceable numeric corruption. So the dispatcher swaps:
+//
+//   dispatcher entry:   guest -> HOST DEFAULT   (we just left JIT code)
+//   handing out a block: HOST DEFAULT -> guest  (about to enter JIT code)
+//   Run() after Enter:  guest -> HOST DEFAULT   (covers jmp-r15 fatal exits)
+//
+// The swap is gated on Sanitize(state->mxcsr) != default, so a guest that
+// never touches MXCSR (or writes a default-equivalent) pays one load + mask
+// + compare per block transition and zero ldmxcsr. Sanitization keeps RC
+// (bits 14:13), FTZ (15), DAZ (6) and forces all exception masks set; the
+// constants MUST match EmitMxcsr in lifter_x86_host.cpp.
+//
+// ARM64 host: not yet wired — the equivalent is mapping guest MXCSR.RC/FTZ
+// onto FPCR.RMode/FZ with the same swap discipline. Until then the arm64
+// backend records guest MXCSR writes without applying them (its pre-existing
+// behavior), which is a documented fidelity gap, not a regression.
+
+#ifdef ARCH_X86_64
+constexpr u32 kHostDefaultMxcsr = 0x1F80;
+constexpr u32 kGuestMxcsrMask = (3u << 13) | (1u << 15) | (1u << 6); // RC|FTZ|DAZ
+
+inline u32 SanitizeGuestMxcsr(u32 guest) noexcept {
+    return kHostDefaultMxcsr | (guest & kGuestMxcsrMask);
+}
+
+/// Entering host C++ from JIT context: put the host default back if the
+/// guest's MXCSR could have been live.
+inline void RestoreHostRounding(const GuestState* state) noexcept {
+    if (SanitizeGuestMxcsr(state->mxcsr) != kHostDefaultMxcsr) {
+        _mm_setcsr(kHostDefaultMxcsr);
+    }
+}
+
+/// About to hand a block pointer to the gateway: arm the guest's rounding
+/// for the JIT code that is about to run.
+inline void ApplyGuestRounding(const GuestState* state) noexcept {
+    const u32 s = SanitizeGuestMxcsr(state->mxcsr);
+    if (s != kHostDefaultMxcsr) {
+        _mm_setcsr(s);
+    }
+}
+#else
+inline void RestoreHostRounding(const GuestState*) noexcept {}
+inline void ApplyGuestRounding(const GuestState*) noexcept {}
+#endif
 
 /// Take a claim, parking while a flush is pending. The increment-then-
 /// re-check dance closes the race where a flusher sets pending between our
@@ -436,6 +492,12 @@ void* DispatcherTrampoline(GuestState* state) {
     // flush is safe -- including for the whole duration of any HLE bridge
     // call this invocation makes.
     ReleaseClaim();
+
+    // We may arrive here with the guest's MXCSR live (a block ran after a
+    // guest LDMXCSR). Host C++ -- this function, the HLE bridge, anything
+    // they call -- must run under the host default. No-op when the guest's
+    // value sanitizes to the default. See the guest-rounding swap block.
+    RestoreHostRounding(state);
 
     // Hot path: the dispatcher trampoline is called once per JIT block
     // exit, which in tight loops (memset/memcpy/scan) is once per loop
@@ -767,17 +829,20 @@ void* DispatcherTrampoline(GuestState* state) {
         AcquireClaim();
 
         if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
+            ApplyGuestRounding(state);
             return host_ptr;
         }
         void* host_ptr = rt->CompileBlockForDispatcher(state->rip);
         if (host_ptr == nullptr) {
             // Compile failed. Returning nullptr causes the gateway to exit
             // with whatever exit_reason the lifter set. We will not be
-            // executing cache code: hand the claim back.
+            // executing cache code: hand the claim back. (No rounding swap:
+            // we exit to host C++, where the default is already live.)
             ReleaseClaim();
             return nullptr;
         }
         bc.Insert(state->rip, host_ptr);
+        ApplyGuestRounding(state);
         return host_ptr;
     }
 }
@@ -835,9 +900,11 @@ void Runtime::Run(GuestState& state) {
     LOG_TRACE(Core, "Run: R3 gateway returned");
     // A block that exits via the FATAL stub (jmp r15: unsupported insn,
     // string-op pointer bail) never re-enters the dispatcher, so the claim
-    // taken when its pointer was handed out is still held here. Normal
-    // exits released at the last dispatcher entry, making this a no-op.
+    // taken when its pointer was handed out is still held here -- and the
+    // guest's MXCSR may still be live for the same reason. Normal exits
+    // released/restored at the last dispatcher entry, making both no-ops.
     ReleaseClaim();
+    RestoreHostRounding(&state);
     tl_current_guest_state = saved_state;
     tl_active_runtime = saved_rt;
 }

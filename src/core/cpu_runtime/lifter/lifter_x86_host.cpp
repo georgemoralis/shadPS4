@@ -5386,9 +5386,21 @@ bool EmitFistp(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                u64 next_rip,
                Xbyak::CodeGenerator& c) {
-    // FISTP rounds ST(0) per the current rounding mode (cvtsd2si follows
-    // MXCSR, default round-to-nearest); FISTTP (SSE3) always truncates toward
-    // zero (cvttsd2si). Both store m16/m32/m64 and pop.
+    // FISTP rounds ST(0) per the x87 CONTROL WORD's RC field (fpu_cw bits
+    // 11:10) — NOT per MXCSR. cvtsd2si follows MXCSR.RC, so to make the host
+    // convert honor the guest's x87 rounding we transplant cw.RC into
+    // MXCSR.RC around the conversion. The two fields use the same encoding
+    // (00 nearest, 01 down, 10 up, 11 chop), so the transplant is a mask,
+    // shift, and OR — no translation table. The save/modify/restore goes
+    // through GuestState::scratch[0..1] (stmxcsr/ldmxcsr need a memory
+    // operand); scratch is documented as not-preserved-across-dispatch,
+    // which a single instruction's emission satisfies trivially. This also
+    // composes with a guest LDMXCSR value applied to the host (the
+    // dispatcher's rounding swap): we save whatever MXCSR is live, override
+    // only RC, and put the live value back.
+    //
+    // FISTTP (SSE3) always truncates regardless of cw.RC: cvttsd2si needs
+    // no MXCSR help.
     const bool is_truncating = (insn.mnemonic == ZYDIS_MNEMONIC_FISTTP);
     if (insn.mnemonic != ZYDIS_MNEMONIC_FISTP && !is_truncating) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
@@ -5404,15 +5416,38 @@ bool EmitFistp(const ZydisDecodedInstruction& insn,
 
     // Destination address (clobbers rax, writes rdx).
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+
+    constexpr int kScratch0 = static_cast<int>(offsetof(GuestState, scratch));
+    constexpr int kScratch1 = kScratch0 + 8;
+    if (!is_truncating) {
+        // Transplant cw.RC (bits 11:10) into MXCSR.RC (bits 14:13): same
+        // encoding, 3-bit left shift. eax/ecx are free here (the EA above
+        // already consumed rax; the value lives in xmm0, the address in rdx).
+        c.stmxcsr(dword[r13 + kScratch0]);              // save live MXCSR
+        c.mov(eax, dword[r13 + kScratch0]);
+        c.and_(eax, ~(3u << 13));                       // clear RC
+        c.movzx(ecx, word[r13 + offsetof(GuestState, fpu_cw)]);
+        c.and_(ecx, 3u << 10);                          // cw.RC in place
+        c.shl(ecx, 3);                                  // -> MXCSR.RC position
+        c.or_(eax, ecx);
+        c.mov(dword[r13 + kScratch1], eax);
+        c.ldmxcsr(dword[r13 + kScratch1]);              // apply
+    }
+
     if (w == 64) {
         if (is_truncating) c.cvttsd2si(rax, xmm0);   // double -> 64-bit signed, truncate
-        else               c.cvtsd2si(rax, xmm0);    // double -> 64-bit signed, round
+        else               c.cvtsd2si(rax, xmm0);    // double -> 64-bit signed, per cw.RC
+        if (!is_truncating) c.ldmxcsr(dword[r13 + kScratch0]); // restore live MXCSR
         c.mov(qword[rdx], rax);
     } else {
         // 16- and 32-bit both convert to a 32-bit signed int; the store width
-        // differs (m16 writes a word, preserving adjacent bytes).
+        // differs (m16 writes a word, preserving adjacent bytes). NOTE: the
+        // m16 form's overflow behavior diverges from hardware (x86 writes the
+        // 0x8000 integer-indefinite on 16-bit overflow; we store the low word
+        // of the 32-bit conversion) — pre-existing, out of scope here.
         if (is_truncating) c.cvttsd2si(eax, xmm0);
         else               c.cvtsd2si(eax, xmm0);
+        if (!is_truncating) c.ldmxcsr(dword[r13 + kScratch0]); // restore live MXCSR
         if (w == 16) c.mov(word[rdx], ax);
         else         c.mov(dword[rdx], eax);
     }
@@ -5760,21 +5795,37 @@ bool EmitFcmov(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 /// effect; we just consume the operand (compute its address for side
 /// effects/faults parity, then ignore the value). FNSTCW reports the
 /// architectural default 0x037F.
+/// FLDCW m16 — load the x87 control word into GuestState::fpu_cw.
+///
+/// What is and is not honored, by design:
+///   - RC (bits 11:10, rounding control) IS honored — EmitFistp consults it,
+///     which covers the classic pre-SSE float->int truncation idiom
+///     `fldcw [chop]; fistp; fldcw [restore]`. Dropping it (as an earlier
+///     revision did) silently turned every such conversion into
+///     round-to-nearest: off-by-one casts all over legacy x87 code.
+///   - PC (precision control) is ignored: our x87 registers are 64-bit
+///     doubles (see guest_state.h's precision note), so the 24/53/64-bit
+///     significand selection has no representation to act on.
+///   - Exception masks are ignored: we never raise x87 exceptions.
 bool EmitFldcw(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                u64 next_rip,
                Xbyak::CodeGenerator& c) {
     if (insn.mnemonic != ZYDIS_MNEMONIC_FLDCW) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
-    // Compute the address (harmless) but do not apply the value.
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+    c.mov(ax, word[rdx]);
+    c.mov(word[r13 + offsetof(GuestState, fpu_cw)], ax);
     return true;
 }
 
-/// FNSTCW / FNSTCW m16 — store the x87 control word. We model it as the
-/// architectural default (0x037F: round-to-nearest, 64-bit precision,
-/// all exceptions masked), which is what FNINIT establishes and what
-/// game code saves/restores around conversions.
+/// FNSTCW m16 — store the x87 control word from GuestState::fpu_cw.
+/// CallGuest initializes the field to the FNINIT default (0x037F), so a
+/// guest that never executed FLDCW reads the architectural reset value;
+/// after an FLDCW, the save/restore idiom round-trips the guest's own
+/// word instead of a hardcoded constant (which broke the restore half of
+/// `fnstcw [save]; fldcw [chop]; ...; fldcw [save]` whenever the guest's
+/// ambient cw differed from 0x037F).
 bool EmitFnstcw(const ZydisDecodedInstruction& insn,
                 const ZydisDecodedOperand* ops,
                 u64 next_rip,
@@ -5782,13 +5833,31 @@ bool EmitFnstcw(const ZydisDecodedInstruction& insn,
     if (insn.mnemonic != ZYDIS_MNEMONIC_FNSTCW) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-    c.mov(word[rdx], 0x037F);
+    c.mov(ax, word[r13 + offsetof(GuestState, fpu_cw)]);
+    c.mov(word[rdx], ax);
     return true;
 }
 
 /// STMXCSR m32 / LDMXCSR m32 — store/load the SSE control-and-status
-/// register. MXCSR is genuinely modelled in GuestState::mxcsr, so these
-/// round-trip faithfully through that field.
+/// register.
+///
+/// STMXCSR reports GuestState::mxcsr (the guest's own last-written value,
+/// initialized to the architectural 0x1F80 by CallGuest), so guest fenv
+/// save/restore round-trips.
+///
+/// LDMXCSR does two things: records the raw value in GuestState::mxcsr,
+/// and APPLIES a sanitized version to the host MXCSR so the SSE/AVX
+/// instructions we emit actually run under the guest's rounding mode and
+/// FTZ/DAZ settings. (An earlier revision only recorded the value — guest
+/// rounding-mode changes and the near-universal game FTZ enable had zero
+/// hardware effect, a silent numeric divergence.) Sanitization keeps RC
+/// (14:13), FTZ (15), and DAZ (6) from the guest and forces all exception
+/// masks set — a guest unmasking SSE exceptions must not arm host SIGFPE.
+/// The dispatcher mirrors this: it restores the host default on every
+/// entry (so HLE / host C++ never runs under guest rounding) and
+/// re-applies the sanitized guest value before jumping into the next
+/// block — see the rounding-swap block in runtime.cpp. The mask and
+/// default constants here MUST stay in sync with that code.
 bool EmitMxcsr(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                u64 next_rip,
@@ -5802,8 +5871,16 @@ bool EmitMxcsr(const ZydisDecodedInstruction& insn,
         c.mov(eax, dword[r13 + offsetof(GuestState, mxcsr)]);
         c.mov(dword[rdx], eax);
     } else {
+        constexpr u32 kHostDefaultMxcsr = 0x1F80;
+        constexpr u32 kGuestMxcsrMask = (3u << 13) | (1u << 15) | (1u << 6);
+        constexpr int kScratch0 = static_cast<int>(offsetof(GuestState, scratch));
         c.mov(eax, dword[rdx]);
         c.mov(dword[r13 + offsetof(GuestState, mxcsr)], eax);
+        // Sanitize and apply: keep RC/FTZ/DAZ, force exception masks.
+        c.and_(eax, kGuestMxcsrMask);
+        c.or_(eax, kHostDefaultMxcsr);
+        c.mov(dword[r13 + kScratch0], eax);
+        c.ldmxcsr(dword[r13 + kScratch0]);
     }
     return true;
 }
