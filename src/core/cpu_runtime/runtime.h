@@ -14,6 +14,30 @@ class CodeCache;
 class Gateway;
 class Lifter;
 
+/// One immutable guest virtual-address reservation, for host-vs-guest
+/// pointer discrimination. The guest VA space is reserved as a small fixed
+/// set of contiguous regions at AddressSpace construction and the regions
+/// never move or resize afterwards (mappings churn WITHIN them); that
+/// immutability is what makes the discrimination lock-free and signal-safe.
+struct GuestAddressRange {
+    u64 base;
+    u64 size;
+};
+
+/// Publish the guest address-space reservation to the runtime, once, at
+/// startup (MemoryManager's constructor), before any guest execution.
+/// After registration, Runtime::IsGuestPointer becomes a pure range test:
+/// exact, lock-free, signal-safe, and a POSITIVE test -- so executable host
+/// memory that belongs to no loaded module (JIT trampolines, third-party
+/// RWX allocations) is correctly classified as host, where the legacy
+/// module-membership heuristic misread it as guest. Without registration
+/// (standalone runtime tests that mmap their guest code at arbitrary host
+/// addresses and never construct a MemoryManager), IsGuestPointer falls
+/// back to that heuristic unchanged. Test binaries must therefore either
+/// not construct a MemoryManager or place guest code inside the registered
+/// ranges. At most 4 ranges; later calls replace earlier ones.
+void RegisterGuestAddressRanges(const GuestAddressRange* ranges, size_t count) noexcept;
+
 /// Public entry point for the CPU runtime. Created once during
 /// emulator init, used by Linker::Execute as the alternative to
 /// native execution when SHADPS4_CPU_BACKEND=runtime.
@@ -225,23 +249,32 @@ public:
     // kinds are just function pointers, but the runtime backend
     // needs to distinguish them.
     //
-    // We use OS APIs to ask "is this address in a loaded host
-    // module?":
-    //   - POSIX: dladdr() succeeds for addresses in loaded .so/.exe
-    //   - Windows: GetModuleHandleExW with FROM_ADDRESS flag
-    // Addresses not in any loaded host module are assumed to be
-    // guest (shadPS4 maps guest code via its own loader, outside
-    // any host module registry).
-    //
-    // A naive address-range check (e.g. "ptr >= 0x800000000") was
-    // tempting but wrong: PIE+ASLR puts host code at high addresses
-    // too. dladdr is the right primitive.
+    // The discrimination primitive: when the MemoryManager has
+    // registered the guest VA reservation, membership in those
+    // immutable ranges IS the answer (positive, exact). Only without
+    // registration do we fall back to asking the OS "is this address
+    // in a loaded host module?" (dladdr / GetModuleHandleExW) and
+    // inferring guest from a negative. Note the historical trap that
+    // motivated the OS query: a naive FIXED-CONSTANT address check
+    // ("ptr >= 0x800000000") breaks under PIE+ASLR, where host code
+    // lives at high addresses too -- the registered ranges don't have
+    // that problem because they are the actual reservation bounds
+    // captured at startup, not assumptions.
     // ========================================================================
 
-    /// Returns true if `ptr` points into guest-loaded code, false if
-    /// it points into a loaded host module (executable or shared
-    /// library), or is null. O(1) amortized via the OS's module
-    /// tables, thread-safe.
+    // Host-vs-guest pointer test, used by the dispatcher to route
+    // state.rip values: guest addresses get JIT-compiled, host
+    // addresses go through the HLE bridge.
+    //
+    // With guest address ranges registered (the normal emulator path:
+    // MemoryManager's constructor publishes the immutable VA
+    // reservation via RegisterGuestAddressRanges), this is an exact,
+    // lock-free, signal-safe positive range test -- a few compares
+    // against startup constants on the per-block-transition hot path.
+    // Without registration (standalone runtime tests), it falls back
+    // to the legacy module-membership heuristic (dladdr /
+    // GetModuleHandleExW), with that heuristic's documented
+    // limitations. See the discrimination block in runtime.cpp.
     [[nodiscard]] static bool IsGuestPointer(const void* ptr) noexcept;
 
 private:

@@ -12,6 +12,9 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/process.h"
 #include "core/memory.h"
+#ifdef SHADPS4_USES_RUNTIME
+#include "core/cpu_runtime/runtime.h" // RegisterGuestAddressRanges
+#endif
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace Core {
@@ -56,6 +59,23 @@ void DiagWatchRange(const char* site, VAddr base, u64 size, u32 type, u32 prot) 
 
 MemoryManager::MemoryManager() {
     LOG_INFO(Kernel_Vmm, "Virtual memory space initialized with regions:");
+
+#ifdef SHADPS4_USES_RUNTIME
+    // Publish the (immutable) guest VA reservation to the CPU runtime so
+    // its host-vs-guest pointer discrimination becomes an exact lock-free
+    // range test instead of a per-block-transition dladdr query. The three
+    // regions are fixed for the life of the AddressSpace; this runs once,
+    // before any guest execution.
+    {
+        const Core::Runtime::GuestAddressRange runtime_ranges[] = {
+            {impl.SystemManagedVirtualBase(), impl.SystemManagedVirtualSize()},
+            {impl.SystemReservedVirtualBase(), impl.SystemReservedVirtualSize()},
+            {impl.UserVirtualBase(), impl.UserVirtualSize()},
+        };
+        Core::Runtime::RegisterGuestAddressRanges(runtime_ranges,
+                                                  std::size(runtime_ranges));
+    }
+#endif
 
     // Construct vma_map using the regions reserved by the address space
     auto regions = impl.GetUsableRegions();

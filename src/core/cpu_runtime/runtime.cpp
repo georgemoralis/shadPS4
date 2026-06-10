@@ -1604,42 +1604,67 @@ u64 Runtime::InvokeGuestCallback(VAddr guest_fn,
 // Host-vs-guest pointer discrimination
 // ============================================================================
 //
-// We use OS APIs to answer "is this address in a loaded host module?"
-//   - POSIX: dladdr(ptr, &info) returns non-zero if ptr is in any loaded
-//            shared object (executable or .so). 0 means not in any loaded
-//            module — which is the case for guest memory mapped via
-//            shadPS4's loader.
-//   - Windows: GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-//              ptr, &handle) succeeds if ptr is in any loaded module (.exe
-//              or .dll), fails otherwise.
+// PREFERRED PATH — registered guest ranges. The guest VA space is reserved
+// as a small fixed set of contiguous regions at AddressSpace construction;
+// the regions never move or resize (mappings churn WITHIN them).
+// MemoryManager's constructor publishes them via
+// RegisterGuestAddressRanges, after which this is a POSITIVE, exact test:
+// a handful of subtract-and-compare operations against startup constants.
+// Lock-free and signal-safe by immutability, which matters twice over --
+// this runs on the dispatcher hot path (EVERY block transition: the old
+// dladdr / GetModuleHandleExW call was a loader-lock-adjacent, hundreds-
+// of-ns OS query paid per block), and it must be callable from fault
+// context. The positive test also retires the legacy heuristic's
+// documented misclassification: executable host memory outside any loaded
+// module (JIT trampolines, third-party RWX, future LLVM stubs) is now
+// correctly HOST, because it is provably not in the guest reservation.
 //
-// A naive address-range check (e.g. "ptr >= 0x800000000") was tempting
-// but wrong: under PIE+ASLR on Linux, host code itself often lives well
-// above that threshold. dladdr is the right primitive.
+// FALLBACK PATH — no ranges registered (standalone runtime tests that mmap
+// guest code at arbitrary host addresses and never construct a
+// MemoryManager): the original module-membership heuristic, verbatim, with
+// its original limitation. Binaries that DO register ranges must place
+// guest code inside them -- with registration active, "outside the ranges"
+// is definitively host and the heuristic is not consulted.
 //
-// KNOWN LIMITATION — this is a heuristic, not a definitive test. The
-// assumption is "not in any loaded host module ⇒ guest". That holds for
-// everything in the tree today (host code is in loaded .so/.exe/.dll
-// modules; guest memory is mapped by shadPS4's loader and belongs to no
-// module), but it can misclassify any *executable host memory that is not
-// part of a loaded module*, which would be reported as "guest". Future
-// sources of such memory include:
-//   - JIT-generated host trampolines / stubs not registered with the loader
-//   - executable memory allocated by third-party libraries
-//   - LLVM-generated stubs, if an LLVM-backed path is ever added
-//   - additional runtime helper code allocated at run time
-// None of these exist today, so the heuristic is currently safe.
-//
-// TODO: once a guest-address range is queryable from the memory manager,
-// prefer a positive test — MemoryManager::ContainsGuestAddress(ptr) — over
-// this negative "not a host module" inference. That test must be callable
-// from the fault path without taking locks (this can run in a signal/fault
-// context), so it depends on a lock-free range query being available.
+// Publication ordering: ranges are written before the count's release
+// store; readers acquire the count first. Registration happens once at
+// startup before guest threads exist, so the atomics are belt-and-braces
+// for the test-binary case rather than a hot-path cost (the acquire load
+// is a plain mov on x86).
+
+namespace {
+constexpr size_t kMaxGuestRanges = 4;
+std::array<GuestAddressRange, kMaxGuestRanges> g_guest_ranges{};
+std::atomic<u32> g_guest_range_count{0};
+} // namespace
+
+void RegisterGuestAddressRanges(const GuestAddressRange* ranges,
+                                size_t count) noexcept {
+    const u32 n = static_cast<u32>(count < kMaxGuestRanges ? count : kMaxGuestRanges);
+    for (u32 i = 0; i < n; ++i) {
+        g_guest_ranges[i] = ranges[i];
+    }
+    g_guest_range_count.store(n, std::memory_order_release);
+}
 
 bool Runtime::IsGuestPointer(const void* ptr) noexcept {
     if (ptr == nullptr) {
         return false;
     }
+    const u64 addr = reinterpret_cast<u64>(ptr);
+    const u32 n = g_guest_range_count.load(std::memory_order_acquire);
+    if (n != 0) {
+        for (u32 i = 0; i < n; ++i) {
+            // Single unsigned compare per range: addr in [base, base+size).
+            if (addr - g_guest_ranges[i].base < g_guest_ranges[i].size) {
+                return true;
+            }
+        }
+        return false; // registered and not in any guest range: host.
+    }
+
+    // Legacy module-membership heuristic (test binaries without a
+    // MemoryManager). "Not in any loaded host module => guest".
 #ifdef _WIN32
     HMODULE handle = nullptr;
     if (GetModuleHandleExW(
@@ -1649,7 +1674,6 @@ bool Runtime::IsGuestPointer(const void* ptr) noexcept {
         // ptr is inside a loaded host module — it's host code.
         return false;
     }
-    // Not in any loaded module — assume guest.
     return true;
 #else
     Dl_info info{};
@@ -1657,8 +1681,6 @@ bool Runtime::IsGuestPointer(const void* ptr) noexcept {
         // dladdr found a containing module — it's host code.
         return false;
     }
-    // dladdr returned 0 — ptr is not in any loaded host module.
-    // Assume guest.
     return true;
 #endif
 }
