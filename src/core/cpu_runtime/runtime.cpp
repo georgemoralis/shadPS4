@@ -4,10 +4,13 @@
 #include "core/cpu_runtime/runtime.h"
 
 #include <array>
+#include <atomic>
 #include <bit>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <type_traits>
 
 #include "common/assert.h"
@@ -109,6 +112,125 @@ thread_local Runtime* tl_active_runtime = nullptr;
 //
 // nullptr when no JIT execution is active on this thread.
 thread_local GuestState* tl_current_guest_state = nullptr;
+
+// ============================================================================
+// Code-cache flush handshake (stop-the-world recycling)
+// ============================================================================
+//
+// PROBLEM. The code cache is a bump allocator; on overflow it is recycled by
+// resetting the bump pointer, which invalidates EVERY host pointer in it.
+// Multiple guest threads run JIT code concurrently. Recycling while another
+// thread is (a) executing a block inside the cache, or (b) between a block-
+// cache lookup/compile and the moment it jumps into the result, overwrites or
+// dangles code that thread is about to run. The old comment ("single compiler
+// thread, no other thread is dispatching") described a world this runtime no
+// longer lives in -- pthread.cpp launches arbitrarily many guest threads
+// through Run().
+//
+// SCHEME. A thread holds a CLAIM for exactly the window in which it may touch
+// code-cache memory:
+//
+//     dispatcher guest path:  AcquireClaim()
+//         -> BlockCache lookup / Lifter compile / BlockCache insert
+//         -> return host_ptr to the gateway
+//         -> gateway jmps into the block; the block executes; jmp r14
+//     next dispatcher entry:  ReleaseClaim()
+//
+// Run() also releases after the gateway returns, covering the fatal-exit path
+// (jmp r15) that bypasses the dispatcher. Everything else a thread can do --
+// the HLE bridge (including arbitrarily long blocking host calls), sentinel
+// handling, watchdog, sitting parked -- holds NO claim, so a thread asleep in
+// sceKernelUsleep for a minute cannot stall a flush; it simply parks at
+// AcquireClaim when it next wants a block, if a flush is mid-flight.
+//
+// FLUSH. The thread that hits a full cache releases its own claim, then:
+//   1. takes g_flush_mutex (serializes flushers),
+//   2. re-checks the generation counter -- if another thread already
+//      recycled, skip (its blocks are gone; just recompile),
+//   3. sets g_flush_pending (new claims now park), waits for the active
+//      claim count to drain to zero,
+//   4. clears the BlockCache, THEN resets the CodeCache bump pointer
+//      (order: no lookup may observe a mapping into recycled memory),
+//   5. bumps the generation, clears pending, wakes everyone.
+//
+// HOT-PATH COST. One thread-local bool test per dispatcher entry; one
+// relaxed-ish fetch_add + two loads per block transition in the guest path.
+// The mutex/condvar are touched only when a flush is actually pending (rare:
+// once per 64 MB of emitted code) or on the last-claim-out wakeup.
+//
+// FUTURE. Block chaining (blocks jumping directly to each other without
+// returning to the dispatcher) breaks the "every transition passes the
+// dispatcher" premise this relies on; when chaining lands, claims must be
+// released by the chained code itself or the handshake replaced with a
+// signal-based suspend. Leave this comment as the tripwire.
+// ============================================================================
+
+// MEMORY ORDERING NOTE. The pending/claims pair forms two Dekker-shaped
+// store-buffer races:
+//   flusher:  W(pending=1)  then  R(claims)     -- "anyone still in?"
+//   releaser: W(claims-1)   then  R(pending)    -- "should I wake a flusher?"
+//   claimant: W(claims+1)   then  R(pending)    -- "did a flush just start?"
+// With acquire/release only, BOTH sides can read stale ("flusher sees the old
+// claim count AND releaser sees pending==false") -- the missed notify parks
+// the flusher forever with claims at zero. seq_cst on these four access
+// kinds forbids that outcome (store-buffer interleaving is impossible under
+// a single total order). Cost on the hot path is nil on x86 (a seq_cst LOAD
+// is a plain mov; the RMWs are lock-prefixed either way) and a stronger
+// barrier flavor on ARM64, paid once per block transition.
+std::mutex g_flush_mutex;
+std::condition_variable g_flush_cv;
+std::atomic<u64> g_active_claims{0};
+std::atomic<bool> g_flush_pending{false};
+std::atomic<u64> g_cache_generation{0};
+thread_local bool tl_has_claim = false;
+
+/// Drop this thread's claim, if held. Called at every dispatcher entry and at
+/// Run() exit. If this was the last claim out while a flusher is waiting,
+/// wake it. Hot path when no flush is pending: one branch + one fetch_sub.
+void ReleaseClaim() noexcept {
+    if (!tl_has_claim) {
+        return;
+    }
+    tl_has_claim = false;
+    const u64 prev = g_active_claims.fetch_sub(1, std::memory_order_seq_cst);
+    if (prev == 1 && g_flush_pending.load(std::memory_order_seq_cst)) {
+        // Last claim out with a flush waiting: the flusher sleeps on the cv
+        // under g_flush_mutex; taking the lock here orders the notify after
+        // its predicate re-check window.
+        std::lock_guard lk{g_flush_mutex};
+        g_flush_cv.notify_all();
+    }
+}
+
+/// Take a claim, parking while a flush is pending. The increment-then-
+/// re-check dance closes the race where a flusher sets pending between our
+/// pending load and our increment: if we lost that race we back out (undoing
+/// the increment, waking the flusher if we were what it was waiting on) and
+/// go around again.
+void AcquireClaim() {
+    for (;;) {
+        if (g_flush_pending.load(std::memory_order_seq_cst)) {
+            std::unique_lock lk{g_flush_mutex};
+            g_flush_cv.wait(lk, [] {
+                return !g_flush_pending.load(std::memory_order_seq_cst);
+            });
+        }
+        g_active_claims.fetch_add(1, std::memory_order_seq_cst);
+        if (!g_flush_pending.load(std::memory_order_seq_cst)) {
+            tl_has_claim = true;
+            return;
+        }
+        // Raced with a starting flush: back out and park. A transient claim
+        // taken here is harmless to an in-progress flush -- we never touch
+        // the cache while holding it -- and the prev==1 notify below covers
+        // the case where the flusher was waiting on exactly this count.
+        const u64 prev = g_active_claims.fetch_sub(1, std::memory_order_seq_cst);
+        if (prev == 1) {
+            std::lock_guard lk{g_flush_mutex};
+            g_flush_cv.notify_all();
+        }
+    }
+}
 
 /// HLE bridge — calls a host function as if it were the next-block
 /// continuation of guest execution.
@@ -307,6 +429,14 @@ HostReturn CallHostFromGuest(VAddr host_fn,
 /// pointing at a guest block (or at the host-return sentinel) does
 /// the function return.
 void* DispatcherTrampoline(GuestState* state) {
+    // We just left JIT code (or this is the first entry of a Run, in which
+    // case this is a no-op): drop the claim taken when the previous block's
+    // pointer was handed out. From here until the guest path's AcquireClaim
+    // below, this thread touches no code-cache memory, so a concurrent
+    // flush is safe -- including for the whole duration of any HLE bridge
+    // call this invocation makes.
+    ReleaseClaim();
+
     // Hot path: the dispatcher trampoline is called once per JIT block
     // exit, which in tight loops (memset/memcpy/scan) is once per loop
     // iteration. The per-entry diagnostics use LOG_TRACE, which expands
@@ -626,13 +756,25 @@ void* DispatcherTrampoline(GuestState* state) {
         // diagnostics are compiled in.
         Diagnostics::MaybeDumpPreBlock(state);
 
+        // Claim the code cache BEFORE the lookup. The claim must cover the
+        // entire lookup -> compile -> insert -> execute window: a pointer
+        // obtained from either the block cache or the lifter is only valid
+        // for the cache generation it was created in, and the claim is what
+        // holds that generation alive. (Acquiring after the lookup re-opens
+        // the race where a flush recycles the cache between Lookup() and the
+        // gateway's jmp.) The matching release happens at the next
+        // dispatcher entry, or in Run() for fatal exits that bypass it.
+        AcquireClaim();
+
         if (void* host_ptr = bc.Lookup(state->rip); host_ptr != nullptr) {
             return host_ptr;
         }
         void* host_ptr = rt->CompileBlockForDispatcher(state->rip);
         if (host_ptr == nullptr) {
-            // Compile failed. Returning nullptr causes the gateway
-            // to exit with whatever exit_reason the lifter set.
+            // Compile failed. Returning nullptr causes the gateway to exit
+            // with whatever exit_reason the lifter set. We will not be
+            // executing cache code: hand the claim back.
+            ReleaseClaim();
             return nullptr;
         }
         bc.Insert(state->rip, host_ptr);
@@ -691,6 +833,11 @@ void Runtime::Run(GuestState& state) {
 
     gateway_->Enter(state, &DispatcherTrampoline);
     LOG_TRACE(Core, "Run: R3 gateway returned");
+    // A block that exits via the FATAL stub (jmp r15: unsupported insn,
+    // string-op pointer bail) never re-enters the dispatcher, so the claim
+    // taken when its pointer was handed out is still held here. Normal
+    // exits released at the last dispatcher entry, making this a no-op.
+    ReleaseClaim();
     tl_current_guest_state = saved_state;
     tl_active_runtime = saved_rt;
 }
@@ -706,61 +853,96 @@ void Runtime::AsyncBreak() {
 }
 
 void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
-    const u64 used_before = code_cache_->Used();
-    void* host_ptr = lifter_->CompileBlock(guest_rip);
-    if (host_ptr != nullptr) {
-        // Diagnostics: optional full per-instruction disassembly of the block
-        // (env-gated dev tool) and, for blocks under investigation, a raw
-        // host-byte dump. All no-ops unless diagnostics are compiled in.
-        Diagnostics::OnBlockCompiled(guest_rip, host_ptr,
-                                     code_cache_->Used() - used_before);
-        return host_ptr;
-    }
-    // CompileBlock returned nullptr. The common (and benign) cause is
-    // a full code cache — the bump allocator ran out of room. This is
-    // not an error: we recycle the cache and recompile. The code
-    // cache and block cache MUST be flushed together — Flush() resets
-    // the code-cache bump pointer, invalidating every host pointer the
-    // block cache holds, so any surviving block-cache entry would
-    // dangle into recycled memory.
+    // Called from the dispatcher's guest path WITH this thread's claim held
+    // (see the flush-handshake block above). Compiling under the claim is
+    // what makes the emitted bytes safe to hand back: a concurrent flush
+    // cannot recycle the cache out from under the emission or the caller's
+    // subsequent BlockCache::Insert + jmp.
     //
-    // Safety: this runs in the dispatcher (plain C++) between guest
-    // blocks — the gateway has returned here to resolve the next
-    // block, so no JIT code is executing in the cache. Per
-    // CodeCache::Flush's contract this is the safe point to recycle.
-    //
-    // We do NOT flush if the cache simply couldn't fit a single block
-    // when already empty (a block larger than the whole cache) — that
-    // is a genuine failure, not a capacity-recycling case. We detect
-    // it by checking whether the cache had any prior usage: if Used()
-    // is already ~0, flushing won't help, so we bail.
-    if (code_cache_->Used() == 0) {
-        // Empty cache yet compile still failed → not a capacity issue.
-        // Propagate the failure (lifter set the exit_reason).
-        return nullptr;
+    // Bounded retry: a compile can fail because the bump allocator is full;
+    // we then recycle via the stop-the-world handshake and try again. Two
+    // recycle attempts are plenty -- if a freshly emptied 64 MB cache cannot
+    // fit one block (<= BLOCK_HOST_SIZE_CAP), no number of flushes will.
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const u64 used_before = code_cache_->Used();
+        void* host_ptr = lifter_->CompileBlock(guest_rip);
+        if (host_ptr != nullptr) {
+            // Diagnostics: optional full per-instruction disassembly of the
+            // block (env-gated dev tool) and, for blocks under investigation,
+            // a raw host-byte dump. No-ops unless diagnostics are compiled in.
+            Diagnostics::OnBlockCompiled(guest_rip, host_ptr,
+                                         code_cache_->Used() - used_before);
+            return host_ptr;
+        }
+
+        // CompileBlock returned nullptr. The common (and benign) cause is a
+        // full code cache. We do NOT flush if the cache was already empty (a
+        // block larger than the whole cache, or a non-capacity failure) --
+        // recycling won't help; propagate (the lifter set exit_reason).
+        if (code_cache_->Used() == 0) {
+            return nullptr;
+        }
+
+        LOG_INFO(Core,
+                 "Code cache full at guest_rip={:#x} ({} / {} bytes used); "
+                 "stop-the-world recycle (attempt {})",
+                 guest_rip, code_cache_->Used(), code_cache_->Capacity(),
+                 attempt + 1);
+
+        // Snapshot the generation BEFORE dropping our claim: if it has moved
+        // by the time we hold the flush mutex, another thread already
+        // recycled and we must not flush again (we'd wipe its fresh blocks).
+        const u64 observed_gen =
+            g_cache_generation.load(std::memory_order_acquire);
+
+        // Drop our own claim for the duration of the handshake -- the flusher
+        // must not wait on itself -- then re-claim before retrying so the
+        // recompile is protected again.
+        ReleaseClaim();
+        FlushCachesForRecycle(observed_gen);
+        AcquireClaim();
     }
 
-    LOG_INFO(Core, "Code cache full at guest_rip={:#x} ({} / {} bytes used); "
-                   "flushing and recompiling",
-             guest_rip, code_cache_->Used(), code_cache_->Capacity());
+    LOG_ERROR(Core,
+              "Code cache recompile still failed at guest_rip={:#x} after "
+              "recycling; block may exceed cache capacity",
+              guest_rip);
+    return nullptr;
+}
 
-    // Flush the block cache first (drop all guest_rip -> host_ptr
-    // mappings), then reset the code-cache bump pointer. Order matters
-    // only for clarity here — both complete before we recompile, and
-    // no other thread is dispatching (single compiler thread).
+void Runtime::FlushCachesForRecycle(u64 observed_generation) {
+    // Caller holds NO claim (it released before calling) but may be one of
+    // several threads that hit the full cache at once: the mutex serializes
+    // them, and the generation re-check makes all but the first a no-op.
+    std::unique_lock lk{g_flush_mutex};
+    if (g_cache_generation.load(std::memory_order_acquire) !=
+        observed_generation) {
+        // Someone else recycled between our failed compile and here. The
+        // cache is fresh; our caller just recompiles into it.
+        return;
+    }
+
+    // Park new claimants, then wait for every in-flight claim -- threads
+    // executing JIT code or mid-compile -- to drain. Threads blocked inside
+    // HLE calls hold no claim and cannot stall this; they park at
+    // AcquireClaim if they come back while we work.
+    g_flush_pending.store(true, std::memory_order_seq_cst);
+    g_flush_cv.wait(lk, [] {
+        return g_active_claims.load(std::memory_order_seq_cst) == 0;
+    });
+
+    // Order: drop every guest_rip -> host_ptr mapping FIRST, so no lookup
+    // can ever observe a pointer into recycled memory, then reset the bump
+    // pointer. (With all claims drained nobody can look up concurrently,
+    // but the ordering keeps the invariant locally checkable.)
     block_cache_->Clear();
     code_cache_->Flush();
 
-    // Retry the compile into the now-empty cache. With a sane cache
-    // size relative to BLOCK_HOST_SIZE_CAP this always succeeds; if it
-    // somehow doesn't, propagate the failure rather than looping.
-    host_ptr = lifter_->CompileBlock(guest_rip);
-    if (host_ptr == nullptr) {
-        LOG_ERROR(Core, "Code cache recompile still failed at guest_rip={:#x} "
-                        "after flush; block may exceed cache capacity",
-                  guest_rip);
-    }
-    return host_ptr;
+    g_cache_generation.fetch_add(1, std::memory_order_seq_cst);
+    g_flush_pending.store(false, std::memory_order_seq_cst);
+    // Wake both populations: parked claimants and any queued flushers (who
+    // will see the bumped generation and no-op).
+    g_flush_cv.notify_all();
 }
 
 // ============================================================================

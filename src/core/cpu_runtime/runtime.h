@@ -62,6 +62,11 @@ public:
     /// the given guest RIP and return its host code pointer. Exposed
     /// because the trampoline is a free function (gateway signature
     /// constraints) and needs access to the lifter.
+    ///
+    /// MUST be called with the calling thread's code-cache claim held
+    /// (the dispatcher's guest path acquires it before the lookup). On a
+    /// full cache this drops the claim, performs a stop-the-world recycle
+    /// via FlushCachesForRecycle, re-claims, and retries (bounded).
     void* CompileBlockForDispatcher(u64 guest_rip);
     // ========================================================================
     // Process-wide singleton.
@@ -240,6 +245,14 @@ public:
     [[nodiscard]] static bool IsGuestPointer(const void* ptr) noexcept;
 
 private:
+    /// Stop-the-world code-cache recycle. Serialized across flushing
+    /// threads; `observed_generation` is the cache generation the caller
+    /// saw when its compile failed -- if it no longer matches, another
+    /// thread already recycled and this is a no-op. Caller must NOT hold a
+    /// code-cache claim (it would deadlock waiting on itself). See the
+    /// flush-handshake design block in runtime.cpp for the full protocol.
+    void FlushCachesForRecycle(u64 observed_generation);
+
     std::unique_ptr<BlockCache> block_cache_;
     std::unique_ptr<CodeCache> code_cache_;
     std::unique_ptr<Gateway> gateway_;
