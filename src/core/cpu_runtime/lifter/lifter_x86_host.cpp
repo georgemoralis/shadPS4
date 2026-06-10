@@ -5968,7 +5968,27 @@ bool EmitMxcsr(const ZydisDecodedInstruction& insn,
 ///
 /// The vector size comes from `ops[0].size` (in bits): 128 or 256.
 /// We deliberately ignore alignment (the U in MOVUPS/MOVDQU =
-/// Unaligned), which suits 64-bit-granular GPR-relayed moves.
+/// Unaligned; the A forms' #GP-on-misalignment is not modelled).
+///
+/// ATOMICITY. Guest-memory traffic goes through a host XMM (movups), one
+/// 16-byte host op per 16-byte chunk -- NOT a 64-bit GPR relay. The relay
+/// (an earlier revision) made every guest vector store visible to other
+/// guest threads as two separate 8-byte writes with a multi-instruction
+/// window between them. The native form is the conservative direction:
+/// aligned 16-byte SSE/AVX accesses are single-copy atomic on every
+/// AVX-era host (Intel SDM / AMD APM both document this for cacheable
+/// memory), which is strictly FEWER observable interleavings than the
+/// original hardware -- the PS4's Jaguar cracked 128-bit accesses into
+/// two 64-bit halves, so guest code never had 16-byte atomicity to rely
+/// on. Accepted theoretical corner: an 8-aligned-but-not-16-aligned
+/// VMOVUPS got two atomic 8-byte halves from the relay (and from Jaguar),
+/// while an unaligned host movups carries no sub-access guarantee; code
+/// depending on the half-atomicity of deliberately misaligned vector
+/// stores would be relying on an accident on real hardware too. The
+/// aligned-required forms (VMOVAPS/VMOVDQA/NT) can't hit the corner.
+/// Non-temporal forms still lower to plain movups (keeps the
+/// LFENCE/SFENCE-no-op reasoning valid: every store we emit is an
+/// ordinary store).
 bool EmitVmovups(const ZydisDecodedInstruction& insn,
                  const ZydisDecodedOperand* ops,
                  u64 next_rip,
@@ -6002,16 +6022,19 @@ bool EmitVmovups(const ZydisDecodedInstruction& insn,
         const int dst_idx = ZydisVecToIndex(ops[0].reg.value);
         if (dst_idx < 0) return false;
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-        // rdx = src address; we use rax as the transfer register.
-        for (int i = 0; i < chunks; ++i) {
-            c.mov(rax, qword[rdx + i * 8]);
-            c.mov(qword[r13 + YmmChunkOffset(dst_idx, i)], rax);
+        // rdx = src address; xmm0 is the 16-byte transfer register (host
+        // XMMs are never live across emitted instructions -- everything
+        // round-trips through GuestState -- so xmm0 is free scratch, same
+        // convention as EmitFistp).
+        for (int i = 0; i < chunks / 2; ++i) {
+            c.movups(xmm0, xword[rdx + i * 16]);
+            c.movups(xword[r13 + YmmChunkOffset(dst_idx, i * 2)], xmm0);
         }
         // VEX 128-bit form zeros bits 255:128 of the destination YMM.
+        // (State is thread-private; no atomicity concern in the zeroing.)
         if (vec_bits == 128) {
-            c.xor_(rax, rax);
-            c.mov(qword[r13 + YmmChunkOffset(dst_idx, 2)], rax);
-            c.mov(qword[r13 + YmmChunkOffset(dst_idx, 3)], rax);
+            c.xorps(xmm0, xmm0);
+            c.movups(xword[r13 + YmmChunkOffset(dst_idx, 2)], xmm0);
         }
         return true;
     }
@@ -6022,10 +6045,12 @@ bool EmitVmovups(const ZydisDecodedInstruction& insn,
         const int src_idx = ZydisVecToIndex(ops[1].reg.value);
         if (src_idx < 0) return false;
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
-        // rdx = dst address; rax is the transfer register.
-        for (int i = 0; i < chunks; ++i) {
-            c.mov(rax, qword[r13 + YmmChunkOffset(src_idx, i)]);
-            c.mov(qword[rdx + i * 8], rax);
+        // rdx = dst address; one 16-byte host store per chunk -- this is
+        // the direction where the GPR relay was observably torn by
+        // concurrent guest threads (see the atomicity note above).
+        for (int i = 0; i < chunks / 2; ++i) {
+            c.movups(xmm0, xword[r13 + YmmChunkOffset(src_idx, i * 2)]);
+            c.movups(xword[rdx + i * 16], xmm0);
         }
         return true;
     }
@@ -6036,14 +6061,13 @@ bool EmitVmovups(const ZydisDecodedInstruction& insn,
         const int dst_idx = ZydisVecToIndex(ops[0].reg.value);
         const int src_idx = ZydisVecToIndex(ops[1].reg.value);
         if (dst_idx < 0 || src_idx < 0) return false;
-        for (int i = 0; i < chunks; ++i) {
-            c.mov(rax, qword[r13 + YmmChunkOffset(src_idx, i)]);
-            c.mov(qword[r13 + YmmChunkOffset(dst_idx, i)], rax);
+        for (int i = 0; i < chunks / 2; ++i) {
+            c.movups(xmm0, xword[r13 + YmmChunkOffset(src_idx, i * 2)]);
+            c.movups(xword[r13 + YmmChunkOffset(dst_idx, i * 2)], xmm0);
         }
         if (vec_bits == 128) {
-            c.xor_(rax, rax);
-            c.mov(qword[r13 + YmmChunkOffset(dst_idx, 2)], rax);
-            c.mov(qword[r13 + YmmChunkOffset(dst_idx, 3)], rax);
+            c.xorps(xmm0, xmm0);
+            c.movups(xword[r13 + YmmChunkOffset(dst_idx, 2)], xmm0);
         }
         return true;
     }

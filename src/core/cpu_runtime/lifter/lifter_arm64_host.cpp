@@ -5110,11 +5110,23 @@ bool EmitVmovq(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
-// vmovaps/vmovups/vmovdqa/vmovdqu/vmovntdqa — 128/256-bit move with the usual
-// VEX zeroing on a register/memory load into a register.
-//   reg <- reg : copy width, zero upper YMM (128-bit form).
-//   reg <- mem : load width, zero upper YMM.
-//   mem <- reg : store width.
+// VMOVUPS/VMOVAPS/VMOVDQU/VMOVDQA/VMOVNT* — full-width vector moves.
+//
+// ATOMICITY. Guest-memory traffic moves through a Q register (ldr/str q),
+// one 16-byte host op per 16-byte chunk -- NOT a 64-bit GPR relay. The
+// relay (an earlier revision) made every guest vector store visible to
+// other guest threads as two separate 8-byte writes with a window between
+// them. On this backend's only target (Apple Silicon, ARMv8.4 => FEAT_LSE2)
+// aligned 16-byte ldr/str q are single-copy atomic: strictly fewer
+// observable interleavings than the PS4's Jaguar, which cracked 128-bit
+// accesses into two 64-bit halves -- guest code never had 16-byte
+// atomicity to rely on. Unaligned accesses carry no sub-access guarantee
+// (same accepted corner as the x86 host; see EmitVmovups there for the
+// full analysis). State-side stores (thread-private) have no atomicity
+// requirement; they use the same q ops for instruction-count reasons.
+//
+// YMM state chunks are 32-byte aligned (alignas on GuestState::ymm), so
+// the q-form scaled immediates at chunk*16 are always encodable.
 bool EmitVmovFull(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                   u64 next_rip, CodeGenerator& c) {
     const bool ymm = (ops[0].size == 256 || ops[1].size == 256);
@@ -5125,14 +5137,14 @@ bool EmitVmovFull(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         const int dst = ZydisVecToIndex(ops[0].reg.value);
         const int src = ZydisVecToIndex(ops[1].reg.value);
         if (dst < 0 || src < 0) return false;
-        for (int ch = 0; ch < nchunks; ++ch) {
-            c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, ch)));
-            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, ch)));
+        for (int ch = 0; ch < nchunks; ch += 2) {
+            c.ldr(QReg(0), ptr(kState, YmmChunkOffset(src, ch)));
+            c.str(QReg(0), ptr(kState, YmmChunkOffset(dst, ch)));
         }
         if (!ymm) {
-            c.mov(kScratch0, 0);
-            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
-            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+            // VEX 128-bit form zeros bits 255:128 of the destination.
+            c.movi(VReg16B(0), 0);
+            c.str(QReg(0), ptr(kState, YmmChunkOffset(dst, 2)));
         }
         return true;
     }
@@ -5142,15 +5154,13 @@ bool EmitVmovFull(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         if (dst < 0) return false;
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
         c.mov(kScratch1, kAddr);
-        for (int ch = 0; ch < nchunks; ++ch) {
-            c.add(kScratch0, kScratch1, ch * 8);
-            c.ldr(kScratch2, ptr(kScratch0));
-            c.str(kScratch2, ptr(kState, YmmChunkOffset(dst, ch)));
+        for (int ch = 0; ch < nchunks; ch += 2) {
+            c.ldr(QReg(0), ptr(kScratch1, ch * 8));
+            c.str(QReg(0), ptr(kState, YmmChunkOffset(dst, ch)));
         }
         if (!ymm) {
-            c.mov(kScratch0, 0);
-            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
-            c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+            c.movi(VReg16B(0), 0);
+            c.str(QReg(0), ptr(kState, YmmChunkOffset(dst, 2)));
         }
         return true;
     }
@@ -5160,10 +5170,11 @@ bool EmitVmovFull(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
         if (src < 0) return false;
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
         c.mov(kScratch1, kAddr);
-        for (int ch = 0; ch < nchunks; ++ch) {
-            c.ldr(kScratch2, ptr(kState, YmmChunkOffset(src, ch)));
-            c.add(kScratch0, kScratch1, ch * 8);
-            c.str(kScratch2, ptr(kScratch0));
+        // The store direction: this is where the GPR relay was observably
+        // torn by concurrent guest threads (see the atomicity note above).
+        for (int ch = 0; ch < nchunks; ch += 2) {
+            c.ldr(QReg(0), ptr(kState, YmmChunkOffset(src, ch)));
+            c.str(QReg(0), ptr(kScratch1, ch * 8));
         }
         return true;
     }
