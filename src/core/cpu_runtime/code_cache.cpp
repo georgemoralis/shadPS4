@@ -280,6 +280,25 @@ u8* CodeCache::Allocate(u64 size) {
     return base_ + prev;
 }
 
+bool CodeCache::ReturnTail(const u8* block_base, u64 reserved, u64 used) noexcept {
+    const u64 begin = static_cast<u64>(block_base - base_);
+    // Mirror Allocate's rounding on both figures: the reservation was
+    // bumped by AlignUp(reserved), and the new top must keep the next
+    // block's BLOCK_ALIGN guarantee.
+    const u64 top_if_last = begin + Common::AlignUp(reserved, BLOCK_ALIGN);
+    const u64 new_top = begin + Common::AlignUp(used, BLOCK_ALIGN);
+    if (new_top >= top_if_last) {
+        return false; // nothing to reclaim
+    }
+    u64 expected = top_if_last;
+    // CAS: only shrink if we are still the top allocation. Failure means a
+    // concurrent Allocate (or its overflow back-out window) moved the bump;
+    // the tail is then unreachable until the next Flush -- accepted.
+    return used_.compare_exchange_strong(expected, new_top,
+                                         std::memory_order_acq_rel,
+                                         std::memory_order_relaxed);
+}
+
 void CodeCache::Flush() {
     std::lock_guard lock{emit_mutex_};
     used_.store(0, std::memory_order_release);

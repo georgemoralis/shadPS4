@@ -8034,6 +8034,13 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
     // the global one), so qualify it explicitly. (`::` does NOT work here.)
     Xbyak_aarch64::sys_icache_invalidate(code_buf, emitted);
 
+    // Hand the unused remainder of the cap-sized reservation back to the
+    // bump allocator (see CodeCache::ReturnTail; the x86 tail has the full
+    // note). Safe relative to the icache invalidate above: the reclaimed
+    // bytes were never executed, and a future block landing in them runs
+    // its own invalidate over its own range.
+    code_cache_.ReturnTail(code_buf, BLOCK_HOST_SIZE_CAP, emitted);
+
     bytes_emitted_ += emitted;
     ++blocks_compiled_;
     return code_buf;

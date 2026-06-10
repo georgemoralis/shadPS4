@@ -9975,6 +9975,13 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
     }
 
     const u64 emitted = c.getSize();
+    // Hand the unused remainder of the cap-sized reservation back to the
+    // bump allocator (succeeds whenever no other thread allocated since;
+    // see CodeCache::ReturnTail). Multiplies effective cache capacity by
+    // the cap-to-typical-block ratio, making stop-the-world recycles
+    // correspondingly rarer.
+    code_cache_.ReturnTail(code_buf, BLOCK_HOST_SIZE_CAP, emitted);
+
     bytes_emitted_ += emitted;
     ++blocks_compiled_;
 

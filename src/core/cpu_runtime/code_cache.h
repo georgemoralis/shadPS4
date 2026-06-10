@@ -66,6 +66,28 @@ public:
     /// allocations are also aligned (the allocator rounds up).
     [[nodiscard]] u8* Allocate(u64 size);
 
+    /// Return the unused tail of the MOST RECENT allocation to the pool.
+    ///
+    /// The lifter reserves a fixed per-block cap up front (it cannot know
+    /// the emitted size before emitting) and calls this with the actual
+    /// byte count afterwards. Without it, every block burned the full cap:
+    /// at a 16 KiB cap the 64 MiB cache held at most 4096 blocks while
+    /// typical blocks emit well under 1 KiB -- a 20-50x effective-capacity
+    /// loss paid for in stop-the-world recycles.
+    ///
+    /// Concurrency: compiles run in parallel, so the tail can only be
+    /// reclaimed if this allocation is still the TOP of the bump -- a
+    /// single CAS from (block start + reserved) down to (block start +
+    /// aligned used). If another thread allocated in between, the CAS
+    /// fails and the tail is simply wasted (the pre-ReturnTail behavior;
+    /// now the rare interleaved case instead of every block). A concurrent
+    /// failing Allocate's inflate/deflate window likewise just fails the
+    /// CAS. Returns whether the tail was reclaimed; callers need not care.
+    ///
+    /// `block_base` must be a pointer returned by Allocate(`reserved`),
+    /// with `used` <= `reserved` bytes actually written.
+    bool ReturnTail(const u8* block_base, u64 reserved, u64 used) noexcept;
+
     /// Reset the bump pointer to the start of the cache. All
     /// previously-allocated regions become invalid; the caller is
     /// responsible for ensuring no host code is executing in the
