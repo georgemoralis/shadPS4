@@ -258,6 +258,34 @@ inline void RestoreHostRounding(const GuestState*) noexcept {}
 inline void ApplyGuestRounding(const GuestState*) noexcept {}
 #endif
 
+/// FNV-1a over the guest's vector and x87 state, for the watchdog's lazy
+/// second-stage progress check. Reads ~1.1 KB; deliberately NOT called on
+/// the per-transition hot path -- only at the two sampling points of a
+/// suspected-stuck episode (see the watchdog below). A 64-bit digest
+/// instead of a stored snapshot keeps the thread_local footprint at 8
+/// bytes; the 2^-64 per-episode collision odds are noise next to the
+/// equivalent aliasing the GPR comparison already accepts.
+u64 HashGuestVectorState(const GuestState* state) noexcept {
+    constexpr u64 kFnvOffset = 0xCBF29CE484222325ULL;
+    constexpr u64 kFnvPrime = 0x100000001B3ULL;
+    u64 h = kFnvOffset;
+    const auto fold = [&](const void* p, size_t n) {
+        const u8* b = static_cast<const u8*>(p);
+        for (size_t i = 0; i < n; ++i) {
+            h ^= b[i];
+            h *= kFnvPrime;
+        }
+    };
+    fold(state->ymm.data(), state->ymm.size() * sizeof(u64));
+    fold(state->st.data(), state->st.size() * sizeof(u64));
+    fold(&state->fpu_top, sizeof(state->fpu_top));
+    fold(&state->fpu_tag, sizeof(state->fpu_tag));
+    fold(&state->fpu_sw_cc, sizeof(state->fpu_sw_cc));
+    fold(&state->fpu_cw, sizeof(state->fpu_cw));
+    fold(&state->mxcsr, sizeof(state->mxcsr));
+    return h;
+}
+
 /// Take a claim, parking while a flush is pending. The increment-then-
 /// re-check dance closes the race where a flusher sets pending between our
 /// pending load and our increment: if we lost that race we back out (undoing
@@ -549,11 +577,36 @@ void* DispatcherTrampoline(GuestState* state) {
         static thread_local u64 same_rip_hits = 0;
         static thread_local std::array<u64, 16> last_gpr{};
         static thread_local u64 last_rflags = 0;
-        // Forward progress = any change in the integer register file or flags
-        // between consecutive entries at the same block. A true spin reads
-        // memory and branches without mutating a register, so its state is
-        // identical every pass and the counter climbs; an advancing loop
-        // changes a counter/pointer and resets it.
+        // Forward progress, stage 1 (every transition, cheap): any change in
+        // the integer register file or flags between consecutive entries at
+        // the same block. A true spin reads memory and branches without
+        // mutating a register, so its state is identical every pass and the
+        // counter climbs; an advancing loop changes a counter/pointer and
+        // resets it.
+        //
+        // Stage 2 (lazy, two reads per suspected episode): loops whose
+        // induction state lives ENTIRELY in vector or x87 registers -- a
+        // convergence loop accumulating in xmm0 with ucomisd producing the
+        // same flag pattern every pass, SIMD DSP/PRNG kernels, x87
+        // accumulation -- are invisible to stage 1 and were previously
+        // KILLED as stuck at 10 M iterations. Comparing the ~1.1 KB of
+        // vector state per transition would tax the hot path, so it is
+        // hashed only twice: a digest at the half-threshold, re-checked at
+        // the threshold. Any difference proves vector-only progress and
+        // resets the episode (it re-arms automatically if the counter
+        // climbs back). Cost: two 1.1 KB hashes per ~10 M transitions of a
+        // suspected loop; zero when loops advance through integer state.
+        //
+        // KNOWN LIMITATION (pre-existing, now multi-thread-relevant): a
+        // guest thread spinning on a memory flag that ANOTHER guest thread
+        // will eventually write (raw spinlock, no register mutation) is
+        // byte-identical state from this thread's view and WILL fire at the
+        // threshold even though the program is correct. With pthread.cpp
+        // launching real concurrent guests, a seconds-long contended spin
+        // is plausible. The honest fix is cross-thread: only fire when no
+        // other guest thread has made progress either, or demote to
+        // LOG_ERROR-and-continue when multiple guest threads exist.
+        // Flagged, not implemented here.
         const bool advanced =
             (last_gpr != state->gpr) || (last_rflags != state->rflags);
         if (cur_rip == last_rip && !advanced) {
@@ -565,11 +618,23 @@ void* DispatcherTrampoline(GuestState* state) {
         last_gpr = state->gpr;
         last_rflags = state->rflags;
         constexpr u64 kStuckThreshold = 10'000'000;
+        constexpr u64 kSuspectThreshold = kStuckThreshold / 2;
+        static thread_local u64 suspect_vec_hash = 0;
+        if (same_rip_hits == kSuspectThreshold) {
+            suspect_vec_hash = HashGuestVectorState(state);
+        }
+        if (same_rip_hits == kStuckThreshold &&
+            HashGuestVectorState(state) != suspect_vec_hash) {
+            // Vector/x87 state moved between the two sampling points:
+            // the loop is advancing, just not through integer state.
+            same_rip_hits = 1;
+        }
         if (same_rip_hits == kStuckThreshold) {
             LOG_ERROR(Core,
                       "Dispatcher: STUCK at {:#x} after {} re-entries with "
-                      "no forward progress; dumping guest GPRs and exiting "
-                      "fatally",
+                      "no forward progress (integer AND vector/x87 state "
+                      "byte-identical across the episode); dumping guest "
+                      "GPRs and exiting fatally",
                       cur_rip, same_rip_hits);
             static const char* const kGprNames[16] = {
                 "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
