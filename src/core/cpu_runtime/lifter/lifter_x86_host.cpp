@@ -699,6 +699,26 @@ constexpr u64 AllArith = CF | PF | ZF | SF | OF;
 constexpr u64 HostLoadMask = CF | PF | AF | ZF | SF | OF;
 }  // namespace RflagsBits
 
+/// Store host-derived ARITHMETIC flags into guest rflags, preserving the
+/// guest's non-arith bits. The dual of the HostLoadMask applied before every
+/// popfq: a wholesale `mov [rflags], host_pushfq_value` writes host DF=0 over
+/// a guest DF=1 (set by STD; the string ops read it from state.rflags) and
+/// imports the host's IF/reserved bits into the guest image. Every emitter
+/// that captures flags via pushfq MUST store through this merge.
+///
+/// host_flags is masked in place (callers treat it as consumed). The memory
+/// AND uses an imm32 that sign-extends to the full ~HostLoadMask -- bit 31
+/// of 0xFFFFF72A is set, so the hardware extension reproduces the intended
+/// 64-bit mask exactly.
+inline void EmitStoreArithFlags(Xbyak::CodeGenerator& c,
+                                const Xbyak::Reg64& host_flags) {
+    using namespace Xbyak::util;
+    c.and_(host_flags, RflagsBits::HostLoadMask);
+    c.and_(qword[r13 + Offsets::Rflags],
+           static_cast<Xbyak::uint32>(~RflagsBits::HostLoadMask));
+    c.or_(qword[r13 + Offsets::Rflags], host_flags);
+}
+
 /// Emit code that computes PF (parity of the low byte of rax) and
 /// writes the bit into r8 with rflags-position alignment.
 /// Uses r9 as additional scratch.
@@ -1871,7 +1891,7 @@ bool EmitNeg(const ZydisDecodedInstruction& insn,
         }
         c.pushfq();
         c.pop(rdx);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
         return true;
     }
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
@@ -1923,7 +1943,7 @@ bool EmitNeg(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
     return true;
 }
 
@@ -1969,7 +1989,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
         c.pop(rdx);
         c.btr(rdx, 0);                            // clear CF in new flags
         c.or_(rdx, r11);                          // restore saved CF
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
         return true;
     }
 
@@ -2001,7 +2021,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
             c.pushfq(); c.pop(rdx);
             c.mov(word[r13 + GprOffset(idx)], ax);
         }
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
         // Restore CF.
         c.mov(r11, qword[r13 + Offsets::Rflags]);
         c.btr(r11, 0);
@@ -2050,7 +2070,7 @@ bool EmitInc(const ZydisDecodedInstruction& insn,
 
         c.pushfq();
         c.pop(rdx);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
 
         // Writeback: store the full rax (low 32 = result, upper 32 =
         // zero from the eax write above) so the guest slot gets the
@@ -2100,7 +2120,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
         c.pop(rdx);
         c.btr(rdx, 0);
         c.or_(rdx, r11);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
         return true;
     }
 
@@ -2123,12 +2143,13 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
         c.pushfq();
         c.pop(rdx);
         // DEC leaves CF unchanged: take CF from the saved guest rflags,
-        // and everything else from the host result.
+        // and everything else ARITH from the host result -- non-arith bits
+        // (DF!) stay the guest's, via the merge store.
         c.mov(r10, qword[r13 + Offsets::Rflags]);
         c.and_(r10, 0x1);          // r10 = old CF
         c.btr(rdx, 0);             // clear CF in the new flags
         c.or_(rdx, r10);           // restore old CF
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
         c.mov(byte[r13 + byte_off], al);
         return true;
     }
@@ -2149,7 +2170,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
         c.and_(r10, 0x1);
         c.btr(rdx, 0);
         c.or_(rdx, r10);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
         c.mov(word[r13 + GprOffset(idx16)], ax);
         return true;
     }
@@ -2188,7 +2209,7 @@ bool EmitDec(const ZydisDecodedInstruction& insn,
 
         c.pushfq();
         c.pop(rdx);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
 
         c.mov(qword[r13 + GprOffset(idx)], rax);
     }
@@ -2454,7 +2475,7 @@ bool EmitXadd(const ZydisDecodedInstruction& insn,
         else         c.xadd(eax, ecx);
         c.pushfq();
         c.pop(r8);
-        c.mov(qword[r13 + Offsets::Rflags], r8);
+        EmitStoreArithFlags(c, r8);
         // rax = sum (new dst); rcx = old dst (new src). 32-bit results
         // already zero-extend; store full qword slots.
         c.mov(qword[r13 + GprOffset(dst_idx)], rax);
@@ -2469,7 +2490,7 @@ bool EmitXadd(const ZydisDecodedInstruction& insn,
         else         c.xadd(dword[r10], ecx);
         c.pushfq();
         c.pop(r8);
-        c.mov(qword[r13 + Offsets::Rflags], r8);
+        EmitStoreArithFlags(c, r8);
         // Memory now holds the sum; rcx holds the old memory value,
         // which XADD wrote back into the source register.
         c.mov(qword[r13 + GprOffset(src_idx)], rcx);
@@ -2606,7 +2627,7 @@ bool EmitCmpxchg(const ZydisDecodedInstruction& insn,
         else         c.cmpxchg(r9d, ecx);
         c.pushfq();
         c.pop(r8);
-        c.mov(qword[r13 + Offsets::Rflags], r8);
+        EmitStoreArithFlags(c, r8);
         // dst and accumulator may both have changed; 32-bit results are
         // already zero-extended in r9/rax, so a full-qword store is right.
         c.mov(qword[r13 + GprOffset(dst_idx)], r9);
@@ -2623,7 +2644,7 @@ bool EmitCmpxchg(const ZydisDecodedInstruction& insn,
         else         c.cmpxchg(dword[r10], ecx);
         c.pushfq();
         c.pop(r8);
-        c.mov(qword[r13 + Offsets::Rflags], r8);
+        EmitStoreArithFlags(c, r8);
         c.mov(qword[r13 + GprOffset(0)], rax);  // acc updated on mismatch
         return true;
     }
@@ -2774,7 +2795,7 @@ bool EmitLockedRmw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
     auto save_flags = [&] {
         c.pushfq();
         c.pop(r8);
-        c.mov(qword[r13 + Offsets::Rflags], r8);
+        EmitStoreArithFlags(c, r8);
     };
 
     // Effective address into r10 first (EmitEffectiveAddress returns rdx and
@@ -2893,6 +2914,55 @@ bool EmitLockedRmw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
         c.cmpxchg(mem(), rcxw()); // implicit rax compare
         save_flags();
         store_rax(static_cast<int>(GprOffset(0))); // rax updated on mismatch
+        return true;
+    }
+
+    // ---- BTS/BTR/BTC: atomic bit test-and-{set,reset,complement} ----
+    //
+    // Host passthrough: the host is x86, so `lock bts/btr/btc` reproduces the
+    // guest instruction EXACTLY -- including the register-offset form's
+    // bit-string addressing (the bit index is a SIGNED offset; the accessed
+    // byte is EA + (index >> 3), which may sit well outside, and even below,
+    // the nominal operand) and the immediate form's modulo-operand-size
+    // masking. Both are done by hardware identically on host and guest, so
+    // no emulation of the addressing is needed or wanted. CF receives the
+    // pre-update bit value; the remaining arith flags are architecturally
+    // undefined after the BT family, so capturing whatever the host produced
+    // is a conforming choice. No load_flags(): these read no flags, and the
+    // store goes through the arith-only merge, so guest DF and friends are
+    // untouched.
+    case ZYDIS_MNEMONIC_BTS:
+    case ZYDIS_MNEMONIC_BTR:
+    case ZYDIS_MNEMONIC_BTC: {
+        if (w == 8)
+            return false; // no 8-bit form architecturally
+        if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+            const int so = gpr_off(ops[1].reg.value);
+            if (so < 0)
+                return false;
+            load_rcx(so);
+            c.db(0xF0);
+            switch (m) {
+            case ZYDIS_MNEMONIC_BTS: c.bts(mem(), rcxw()); break;
+            case ZYDIS_MNEMONIC_BTR: c.btr(mem(), rcxw()); break;
+            default:                 c.btc(mem(), rcxw()); break;
+            }
+        } else if (ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            // Hardware masks the immediate to the operand size on both
+            // sides; pass it through raw.
+            const u8 bit = static_cast<u8>(ops[1].imm.value.u);
+            c.db(0xF0);
+            switch (m) {
+            case ZYDIS_MNEMONIC_BTS: c.bts(mem(), bit); break;
+            case ZYDIS_MNEMONIC_BTR: c.btr(mem(), bit); break;
+            default:                 c.btc(mem(), bit); break;
+            }
+        } else {
+            return false;
+        }
+        c.pushfq();
+        c.pop(r8);
+        EmitStoreArithFlags(c, r8);
         return true;
     }
 
@@ -3285,7 +3355,7 @@ bool EmitShift64(const ZydisDecodedInstruction& insn,
     // Capture host → guest.
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     // Store the shifted value back (register slot or memory).
     if (dst_mem) c.mov(qword[r8], rax);
@@ -3352,7 +3422,7 @@ bool EmitShift32(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     if (dst_mem) {
         c.mov(dword[r8], eax);   // 32-bit memory store; adjacent bytes untouched
@@ -3419,7 +3489,7 @@ bool EmitShiftNarrow(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     // Narrow store preserves surrounding bytes (memory) or the upper bits of
     // the guest GPR slot (register).
@@ -3507,7 +3577,7 @@ bool EmitRotate64(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     // Store back. Memory: width-sized store (adjacent bytes untouched).
     // Register: 8/16 preserve the upper GPR bits; 32/64 store the full qword
@@ -3584,7 +3654,7 @@ bool EmitImul1Op(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
 
     // Write both halves of the result.
     c.mov(qword[r13 + GprOffset(0)], rax);  // low → RAX
@@ -3635,7 +3705,7 @@ bool EmitImul2Op(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
 
     // Full-qword writeback. For the 32-bit form the 32-bit IMUL
     // already zero-extended rax above, so this stores the canonical
@@ -3688,7 +3758,7 @@ bool EmitImul3Op(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
 
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
     return true;
@@ -3755,7 +3825,7 @@ bool EmitMul(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
 
     // Write results per width.
     if (w == 8) {
@@ -3827,7 +3897,7 @@ bool EmitBlsi(const ZydisDecodedInstruction& insn,
     // Capture host flags (CF/ZF/SF/OF set per BLSI spec).
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
     return true;
 }
@@ -3867,7 +3937,7 @@ bool EmitBlsr(const ZydisDecodedInstruction& insn,
     // Capture host flags (CF/ZF/SF/OF set per BLSR spec).
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
     return true;
 }
@@ -4122,7 +4192,7 @@ bool EmitAdcSbb64(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
 
     c.mov(qword[r13 + GprOffset(dst_idx)], rax);
     return true;
@@ -4220,7 +4290,7 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
 
         c.pushfq();
         c.pop(rdx);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
 
         if (writeback) {
             c.mov(byte[r10], al);     // store result back to [mem]
@@ -4279,7 +4349,7 @@ bool EmitNarrowArith8(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     // CMP and TEST discard the result — only the others write back.
     // Narrow store preserves upper 56 bits per x86-64 semantics; writes
@@ -4345,7 +4415,7 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
 
         c.pushfq();
         c.pop(rdx);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
 
         if (writeback) {
             c.mov(word[r10], ax);
@@ -4391,7 +4461,7 @@ bool EmitNarrowArith16(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
         c.mov(word[r13 + GprOffset(dst_idx)], ax);
@@ -4488,7 +4558,7 @@ bool EmitNarrowArith32(const ZydisDecodedInstruction& insn,
 
         c.pushfq();
         c.pop(rdx);
-        c.mov(qword[r13 + Offsets::Rflags], rdx);
+        EmitStoreArithFlags(c, rdx);
 
         // Store the result back. dword store leaves the upper 32
         // bits of the surrounding qword untouched, which is the
@@ -4545,7 +4615,7 @@ bool EmitNarrowArith32(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(rdx);
-    c.mov(qword[r13 + Offsets::Rflags], rdx);
+    EmitStoreArithFlags(c, rdx);
 
     if (kind != NarrowArithKind::Cmp && kind != NarrowArithKind::Test) {
         // 32-bit write to a register zeros the upper 32 bits. Our
@@ -8686,7 +8756,7 @@ bool EmitVpcmpistri(const ZydisDecodedInstruction& insn,
     // Capture flags, then store host ECX → guest ECX (zero-extended).
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
     c.mov(eax, ecx);                          // zero-extends rax
     c.mov(qword[r13 + GprOffset(1)], rax);    // guest RCX/ECX
     return true;
@@ -8735,7 +8805,7 @@ bool EmitVpcmpistrm(const ZydisDecodedInstruction& insn,
 
     c.pushfq();
     c.pop(r8);
-    c.mov(qword[r13 + Offsets::Rflags], r8);
+    EmitStoreArithFlags(c, r8);
 
     // Copy host XMM0 (the result mask) to the guest xmm0 slot; the mask
     // is 128-bit, upper YMM unaffected by the legacy/VEX.128 form -> zero.
