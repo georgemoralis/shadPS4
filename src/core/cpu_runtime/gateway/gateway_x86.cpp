@@ -52,6 +52,21 @@ void FreeGatewayRegion(u8* p) {
 #endif
 }
 
+/// Frame allocation made once in the Windows prologue: 32 bytes of MS x64
+/// shadow space for the dispatcher call PLUS 8 bytes of alignment. Keeping
+/// the whole amount in the prologue (instead of sub/add rsp,32 around every
+/// dispatcher call, as an earlier revision did) gives the gateway a CONSTANT
+/// rsp for every instruction past the prologue -- which is the property that
+/// lets a single UNWIND_INFO describe the frame correctly at any PC. The OS
+/// unwinder applies the full code array for any PC past the prologue; an rsp
+/// that changes mid-function (per-call shadow space) cannot be expressed in
+/// one static UNWIND_INFO, and the walk reconstructed the caller frame 40
+/// bytes off exactly when it mattered most: while parked inside the
+/// dispatcher call, where the gateway spends nearly all of its time.
+#ifdef _WIN32
+constexpr u32 WIN_GATEWAY_FRAME_ALLOC = 40; // 32 shadow + 8 align
+#endif
+
 /// Generate the gateway entry stub. Called once at Gateway
 /// construction time; the returned pointer is callable as
 /// `void (*)(GuestState*, DispatcherFn)`.
@@ -70,7 +85,12 @@ void FreeGatewayRegion(u8* p) {
 /// helper calls the JIT makes. Why those three specifically: they
 /// have low encoding cost (REX.B variants) and don't collide with
 /// the C ABI's argument registers.
-void GenerateGateway(u8* code_buf, u64 code_size) {
+/// Returns the measured byte length of the (Windows) prologue -- the offset
+/// of the first instruction after the frame allocation -- so the unwind
+/// registration describes the bytes ACTUALLY emitted rather than a hardcoded
+/// guess that an xbyak encoding choice could silently desync. Returns 0 on
+/// System V (no unwind tables are registered there).
+u32 GenerateGateway(u8* code_buf, u64 code_size) {
     using namespace Xbyak::util;
 
     Xbyak::CodeGenerator c{code_size, code_buf};
@@ -89,8 +109,9 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     // - Args in rcx, rdx, r8, r9.
     // - Callee-saved: rbx, rbp, rdi, rsi, r12-r15, xmm6-xmm15.
     // - Shadow space: 32 bytes the caller reserves below rsp.
-    //   We don't need to allocate it here (we're the callee) but
-    //   we DO need to allocate it before calling C from JIT.
+    //   We don't need it for OUR entry (we're the callee; our caller
+    //   provided it), but we must provide it for the dispatcher calls
+    //   we make -- done once, in the frame allocation below.
     c.push(rbp);
     c.push(rbx);
     c.push(rdi);
@@ -99,21 +120,28 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     c.push(r13);
     c.push(r14);
     c.push(r15);
-    // Stack alignment after the 8 pushes:
+    // The pushes have fixed encodings (1 byte for the legacy regs, 2 bytes
+    // for the REX.B r12..r15 forms); the unwind codes below depend on those
+    // offsets, so pin them.
+    const u32 pushes_end = static_cast<u32>(c.getSize());
+    ASSERT_MSG(pushes_end == 12,
+               "Gateway: unexpected push encoding length {} (unwind codes "
+               "assume 12)", pushes_end);
+
+    // Frame allocation, ONCE, covering the whole function:
     //
-    //   At Enter() entry (immediately after CALL), rsp is misaligned
-    //   by 8 from a 16-byte boundary — the CALL pushed an 8-byte
-    //   return address onto a 16-aligned caller rsp.
+    //   At Enter() entry (immediately after CALL), rsp is misaligned by 8
+    //   from a 16-byte boundary. 8 pushes = 64 bytes, still misaligned by
+    //   8. Subtracting 40 (= WIN_GATEWAY_FRAME_ALLOC: 32 bytes of MS x64
+    //   shadow space + 8 alignment) leaves rsp 16-aligned at every
+    //   subsequent CALL site, with the shadow space permanently sitting
+    //   just above rsp where the callee expects it.
     //
-    //   8 pushes = 64 bytes added. 64 mod 16 = 0, so rsp is STILL
-    //   misaligned by 8 here. To call C cleanly later (which expects
-    //   rsp 16-aligned right before the CALL, becoming misaligned by
-    //   8 inside the callee), we need to compensate by 8.
-    //
-    // The SysV branch below documents the analogous reasoning for
-    // 6 pushes = 48 bytes. The conclusion is the same: an extra
-    // 8-byte sub to realign.
-    c.sub(rsp, 8);
+    //   Allocating per call (sub/add rsp,32 around the dispatcher call)
+    //   was rejected: it makes rsp PC-dependent, which a single static
+    //   UNWIND_INFO cannot describe -- see the unwind registration below.
+    c.sub(rsp, WIN_GATEWAY_FRAME_ALLOC);
+    const u32 prolog_end = static_cast<u32>(c.getSize());
 
     c.mov(r13, rcx); // state
     c.mov(r12, rdx); // dispatcher
@@ -178,10 +206,11 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     // Call dispatcher(state). r13 is state. We need state in rdi
     // (System V) or rcx (Windows) for the C call.
 #ifdef _WIN32
-    c.sub(rsp, 32); // shadow space for the C call
+    // Shadow space was allocated once in the prologue; rsp is already
+    // 16-aligned here with 32 free bytes above it. No per-call adjustment
+    // (that would break the static unwind description -- see prologue).
     c.mov(rcx, r13);
     c.call(r12);
-    c.add(rsp, 32);
 #else
     c.mov(rdi, r13);
     c.call(r12);
@@ -205,7 +234,9 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     c.L(exit_stub);
 
 #ifdef _WIN32
-    c.add(rsp, 8); // undo the alignment dummy (matches `sub rsp, 8` in prologue)
+    // Undo the prologue's single frame allocation. `add rsp, imm8` followed
+    // by pops + ret matches the OS unwinder's legal-epilogue pattern.
+    c.add(rsp, WIN_GATEWAY_FRAME_ALLOC);
     c.pop(r15);
     c.pop(r14);
     c.pop(r13);
@@ -231,6 +262,11 @@ void GenerateGateway(u8* code_buf, u64 code_size) {
     // is the start of the buffer (entry point is the first
     // instruction).
     // ============================================================
+#ifdef _WIN32
+    return prolog_end;
+#else
+    return 0;
+#endif
 }
 
 } // namespace
@@ -277,6 +313,9 @@ namespace {
 
 // Operation codes for UNWIND_CODE.UnwindOp.
 constexpr u8 UWOP_PUSH_NONVOL = 0;
+// Fixed stack allocation of (op_info + 1) * 8 bytes, 8..128. Describes the
+// prologue's `sub rsp, WIN_GATEWAY_FRAME_ALLOC`.
+constexpr u8 UWOP_ALLOC_SMALL = 2;
 // (other UWOPs not used here)
 
 // Register encodings for UWOP_PUSH_NONVOL.OpInfo (matches AMD64 reg-num).
@@ -300,9 +339,10 @@ struct UnwindCode {
 static_assert(sizeof(UnwindCode) == 2, "UNWIND_CODE must be exactly 2 bytes");
 
 // UNWIND_INFO header + the inline codes array. Layout matches
-// winnt.h:_UNWIND_INFO. codes[] is sized to the max we use (8 pushes);
-// CountOfCodes tells the OS how many are valid. The array must end
-// on a 4-byte boundary, which 8 codes (16 bytes) satisfies.
+// winnt.h:_UNWIND_INFO. We use 9 codes (1 ALLOC_SMALL + 8 pushes);
+// CountOfCodes tells the OS how many are valid. Per the documented
+// format the array always holds an EVEN number of slots for alignment,
+// so it is sized 10 with the last entry unused.
 struct UnwindInfoGateway {
     u8 version : 3; // = 1
     u8 flags : 5;   // = 0 (no exception handler, no chained)
@@ -310,9 +350,9 @@ struct UnwindInfoGateway {
     u8 count_of_codes;
     u8 frame_register : 4; // = 0 (no frame register)
     u8 frame_offset : 4;   // = 0
-    UnwindCode codes[8];   // exactly 8 pushes in gateway prolog
+    UnwindCode codes[10];  // 9 used: ALLOC_SMALL + 8 pushes; [9] = pad
 };
-static_assert(sizeof(UnwindInfoGateway) == 4 + 8 * 2,
+static_assert(sizeof(UnwindInfoGateway) == 4 + 10 * 2,
               "UNWIND_INFO layout mismatch — check bit-field packing");
 
 // Offsets within the gateway RWX page. We co-locate unwind metadata
@@ -327,11 +367,15 @@ static_assert(GATEWAY_RUNTIME_FN_OFFSET + sizeof(RUNTIME_FUNCTION) < GATEWAY_SIZ
 /// Populate unwind metadata for the gateway and register it with the OS.
 ///
 /// Called once per Gateway construction, after the gateway code has
-/// been emitted. Returns true if the OS accepted the registration.
-/// On false, JIT execution may still work for tests that don't
-/// trigger SEH walks, but anything that does (debugger break,
-/// exception, /GS failure) will crash.
-bool RegisterGatewayUnwindInfo(u8* gateway_base) {
+/// been emitted. `prolog_size` is the MEASURED prologue length returned
+/// by GenerateGateway (the offset of the first instruction after the
+/// frame allocation) -- using the emitted truth instead of a hardcoded
+/// constant means an xbyak encoding change cannot silently desync the
+/// unwind description from the code. Returns true if the OS accepted
+/// the registration. On false, JIT execution may still work for tests
+/// that don't trigger SEH walks, but anything that does (debugger
+/// break, exception, /GS failure) will crash.
+bool RegisterGatewayUnwindInfo(u8* gateway_base, u32 prolog_size) {
     // ----------------------------------------------------------------
     // Build UNWIND_INFO describing the gateway's MS x64 prologue:
     //
@@ -343,31 +387,48 @@ bool RegisterGatewayUnwindInfo(u8* gateway_base) {
     //   offset 6:  push r13    (2 bytes; rsp after = -48)
     //   offset 8:  push r14    (2 bytes; rsp after = -56)
     //   offset 10: push r15    (2 bytes; rsp after = -64)
-    //   offset 12: (prologue ends; following movs/leas don't affect
-    //              unwind state, so we set size_of_prolog = 12)
+    //   offset 12: sub rsp, 40 (4 bytes; rsp after = -104)
+    //   offset 16: (prologue ends = prolog_size; the following movs /
+    //              leas don't affect unwind state)
+    //
+    // The ALLOC_SMALL entry is the load-bearing addition: every PC past
+    // the prologue -- including the return address of the dispatcher
+    // call, where SEH walks overwhelmingly arrive -- now reconstructs
+    // the caller's rsp through the full 104-byte frame. The previous
+    // revision described only the pushes while the code subtracted an
+    // extra 8 (alignment) plus a per-call 32 (shadow space), so every
+    // walk through a parked gateway frame was 40 bytes off and chased
+    // a garbage return address: the exact crash this registration
+    // exists to prevent.
     //
     // Per Microsoft documentation, codes are stored in REVERSE
     // prologue order: codes[0] describes the LAST prologue op. The
     // CodeOffset field records where the corresponding instruction
     // ENDS (its "rsp value after this op was applied").
     // ----------------------------------------------------------------
+    static_assert(WIN_GATEWAY_FRAME_ALLOC % 8 == 0 && WIN_GATEWAY_FRAME_ALLOC <= 128,
+                  "UWOP_ALLOC_SMALL encodes (n/8 - 1) in 4 bits: size must be "
+                  "a multiple of 8, at most 128");
+    constexpr u8 kAllocSmallInfo = WIN_GATEWAY_FRAME_ALLOC / 8 - 1;
+
     UnwindInfoGateway* ui =
         reinterpret_cast<UnwindInfoGateway*>(gateway_base + GATEWAY_UNWIND_INFO_OFFSET);
     *ui = {};
     ui->version = 1;
     ui->flags = 0;
-    ui->size_of_prolog = 12;
-    ui->count_of_codes = 8;
+    ui->size_of_prolog = static_cast<u8>(prolog_size);
+    ui->count_of_codes = 9;
     ui->frame_register = 0;
     ui->frame_offset = 0;
-    ui->codes[0] = {12, UWOP_PUSH_NONVOL, UWREG_R15};
-    ui->codes[1] = {10, UWOP_PUSH_NONVOL, UWREG_R14};
-    ui->codes[2] = {8, UWOP_PUSH_NONVOL, UWREG_R13};
-    ui->codes[3] = {6, UWOP_PUSH_NONVOL, UWREG_R12};
-    ui->codes[4] = {4, UWOP_PUSH_NONVOL, UWREG_RSI};
-    ui->codes[5] = {3, UWOP_PUSH_NONVOL, UWREG_RDI};
-    ui->codes[6] = {2, UWOP_PUSH_NONVOL, UWREG_RBX};
-    ui->codes[7] = {1, UWOP_PUSH_NONVOL, UWREG_RBP};
+    ui->codes[0] = {static_cast<u8>(prolog_size), UWOP_ALLOC_SMALL, kAllocSmallInfo};
+    ui->codes[1] = {12, UWOP_PUSH_NONVOL, UWREG_R15};
+    ui->codes[2] = {10, UWOP_PUSH_NONVOL, UWREG_R14};
+    ui->codes[3] = {8, UWOP_PUSH_NONVOL, UWREG_R13};
+    ui->codes[4] = {6, UWOP_PUSH_NONVOL, UWREG_R12};
+    ui->codes[5] = {4, UWOP_PUSH_NONVOL, UWREG_RSI};
+    ui->codes[6] = {3, UWOP_PUSH_NONVOL, UWREG_RDI};
+    ui->codes[7] = {2, UWOP_PUSH_NONVOL, UWREG_RBX};
+    ui->codes[8] = {1, UWOP_PUSH_NONVOL, UWREG_RBP};
 
     // ----------------------------------------------------------------
     // RUNTIME_FUNCTION ties code range -> unwind info. Addresses are
@@ -401,20 +462,23 @@ Gateway::Gateway() {
     ASSERT_MSG(gateway_code_ != nullptr, "Gateway: failed to allocate RWX page");
     gateway_size_ = GATEWAY_SIZE;
 
-    GenerateGateway(gateway_code_, gateway_size_);
+    const u32 prolog_size = GenerateGateway(gateway_code_, gateway_size_);
     entry_ = reinterpret_cast<EntryFn>(gateway_code_);
 
 #ifdef _WIN32
     // Register the gateway's unwind metadata so Windows can walk
     // stack frames through it. Without this, SEH walks (from /GS
     // checks, debugger breaks, etc.) crash the process even for
-    // simple JIT operations. See RegisterGatewayUnwindInfo for the
-    // full rationale.
-    if (!RegisterGatewayUnwindInfo(gateway_code_)) {
+    // simple JIT operations. The MEASURED prologue size from the
+    // generator keeps the description tied to the bytes actually
+    // emitted. See RegisterGatewayUnwindInfo for the full rationale.
+    if (!RegisterGatewayUnwindInfo(gateway_code_, prolog_size)) {
         LOG_WARNING(Core, "Gateway: RtlAddFunctionTable failed; SEH walks "
                           "through JIT frames will crash. JIT may still "
                           "work for code paths that don't trigger walks.");
     }
+#else
+    (void)prolog_size; // only consumed by the Windows unwind registration
 #endif
 
     LOG_INFO(Core, "Gateway: generated at {} (size budget {} bytes)",
