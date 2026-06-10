@@ -32,7 +32,17 @@ namespace Core::Runtime {
 ///      even on hosts that only have 16. This matches the prototype
 ///      design and keeps the offsets stable across hosts.
 ///
-/// The struct is intentionally trivial and aggregate-constructible.
+/// The struct is intentionally standard-layout (offsetof everywhere),
+/// trivially copyable, and aggregate-constructible. It is NOT trivially
+/// default-constructible, deliberately: the two FP control fields carry
+/// default member initializers so that `GuestState st{}` -- the universal
+/// construction idiom across the runtime and several hundred tests --
+/// yields the ARCHITECTURAL reset state (post-FNINIT cw, power-on MXCSR)
+/// instead of an impossible one. Zero is not a neutral value for either
+/// field: cw=0 / mxcsr=0 mean "all FP exceptions unmasked", a state no
+/// fresh x86 thread has ever been in, and FNSTCW/STMXCSR faithfully
+/// report whatever the field holds. Whole-struct memset would erase the
+/// defaults; construct with {} instead (no current code memsets it).
 /// Constructors / destructors / virtual functions would all complicate
 /// the gateway path with no benefit.
 struct alignas(64) GuestState {
@@ -83,7 +93,11 @@ struct alignas(64) GuestState {
     alignas(32) std::array<u64, 32 * 4> ymm;
 
     // ---- MXCSR (SSE control/status) ----
-    u32 mxcsr;
+    // Default = the architectural power-on value: round-to-nearest, all
+    // exceptions masked, FTZ/DAZ off. STMXCSR reports this field verbatim,
+    // and the dispatcher's rounding swap sanitizes it before applying to
+    // the host, so the default must be the real reset value, not zero.
+    u32 mxcsr = 0x1F80;
 
     // ---- Exit code ----
     // Set by the dispatcher / helpers when guest execution should
@@ -145,10 +159,12 @@ struct alignas(64) GuestState {
     u16 fpu_tag;
 
     // Control word (rounding mode, precision control, exception masks).
-    // Read/written by fldcw/fnstcw. Initialized to 0x037F (the x87
-    // default: round-to-nearest, 64-bit precision, all exceptions
-    // masked) when the FPU is reset (finit).
-    u16 fpu_cw;
+    // Read/written by fldcw/fnstcw; the RC field (bits 11:10) drives
+    // FISTP's rounding. Default = 0x037F, the post-FNINIT word
+    // (round-to-nearest, 64-bit precision, all exceptions masked), so a
+    // freshly constructed state reports the architectural value from
+    // FNSTCW even when it never passed through CallGuest.
+    u16 fpu_cw = 0x037F;
 
     // Cached condition codes C0/C1/C2/C3 from the last compare-class
     // instruction (fcom/fucom/fxam/...), in their status-word bit

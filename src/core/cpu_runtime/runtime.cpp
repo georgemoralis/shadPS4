@@ -1261,16 +1261,10 @@ GuestState Runtime::CallGuest(VAddr guest_fn, void* guest_stack_top,
     ASSERT_MSG(guest_stack_top != nullptr, "CallGuest: null guest_stack_top");
 
     GuestState state{};
-
-    // FP control state must come up in the architectural reset values, not
-    // zero: mxcsr = 0x1F80 (round-to-nearest, all exceptions masked --
-    // mxcsr 0 means everything UNMASKED, and a guest stmxcsr/ldmxcsr fenv
-    // round-trip would faithfully propagate that), fpu_cw = 0x037F (the
-    // FNINIT default that guest_state.h documents and EmitFnstcw reports).
-    // fpu_tag = 0 is correct for the lifter's 1-bit "in use" model (all
-    // slots empty).
-    state.mxcsr = 0x1F80;
-    state.fpu_cw = 0x037F;
+    // FP control state (mxcsr / fpu_cw) comes up in the architectural reset
+    // values via GuestState's default member initializers -- every
+    // construction site gets them, not just this one. fpu_tag = 0 is
+    // correct for the lifter's 1-bit "in use" model (all slots empty).
 
     // Record the true top of this guest stack for the HLE bridge's
     // stack-argument bound (see GuestState::stack_top). The raw, pre-
