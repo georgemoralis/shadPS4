@@ -48,11 +48,25 @@ public:
     /// pinned r14 (x86) / x26 (arm64) for a normal block end, or to the
     /// exit stub via r15 (x86) / x25 (arm64) for a fatal exit. (An earlier
     /// comment swapped these; the gateway sources are authoritative.)
+    ///
+    /// Never throws: assembler exceptions (Xbyak / Xbyak_aarch64 Error)
+    /// are caught at this boundary and surfaced as nullptr. They must not
+    /// propagate -- the caller sits below a JIT-emitted gateway frame that
+    /// C++ unwinding cannot cross (no eh_frame / no SEH handler), so an
+    /// escaped exception is std::terminate at best.
     void* CompileBlock(u64 guest_rip);
 
     /// Diagnostics: number of blocks compiled, number of bytes of
     /// host code emitted, number of unsupported-instruction
     /// terminations.
+    /// The fixed per-block code-cache reservation (BLOCK_HOST_SIZE_CAP of
+    /// the active host backend). The dispatcher uses it to discriminate
+    /// compile failures: if the cache has at least this much free space,
+    /// a nullptr from CompileBlock was NOT an allocation failure -- it was
+    /// a hard per-block error (assembler threw, oversized block) that no
+    /// amount of cache recycling can fix.
+    [[nodiscard]] static u64 BlockReservationSize() noexcept;
+
     [[nodiscard]] u64 BlocksCompiled() const noexcept {
         return blocks_compiled_.load(std::memory_order_relaxed);
     }

@@ -7487,7 +7487,20 @@ Lifter::~Lifter() {
     std::fflush(stderr);
 }
 
-void* Lifter::CompileBlock(u64 guest_rip) {
+u64 Lifter::BlockReservationSize() noexcept {
+    return BLOCK_HOST_SIZE_CAP;
+}
+
+// Function-try-block: converts any assembler throw (Xbyak_aarch64::Error,
+// a std::exception) into the nullptr compile-failure path -- an escaped
+// exception cannot unwind through the JIT gateway frame. See the x86 host's
+// CompileBlock for the full rationale; one arm64-specific addition: the
+// catch MUST restore W^X before returning. Emission runs between
+// WriteBegin() (MAP_JIT pages writable for this thread) and WriteEnd()
+// (back to executable); a throw mid-emit would otherwise strand the thread
+// in the writable state, and its next jump into ANY cached block faults --
+// macOS refuses to execute writable MAP_JIT pages.
+void* Lifter::CompileBlock(u64 guest_rip) try {
     u8* code_buf = code_cache_.Allocate(BLOCK_HOST_SIZE_CAP);
     if (code_buf == nullptr) {
         return nullptr; // caller flushes + retries
@@ -8024,6 +8037,18 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     bytes_emitted_ += emitted;
     ++blocks_compiled_;
     return code_buf;
+} catch (const std::exception& e) {
+    // Restore W^X first: Allocate() cannot throw, so any exception landing
+    // here was raised at or after the CodeGenerator -- i.e., after
+    // WriteBegin(). WriteEnd() flips pthread_jit_write_protect_np back to
+    // executable; the abandoned reservation was never executed or inserted,
+    // so no i-cache maintenance is needed for it.
+    code_cache_.WriteEnd();
+    std::fprintf(stderr,
+                 "[lifter] compile threw at guest RIP 0x%llx: %s\n",
+                 static_cast<unsigned long long>(guest_rip), e.what());
+    std::fflush(stderr);
+    return nullptr;
 }
 
 } // namespace Core::Runtime

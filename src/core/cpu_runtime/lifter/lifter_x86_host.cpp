@@ -9097,7 +9097,22 @@ Lifter::~Lifter() {
     std::fflush(stderr);
 }
 
-void* Lifter::CompileBlock(u64 guest_rip) {
+u64 Lifter::BlockReservationSize() noexcept {
+    return BLOCK_HOST_SIZE_CAP;
+}
+
+// Function-try-block: the emit loop below calls hundreds of xbyak emitters,
+// any of which can throw Xbyak::Error (ERR_CODE_IS_TOO_BIG past the margin
+// check, label misuse, bad operand combinations). An escaped exception would
+// unwind into the dispatcher and then into the JIT gateway frame, which C++
+// unwinding cannot cross -- std::terminate with no diagnostics. The catch
+// converts any throw into the nullptr compile-failure path; the dispatcher
+// distinguishes it from cache exhaustion via BlockReservationSize() (a hard
+// failure with cache room left is NOT retried, so a deterministic oversized
+// block can't wipe the cache pointlessly). The cap-sized reservation made
+// below is abandoned on throw -- it was never inserted anywhere, no claim
+// ever points at it, and the next recycle reclaims it.
+void* Lifter::CompileBlock(u64 guest_rip) try {
     // Diagnostic: trace the compile path via fprintf(stderr).
     //
     // We deliberately do NOT use LOG_INFO here, even though it would
@@ -9904,6 +9919,15 @@ void* Lifter::CompileBlock(u64 guest_rip) {
     }
 
     return code_buf;
+} catch (const std::exception& e) {
+    // The only thrower in scope is the assembler (Xbyak::Error derives from
+    // std::exception; what() carries the error string). fprintf, not LOG_*:
+    // same JIT-dispatched-context rule as the rest of this function.
+    std::fprintf(stderr,
+                 "[lifter] compile threw at guest RIP 0x%llx: %s\n",
+                 static_cast<unsigned long long>(guest_rip), e.what());
+    std::fflush(stderr);
+    return nullptr;
 }
 
 } // namespace Core::Runtime

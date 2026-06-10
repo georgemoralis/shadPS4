@@ -834,10 +834,17 @@ void* DispatcherTrampoline(GuestState* state) {
         }
         void* host_ptr = rt->CompileBlockForDispatcher(state->rip);
         if (host_ptr == nullptr) {
-            // Compile failed. Returning nullptr causes the gateway to exit
-            // with whatever exit_reason the lifter set. We will not be
-            // executing cache code: hand the claim back. (No rounding swap:
-            // we exit to host C++, where the default is already live.)
+            // Compile failed terminally (hard per-block error, or recycle
+            // attempts exhausted). state->rip already points at the block
+            // we couldn't compile; stamp exit_reason so the gateway exit
+            // reports the truth instead of whatever stale value the last
+            // successful block left behind. UnsupportedInstruction is the
+            // honest fit: the lifter could not produce code for this RIP.
+            state->exit_reason =
+                static_cast<u32>(ExitReason::UnsupportedInstruction);
+            // We will not be executing cache code: hand the claim back.
+            // (No rounding swap: we exit to host C++, where the default is
+            // already live.)
             ReleaseClaim();
             return nullptr;
         }
@@ -942,11 +949,26 @@ void* Runtime::CompileBlockForDispatcher(u64 guest_rip) {
             return host_ptr;
         }
 
-        // CompileBlock returned nullptr. The common (and benign) cause is a
-        // full code cache. We do NOT flush if the cache was already empty (a
-        // block larger than the whole cache, or a non-capacity failure) --
-        // recycling won't help; propagate (the lifter set exit_reason).
-        if (code_cache_->Used() == 0) {
+        // CompileBlock returned nullptr. Two distinct causes, two distinct
+        // responses:
+        //
+        //   1. Cache exhaustion: Allocate() couldn't reserve a block-sized
+        //      chunk. Detectable as free space < BlockReservationSize().
+        //      Benign -- recycle and retry.
+        //   2. Hard per-block failure: the assembler threw (oversized
+        //      block, emitter bug) or some other non-capacity error, with
+        //      room still available. Recycling wipes EVERY compiled block
+        //      and cannot possibly help -- and because such failures are
+        //      deterministic, the old undiscriminated retry would have
+        //      flushed the entire cache twice per occurrence before giving
+        //      up. Propagate immediately instead.
+        //
+        // (Used() is read while other threads may be allocating; the value
+        // is monotonic within a generation, so the heuristic can only err
+        // toward one unnecessary recycle in a tight race, never toward
+        // missing a needed one: the retry loop re-evaluates.)
+        const u64 free_bytes = code_cache_->Capacity() - code_cache_->Used();
+        if (free_bytes >= Lifter::BlockReservationSize()) {
             return nullptr;
         }
 
