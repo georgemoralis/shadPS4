@@ -185,6 +185,99 @@ std::atomic<bool> g_flush_pending{false};
 std::atomic<u64> g_cache_generation{0};
 thread_local bool tl_has_claim = false;
 
+// ============================================================================
+// Guest-thread progress registry (watchdog cross-thread verdicts)
+// ============================================================================
+//
+// The stuck-RIP watchdog (see DispatcherTrampoline) needs to distinguish two
+// situations that look identical from one thread's chair:
+//
+//   (a) a thread spin-reading a memory flag that ANOTHER guest thread will
+//       eventually write (raw spinlock, no register mutation per pass) --
+//       a CORRECT program under contention, must not be killed;
+//   (b) the whole guest frozen -- every thread spinning or wedged -- a true
+//       hang where a fatal exit with register dumps is the useful outcome.
+//
+// Each thread that enters Run() takes a cache-line-sized slot here and bumps
+// its transition counter (relaxed, on an exclusively-owned line: a couple of
+// cycles) at every dispatcher entry; the HLE bridge marks the slot while the
+// thread is parked inside a host call. A stuck thread's verdict then reads
+// the OTHER slots: anyone advancing, or anyone parked in HLE (presumed
+// legitimately waiting -- sema, sleep, io), means the system is alive and
+// the watchdog demotes to log-and-continue. Fatal fires only when this
+// thread is provably frozen AND every other guest thread is too. The
+// single-threaded case degenerates to the original behavior exactly (no
+// other slots -> fatal), which the true-spin runtime test pins.
+//
+// Slots are registered on the OUTERMOST Run() of a thread (nested Run via
+// caller-stack callbacks reuses the slot; depth-counted) and released at its
+// exit. The fixed pool bounds the cost; a thread beyond the pool runs
+// without a slot -- it is invisible to other threads' verdicts, and its own
+// watchdog demotes to log-and-continue rather than risk a false kill on
+// partial information (degradation documented over silent wrongness).
+
+struct alignas(64) ThreadProgressSlot {
+    std::atomic<u64> transitions{0};
+    std::atomic<bool> in_hle{false};
+    std::atomic<bool> active{false};
+};
+constexpr size_t kMaxProgressSlots = 512; // 32 KiB static; >n guest threads
+std::array<ThreadProgressSlot, kMaxProgressSlots> g_progress_slots{};
+std::mutex g_progress_registry_mutex; // register/release only (rare)
+thread_local ThreadProgressSlot* tl_progress_slot = nullptr;
+thread_local u32 tl_run_depth = 0;
+
+ThreadProgressSlot* AcquireProgressSlot() {
+    std::lock_guard lk{g_progress_registry_mutex};
+    for (auto& slot : g_progress_slots) {
+        if (!slot.active.load(std::memory_order_relaxed)) {
+            slot.transitions.store(0, std::memory_order_relaxed);
+            slot.in_hle.store(false, std::memory_order_relaxed);
+            slot.active.store(true, std::memory_order_release);
+            return &slot;
+        }
+    }
+    return nullptr; // pool exhausted: run slotless (see block comment)
+}
+
+void ReleaseProgressSlot(ThreadProgressSlot* slot) {
+    if (slot == nullptr) {
+        return;
+    }
+    std::lock_guard lk{g_progress_registry_mutex};
+    slot->in_hle.store(false, std::memory_order_relaxed);
+    slot->active.store(false, std::memory_order_release);
+}
+
+/// Sum of all OTHER active threads' transition counters, plus liveness
+/// census. Per-slot counters are monotonic, so cross-thread progress
+/// strictly changes the sum -- but the SUM itself is not monotonic: a slot
+/// RELEASE (thread exit) removes its contribution. The consequence is
+/// bounded and self-correcting: a thread-exit between a verdict's two
+/// samples reads as "others changed" and demotes that one episode; the
+/// next episode re-snapshots the post-exit sum, and a genuinely frozen
+/// remainder then goes fatal one ~10 M-transition cycle later than ideal.
+/// Erring toward one extra demotion beats erring toward a false kill.
+struct OthersSnapshot {
+    u64 transition_sum = 0;
+    u32 active_count = 0;
+    u32 in_hle_count = 0;
+};
+OthersSnapshot SnapshotOthers(const ThreadProgressSlot* self) noexcept {
+    OthersSnapshot s;
+    for (const auto& slot : g_progress_slots) {
+        if (&slot == self || !slot.active.load(std::memory_order_acquire)) {
+            continue;
+        }
+        ++s.active_count;
+        s.transition_sum += slot.transitions.load(std::memory_order_relaxed);
+        if (slot.in_hle.load(std::memory_order_relaxed)) {
+            ++s.in_hle_count;
+        }
+    }
+    return s;
+}
+
 /// Drop this thread's claim, if held. Called at every dispatcher entry and at
 /// Run() exit. If this was the last claim out while a flusher is waiting,
 /// wake it. Hot path when no flush is pending: one branch + one fetch_sub.
@@ -523,6 +616,14 @@ void* DispatcherTrampoline(GuestState* state) {
     // call this invocation makes.
     ReleaseClaim();
 
+    // Publish forward progress for OTHER threads' watchdog verdicts: one
+    // relaxed increment on this thread's own cache line per block
+    // transition. (Self-progress is judged by the register/vector checks
+    // below, not this counter -- a spinning thread bumps it too.)
+    if (tl_progress_slot != nullptr) {
+        tl_progress_slot->transitions.fetch_add(1, std::memory_order_relaxed);
+    }
+
     // We may arrive here with the guest's MXCSR live (a block ran after a
     // guest LDMXCSR). Host C++ -- this function, the HLE bridge, anything
     // they call -- must run under the host default. No-op when the guest's
@@ -597,16 +698,20 @@ void* DispatcherTrampoline(GuestState* state) {
         // climbs back). Cost: two 1.1 KB hashes per ~10 M transitions of a
         // suspected loop; zero when loops advance through integer state.
         //
-        // KNOWN LIMITATION (pre-existing, now multi-thread-relevant): a
-        // guest thread spinning on a memory flag that ANOTHER guest thread
-        // will eventually write (raw spinlock, no register mutation) is
-        // byte-identical state from this thread's view and WILL fire at the
-        // threshold even though the program is correct. With pthread.cpp
-        // launching real concurrent guests, a seconds-long contended spin
-        // is plausible. The honest fix is cross-thread: only fire when no
-        // other guest thread has made progress either, or demote to
-        // LOG_ERROR-and-continue when multiple guest threads exist.
-        // Flagged, not implemented here.
+        // Stage 3 (cross-thread, evaluated only at the threshold): a thread
+        // spinning on a memory flag that ANOTHER guest thread will write
+        // (raw spinlock under contention) is byte-identical state from this
+        // chair yet a CORRECT program. The verdict consults the progress
+        // registry: if any other guest thread advanced during the episode,
+        // or is parked inside an HLE call (sema/sleep/io -- presumed
+        // legitimately waiting), the system is alive and the watchdog
+        // DEMOTES to a one-per-RIP LOG_ERROR and continues. FATAL is
+        // reserved for whole-system freeze: this thread provably frozen
+        // (integer + vector state byte-identical) and every other guest
+        // thread equally silent. Killing a correct program is strictly
+        // worse than logging a hang. Slotless threads (registry pool
+        // exhausted) demote unconditionally -- partial information must
+        // not kill.
         const bool advanced =
             (last_gpr != state->gpr) || (last_rflags != state->rflags);
         if (cur_rip == last_rip && !advanced) {
@@ -620,8 +725,11 @@ void* DispatcherTrampoline(GuestState* state) {
         constexpr u64 kStuckThreshold = 10'000'000;
         constexpr u64 kSuspectThreshold = kStuckThreshold / 2;
         static thread_local u64 suspect_vec_hash = 0;
+        static thread_local u64 suspect_others_sum = 0;
         if (same_rip_hits == kSuspectThreshold) {
             suspect_vec_hash = HashGuestVectorState(state);
+            suspect_others_sum =
+                SnapshotOthers(tl_progress_slot).transition_sum;
         }
         if (same_rip_hits == kStuckThreshold &&
             HashGuestVectorState(state) != suspect_vec_hash) {
@@ -630,11 +738,40 @@ void* DispatcherTrampoline(GuestState* state) {
             same_rip_hits = 1;
         }
         if (same_rip_hits == kStuckThreshold) {
+            // This thread is provably frozen. Cross-thread verdict (stage 3).
+            const OthersSnapshot others = SnapshotOthers(tl_progress_slot);
+            const bool others_advanced =
+                others.transition_sum != suspect_others_sum;
+            const bool others_waiting = others.in_hle_count > 0;
+            const bool slotless = (tl_progress_slot == nullptr);
+            if (others_advanced || others_waiting || slotless) {
+                // System alive (or unknowable): demote. Log once per RIP so
+                // a minutes-long contended spin doesn't flood the log at one
+                // line per ~10 M transitions.
+                static thread_local u64 last_warned_spin_rip = 0;
+                if (last_warned_spin_rip != cur_rip) {
+                    last_warned_spin_rip = cur_rip;
+                    LOG_ERROR(Core,
+                              "Dispatcher: thread spin-waiting at {:#x} ({} "
+                              "re-entries, registers/vectors byte-identical) "
+                              "but the system is alive ({} other guest "
+                              "threads: progressed={}, parked-in-HLE={}{}); "
+                              "continuing",
+                              cur_rip, same_rip_hits, others.active_count,
+                              others_advanced, others.in_hle_count,
+                              slotless ? ", self slotless" : "");
+                }
+                same_rip_hits = 1; // re-arm; re-verdicts every ~10 M
+            }
+        }
+        if (same_rip_hits == kStuckThreshold) {
             LOG_ERROR(Core,
                       "Dispatcher: STUCK at {:#x} after {} re-entries with "
                       "no forward progress (integer AND vector/x87 state "
-                      "byte-identical across the episode); dumping guest "
-                      "GPRs and exiting fatally",
+                      "byte-identical across the episode; no other guest "
+                      "thread progressed or is waiting in HLE -- whole-"
+                      "system freeze); dumping guest GPRs and exiting "
+                      "fatally",
                       cur_rip, same_rip_hits);
             static const char* const kGprNames[16] = {
                 "rax","rcx","rdx","rbx","rsp","rbp","rsi","rdi",
@@ -840,6 +977,14 @@ void* DispatcherTrampoline(GuestState* state) {
             // release-visible call is the LOG_WARNING above — so the
             // short-circuit was removed. Gating host calls on prior
             // registration is the wrong contract for a JIT bridge.)
+            // Mark this thread parked-in-HLE for the duration of the host
+            // call: a thread blocked here (sema wait, sleep, io) is
+            // presumed legitimately waiting, and other threads' watchdog
+            // verdicts treat its presence as "system alive" even though
+            // its transition counter is static.
+            if (tl_progress_slot != nullptr) {
+                tl_progress_slot->in_hle.store(true, std::memory_order_relaxed);
+            }
             HostReturn ret = CallHostFromGuest(
                 host_fn,
                 state->gpr[kSysvArg0],   // RDI
@@ -856,6 +1001,9 @@ void* DispatcherTrampoline(GuestState* state) {
             // have been clobbered by the call but x86-64 calling
             // convention says rax/xmm0 are caller-saved, so the
             // guest doesn't rely on the pre-call values surviving.
+            if (tl_progress_slot != nullptr) {
+                tl_progress_slot->in_hle.store(false, std::memory_order_relaxed);
+            }
             state->gpr[kSysvRet] = ret.rax;
             const u64 xmm0_bits = std::bit_cast<u64>(ret.xmm0);
             std::memcpy(&state->ymm[0], &xmm0_bits, sizeof(u64));
@@ -981,6 +1129,24 @@ void Runtime::Run(GuestState& state) {
     if (auto* tcb = Core::GetTcbBase()) {
         state.fs_base = reinterpret_cast<u64>(tcb);
     }
+
+    //  (3) Register this thread in the progress registry (outermost Run only;
+    //      nested Run via caller-stack callbacks reuses the slot). The slot
+    //      is what lets OTHER threads' watchdogs see this thread advancing,
+    //      and vice versa. RAII so the slot is released on every exit path.
+    struct ProgressRegistration {
+        ProgressRegistration() {
+            if (tl_run_depth++ == 0) {
+                tl_progress_slot = AcquireProgressSlot();
+            }
+        }
+        ~ProgressRegistration() {
+            if (--tl_run_depth == 0) {
+                ReleaseProgressSlot(tl_progress_slot);
+                tl_progress_slot = nullptr;
+            }
+        }
+    } progress_registration;
 
     gateway_->Enter(state, &DispatcherTrampoline);
     LOG_TRACE(Core, "Run: R3 gateway returned");
