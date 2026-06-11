@@ -3903,7 +3903,7 @@ bool EmitVScalarArith(const ZydisDecodedInstruction& insn,
 
     // Load src2 low element into v1 (from reg lane or memory).
     if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int s2 = ZydisVecToIndex(ops[2].reg.value);
+        const int s2  = ZydisVecToIndex(ops[merge3 ? 2 : 1].reg.value);
         if (s2 < 0) return false;
         if (dbl) c.ldr(DReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
         else     c.ldr(SReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
@@ -3987,17 +3987,24 @@ bool EmitVScalarArith(const ZydisDecodedInstruction& insn,
 // vmovss / vmovsd — three forms: merge (3 reg), load (reg<-mem), store (mem<-reg).
 bool EmitVmovss(const ZydisDecodedInstruction& insn,
                 const ZydisDecodedOperand* ops, u64 next_rip, CodeGenerator& c) {
-    const bool ss = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSS);
-    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSD);
+    const bool ss = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSS ||
+                     insn.mnemonic == ZYDIS_MNEMONIC_MOVSS);
+    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSD ||
+                     insn.mnemonic == ZYDIS_MNEMONIC_MOVSD);
     if (!ss && !sd) return false;
 
-    // Merge form: 3 visible register operands.
-    if (insn.operand_count_visible == 3 &&
-        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-        ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+    // Merge form: 3 visible register operands (VEX) or legacy 2-op reg-reg
+    // (movsd xmm1, xmm2 -- merge with src1 = dst, preserving dst's upper).
+    const bool merge3 = (insn.operand_count_visible == 3 &&
+                         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER);
+    const bool merge2 = (insn.operand_count_visible == 2 &&
+                         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER);
+    if (merge3 || merge2) {
         const int dst = ZydisVecToIndex(ops[0].reg.value);
-        const int s1  = ZydisVecToIndex(ops[1].reg.value);
+        const int s1  = merge3 ? ZydisVecToIndex(ops[1].reg.value) : dst;
         const int s2  = ZydisVecToIndex(ops[2].reg.value);
         if (dst < 0 || s1 < 0 || s2 < 0) return false;
         if (sd) {
@@ -5681,72 +5688,142 @@ bool EmitVround(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
     return true;
 }
 
-// Compose an AArch64 predicate compare on VReg4S(0) (a) vs VReg4S(1) (b) into
-// VReg16B(0) (all-ones/all-zeros per lane), matching x86 CMPPS imm predicates.
-// Handles the common predicates seen in PS4 code: EQ/LT/LE/UNORD/NEQ/NLT/NLE/ORD.
-static bool EmitFpPredicate4S(int pred, CodeGenerator& c) {
-    // a in v0, b in v1, scratch v2. Result mask -> v0.
-    switch (pred & 0x7) {
-        case 0: c.fcmeq(VReg4S(0), VReg4S(0), VReg4S(1)); return true;          // EQ
-        case 1: c.fcmgt(VReg4S(0), VReg4S(1), VReg4S(0)); return true;          // LT: b>a
-        case 2: c.fcmge(VReg4S(0), VReg4S(1), VReg4S(0)); return true;          // LE: b>=a
-        case 3: // UNORD: neither a<=... ordered. ord = a==a & b==b; unord = ~ord.
-            c.fcmeq(VReg4S(2), VReg4S(0), VReg4S(0));
-            c.fcmeq(VReg4S(0), VReg4S(1), VReg4S(1));
-            c.and_(VReg16B(0), VReg16B(0), VReg16B(2));
-            c.not_(VReg16B(0), VReg16B(0));
-            return true;
-        case 4: c.fcmeq(VReg4S(0), VReg4S(0), VReg4S(1));                       // NEQ = ~EQ
-                c.not_(VReg16B(0), VReg16B(0)); return true;
-        case 5: c.fcmgt(VReg4S(0), VReg4S(1), VReg4S(0));                       // NLT = ~LT
-                c.not_(VReg16B(0), VReg16B(0)); return true;
-        case 6: c.fcmge(VReg4S(0), VReg4S(1), VReg4S(0));                       // NLE = ~LE
-                c.not_(VReg16B(0), VReg16B(0)); return true;
-        case 7: // ORD: a==a & b==b
-            c.fcmeq(VReg4S(2), VReg4S(0), VReg4S(0));
-            c.fcmeq(VReg4S(0), VReg4S(1), VReg4S(1));
-            c.and_(VReg16B(0), VReg16B(0), VReg16B(2));
-            return true;
+// Compose an AArch64 predicate compare on v0 (a) vs v1 (b) into v0
+// (all-ones/all-zeros per lane), matching x86 (V)CMPPS/PD imm predicates.
+// `dd` selects 2D (double) vs 4S (single) lanes. All 32 AVX predicates are
+// covered: 0x10..0x1F differ from 0x00..0x0F only in quiet-vs-signaling,
+// which we do not model, so the table is the low nibble. The previous
+// version masked to the base 8 (& 0x7), which is WRONG on NaN inputs for
+// most extended predicates (EQ_UQ must be true on unordered; FALSE/TRUE
+// are constants, not UNORD/ORD). Scratch: v2, v4 (v3 is reserved by the
+// caller for the scalar merge copy).
+static bool EmitFpPredicate(int pred, bool dd, CodeGenerator& c) {
+    auto fcmeq = [&](int d, int a, int b) {
+        if (dd) c.fcmeq(VReg2D(d), VReg2D(a), VReg2D(b));
+        else    c.fcmeq(VReg4S(d), VReg4S(a), VReg4S(b)); };
+    auto fcmgt = [&](int d, int a, int b) {
+        if (dd) c.fcmgt(VReg2D(d), VReg2D(a), VReg2D(b));
+        else    c.fcmgt(VReg4S(d), VReg4S(a), VReg4S(b)); };
+    auto fcmge = [&](int d, int a, int b) {
+        if (dd) c.fcmge(VReg2D(d), VReg2D(a), VReg2D(b));
+        else    c.fcmge(VReg4S(d), VReg4S(a), VReg4S(b)); };
+    // ord(a,b) -> v2 (uses v4 as the second temp).
+    auto ord2 = [&]() {
+        fcmeq(2, 0, 0);                          // v2 = a==a
+        fcmeq(4, 1, 1);                          // v4 = b==b
+        c.and_(VReg16B(2), VReg16B(2), VReg16B(4));
+    };
+    switch (pred & 0xF) {
+    case 0x0: fcmeq(0, 0, 1); return true;                         // EQ_O
+    case 0x1: fcmgt(0, 1, 0); return true;                         // LT_O: b>a
+    case 0x2: fcmge(0, 1, 0); return true;                         // LE_O: b>=a
+    case 0x3: ord2();                                              // UNORD
+              c.not_(VReg16B(0), VReg16B(2)); return true;
+    case 0x4: fcmeq(0, 0, 1);                                      // NEQ_UQ = ~EQ
+              c.not_(VReg16B(0), VReg16B(0)); return true;
+    case 0x5: fcmgt(0, 1, 0);                                      // NLT_US = ~LT
+              c.not_(VReg16B(0), VReg16B(0)); return true;
+    case 0x6: fcmge(0, 1, 0);                                      // NLE_US = ~LE
+              c.not_(VReg16B(0), VReg16B(0)); return true;
+    case 0x7: ord2();                                              // ORD
+              c.mov(VReg16B(0), VReg16B(2)); return true;
+    case 0x8: ord2();                                              // EQ_UQ = eq | ~ord
+              fcmeq(0, 0, 1);
+              c.not_(VReg16B(2), VReg16B(2));
+              c.orr(VReg16B(0), VReg16B(0), VReg16B(2)); return true;
+    case 0x9: ord2();                                              // NGE_US = lt | ~ord
+              fcmgt(0, 1, 0);
+              c.not_(VReg16B(2), VReg16B(2));
+              c.orr(VReg16B(0), VReg16B(0), VReg16B(2)); return true;
+    case 0xA: ord2();                                              // NGT_US = le | ~ord
+              fcmge(0, 1, 0);
+              c.not_(VReg16B(2), VReg16B(2));
+              c.orr(VReg16B(0), VReg16B(0), VReg16B(2)); return true;
+    case 0xB: c.movi(VReg16B(0), 0); return true;                  // FALSE
+    case 0xC: ord2();                                              // NEQ_OQ = ~eq & ord
+              fcmeq(0, 0, 1);
+              c.not_(VReg16B(0), VReg16B(0));
+              c.and_(VReg16B(0), VReg16B(0), VReg16B(2)); return true;
+    case 0xD: fcmge(0, 0, 1); return true;                         // GE_O: a>=b
+    case 0xE: fcmgt(0, 0, 1); return true;                         // GT_O: a>b
+    case 0xF: c.movi(VReg16B(0), 0xFF); return true;               // TRUE
     }
     return false;
 }
 
-// vcmpps/vcmpss dst, src1, src2, imm8 — packed/scalar FP compare producing a
-// per-element all-ones/all-zeros mask. Scalar form writes only the low element;
-// dst[127:32] from src1. XMM zeroes upper 128.
+// (v)cmpps/pd/ss/sd dst, src1, src2, imm8 — packed/scalar FP compare
+// producing per-element all-ones/all-zeros masks via EmitFpPredicate.
+// Scalar forms write only the low element; dst[127:ELEM] from src1. The
+// legacy folded 3-op shape (dst = src1) is accepted; legacy CMPSD reaches
+// here only through the dispatch's imm-presence guard (string-op mnemonic
+// collision). XMM zeroes upper 128.
 bool EmitVcmpfp(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                 u64 next_rip, CodeGenerator& c) {
-    const bool scalar = (insn.mnemonic == ZYDIS_MNEMONIC_VCMPSS);
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst = ZydisVecToIndex(ops[0].reg.value);
-    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    bool dd, scalar;
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_VCMPSS: case ZYDIS_MNEMONIC_CMPSS: dd = false; scalar = true;  break;
+    case ZYDIS_MNEMONIC_VCMPSD: case ZYDIS_MNEMONIC_CMPSD: dd = true;  scalar = true;  break;
+    case ZYDIS_MNEMONIC_VCMPPS: case ZYDIS_MNEMONIC_CMPPS: dd = false; scalar = false; break;
+    case ZYDIS_MNEMONIC_VCMPPD: case ZYDIS_MNEMONIC_CMPPD: dd = true;  scalar = false; break;
+    default: return false;
+    }
+    int dst, s1;
+    const ZydisDecodedOperand* s2;
+    int pred;
+    if (insn.operand_count_visible == 4) {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[3].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+        dst = ZydisVecToIndex(ops[0].reg.value);
+        s1  = ZydisVecToIndex(ops[1].reg.value);
+        s2  = &ops[2];
+        pred = static_cast<int>(ops[3].imm.value.u) & 0x1F;   // VEX: full range
+    } else if (insn.operand_count_visible == 3) {          // legacy fold
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+        dst = ZydisVecToIndex(ops[0].reg.value);
+        s1  = dst;
+        s2  = &ops[1];
+        pred = static_cast<int>(ops[2].imm.value.u) & 0x1F;
+    } else {
+        return false;
+    }
     if (dst < 0 || s1 < 0) return false;
-    const int pred = static_cast<int>(ops[3].imm.value.u) & 0x7;
+    // Legacy encodings mask the predicate to 3 bits in hardware; the
+    // extended predicates (0x08..0x1F) are VEX-only.
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_CMPSS: case ZYDIS_MNEMONIC_CMPSD:
+    case ZYDIS_MNEMONIC_CMPPS: case ZYDIS_MNEMONIC_CMPPD:
+        pred &= 0x7; break;
+    default: break;
+    }
 
     c.add(kScratch0, kState, YmmChunkOffset(s1, 0));
     c.ldr(QReg(0), ptr(kScratch0));      // a
-    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int s2 = ZydisVecToIndex(ops[2].reg.value);
-        if (s2 < 0) return false;
-        c.add(kScratch0, kState, YmmChunkOffset(s2, 0));
+    if (s2->type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2i = ZydisVecToIndex(s2->reg.value);
+        if (s2i < 0) return false;
+        c.add(kScratch0, kState, YmmChunkOffset(s2i, 0));
         c.ldr(QReg(1), ptr(kScratch0));
-    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
-        c.ldr(QReg(1), ptr(kAddr));
+    } else if (s2->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(s2->mem, next_rip, c)) return false;
+        if (scalar && dd)       c.ldr(DReg(1), ptr(kAddr));   // m64
+        else if (scalar && !dd) c.ldr(SReg(1), ptr(kAddr));   // m32
+        else                    c.ldr(QReg(1), ptr(kAddr));   // m128
     } else {
         return false;
     }
     // Preserve src1 for the scalar merge (a is clobbered by the predicate).
     if (scalar) c.mov(VReg16B(3), VReg16B(0));
-    if (!EmitFpPredicate4S(pred, c)) return false;   // mask -> v0
+    if (!EmitFpPredicate(pred, dd, c)) return false;   // mask -> v0
 
     if (!scalar) {
         c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
         c.str(QReg(0), ptr(kScratch0));
     } else {
         // Insert mask low lane into src1 copy (v3), store that.
-        c.ins(VReg4S(3)[0], VReg4S(0)[0]);
+        if (dd) c.ins(VReg2D(3)[0], VReg2D(0)[0]);
+        else    c.ins(VReg4S(3)[0], VReg4S(0)[0]);
         c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
         c.str(QReg(3), ptr(kScratch0));
     }
@@ -8056,7 +8133,8 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VSQRTSS: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Sqrt, false, c); break;
         case ZYDIS_MNEMONIC_VSQRTSD: handled = EmitVScalarArith(insn, ops, next_rip, VScalarOp::Sqrt, true,  c); break;
         case ZYDIS_MNEMONIC_VMOVSS:
-        case ZYDIS_MNEMONIC_VMOVSD: handled = EmitVmovss(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVSD: case ZYDIS_MNEMONIC_MOVSS:
+            handled = EmitVmovss(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VADDPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddPS, c); break;
         case ZYDIS_MNEMONIC_VSUBPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubPS, c); break;
         case ZYDIS_MNEMONIC_VMULPS: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulPS, c); break;
@@ -8204,6 +8282,9 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VRSQRTPS: handled = EmitVrecip(insn, ops, next_rip, true,  false, c); break;
         case ZYDIS_MNEMONIC_VRSQRTSS: handled = EmitVrecip(insn, ops, next_rip, true,  true,  c); break;
         case ZYDIS_MNEMONIC_VCMPPS: case ZYDIS_MNEMONIC_VCMPSS:
+        case ZYDIS_MNEMONIC_VCMPPD: case ZYDIS_MNEMONIC_VCMPSD:
+        case ZYDIS_MNEMONIC_CMPPS:  case ZYDIS_MNEMONIC_CMPPD:
+        case ZYDIS_MNEMONIC_CMPSS:
             handled = EmitVcmpfp(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPMOVZXDQ: handled = EmitVpmovzxdq(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPMOVZXBW: handled = EmitVpmovx(insn, ops, next_rip, false, 8, 16, c); break;
@@ -8251,16 +8332,36 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_STD:
             handled = EmitCldStd(insn, c);
             break;
+        case ZYDIS_MNEMONIC_MOVSD:
+            // SSE2 scalar move vs string op: same Zydis mnemonic. The SSE
+            // forms carry visible operands; misrouting them to the string
+            // handler emits an rsi/rdi memory move (silent corruption). The
+            // string path is a block terminator like the group below.
+            if (insn.operand_count_visible >= 2) {
+                handled = EmitVmovss(insn, ops, next_rip, c);
+            } else {
+                handled = EmitStringOp(insn, next_rip, c);
+                if (handled) emitted_terminator = true;
+            }
+            break;
+        case ZYDIS_MNEMONIC_CMPSD:
+            if (insn.operand_count_visible >= 3) {      // F2 0F C2 has imm8
+                handled = EmitVcmpfp(insn, ops, next_rip, c);
+            } else {
+                handled = EmitStringOp(insn, next_rip, c);
+                if (handled) emitted_terminator = true;
+            }
+            break;
         case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW:
         case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ:
         case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW:
-        case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_MOVSQ:
+        case ZYDIS_MNEMONIC_MOVSQ:
         case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW:
         case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_LODSQ:
         case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW:
         case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ:
         case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW:
-        case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ:
+        case ZYDIS_MNEMONIC_CMPSQ:
             handled = EmitStringOp(insn, next_rip, c);
             if (handled) emitted_terminator = true;  // string op is a terminator
             break;

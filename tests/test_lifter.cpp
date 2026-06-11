@@ -19574,6 +19574,150 @@ TEST_F(CpuRuntimeTest, Arm64_Movlps_LegacyLoad_PreservesHighHalf) {
     EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0xBBBBBBBBBBBBBBBBULL);
 }
 
+// ============================================================================
+// (V)CMPSS/SD/PS/PD — FP compares with imm8 predicates, plus the
+// MOVSD/CMPSD string-mnemonic collision. vcmpsd reg,reg landed at
+// 0x80784abce. Hardware facts pinned here (verified on real silicon):
+// legacy encodings mask the predicate to 3 bits — the extended predicates
+// (0x08..0x1F) are VEX-only — and the extended predicates have NaN
+// behavior that & 0x7 masking gets wrong (EQ_UQ is TRUE on unordered;
+// FALSE/TRUE are constants).
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vcmpsd_LT_MergesHighFromSrc1) {
+    const u8 program[] = { 0xc5, 0xf3, 0xc2, 0xc2, 0x01, 0xc3 };  // vcmpsd xmm0,xmm1,xmm2,1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x3FF8000000000000ULL;   // src1 lane0 = 1.5
+    st.ymm[XmmChunk(1,1)] = 0x4058C00000000000ULL;   // src1 lane1 = 99.0
+    st.ymm[XmmChunk(2,0)] = 0x4004000000000000ULL;   // src2 lane0 = 2.5
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], ~0ULL) << "1.5 < 2.5";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x4058C00000000000ULL)
+        << "lane1 merged from src1";
+}
+
+TEST_F(CpuRuntimeTest, Vcmpsd_LT_NaNIsFalse) {
+    const u8 program[] = { 0xc5, 0xf3, 0xc2, 0xc2, 0x01, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x7FF8000000000000ULL;   // NaN
+    st.ymm[XmmChunk(2,0)] = 0x4004000000000000ULL;   // 2.5
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0ULL) << "LT is ordered: false on NaN";
+}
+
+TEST_F(CpuRuntimeTest, Arm64_Cmppd_ExtendedPredicates) {
+    // The pre-matrix code masked predicates with & 0x7, which maps EQ_UQ
+    // (0x8) onto EQ, FALSE (0xB) onto UNORD and TRUE (0xF) onto ORD — all
+    // wrong on NaN. Lanes: (NaN vs 0.0, 3.0 vs 3.0). VEX encodings (the
+    // extended predicates do not exist in legacy encodings).
+    struct Case { u8 imm; u64 lo, hi; const char* what; };
+    const Case cases[] = {
+        { 0x08, ~0ULL, ~0ULL, "EQ_UQ: NaN lane TRUE, equal lane TRUE" },
+        { 0x0B, 0ULL,  0ULL,  "FALSE: constant zero" },
+        { 0x0F, ~0ULL, ~0ULL, "TRUE: constant ones" },
+    };
+    for (const Case& cs : cases) {
+        const u8 program[] = { 0xc5, 0xf1, 0xc2, 0xc2, cs.imm, 0xc3 }; // vcmppd xmm0,xmm1,xmm2,imm
+        std::memcpy(mem.CodePtr(), program, sizeof(program));
+        u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+        GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+        st.ymm[XmmChunk(1,0)] = 0x7FF8000000000000ULL;  // NaN
+        st.ymm[XmmChunk(1,1)] = 0x4008000000000000ULL;  // 3.0
+        st.ymm[XmmChunk(2,0)] = 0;                      // 0.0
+        st.ymm[XmmChunk(2,1)] = 0x4008000000000000ULL;  // 3.0
+        Runtime rt; rt.Run(st);
+        EXPECT_EQ(st.ymm[XmmChunk(0,0)], cs.lo) << cs.what;
+        EXPECT_EQ(st.ymm[XmmChunk(0,1)], cs.hi) << cs.what;
+    }
+}
+
+TEST_F(CpuRuntimeTest, Movsd_LegacyRegReg_PreservesHigh) {
+    // f2 0f 10 c1: SSE2 movsd xmm0, xmm1. Shares its Zydis mnemonic with
+    // the string op; before the dispatch guard this either misrouted to an
+    // rsi/rdi string move or fell through every branch of the handler.
+    const u8 program[] = { 0xf2, 0x0f, 0x10, 0xc1, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x1111111111111111ULL;
+    st.ymm[XmmChunk(0,1)] = 0x2222222222222222ULL;   // MUST survive
+    st.ymm[XmmChunk(1,0)] = 0x9999999999999999ULL;
+    st.gpr[6] = 0xDEAD0001; st.gpr[7] = 0xDEAD0002;  // rsi/rdi canaries
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x9999999999999999ULL) << "low from src";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x2222222222222222ULL)
+        << "legacy reg-reg movsd preserves dst's upper half";
+    EXPECT_EQ(st.gpr[6], 0xDEAD0001ULL) << "not a string op";
+    EXPECT_EQ(st.gpr[7], 0xDEAD0002ULL);
+}
+
+TEST_F(CpuRuntimeTest, Cmpsd_SSE_NotStringOp) {
+    // f2 0f c2 c1 02: SSE2 cmpsd xmm0, xmm1, LE — same mnemonic collision
+    // as movsd. Legacy fold: dst is also src1; lane1 preserved from dst.
+    const u8 program[] = { 0xf2, 0x0f, 0xc2, 0xc1, 0x02, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x4010000000000000ULL;   // 4.0
+    st.ymm[XmmChunk(0,1)] = 0x401C000000000000ULL;   // 7.0 (preserved)
+    st.ymm[XmmChunk(1,0)] = 0x4010000000000000ULL;   // 4.0
+    st.gpr[6] = 0xBEEF0001; st.gpr[7] = 0xBEEF0002;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], ~0ULL) << "4.0 <= 4.0";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x401C000000000000ULL) << "fold preserves lane1";
+    EXPECT_EQ(st.gpr[6], 0xBEEF0001ULL) << "not a string op";
+    EXPECT_EQ(st.gpr[7], 0xBEEF0002ULL);
+}
+
+// ============================================================================
+// Dispatch-structure regressions. The movlh batch split the VUNPCK->
+// VecHostStaged fall-through group by inserting its cases mid-group,
+// rerouting vunpcklpd to EmitVmovLowHigh (-> "unsupported" in a live
+// title at 0x800294ffe). The collision-guard batch similarly absorbed
+// STOS*/MOVSB/MOVSW into a guarded case lacking the emitted_terminator
+// flag. These tests pin the routing behaviorally.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vunpcklpd_RoutesAndInterleaves) {
+    const u8 program[] = { 0xc5, 0xf1, 0x14, 0xc2, 0xc3 };  // vunpcklpd xmm0,xmm1,xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x1111111111111111ULL;  // src1 low
+    st.ymm[XmmChunk(1,1)] = 0xDEADDEADDEADDEADULL;  // (ignored)
+    st.ymm[XmmChunk(2,0)] = 0x2222222222222222ULL;  // src2 low
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x1111111111111111ULL) << "lane0 = src1.q0";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x2222222222222222ULL) << "lane1 = src2.q0";
+    EXPECT_EQ(st.exit_reason, static_cast<u32>(ExitReason::ReturnSentinel))
+        << "must not exit as unsupported";
+}
+
+TEST_F(CpuRuntimeTest, RepMovsd_StringForm_StillCopies) {
+    // f3 a5: rep movsd — the STRING op behind the shared MOVSD mnemonic.
+    // Routed through the collision guard's no-visible-operands path; must
+    // copy and must terminate the block (emitted_terminator).
+    const u8 program[] = { 0xf3, 0xa5, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* srcb = mem.StackTop()-128;
+    u8* dstb = mem.StackTop()-64;
+    for (int k = 0; k < 16; k++) srcb[k] = static_cast<u8>(0xA0 + k);
+    std::memset(dstb, 0, 16);
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(srcb);   // rsi
+    st.gpr[7] = reinterpret_cast<u64>(dstb);   // rdi
+    st.gpr[1] = 4;                             // rcx = 4 dwords = 16 bytes
+    st.rflags = 0x202;                         // DF clear
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(std::memcmp(dstb, srcb, 16), 0) << "rep movsd copied 16 bytes";
+    EXPECT_EQ(st.gpr[1], 0ULL) << "rcx exhausted";
+}
+
 // VRCPPS / VRSQRTPS are fast approximations. The x86 host estimate is ~12-bit
 // and the arm64 frecpe/frsqrte estimate is ~8-bit, so the two backends produce
 // DIFFERENT bit patterns by design. These tests therefore assert each lane is

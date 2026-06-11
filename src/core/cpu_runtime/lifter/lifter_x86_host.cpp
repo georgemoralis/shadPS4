@@ -6343,18 +6343,26 @@ bool EmitVmovss(const ZydisDecodedInstruction& insn,
                 const ZydisDecodedOperand* ops,
                 u64 next_rip,
                 Xbyak::CodeGenerator& c) {
-    const bool ss = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSS);
-    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSD);
+    const bool ss = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSS ||
+                     insn.mnemonic == ZYDIS_MNEMONIC_MOVSS);
+    const bool sd = (insn.mnemonic == ZYDIS_MNEMONIC_VMOVSD ||
+                     insn.mnemonic == ZYDIS_MNEMONIC_MOVSD);
     if (!ss && !sd) return false;
 
-    // Merge form: 3 visible register operands.
-    if (insn.operand_count_visible == 3 &&
-        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-        ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+    // Merge form: 3 visible register operands (VEX), or the legacy 2-op
+    // reg-reg form (movsd xmm1, xmm2: low element from src, dst's own
+    // upper preserved == merge with src1 = dst).
+    const bool merge3 = (insn.operand_count_visible == 3 &&
+                         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER);
+    const bool merge2 = (insn.operand_count_visible == 2 &&
+                         ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER);
+    if (merge3 || merge2) {
         const int dst = ZydisVecToIndex(ops[0].reg.value);
-        const int s1  = ZydisVecToIndex(ops[1].reg.value);
-        const int s2  = ZydisVecToIndex(ops[2].reg.value);
+        const int s1  = merge3 ? ZydisVecToIndex(ops[1].reg.value) : dst;
+        const int s2  = ZydisVecToIndex(ops[merge3 ? 2 : 1].reg.value);
         if (dst < 0 || s1 < 0 || s2 < 0) return false;
 
         if (sd) {
@@ -7375,6 +7383,8 @@ bool EmitVecImm8(const ZydisDecodedInstruction& insn,
     switch (m) {
         case ZYDIS_MNEMONIC_VSHUFPS: case ZYDIS_MNEMONIC_VBLENDPS:
         case ZYDIS_MNEMONIC_VPBLENDW: case ZYDIS_MNEMONIC_VCMPPS:
+        case ZYDIS_MNEMONIC_VCMPPD:   case ZYDIS_MNEMONIC_CMPPS:
+        case ZYDIS_MNEMONIC_CMPPD:
         case ZYDIS_MNEMONIC_VSHUFPD: case ZYDIS_MNEMONIC_VBLENDPD:
         case ZYDIS_MNEMONIC_VPBLENDD:
             break;
@@ -7420,13 +7430,19 @@ bool EmitVecImm8(const ZydisDecodedInstruction& insn,
         return false;
     }
 
+    if (m == ZYDIS_MNEMONIC_CMPPS || m == ZYDIS_MNEMONIC_CMPPD)
+        imm &= 0x7;            // legacy encodings: predicate is 3 bits
+
 #define VEC_IMM(opname) \
     do { if (ymm) c.opname(ymm0, ymm0, ymm1, imm); else c.opname(xmm0, xmm0, xmm1, imm); } while (0)
     switch (m) {
         case ZYDIS_MNEMONIC_VSHUFPS:  VEC_IMM(vshufps);  break;
         case ZYDIS_MNEMONIC_VBLENDPS: VEC_IMM(vblendps); break;
         case ZYDIS_MNEMONIC_VPBLENDW: VEC_IMM(vpblendw); break;
-        case ZYDIS_MNEMONIC_VCMPPS:   VEC_IMM(vcmpps);   break;
+        case ZYDIS_MNEMONIC_VCMPPS:   case ZYDIS_MNEMONIC_CMPPS:
+                                      VEC_IMM(vcmpps);   break;
+        case ZYDIS_MNEMONIC_VCMPPD:   case ZYDIS_MNEMONIC_CMPPD:
+                                      VEC_IMM(vcmppd);   break;
         case ZYDIS_MNEMONIC_VSHUFPD:  VEC_IMM(vshufpd);  break;
         case ZYDIS_MNEMONIC_VBLENDPD: VEC_IMM(vblendpd); break;
         case ZYDIS_MNEMONIC_VPBLENDD: VEC_IMM(vpblendd); break;
@@ -8044,14 +8060,23 @@ bool EmitLaneGpr(const ZydisDecodedInstruction& insn,
     return false;
 }
 
-/// VCMPSS — scalar single compare with imm8 predicate, producing an
-/// all-ones/all-zeros 32-bit mask in lane 0 and preserving src1[127:32].
-/// Host vcmpss does exactly this merge; we stage src1 into xmm0.
-bool EmitVcmpss(const ZydisDecodedInstruction& insn,
-                const ZydisDecodedOperand* ops,
-                u64 next_rip,
-                Xbyak::CodeGenerator& c) {
-    if (insn.mnemonic != ZYDIS_MNEMONIC_VCMPSS) return false;
+/// (V)CMPSS / (V)CMPSD — scalar single/double compare with imm8 predicate,
+/// producing an all-ones/all-zeros element mask in lane 0 and preserving
+/// src1[127:ELEM]. Host vcmpss/vcmpsd does exactly this merge; we stage
+/// src1 into xmm0. Legacy folded forms (dst = src1) route through the
+/// 3-visible-operand path. NOTE: legacy CMPSD shares its Zydis mnemonic
+/// with the string op; the dispatch disambiguates by the visible imm8
+/// before routing here.
+bool EmitVcmpScalar(const ZydisDecodedInstruction& insn,
+                    const ZydisDecodedOperand* ops,
+                    u64 next_rip,
+                    Xbyak::CodeGenerator& c) {
+    bool dd;
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_VCMPSS: case ZYDIS_MNEMONIC_CMPSS: dd = false; break;
+    case ZYDIS_MNEMONIC_VCMPSD: case ZYDIS_MNEMONIC_CMPSD: dd = true;  break;
+    default: return false;
+    }
     int dst_idx, src1_idx;
     const ZydisDecodedOperand* src2 = nullptr;
     u8 imm = 0;
@@ -8074,16 +8099,23 @@ bool EmitVcmpss(const ZydisDecodedInstruction& insn,
         return false;
     }
     if (dst_idx < 0 || src1_idx < 0) return false;
+    // Legacy encodings mask the predicate to 3 bits in hardware (extended
+    // predicates are VEX-only); reproduce that, or the host's VEX
+    // passthrough would grant the guest semantics its own CPU never had.
+    if (insn.mnemonic == ZYDIS_MNEMONIC_CMPSS ||
+        insn.mnemonic == ZYDIS_MNEMONIC_CMPSD) imm &= 0x7;
 
     c.vmovdqu(xmm0, ptr[r13 + YmmChunkOffset(src1_idx, 0)]);
     if (src2->type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int s2 = ZydisVecToIndex(src2->reg.value);
         if (s2 < 0) return false;
         c.vmovdqu(xmm1, ptr[r13 + YmmChunkOffset(s2, 0)]);
-        c.vcmpss(xmm0, xmm0, xmm1, imm);
+        if (dd) c.vcmpsd(xmm0, xmm0, xmm1, imm);
+        else    c.vcmpss(xmm0, xmm0, xmm1, imm);
     } else if (src2->type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(src2->mem, next_rip, c)) return false;
-        c.vcmpss(xmm0, xmm0, dword[rdx], imm);
+        if (dd) c.vcmpsd(xmm0, xmm0, qword[rdx], imm);
+        else    c.vcmpss(xmm0, xmm0, dword[rdx], imm);
     } else {
         return false;
     }
@@ -9939,16 +9971,40 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             case ZYDIS_MNEMONIC_MUL:  handled = EmitMul(insn, ops, next_rip, c); break; // basic
             case ZYDIS_MNEMONIC_BLSI: handled = EmitBlsi(insn, ops, next_rip, c); break; // BMI
             case ZYDIS_MNEMONIC_BLSR: handled = EmitBlsr(insn, ops, next_rip, c); break; // BMI
+            case ZYDIS_MNEMONIC_MOVSD:
+                // F2 0F 10/11 (SSE2 scalar move) shares the Zydis mnemonic
+                // with the string op. The SSE forms have visible operands;
+                // the string form has none. Misrouting the SSE form to the
+                // string handler would emit an rsi/rdi memory move -- silent
+                // corruption -- so the guard is load-bearing. The string
+                // path must set emitted_terminator like the group below.
+                if (insn.operand_count_visible >= 2) {
+                    handled = EmitVmovss(insn, ops, next_rip, c);
+                } else {
+                    handled = EmitStringOp(insn, ops, next_rip, c);
+                    if (handled) emitted_terminator = true;
+                }
+                break;
+            case ZYDIS_MNEMONIC_CMPSD:
+                // Same collision: F2 0F C2 (scalar compare, has imm8) vs
+                // the string compare (no visible operands).
+                if (insn.operand_count_visible >= 3) {
+                    handled = EmitVcmpScalar(insn, ops, next_rip, c);
+                } else {
+                    handled = EmitStringOp(insn, ops, next_rip, c);
+                    if (handled) emitted_terminator = true;
+                }
+                break;
             case ZYDIS_MNEMONIC_STOSB: case ZYDIS_MNEMONIC_STOSW: // string
             case ZYDIS_MNEMONIC_STOSD: case ZYDIS_MNEMONIC_STOSQ: // string
             case ZYDIS_MNEMONIC_MOVSB: case ZYDIS_MNEMONIC_MOVSW: // string
-            case ZYDIS_MNEMONIC_MOVSD: case ZYDIS_MNEMONIC_MOVSQ: // string
+            case ZYDIS_MNEMONIC_MOVSQ: // string
             case ZYDIS_MNEMONIC_LODSB: case ZYDIS_MNEMONIC_LODSW: // string
             case ZYDIS_MNEMONIC_LODSD: case ZYDIS_MNEMONIC_LODSQ: // string
             case ZYDIS_MNEMONIC_SCASB: case ZYDIS_MNEMONIC_SCASW: // string
             case ZYDIS_MNEMONIC_SCASD: case ZYDIS_MNEMONIC_SCASQ: // string
             case ZYDIS_MNEMONIC_CMPSB: case ZYDIS_MNEMONIC_CMPSW: // string
-            case ZYDIS_MNEMONIC_CMPSD: case ZYDIS_MNEMONIC_CMPSQ: // string
+            case ZYDIS_MNEMONIC_CMPSQ: // string
                 handled = EmitStringOp(insn, ops, next_rip, c);
                 // EmitStringOp emits its own exit (jmp r14 / r15): it IS the
                 // block terminator. Without this flag the loop kept decoding
@@ -10105,7 +10161,7 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
                 handled = EmitVmovq(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VMOVSS: // AVX
-            case ZYDIS_MNEMONIC_VMOVSD: // AVX
+            case ZYDIS_MNEMONIC_VMOVSD: case ZYDIS_MNEMONIC_MOVSS: // AVX+SSE
                 handled = EmitVmovss(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VCVTSI2SS: // AVX
@@ -10185,14 +10241,18 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             case ZYDIS_MNEMONIC_VPCMPGTW: // AVX
                 handled = EmitPackedIntArith(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VUNPCKLPS: case ZYDIS_MNEMONIC_VUNPCKHPS: // AVX
-            case ZYDIS_MNEMONIC_VUNPCKLPD: case ZYDIS_MNEMONIC_VUNPCKHPD: // AVX
             case ZYDIS_MNEMONIC_VMOVLPS: case ZYDIS_MNEMONIC_MOVLPS:
             case ZYDIS_MNEMONIC_VMOVLPD: case ZYDIS_MNEMONIC_MOVLPD:
             case ZYDIS_MNEMONIC_VMOVHPS: case ZYDIS_MNEMONIC_MOVHPS:
             case ZYDIS_MNEMONIC_VMOVHPD: case ZYDIS_MNEMONIC_MOVHPD:
                 handled = EmitVmovLowHigh(insn, ops, next_rip, c);
                 break;
+            // NOTE: the labels below are one fall-through group ending at
+            // EmitVecHostStaged. A previous batch inserted an unrelated case
+            // in the middle of it, silently rerouting VUNPCK* to the wrong
+            // emitter (-> "unsupported"). Keep this group contiguous.
+            case ZYDIS_MNEMONIC_VUNPCKLPS: case ZYDIS_MNEMONIC_VUNPCKHPS: // AVX
+            case ZYDIS_MNEMONIC_VUNPCKLPD: case ZYDIS_MNEMONIC_VUNPCKHPD: // AVX
             case ZYDIS_MNEMONIC_VPACKUSDW: case ZYDIS_MNEMONIC_PACKUSDW:
             case ZYDIS_MNEMONIC_VPACKUSWB: case ZYDIS_MNEMONIC_PACKUSWB:
             case ZYDIS_MNEMONIC_VPACKSSWB: case ZYDIS_MNEMONIC_PACKSSWB:
@@ -10206,6 +10266,8 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
                 break;
             case ZYDIS_MNEMONIC_VSHUFPS: case ZYDIS_MNEMONIC_VBLENDPS: // AVX
             case ZYDIS_MNEMONIC_VPBLENDW: case ZYDIS_MNEMONIC_VCMPPS: // AVX
+            case ZYDIS_MNEMONIC_VCMPPD: case ZYDIS_MNEMONIC_CMPPS:
+            case ZYDIS_MNEMONIC_CMPPD: // AVX+SSE
             case ZYDIS_MNEMONIC_VSHUFPD: case ZYDIS_MNEMONIC_VBLENDPD: // AVX
             case ZYDIS_MNEMONIC_VPBLENDD: // AVX
                 handled = EmitVecImm8(insn, ops, next_rip, c);
@@ -10215,8 +10277,9 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             case ZYDIS_MNEMONIC_VPINSRW: case ZYDIS_MNEMONIC_VPINSRB: // AVX
                 handled = EmitLaneGpr(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_VCMPSS: // AVX
-                handled = EmitVcmpss(insn, ops, next_rip, c);
+            case ZYDIS_MNEMONIC_VCMPSS: case ZYDIS_MNEMONIC_CMPSS: // AVX+SSE
+            case ZYDIS_MNEMONIC_VCMPSD: // (legacy CMPSD routed below w/ guard)
+                handled = EmitVcmpScalar(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_VPSRAD: case ZYDIS_MNEMONIC_VPSRLD: // AVX
             case ZYDIS_MNEMONIC_VPSLLDQ: case ZYDIS_MNEMONIC_VPSRLDQ: // AVX

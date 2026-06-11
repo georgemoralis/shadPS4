@@ -40,12 +40,15 @@ namespace Core::Runtime {
 ///     enforce W^X for userspace).
 class CodeCache {
 public:
-    /// Initial / maximum size for the code cache. 64MB is enough for
-    /// the hottest game workloads we've seen in similar emulators;
-    /// can be tuned up later if needed. We do NOT grow the cache —
-    /// on overflow, we flush and start over (correctness preserved
-    /// because the block cache is also flushed).
-    static constexpr u64 DEFAULT_SIZE = 64 * 1024 * 1024;
+    /// Initial / maximum size for the code cache. We do NOT grow the
+    /// cache — on overflow, we flush and start over (correctness
+    /// preserved because the block cache is also flushed). 256MB:
+    /// large titles have been observed filling 64MB (with diagnostics
+    /// instrumentation inflating emission several-fold), and a recycle
+    /// of a 50k-block working set is a visible recompile stall, so
+    /// headroom is cheap insurance. Memory is reserved, not committed,
+    /// until blocks are actually emitted into it.
+    static constexpr u64 DEFAULT_SIZE = 256 * 1024 * 1024;
 
     /// Code cache alignment for individual blocks. 16 bytes matches
     /// the icache line size on most x86 hosts and the optimal branch
