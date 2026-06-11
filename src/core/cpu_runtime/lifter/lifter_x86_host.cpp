@@ -220,6 +220,12 @@ using namespace Xbyak::util;
 ///
 /// Returns true on success; false if the addressing mode isn't
 /// supported (e.g. segment override, non-GPR base).
+/// CONTRACT: returns the effective address in rdx. Clobbers rdx and
+/// r11 ONLY -- rax and rcx are preserved, so callers may hold live
+/// operand values in them across this call. (Historically this
+/// clobbered rax for the index scale, which corrupted every
+/// reg-destination ALU op with an indexed memory source; do not
+/// reintroduce rax/rcx usage here.)
 bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
                           u64 next_rip,
                           Xbyak::CodeGenerator& c) {
@@ -284,24 +290,29 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem,
     if (has_index) {
         const int index_idx = ZydisGprToIndex(mem.index);
         if (index_idx < 0) return false;
-        // Load index into rax, scale it, add to rdx.
-        c.mov(rax, qword[r13 + GprOffset(index_idx)]);
+        // Load index into r11, scale it, add to rdx. r11 -- NOT rax:
+        // several reg-dest ALU paths load their lhs into rax before
+        // computing a memory-source address, and an rax clobber here
+        // silently corrupts the operand (found via the CRC-32 IHDR
+        // differential test: every `op r32, [base+index*scale]`
+        // computed (index*scale) ^ rhs instead of lhs ^ rhs).
+        c.mov(r11, qword[r13 + GprOffset(index_idx)]);
         switch (mem.scale) {
             case 1:  break;  // no shift
-            case 2:  c.shl(rax, 1); break;
-            case 4:  c.shl(rax, 2); break;
-            case 8:  c.shl(rax, 3); break;
+            case 2:  c.shl(r11, 1); break;
+            case 4:  c.shl(r11, 2); break;
+            case 8:  c.shl(r11, 3); break;
             default: return false;  // invalid SIB scale
         }
-        c.add(rdx, rax);
+        c.add(rdx, r11);
     }
 
     if (disp != 0) {
         if (disp >= INT32_MIN && disp <= INT32_MAX) {
             c.add(rdx, static_cast<int>(disp));
         } else {
-            c.mov(rax, static_cast<u64>(disp));
-            c.add(rdx, rax);
+            c.mov(r11, static_cast<u64>(disp));  // r11, not rax: see index note
+            c.add(rdx, r11);
         }
     }
 
@@ -486,7 +497,7 @@ bool EmitMov32(const ZydisDecodedInstruction& insn,
 /// load/store plus a byte reversal — BSWAP for 32/64, and ROR by 8 for the
 /// 16-bit case (BSWAP is undefined on a 16-bit register). This needs no host
 /// MOVBE support. No flags are affected. The effective address is computed
-/// first (it uses rax/rcx as scratch), then the value is moved through rax.
+/// first (it clobbers rdx/r11; rax/rcx survive), then the value is moved through rax.
 bool EmitMovbe(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                u64 next_rip,
@@ -1112,7 +1123,7 @@ bool EmitCmp(const ZydisDecodedInstruction& insn,
         }
 
         if (rhs_op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            // EmitEffectiveAddress → rdx = addr (clobbers rax).
+            // EmitEffectiveAddress → rdx = addr (rax/rcx preserved).
             // Then rdx = *rdx (the value). Then load lhs into rcx.
             if (!EmitEffectiveAddress(rhs_op.mem, next_rip, c)) return false;
             c.mov(rdx, qword[rdx]);
@@ -1386,7 +1397,7 @@ bool EmitAnd(const ZydisDecodedInstruction& insn,
     // Zydis hands us the sign-extended s64, which we materialize into a
     // register to avoid xbyak immediate-size foot-guns. Stash the address in
     // r10 across the value setup (EmitEffectiveAddress returns it in rdx and
-    // clobbers rax/rdx during computation).
+    // clobbers rdx/r11 during computation; rax/rcx preserved).
     if (insn.operand_width == 64 &&
         ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
         ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
@@ -2268,7 +2279,7 @@ bool EmitSetcc(const ZydisDecodedInstruction& insn,
 
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         // Compute condition first (uses rax/rcx), then the address.
-        // EmitEffectiveAddress clobbers rax and returns the address in
+        // EmitEffectiveAddress returns the address in
         // rdx; condition is preserved in rcx across it.
         if (!EmitJccCondition(jcc_equiv, c)) return false;
         c.mov(r8, rcx);                       // stash indicator
@@ -2315,7 +2326,7 @@ bool EmitDiv(const ZydisDecodedInstruction& insn,
         } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
             if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
             c.mov(cl, byte[rdx]);
-            c.mov(ax, r8w);                       // EA clobbered rax; reload
+            c.mov(ax, r8w);                       // defensive reload (EA preserves rax)
         } else {
             return false;
         }
@@ -2393,7 +2404,7 @@ bool EmitIdiv(const ZydisDecodedInstruction& insn,
         } else if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
             if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
             c.mov(cl, byte[rdx]);
-            c.mov(ax, r8w);                       // EA clobbered rax; reload
+            c.mov(ax, r8w);                       // defensive reload (EA preserves rax)
         } else {
             return false;
         }
@@ -2636,7 +2647,7 @@ bool EmitCmpxchg(const ZydisDecodedInstruction& insn,
     }
 
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        // Address first (clobbers rax); stash in r10, then load acc.
+        // Address first (rdx/r11 scratch); stash in r10, then load acc.
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
         c.mov(r10, rdx);
         c.mov(rax, qword[r13 + GprOffset(0)]);
@@ -2799,7 +2810,7 @@ bool EmitLockedRmw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
     };
 
     // Effective address into r10 first (EmitEffectiveAddress returns rdx and
-    // uses rax/rcx as scratch and perturbs host flags, so it must precede the
+    // clobbers rdx/r11 and perturbs host flags, so it must precede the
     // flag load below).
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c))
         return false;
@@ -3628,7 +3639,7 @@ bool EmitImul1Op(const ZydisDecodedInstruction& insn,
     if (insn.operand_width != 64) return false;
 
     // Load src into rcx. For memory operands, EmitEffectiveAddress
-    // writes rdx (the address) and clobbers rax — so we must
+    // writes rdx (the address; rax/rcx preserved) — so we must
     // dereference the address into rcx *before* loading rax.
     if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_idx = ZydisGprToIndex(ops[0].reg.value);
@@ -5212,12 +5223,12 @@ constexpr u32 YmmChunkOffset(int lane_idx, int chunk) {
 // Register/scratch usage inside these emitters:
 //   r13 = GuestState (never modified)
 //   rdx = effective address of the memory operand (from
-//         EmitEffectiveAddress; also clobbers rax)
+//         EmitEffectiveAddress; rax/rcx preserved)
 //   rcx = scratch for the top-of-stack index math
 //   rax = scratch (clobbered by EmitEffectiveAddress)
 //   xmm0 = transfer register for the FP value
 //
-// IMPORTANT ordering rule: EmitEffectiveAddress clobbers rax and writes
+// IMPORTANT ordering rule: EmitEffectiveAddress clobbers r11 and writes
 // rdx. The fpu_top index math uses rcx (and a fresh rax load), so we
 // always compute the address FIRST, move the loaded value into xmm0,
 // and only THEN touch fpu_top — never interleaving in a way that lets
@@ -5407,7 +5418,7 @@ bool EmitFstOrFstp(const ZydisDecodedInstruction& insn,
     EmitX87RegAddr(c, r8, 0);     // r8 = &st[top]
     c.movsd(xmm0, ptr[r8]);
 
-    // Compute the destination address (clobbers rax, writes rdx).
+    // Compute the destination address (writes rdx; rax/rcx preserved).
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
     if (w == 32) {
         c.cvtsd2ss(xmm0, xmm0);
@@ -5484,7 +5495,7 @@ bool EmitFistp(const ZydisDecodedInstruction& insn,
     EmitX87RegAddr(c, r8, 0);
     c.movsd(xmm0, ptr[r8]);
 
-    // Destination address (clobbers rax, writes rdx).
+    // Destination address (writes rdx; rax/rcx preserved).
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
 
     constexpr int kScratch0 = static_cast<int>(offsetof(GuestState, scratch));
@@ -6150,7 +6161,7 @@ bool EmitVmovd(const ZydisDecodedInstruction& insn,
         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_vec = ZydisVecToIndex(ops[1].reg.value);
         if (src_vec < 0) return false;
-        // Compute EA first (it clobbers rax/rdx), stash &dst, then load value.
+        // Compute EA first (it clobbers rdx/r11), stash &dst, then load value.
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
         c.mov(r10, rdx);                          // r10 = &dst
         c.mov(eax, dword[r13 + YmmChunkOffset(src_vec, 0)]);
@@ -6235,7 +6246,7 @@ bool EmitVmovq(const ZydisDecodedInstruction& insn,
         ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int src_vec = ZydisVecToIndex(ops[1].reg.value);
         if (src_vec < 0) return false;
-        // Load the value first (EmitEffectiveAddress clobbers rax).
+        // Value-then-address order is safe: EA preserves rax/rcx.
         if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
         c.mov(r10, rdx);                          // r10 = &dst
         c.mov(rax, qword[r13 + YmmChunkOffset(src_vec, 0)]);

@@ -3441,6 +3441,87 @@ TEST_F(CpuRuntimeTest, Lahf_Sahf_RoundTripRestoresFlags) {
         << "round trip restores ZF|PF, CF clear";
 }
 
+// ============================================================================
+// Regression: EmitEffectiveAddress must not clobber rax (or rcx).
+//
+// Root cause of the CRC-32 IHDR differential failure: the EA helper
+// loaded the SIB index into host rax to scale it, while the
+// reg-destination ALU paths had already staged the lhs in rax -- so
+// every `op r32/r64, [base+index*scale]` computed (index*scale) OP
+// rhs instead of lhs OP rhs. Base+disp operands never triggered it
+// (no index, no rax use), which is why simple struct-field forms all
+// passed. These tests pin the indexed-memory-source shape across
+// widths and ALU kinds; values are chosen so the buggy result
+// ((index*scale) OP rhs) differs from the correct one.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Xor_Reg32_IndexedMemSrc_LhsSurvivesAddressing) {
+    u8* base = mem.CodePtr() + 0x100;
+    *reinterpret_cast<u32*>(base + 12) = 0xA5A5A5A5u;    // [rsi + 3*4]
+    u8 program[] = {
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,                     // mov rsi, <base>
+        0x48, 0xc7, 0xc7, 0x03, 0x00, 0x00, 0x00,        // mov rdi, 3
+        0x48, 0xb8, 0xf0, 0x0f, 0xcc, 0x33,
+                    0x99, 0x88, 0x77, 0x66,              // mov rax, 0x66778899_33CC0FF0
+        0x33, 0x04, 0xbe,                                // xor eax, [rsi+rdi*4]
+        0xc3,
+    };
+    const u64 base_addr = reinterpret_cast<u64>(base);
+    std::memcpy(program + 2, &base_addr, sizeof(base_addr));
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x33CC0FF0ULL ^ 0xA5A5A5A5ULL)
+        << "lhs must be the staged EAX value, not the scaled index";
+}
+
+TEST_F(CpuRuntimeTest, Add_Reg64_IndexedMemSrc_LhsSurvivesAddressing) {
+    u8* base = mem.CodePtr() + 0x140;
+    *reinterpret_cast<u64*>(base + 16) = 0x0000000100000001ULL;  // [rsi + 2*8]
+    u8 program[] = {
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,                     // mov rsi, <base>
+        0x48, 0xc7, 0xc7, 0x02, 0x00, 0x00, 0x00,        // mov rdi, 2
+        0x48, 0xb8, 0x11, 0x11, 0x11, 0x11,
+                    0x11, 0x11, 0x11, 0x11,              // mov rax, 0x1111111111111111
+        0x48, 0x03, 0x04, 0xfe,                          // add rax, [rsi+rdi*8]
+        0xc3,
+    };
+    const u64 base_addr = reinterpret_cast<u64>(base);
+    std::memcpy(program + 2, &base_addr, sizeof(base_addr));
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0], 0x1111111211111112ULL);
+}
+
+TEST_F(CpuRuntimeTest, And_Reg32_IndexedMemSrc_LhsSurvivesAddressing) {
+    u8* base = mem.CodePtr() + 0x180;
+    *reinterpret_cast<u32*>(base + 4) = 0xFF00FF00u;     // [rsi + 1*4]
+    u8 program[] = {
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,                     // mov rsi, <base>
+        0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,        // mov rax, 1 (the index)
+        0x48, 0xc7, 0xc1, 0x78, 0x56, 0x34, 0x12,        // mov rcx, 0x12345678
+        0x23, 0x0c, 0x86,                                // and ecx, [rsi+rax*4]
+        0xc3,
+    };
+    const u64 base_addr = reinterpret_cast<u64>(base);
+    std::memcpy(program + 2, &base_addr, sizeof(base_addr));
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[1], 0x12345678ULL & 0xFF00FF00ULL);
+}
+
+TEST_F(CpuRuntimeTest, Or_Reg64_IndexedMemSrc_LhsSurvivesAddressing) {
+    u8* base = mem.CodePtr() + 0x1C0;
+    *reinterpret_cast<u64*>(base + 8) = 0x8000000000000001ULL;   // [rsi + 4*2]
+    u8 program[] = {
+        0x48, 0xbe, 0,0,0,0,0,0,0,0,                     // mov rsi, <base>
+        0x48, 0xc7, 0xc1, 0x04, 0x00, 0x00, 0x00,        // mov rcx, 4 (the index)
+        0x48, 0xc7, 0xc3, 0x0f, 0x00, 0x00, 0x00,        // mov rbx, 0x0F
+        0x48, 0x0b, 0x1c, 0x4e,                          // or rbx, [rsi+rcx*2]
+        0xc3,
+    };
+    const u64 base_addr = reinterpret_cast<u64>(base);
+    std::memcpy(program + 2, &base_addr, sizeof(base_addr));
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[3], 0x800000000000000FULL);
+}
+
 // Brand string leaves concatenated must reconstruct
 // "AMD Custom Jaguar 8-Core APU" + trailing space padding + NUL.
 // Calls CPUID three times back-to-back and stashes each result into
