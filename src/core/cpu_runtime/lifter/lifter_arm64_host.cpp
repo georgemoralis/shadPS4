@@ -4713,7 +4713,13 @@ bool EmitVcvtScalar(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
 // float -> 4x int32, truncating; NaN/out-of-range -> INT_MIN (0x80000000).
 bool EmitVcvtPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                     u64 next_rip, CodeGenerator& c) {
-    const bool dq2ps = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTDQ2PS);
+    const bool dq2ps = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTDQ2PS ||
+                        insn.mnemonic == ZYDIS_MNEMONIC_CVTDQ2PS);
+    // (V)CVTPS2DQ rounds per MXCSR instead of truncating; explicit
+    // nearest-even (frintn) per the house default-rounding convention, then
+    // the truncating path below converts the already-integral values.
+    const bool round_first = (insn.mnemonic == ZYDIS_MNEMONIC_VCVTPS2DQ ||
+                              insn.mnemonic == ZYDIS_MNEMONIC_CVTPS2DQ);
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
     if (dst < 0) return false;
@@ -4740,6 +4746,7 @@ bool EmitVcvtPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
         if (dq2ps) {
             c.scvtf(VReg4S(0), VReg4S(0));
         } else {
+            if (round_first) c.frintn(VReg4S(0), VReg4S(0));
             // fcvtzs saturates: NaN->0, +ovf->INT_MAX, -ovf->INT_MIN. x86 wants
             // INT_MIN for all invalid. Detect NaN (v != v) and +INT_MAX result,
             // force 0x80000000 there.
@@ -4770,6 +4777,124 @@ bool EmitVcvtPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
         c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
     }
     return true;
+}
+
+// Packed double conversions — no NEON 1:1, lowered per shape:
+//   (V)CVTPD2PS  f64->f32 narrow:        fcvtn / fcvtn2     (dst always xmm)
+//   (V)CVTPS2PD  f32->f64 lengthen:      fcvtl / fcvtl2
+//   (V)CVTDQ2PD  i32->f64:               sxtl(+2) then scvtf.2d (exact)
+//   (V)CVTPD2DQ  f64->i32 rounded, (V)CVTTPD2DQ truncating:  scalar per lane.
+//
+// The f64->i32 direction needs care: fcvtzs Wd,Dn saturates NaN->0 and
+// +ovf->INT_MAX where x86 wants 0x80000000 for every invalid input. The
+// result==INT_MAX heuristic used for the f32 path is WRONG here because
+// 2147483647.0 is exactly representable as f64 and converts legitimately.
+// Instead each lane is bounds-checked: valid iff value < 2^31 with an
+// ordered compare (condition LO — false for NaN since fcmp sets C on
+// unordered), else INT_MIN. fcvtzs's own negative saturation already
+// matches the x86 indefinite. Rounded forms frintn first (nearest-even,
+// the house default-MXCSR convention; FPCR-honoring is a known follow-on).
+// Memory widths follow the decoded operand: the widening xmm forms read
+// m64 (8-byte load), never a blind 16-byte load.
+bool EmitVcvtPdPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                      u64 next_rip, CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    enum class Op { Pd2Ps, Ps2Pd, Dq2Pd, Pd2Dq, TtPd2Dq } op;
+    switch (m) {
+    case ZYDIS_MNEMONIC_VCVTPD2PS:  case ZYDIS_MNEMONIC_CVTPD2PS:  op = Op::Pd2Ps;   break;
+    case ZYDIS_MNEMONIC_VCVTPS2PD:  case ZYDIS_MNEMONIC_CVTPS2PD:  op = Op::Ps2Pd;   break;
+    case ZYDIS_MNEMONIC_VCVTDQ2PD:  case ZYDIS_MNEMONIC_CVTDQ2PD:  op = Op::Dq2Pd;   break;
+    case ZYDIS_MNEMONIC_VCVTPD2DQ:  case ZYDIS_MNEMONIC_CVTPD2DQ:  op = Op::Pd2Dq;   break;
+    case ZYDIS_MNEMONIC_VCVTTPD2DQ: case ZYDIS_MNEMONIC_CVTTPD2DQ: op = Op::TtPd2Dq; break;
+    default: return false;
+    }
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+    const bool dst_ymm = (ops[0].size == 256);
+    const bool src_ymm = (ops[1].size == 256);
+    const bool src_m64 = (ops[1].size == 64);
+    const int src_idx = (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                            ? ZydisVecToIndex(ops[1].reg.value) : -1;
+    const bool b_mem = (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    if (!b_mem && src_idx < 0) return false;
+    if (b_mem) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.mov(XReg(12), kAddr);                          // stash; EA used once
+    }
+    // Loads a 16-byte source chunk (0 or 1) into Q0, or 8 bytes into D0.
+    auto loadSrcQ = [&](int chunk) {
+        if (b_mem) { c.add(kScratch0, XReg(12), chunk * 16); c.ldr(QReg(0), ptr(kScratch0)); }
+        else { c.add(kScratch0, kState, YmmChunkOffset(src_idx, chunk * 2)); c.ldr(QReg(0), ptr(kScratch0)); }
+    };
+    auto loadSrcD = [&]() {
+        if (b_mem && src_m64) { c.ldr(DReg(0), ptr(XReg(12))); }
+        else if (b_mem)       { c.ldr(QReg(0), ptr(XReg(12))); }
+        else { c.add(kScratch0, kState, YmmChunkOffset(src_idx, 0)); c.ldr(QReg(0), ptr(kScratch0)); }
+    };
+    auto zeroChunks = [&](int from) {
+        c.mov(kScratch0, 0);
+        for (int k = from; k < 4; ++k) c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, k)));
+    };
+
+    switch (op) {
+    case Op::Pd2Ps: {
+        loadSrcQ(0);
+        c.fcvtn(VReg2S(1), VReg2D(0));                   // low pair -> v1.2s
+        if (src_ymm) { loadSrcQ(1); c.fcvtn2(VReg4S(1), VReg2D(0)); }
+        if (src_ymm) {                                   // 4 floats
+            c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+            c.str(QReg(1), ptr(kScratch0));
+            zeroChunks(2);
+        } else {                                         // 2 floats, upper 64 zero
+            c.str(DReg(1), ptr(kState, YmmChunkOffset(dst, 0)));
+            zeroChunks(1);
+        }
+        return true;
+    }
+    case Op::Ps2Pd:
+    case Op::Dq2Pd: {
+        loadSrcD();
+        if (op == Op::Ps2Pd) c.fcvtl(VReg2D(1), VReg2S(0));
+        else { c.sxtl(VReg2D(1), VReg2S(0)); c.scvtf(VReg2D(1), VReg2D(1)); }
+        if (dst_ymm) {
+            if (op == Op::Ps2Pd) c.fcvtl2(VReg2D(2), VReg4S(0));
+            else { c.sxtl2(VReg2D(2), VReg4S(0)); c.scvtf(VReg2D(2), VReg2D(2)); }
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
+        c.str(QReg(1), ptr(kScratch0));
+        if (dst_ymm) {
+            c.add(kScratch0, kState, YmmChunkOffset(dst, 2));
+            c.str(QReg(2), ptr(kScratch0));
+        } else {
+            zeroChunks(2);
+        }
+        return true;
+    }
+    case Op::Pd2Dq:
+    case Op::TtPd2Dq: {
+        const bool rounded = (op == Op::Pd2Dq);
+        const int nlanes = src_ymm ? 4 : 2;
+        c.movi(VReg16B(2), 0);                            // result accumulator
+        c.mov(XReg(10), 0x41E0000000000000ULL);           // 2^31 as f64
+        c.fmov(DReg(4), XReg(10));
+        c.mov(WReg(10), 0x80000000);                      // x86 integer indefinite
+        for (int lane = 0; lane < nlanes; ++lane) {
+            if ((lane & 1) == 0) loadSrcQ(lane / 2);      // chunk per 2 lanes
+            c.ins(VReg2D(1)[0], VReg2D(0)[lane & 1]);
+            if (rounded) c.frintn(DReg(1), DReg(1));
+            c.fcvtzs(WReg(9), DReg(1));                   // saturating trunc
+            c.fcmp(DReg(1), DReg(4));
+            c.csel(WReg(9), WReg(9), WReg(10), LO);       // NaN/+ovf -> INT_MIN
+            c.ins(VReg4S(2)[lane], WReg(9));
+        }
+        c.add(kScratch0, kState, YmmChunkOffset(dst, 0)); // 2-lane case: dwords
+        c.str(QReg(2), ptr(kScratch0));                   // 2,3 already zero
+        zeroChunks(2);
+        return true;
+    }
+    }
+    return false;
 }
 
 // Lane extract to GPR or memory: vpextrd (dword), vpextrq (qword), vextractps
@@ -6336,24 +6461,21 @@ inline int PcmpElemVal(const u8* P, int i, int sz, int sgn) {
     return sgn ? (int)(short)(u16)v : (int)v;
 }
 
-// Called from JIT-emitted code via blr. AAPCS64: x28 (kState) and x25-x27 are
-// callee-saved, so the only register the emitted shim must preserve across the
-// call is the link register.
-void Pcmpistr_helper(const void* aptr, const void* bptr,
-                     u32 imm, u32 ret_mask, void* outptr) {
-    const u8* A = (const u8*)aptr;
-    const u8* B = (const u8*)bptr;
-    PcmpistrOut* out = (PcmpistrOut*)outptr;
+/// Shared aggregation/polarity/output core for the implicit-length (ISTR*)
+/// and explicit-length (ESTR*) families. la/lb are the valid element counts,
+/// already clamped to [0, n]. ZF/SF are computed as lb<n / la<n, which reads
+/// "operand had a null" for ISTR (la/lb = first-null index, n if none) and
+/// "|EDX|/|EAX| < n" for ESTR (la/lb = |reg| saturated at n) -- the same
+/// expression is correct for both per the SDM. Everything below the length
+/// derivation is byte-identical to the hardware-validated ISTR matrix.
+static void PcmpstrCore(const u8* A, const u8* B, int la, int lb,
+                        u32 imm, u32 ret_mask, PcmpistrOut* out) {
     const int sz  = (imm & 1) ? 2 : 1;
     const int n   = (imm & 1) ? 8 : 16;
     const int sgn = (imm >> 1) & 1;
     const int agg = (imm >> 2) & 3;
     const int pol = (imm >> 4) & 3;
     const int sel = (imm >> 6) & 1;
-
-    int la = n, lb = n;   // implicit lengths: index of first null element
-    for (int i = 0; i < n; i++) { if (PcmpElemZero(A, i, sz)) { la = i; break; } }
-    for (int j = 0; j < n; j++) { if (PcmpElemZero(B, j, sz)) { lb = j; break; } }
 
     int a[16], b[16];
     for (int i = 0; i < n; i++) { a[i] = PcmpElemVal(A, i, sz, sgn); b[i] = PcmpElemVal(B, i, sz, sgn); }
@@ -6423,6 +6545,38 @@ void Pcmpistr_helper(const void* aptr, const void* bptr,
     }
 }
 
+// Called from JIT-emitted code via blr. AAPCS64: x28 (kState) and x25-x27 are
+// callee-saved, so the only register the emitted shim must preserve across the
+// call is the link register. Implicit lengths: first null element, else n.
+void Pcmpistr_helper(const void* aptr, const void* bptr,
+                     u32 imm, u32 ret_mask, void* outptr) {
+    const u8* A = (const u8*)aptr;
+    const u8* B = (const u8*)bptr;
+    const int sz = (imm & 1) ? 2 : 1;
+    const int n  = (imm & 1) ? 8 : 16;
+    int la = n, lb = n;
+    for (int i = 0; i < n; i++) { if (PcmpElemZero(A, i, sz)) { la = i; break; } }
+    for (int j = 0; j < n; j++) { if (PcmpElemZero(B, j, sz)) { lb = j; break; } }
+    PcmpstrCore(A, B, la, lb, imm, ret_mask, (PcmpistrOut*)outptr);
+}
+
+// Explicit-length variant (PCMPESTRI/PCMPESTRM and the VEX forms): the valid
+// lengths come from guest EAX (operand 1) and EDX (operand 2) as SIGNED 32-bit
+// values; hardware takes the absolute value and saturates at the element
+// count. Null elements inside the window are ordinary data. |INT32_MIN| is
+// taken through s64 to dodge the C abs() overflow.
+void Pcmpestr_helper(const void* aptr, const void* bptr,
+                     u32 eax, u32 edx, u32 imm, u32 ret_mask, void* outptr) {
+    const int n = (imm & 1) ? 8 : 16;
+    auto clampLen = [n](u32 v) -> int {
+        const s64 s = (s64)(s32)v;
+        const u64 a = (s < 0) ? (u64)(-s) : (u64)s;
+        return (a > (u64)n) ? n : (int)a;
+    };
+    PcmpstrCore((const u8*)aptr, (const u8*)bptr,
+                clampLen(eax), clampLen(edx), imm, ret_mask, (PcmpistrOut*)outptr);
+}
+
 // pcmpistri/pcmpistrm xmm1, xmm2/m128, imm8 — marshal to Pcmpistr_helper. The
 // out buffer and the link-register save live in a 48-byte host stack frame.
 bool EmitPcmpistr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
@@ -6482,6 +6636,77 @@ bool EmitPcmpistr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
     // dead here in both operand paths. (A previous version loaded the flags into
     // WReg(10), which aliases kScratch1, so the subsequent rflags load clobbered
     // them and every flag came out zero.)
+    c.ldr(kScratch1, ptr(kState, Offsets::Rflags));
+    c.ldr(WReg(11), ptr(kSp, 20));
+    c.mov(kScratch2, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
+    c.and_(kScratch1, kScratch1, kScratch2);
+    c.orr(kScratch1, kScratch1, XReg(11));
+    c.str(kScratch1, ptr(kState, Offsets::Rflags));
+
+    c.add(kSp, kSp, 48);
+    return true;
+}
+
+// pcmpestri/pcmpestrm xmm1, xmm2/m128, imm8 (and the VEX.128 forms, which are
+// encoding-only variants with identical semantics) — marshal to
+// Pcmpestr_helper. Identical to EmitPcmpistr except guest EAX/EDX ride along
+// as the explicit lengths (w2/w3). The VEX forms route here too, through the
+// full validated matrix, rather than the partial inline EmitVpcmpistr path.
+bool EmitPcmpestr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                  u64 next_rip, CodeGenerator& c) {
+    const bool ret_mask = (insn.mnemonic == ZYDIS_MNEMONIC_PCMPESTRM ||
+                           insn.mnemonic == ZYDIS_MNEMONIC_VPCMPESTRM);
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    const int a_idx = ZydisVecToIndex(ops[0].reg.value);
+    if (a_idx < 0) return false;
+    if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+    const u32 imm = (u32)(ops[2].imm.value.u & 0xFF);
+
+    // Resolve operand 2's address. For memory, compute the EA first (it clobbers
+    // x9-x11) and stash it in x12 before we build the call frame and args.
+    const bool b_mem = (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
+    int b_idx = -1;
+    if (b_mem) {
+        if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
+        c.mov(XReg(12), kAddr);
+    } else {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        b_idx = ZydisVecToIndex(ops[1].reg.value);
+        if (b_idx < 0) return false;
+    }
+
+    c.sub(kSp, kSp, 48);
+    c.str(XReg(30), ptr(kSp, 32));                          // save link register
+    c.add(XReg(0), kState, YmmChunkOffset(a_idx, 0));      // x0 = &xmm1
+    if (b_mem) c.mov(XReg(1), XReg(12));                   // x1 = &operand2
+    else       c.add(XReg(1), kState, YmmChunkOffset(b_idx, 0));
+    c.ldr(WReg(2), ptr(kState, GprOffset(0)));             // w2 = guest EAX (len a)
+    c.ldr(WReg(3), ptr(kState, GprOffset(2)));             // w3 = guest EDX (len b)
+    c.mov(XReg(4), imm);                                   // x4 = imm8
+    c.mov(XReg(5), ret_mask ? 1 : 0);                      // x5 = ret_mask
+    c.add(XReg(6), kSp, 0);                                 // x6 = &out
+    c.mov(XReg(9), reinterpret_cast<u64>(&Pcmpestr_helper));
+    c.blr(XReg(9));
+    c.ldr(XReg(30), ptr(kSp, 32));                          // restore link register
+
+    if (ret_mask) {
+        // XMM0 (guest vec 0) low 128 = mask; upper 128 zeroed for backend
+        // parity with the x86 EmitVpcmpestrm (see that function's comment).
+        c.ldr(kScratch0, ptr(kSp, 0));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 0)));
+        c.ldr(kScratch0, ptr(kSp, 8));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 1)));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(0, 3)));
+    } else {
+        // ECX = index, zero-extended into RCX (gpr index 1).
+        c.ldr(kWScratch0, ptr(kSp, 16));
+        c.str(kScratch0, ptr(kState, GprOffset(1)));
+    }
+    // Merge CF/ZF/SF/OF (helper already placed them at their rflags positions);
+    // same register discipline as EmitPcmpistr (flags word via x11, which is
+    // dead here in both operand paths).
     c.ldr(kScratch1, ptr(kState, Offsets::Rflags));
     c.ldr(WReg(11), ptr(kSp, 20));
     c.mov(kScratch2, ~((1ull<<0)|(1ull<<2)|(1ull<<4)|(1ull<<6)|(1ull<<7)|(1ull<<11)));
@@ -6728,32 +6953,118 @@ static bool EmitVpcmpistr(const ZydisDecodedInstruction& insn,
     return true;
 }
 
-// vpackusdw dst, src1, src2 — pack 8 signed dwords (src1 low 4, src2 high 4)
-// into 8 unsigned words with saturation. NEON sqxtun (signed->unsigned sat).
-bool EmitVpackusdw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
-                   u64 next_rip, CodeGenerator& c) {
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+// (v)mov[lh]ps / (v)mov[lh]pd — 64-bit half-register moves; see the x86
+// emitter's comment for the three shapes. Pure qword ldr/str through the
+// scratch register; legacy loads preserve the other half, VEX loads take it
+// from src1 and zero the upper YMM.
+bool EmitVmovLowHigh(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                     u64 next_rip, CodeGenerator& c) {
+    bool high;
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_VMOVLPS: case ZYDIS_MNEMONIC_MOVLPS:
+    case ZYDIS_MNEMONIC_VMOVLPD: case ZYDIS_MNEMONIC_MOVLPD: high = false; break;
+    case ZYDIS_MNEMONIC_VMOVHPS: case ZYDIS_MNEMONIC_MOVHPS:
+    case ZYDIS_MNEMONIC_VMOVHPD: case ZYDIS_MNEMONIC_MOVHPD: high = true;  break;
+    default: return false;
+    }
+    const int tgt = high ? 1 : 0;
+
+    if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {        // store form
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        const int s = ZydisVecToIndex(ops[1].reg.value);
+        if (s < 0) return false;
+        if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s, tgt)));
+        c.str(kScratch0, ptr(kAddr));
+        return true;
+    }
+
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
-    const int s1  = ZydisVecToIndex(ops[1].reg.value);
-    if (dst < 0 || s1 < 0) return false;
+    if (dst < 0) return false;
+    const ZydisDecodedOperand* m;
+    int src1 = -1;
+    if (insn.operand_count_visible == 3) {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[2].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+        src1 = ZydisVecToIndex(ops[1].reg.value);
+        if (src1 < 0) return false;
+        m = &ops[2];
+    } else if (insn.operand_count_visible == 2) {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+        m = &ops[1];
+    } else {
+        return false;
+    }
+    if (!EmitEffectiveAddress(m->mem, next_rip, c)) return false;
+    c.ldr(kScratch0, ptr(kAddr));                          // m64 value
+    if (src1 >= 0) {
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(src1, high ? 0 : 1)));
+        c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, high ? 0 : 1)));
+    }
+    c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, tgt)));
+    if (src1 >= 0) {                                       // VEX zeroes upper
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
+// (v)packuswb / (v)packsswb / (v)packssdw / (v)packusdw — saturating packs.
+// dst low half = pack(src1), high half = pack(src2). NEON narrows map 1:1:
+// sqxtun (signed -> unsigned saturate) for the US forms, sqxtn (signed ->
+// signed) for the SS forms, at 8H->8B/16B for the word->byte ops and
+// 4S->4H/8H for the dword->word ops. Handles the VEX 3-op shape and the
+// legacy SSE folded-2-op shape (dst = pack(dst, src)). xmm widths only;
+// a ymm form (AVX2, per-128-lane) would need a chunk loop and bails to the
+// unsupported exit instead of silently mangling lanes.
+bool EmitVpack(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    enum class K { UsWb, SsWb, SsDw, UsDw } k;
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_VPACKUSWB: case ZYDIS_MNEMONIC_PACKUSWB: k = K::UsWb; break;
+    case ZYDIS_MNEMONIC_VPACKSSWB: case ZYDIS_MNEMONIC_PACKSSWB: k = K::SsWb; break;
+    case ZYDIS_MNEMONIC_VPACKSSDW: case ZYDIS_MNEMONIC_PACKSSDW: k = K::SsDw; break;
+    case ZYDIS_MNEMONIC_VPACKUSDW: case ZYDIS_MNEMONIC_PACKUSDW: k = K::UsDw; break;
+    default: return false;
+    }
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER || ops[0].size != 128) return false;
+    const int dst = ZydisVecToIndex(ops[0].reg.value);
+    if (dst < 0) return false;
+    int s1;
+    const ZydisDecodedOperand* s2;
+    if (insn.operand_count_visible == 3) {
+        if (ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        s1 = ZydisVecToIndex(ops[1].reg.value);
+        s2 = &ops[2];
+    } else if (insn.operand_count_visible == 2) {
+        s1 = dst;                                   // legacy: dst = pack(dst, src)
+        s2 = &ops[1];
+    } else {
+        return false;
+    }
+    if (s1 < 0) return false;
 
     c.add(kScratch0, kState, YmmChunkOffset(s1, 0));
     c.ldr(QReg(0), ptr(kScratch0));
-    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int s2 = ZydisVecToIndex(ops[2].reg.value);
-        if (s2 < 0) return false;
-        c.add(kScratch0, kState, YmmChunkOffset(s2, 0));
+    if (s2->type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int s2i = ZydisVecToIndex(s2->reg.value);
+        if (s2i < 0) return false;
+        c.add(kScratch0, kState, YmmChunkOffset(s2i, 0));
         c.ldr(QReg(1), ptr(kScratch0));
-    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+    } else if (s2->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(s2->mem, next_rip, c)) return false;
         c.ldr(QReg(1), ptr(kAddr));
     } else {
         return false;
     }
-    // low 4 words = sat(src1 dwords); high 4 words = sat(src2 dwords).
-    c.sqxtun(VReg4H(2), VReg4S(0));        // v2.low64 = packed src1
-    c.sqxtun2(VReg8H(2), VReg4S(1));       // v2.high64 = packed src2
+    switch (k) {
+    case K::UsWb: c.sqxtun(VReg8B(2), VReg8H(0)); c.sqxtun2(VReg16B(2), VReg8H(1)); break;
+    case K::SsWb: c.sqxtn(VReg8B(2), VReg8H(0));  c.sqxtn2(VReg16B(2), VReg8H(1));  break;
+    case K::SsDw: c.sqxtn(VReg4H(2), VReg4S(0));  c.sqxtn2(VReg8H(2), VReg4S(1));   break;
+    case K::UsDw: c.sqxtun(VReg4H(2), VReg4S(0)); c.sqxtun2(VReg8H(2), VReg4S(1));  break;
+    }
     c.add(kScratch0, kState, YmmChunkOffset(dst, 0));
     c.str(QReg(2), ptr(kScratch0));
     c.mov(kScratch0, 0);
@@ -7837,7 +8148,15 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VCVTSS2SD: case ZYDIS_MNEMONIC_VCVTSD2SS:
             handled = EmitVcvtScalar(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VCVTDQ2PS: case ZYDIS_MNEMONIC_VCVTTPS2DQ:
+        case ZYDIS_MNEMONIC_CVTDQ2PS:  case ZYDIS_MNEMONIC_CVTTPS2DQ:
+        case ZYDIS_MNEMONIC_VCVTPS2DQ: case ZYDIS_MNEMONIC_CVTPS2DQ:
             handled = EmitVcvtPacked(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VCVTPD2PS:  case ZYDIS_MNEMONIC_CVTPD2PS:
+        case ZYDIS_MNEMONIC_VCVTPS2PD:  case ZYDIS_MNEMONIC_CVTPS2PD:
+        case ZYDIS_MNEMONIC_VCVTDQ2PD:  case ZYDIS_MNEMONIC_CVTDQ2PD:
+        case ZYDIS_MNEMONIC_VCVTPD2DQ:  case ZYDIS_MNEMONIC_CVTPD2DQ:
+        case ZYDIS_MNEMONIC_VCVTTPD2DQ: case ZYDIS_MNEMONIC_CVTTPD2DQ:
+            handled = EmitVcvtPdPacked(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
         case ZYDIS_MNEMONIC_VEXTRACTPS:
             handled = EmitVpextr(insn, ops, next_rip, c); break;
@@ -7908,8 +8227,22 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_PCMPISTRI:
         case ZYDIS_MNEMONIC_PCMPISTRM:
             handled = EmitPcmpistr(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_PCMPESTRI:
+        case ZYDIS_MNEMONIC_PCMPESTRM:
+        case ZYDIS_MNEMONIC_VPCMPESTRI:
+        case ZYDIS_MNEMONIC_VPCMPESTRM:
+            handled = EmitPcmpestr(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPSHUFB:   handled = EmitVpshufb(insn, ops, next_rip, c); break;
-        case ZYDIS_MNEMONIC_VPACKUSDW: handled = EmitVpackusdw(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VMOVLPS: case ZYDIS_MNEMONIC_MOVLPS:
+        case ZYDIS_MNEMONIC_VMOVLPD: case ZYDIS_MNEMONIC_MOVLPD:
+        case ZYDIS_MNEMONIC_VMOVHPS: case ZYDIS_MNEMONIC_MOVHPS:
+        case ZYDIS_MNEMONIC_VMOVHPD: case ZYDIS_MNEMONIC_MOVHPD:
+            handled = EmitVmovLowHigh(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPACKUSDW: case ZYDIS_MNEMONIC_PACKUSDW:
+        case ZYDIS_MNEMONIC_VPACKUSWB: case ZYDIS_MNEMONIC_PACKUSWB:
+        case ZYDIS_MNEMONIC_VPACKSSWB: case ZYDIS_MNEMONIC_PACKSSWB:
+        case ZYDIS_MNEMONIC_VPACKSSDW: case ZYDIS_MNEMONIC_PACKSSDW:
+            handled = EmitVpack(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPCMPISTRI:
             handled = EmitVpcmpistr(insn, ops, next_rip, /*wantMask=*/false, c); break;
         case ZYDIS_MNEMONIC_VPCMPISTRM:

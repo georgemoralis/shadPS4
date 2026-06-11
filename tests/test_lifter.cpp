@@ -3907,6 +3907,46 @@ TEST_F(CpuRuntimeTest, Div32_DividendStraddlesEdxEax) {
     EXPECT_EQ(r.state.gpr[2] >> 32, 0u) << "RDX upper 32 must zero-extend";
 }
 
+// ============================================================================
+// DIV/IDIV 16-bit — DX:AX / r/m16 -> AX = quotient, DX = remainder, with the
+// upper 48 bits of guest RAX/RDX preserved. Landed in the YoYo Games runner
+// at 0x80c5244d4 (the emitter previously handled 8/32/64 only).
+// Expectations hardware-captured.
+// ============================================================================
+
+// Dividend 0x1_0005 (DX=1, AX=5) / 6 = 0x2AAB remainder 3. Upper bits of
+// RAX/RDX are pre-polluted and must survive; the divisor register must not
+// be clobbered.
+TEST_F(CpuRuntimeTest, Div16_DividendStraddlesDxAx) {
+    const u8 program[] = { 0x66, 0xf7, 0xf1, 0xc3 };       // div cx
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAAAAAAAAAAAA0005ULL;                     // AX = 5
+    st.gpr[2] = 0xBBBBBBBBBBBB0001ULL;                     // DX = 1
+    st.gpr[1] = 0xCCCCCCCCCCCC0006ULL;                     // CX = 6
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xAAAAAAAAAAAA2AABULL) << "AX = 0x10005 / 6";
+    EXPECT_EQ(st.gpr[2], 0xBBBBBBBBBBBB0003ULL) << "DX = 0x10005 % 6";
+    EXPECT_EQ(st.gpr[1], 0xCCCCCCCCCCCC0006ULL) << "divisor untouched";
+}
+
+// Signed: -10 / 3 with the dividend sign-extended into DX (as CWD would).
+// Quotient truncates toward zero (-3), remainder takes the dividend's sign
+// (-1) — both 16-bit two's complement in the low words.
+TEST_F(CpuRuntimeTest, Idiv16_NegativeDividend) {
+    const u8 program[] = { 0x66, 0xf7, 0xf9, 0xc3 };       // idiv cx
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xAAAAAAAAAAAAFFF6ULL;                     // AX = -10
+    st.gpr[2] = 0xBBBBBBBBBBBBFFFFULL;                     // DX = sign extension
+    st.gpr[1] = 0xCCCCCCCCCCCC0003ULL;                     // CX = 3
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0xAAAAAAAAAAAAFFFDULL) << "AX = -3 (trunc toward zero)";
+    EXPECT_EQ(st.gpr[2], 0xBBBBBBBBBBBBFFFFULL) << "DX = -1 (sign of dividend)";
+}
+
 // Confirm the upper 32 of guest RAX/RDX is IGNORED by 32-bit DIV.
 // Pre-pollutes those upper halves; if the emitter erroneously loaded
 // the full 64-bit slots into host rdx:rax we'd see a wildly different
@@ -7963,6 +8003,239 @@ TEST_F(CpuRuntimeTest, Vcvttps2dq_TruncationTowardZero) {
     EXPECT_EQ(st.ymm[3], 0ULL);
 }
 
+// ============================================================================
+// Packed DOUBLE conversions — (V)CVTPD2PS / PS2PD / DQ2PD / PD2DQ / TTPD2DQ.
+// Landed in the YoYo Games PS4 Runner (GameMaker; GML numbers are f64) via
+// vcvtpd2ps at 0x800b7e0fc. All expectations captured from real hardware.
+// f64->i32 invalid inputs (NaN, out-of-range) produce the x86 integer
+// indefinite 0x80000000.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vcvtpd2ps_NarrowsToFloats) {
+    const u8 program[] = { 0xc5, 0xf9, 0x5a, 0xc1, 0xc3 };   // vcvtpd2ps xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x3FF8000000000000ULL;           // 1.5
+    st.ymm[XmmChunk(1,1)] = 0xC002000000000000ULL;           // -2.25
+    st.ymm[XmmChunk(0,2)] = ~0ULL; st.ymm[XmmChunk(0,3)] = ~0ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0xC01000003FC00000ULL) << "{1.5f, -2.25f}";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0ULL) << "bits 127:64 zeroed";
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL); EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vcvtps2pd_WidensLowPair) {
+    const u8 program[] = { 0xc5, 0xf8, 0x5a, 0xc1, 0xc3 };   // vcvtps2pd xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0xC10000003F000000ULL;           // {0.5f, -8.0f}
+    st.ymm[XmmChunk(1,1)] = 0x42C6000042C60000ULL;           // {99f, 99f} -- ignored
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x3FE0000000000000ULL) << "0.5";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0xC020000000000000ULL) << "-8.0";
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL); EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vcvtdq2pd_IntsToDoubles) {
+    const u8 program[] = { 0xc5, 0xfa, 0xe6, 0xc1, 0xc3 };   // vcvtdq2pd xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0xFFFFFFFD00000007ULL;           // {7, -3}
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x401C000000000000ULL) << "7.0";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0xC008000000000000ULL) << "-3.0";
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL); EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vcvttpd2dq_TruncatesAndSaturatesToIndefinite) {
+    const u8 program[] = { 0xc5, 0xf9, 0xe6, 0xc1, 0xc3 };   // vcvttpd2dq xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x400D99999999999AULL;           // 3.7
+    st.ymm[XmmChunk(1,1)] = 0xC1E0000000200000ULL;           // -2147483649.0
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x8000000000000003ULL)
+        << "{trunc(3.7)=3, -2^31-1 -> integer indefinite}";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0ULL) << "bits 127:64 zeroed";
+}
+
+TEST_F(CpuRuntimeTest, Vcvtpd2dq_RoundsNearestEven) {
+    const u8 program[] = { 0xc5, 0xfb, 0xe6, 0xc1, 0xc3 };   // vcvtpd2dq xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x4004000000000000ULL;           // 2.5
+    st.ymm[XmmChunk(1,1)] = 0x400C000000000000ULL;           // 3.5
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x0000000400000002ULL)
+        << "ties to even: 2.5 -> 2, 3.5 -> 4";
+}
+
+TEST_F(CpuRuntimeTest, Cvtpd2ps_LegacyEncoding) {
+    const u8 program[] = { 0x66, 0x0f, 0x5a, 0xca, 0xc3 };   // cvtpd2ps xmm1, xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(2,0)] = 0x3FF8000000000000ULL;           // 1.5
+    st.ymm[XmmChunk(2,1)] = 0xC002000000000000ULL;           // -2.25
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0xC01000003FC00000ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0ULL);
+}
+
+// ============================================================================
+// (V)PACKUSWB / (V)PACKSSWB / (V)PACKSSDW — saturating packs. VPACKUSDW was
+// already covered; vpackuswb landed in the YoYo Games runner at 0x800226eb6.
+// dst low half = saturate(src1), high half = saturate(src2). Expectations
+// hardware-captured.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpackuswb_SaturatesSignedWordsToUnsignedBytes) {
+    const u8 program[] = { 0xc5, 0xf9, 0x67, 0xc1, 0xc3 };  // vpackuswb xmm0, xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    // src1 words {-1, 0, 255, 256, 300, -32768, 32767, 1}
+    st.ymm[XmmChunk(0,0)] = 0x010000FF0000FFFFULL;
+    st.ymm[XmmChunk(0,1)] = 0x00017FFF8000012CULL;
+    // src2 words {65..72} ('A'..'H')
+    st.ymm[XmmChunk(1,0)] = 0x0044004300420041ULL;
+    st.ymm[XmmChunk(1,1)] = 0x0048004700460045ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x01FF00FFFFFF0000ULL)
+        << "{0,0,255,255,255,0,255,1}: negatives clamp to 0, >255 to 255";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x4847464544434241ULL) << "'A'..'H' pass through";
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL); EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vpacksswb_SaturatesToSignedBytes) {
+    const u8 program[] = { 0xc5, 0xf9, 0x63, 0xc1, 0xc3 };  // vpacksswb xmm0, xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    // src1 words {-129, -128, 127, 128, 200, -200, 5, -5}
+    st.ymm[XmmChunk(0,0)] = 0x0080007FFF80FF7FULL;
+    st.ymm[XmmChunk(0,1)] = 0xFFFB0005FF3800C8ULL;
+    st.ymm[XmmChunk(1,0)] = 0x0044004300420041ULL;
+    st.ymm[XmmChunk(1,1)] = 0x0048004700460045ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0xFB05807F7F7F8080ULL)
+        << "{-128,-128,127,127,127,-128,5,-5}";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x4847464544434241ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vpackssdw_SaturatesToSignedWords) {
+    const u8 program[] = { 0xc5, 0xf9, 0x6b, 0xc1, 0xc3 };  // vpackssdw xmm0, xmm0, xmm1
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    // src1 dwords {-40000, 40000, 32767, -32768}
+    st.ymm[XmmChunk(0,0)] = 0x00009C40FFFF63C0ULL;
+    st.ymm[XmmChunk(0,1)] = 0xFFFF800000007FFFULL;
+    // src2 dwords {1, 2, 3, 4}
+    st.ymm[XmmChunk(1,0)] = 0x0000000200000001ULL;
+    st.ymm[XmmChunk(1,1)] = 0x0000000400000003ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x80007FFF7FFF8000ULL)
+        << "{-32768, 32767, 32767, -32768}";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x0004000300020001ULL);
+}
+
+// Legacy SSE folded shape: packuswb xmm1, xmm2 means dst = pack(dst, src).
+TEST_F(CpuRuntimeTest, Packuswb_LegacyFoldedDst) {
+    const u8 program[] = { 0x66, 0x0f, 0x67, 0xca, 0xc3 };  // packuswb xmm1, xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x010000FF0000FFFFULL;          // dst doubles as src1
+    st.ymm[XmmChunk(1,1)] = 0x00017FFF8000012CULL;
+    st.ymm[XmmChunk(2,0)] = 0x0044004300420041ULL;
+    st.ymm[XmmChunk(2,1)] = 0x0048004700460045ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x01FF00FFFFFF0000ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0x4847464544434241ULL);
+}
+
+// ============================================================================
+// (V)MOVLPS / (V)MOVHPS / (V)MOVLPD / (V)MOVHPD — 64-bit half-register
+// moves (mem forms; the reg-reg encodings decode as MOVHLPS/MOVLHPS).
+// vmovlps store landed in an Ngs2-audio title at 0x8001b4a05. Key semantics
+// under test: stores write exactly 8 bytes and leave the register alone;
+// VEX loads take the other half from src1 and zero the upper YMM; legacy
+// loads PRESERVE the untouched half.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vmovlps_StoreLowQword) {
+    const u8 program[] = { 0xc5, 0xf8, 0x13, 0x01, 0xc3 };  // vmovlps [rcx], xmm0
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;                            // guest-visible scratch
+    *reinterpret_cast<u64*>(buf)     = 0x1111111111111111ULL;
+    *reinterpret_cast<u64*>(buf + 8) = 0x2222222222222222ULL;  // must survive
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = reinterpret_cast<u64>(buf);
+    st.ymm[XmmChunk(0,0)] = 0xAABBCCDDEEFF0011ULL;
+    st.ymm[XmmChunk(0,1)] = 0x5566778899AABBCCULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf), 0xAABBCCDDEEFF0011ULL) << "xmm0 low qword";
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf + 8), 0x2222222222222222ULL)
+        << "store is exactly 8 bytes";
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0xAABBCCDDEEFF0011ULL) << "register untouched";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x5566778899AABBCCULL);
+}
+
+TEST_F(CpuRuntimeTest, Vmovhps_StoreHighQword) {
+    const u8 program[] = { 0xc5, 0xf8, 0x17, 0x01, 0xc3 };  // vmovhps [rcx], xmm0
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(buf) = 0;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = reinterpret_cast<u64>(buf);
+    st.ymm[XmmChunk(0,0)] = 0xAABBCCDDEEFF0011ULL;
+    st.ymm[XmmChunk(0,1)] = 0x5566778899AABBCCULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf), 0x5566778899AABBCCULL) << "xmm0 HIGH qword";
+}
+
+TEST_F(CpuRuntimeTest, Vmovlps_Load3op_MergesAndZeroesUpper) {
+    const u8 program[] = { 0xc5, 0xf0, 0x12, 0x01, 0xc3 };  // vmovlps xmm0, xmm1, [rcx]
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(buf) = 0x123456789ABCDEF0ULL;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = reinterpret_cast<u64>(buf);
+    st.ymm[XmmChunk(1,0)] = 0x1111111111111111ULL;          // src1 low (ignored)
+    st.ymm[XmmChunk(1,1)] = 0x9999999999999999ULL;          // src1 high (merged)
+    st.ymm[XmmChunk(0,2)] = ~0ULL; st.ymm[XmmChunk(0,3)] = ~0ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x123456789ABCDEF0ULL) << "low = m64";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x9999999999999999ULL) << "high = src1 high";
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL) << "VEX zeroes upper";
+    EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Movhps_LegacyLoad_PreservesLowHalf) {
+    const u8 program[] = { 0x0f, 0x16, 0x01, 0xc3 };        // movhps xmm0, [rcx]
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(buf) = 0xFEDCBA9876543210ULL;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = reinterpret_cast<u64>(buf);
+    st.ymm[XmmChunk(0,0)] = 0x4444444444444444ULL;          // MUST survive
+    st.ymm[XmmChunk(0,1)] = 0x5555555555555555ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x4444444444444444ULL)
+        << "legacy partial load preserves the other half";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0xFEDCBA9876543210ULL) << "high = m64";
+}
+
 // Out-of-range / NaN / inf produces Intel's "integer indefinite"
 // value: 0x80000000 (INT32_MIN). This is the canonical sentinel for
 // "couldn't represent the result as a signed int32".
@@ -8915,6 +9188,110 @@ TEST_F(CpuRuntimeTest, Vpcmpistrm_ZFOnNullInB) {
     rt.Run(st);
     // ZF set because b contains a null terminator.
     EXPECT_EQ(st.rflags & (1ULL<<6), (1ULL<<6)) << "ZF: b has a null terminator";
+}
+
+// ============================================================================
+// VPCMPESTRI / PCMPESTRI / VPCMPESTRM — SSE4.2 EXPLICIT-length string
+// compare. Lengths come from EAX (operand 1) and EDX (operand 2) as signed
+// 32-bit values, |abs| saturated at the element count; null bytes inside the
+// window are ordinary data (the defining difference vs the ISTR forms).
+// Landed in WE ARE DOOMED-adjacent titles via clang's memchr/strstr
+// vectorization (vpcmpestri at 0x81638a363). All expectations below were
+// captured from real SSE4.2 hardware.
+// ============================================================================
+
+// The I-vs-E differential: b[0] is a null byte INSIDE the explicit window.
+// Implicit-length would terminate operand 2 there and find nothing
+// (ECX=16); explicit-length treats it as data and finds the 'x' at index 1.
+TEST_F(CpuRuntimeTest, Vpcmpestri_NulInsideWindowIsData) {
+    const u8 program[] = {
+        0xb8, 0x01, 0x00, 0x00, 0x00,                 // mov eax, 1   (len a)
+        0xba, 0x04, 0x00, 0x00, 0x00,                 // mov edx, 4   (len b)
+        0xc4, 0xe3, 0x79, 0x61, 0xc1, 0x00,           // vpcmpestri xmm0, xmm1, 0x00
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x78ULL;                  // a = {'x'}
+    st.ymm[XmmChunk(1,0)] = 0x0000000042427800ULL;    // b = {0,'x',0x42,0x42,...}
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 1ULL) << "'x' found at index 1; the null at b[0] is data";
+    EXPECT_TRUE(st.rflags & (1ULL<<0))   << "CF = IntRes2 != 0";
+    EXPECT_TRUE(st.rflags & (1ULL<<6))   << "ZF = |EDX| < 16";
+    EXPECT_TRUE(st.rflags & (1ULL<<7))   << "SF = |EAX| < 16";
+    EXPECT_FALSE(st.rflags & (1ULL<<11)) << "OF = IntRes2[0] (no match at index 0)";
+}
+
+// EDX=0 -> operand 2 has no valid elements: no match, ECX = element count.
+// SF stays clear because |EAX| = 16 is NOT < 16 (saturation boundary).
+TEST_F(CpuRuntimeTest, Pcmpestri_ZeroLengthB_NoMatch) {
+    const u8 program[] = {
+        0xb8, 0x10, 0x00, 0x00, 0x00,                 // mov eax, 16
+        0xba, 0x00, 0x00, 0x00, 0x00,                 // mov edx, 0
+        0x66, 0x0f, 0x3a, 0x61, 0xc1, 0x00,           // pcmpestri xmm0, xmm1, 0x00
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x4141414141414141ULL; st.ymm[XmmChunk(0,1)] = 0x4141414141414141ULL;
+    st.ymm[XmmChunk(1,0)] = 0x4141414141414141ULL; st.ymm[XmmChunk(1,1)] = 0x4141414141414141ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 16ULL) << "no valid b elements -> ECX = 16";
+    EXPECT_FALSE(st.rflags & (1ULL<<0)) << "CF = 0";
+    EXPECT_TRUE(st.rflags & (1ULL<<6))  << "ZF: |EDX| = 0 < 16";
+    EXPECT_FALSE(st.rflags & (1ULL<<7)) << "SF: |EAX| = 16, not < 16";
+}
+
+// EAX = -3: lengths are SIGNED; hardware takes |EAX| = 3. a = "abcd..." with
+// only a[0..2] valid; b[0]='d' (=a[3], invalid -> no match), b[1]='c' (=a[2],
+// valid -> match). Verifies abs() and the validity cutoff together.
+TEST_F(CpuRuntimeTest, Vpcmpestri_NegativeLengthTakesAbs) {
+    const u8 program[] = {
+        0xb8, 0xfd, 0xff, 0xff, 0xff,                 // mov eax, -3
+        0xba, 0x02, 0x00, 0x00, 0x00,                 // mov edx, 2
+        0xc4, 0xe3, 0x79, 0x61, 0xc1, 0x00,           // vpcmpestri xmm0, xmm1, 0x00
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x6867666564636261ULL;    // a = "abcdefgh"
+    st.ymm[XmmChunk(0,1)] = 0x706f6e6d6c6b6a69ULL;    //     "ijklmnop"
+    st.ymm[XmmChunk(1,0)] = 0x6364ULL;                // b = {'d','c'}
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 1ULL) << "'c' = a[2] (valid under |EAX|=3); 'd' = a[3] is not";
+    EXPECT_TRUE(st.rflags & (1ULL<<0)) << "CF";
+    EXPECT_TRUE(st.rflags & (1ULL<<6)) << "ZF: 2 < 16";
+    EXPECT_TRUE(st.rflags & (1ULL<<7)) << "SF: 3 < 16";
+}
+
+// ESTRM bit-mask: matches at b[1] and b[3] -> XMM0 = 0xA. The null at b[2]
+// is data (implicit-length would stop there and produce 0x2). Upper YMM of
+// xmm0 must come out zeroed (backend convention shared with PCMPISTRM).
+TEST_F(CpuRuntimeTest, Vpcmpestrm_BitMask_NulIsData) {
+    const u8 program[] = {
+        0xb8, 0x01, 0x00, 0x00, 0x00,                 // mov eax, 1
+        0xba, 0x04, 0x00, 0x00, 0x00,                 // mov edx, 4
+        0xc4, 0xe3, 0x79, 0x60, 0xca, 0x00,           // vpcmpestrm xmm1, xmm2, 0x00
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x61ULL;                  // a = {'a'}
+    st.ymm[XmmChunk(2,0)] = 0x61006162ULL;            // b = {'b','a',0,'a'}
+    st.ymm[XmmChunk(0,2)] = 0xCAFEF00DCAFEF00DULL;    // pre-pollute upper ymm0
+    st.ymm[XmmChunk(0,3)] = 0xCAFEF00DCAFEF00DULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0xAULL) << "matches at indices 1 and 3";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(0,2)], 0ULL) << "upper 128 zeroed";
+    EXPECT_EQ(st.ymm[XmmChunk(0,3)], 0ULL);
+    EXPECT_TRUE(st.rflags & (1ULL<<0)) << "CF";
+    EXPECT_TRUE(st.rflags & (1ULL<<6)) << "ZF";
+    EXPECT_TRUE(st.rflags & (1ULL<<7)) << "SF";
 }
 
 // ============================================================================
@@ -19106,6 +19483,95 @@ TEST_F(CpuRuntimeTest, Arm64_Pcmpistrm_EqualAnyMask) {
     EXPECT_FALSE(st.rflags & (1ULL<<6))  << "ZF = operand2 has null";
     EXPECT_TRUE(st.rflags & (1ULL<<7))  << "SF = operand1 has null";
     EXPECT_FALSE(st.rflags & (1ULL<<11)) << "OF";
+}
+
+// Explicit-length sibling for the arm64 software path: same NulIsData
+// differential as Vpcmpestri_NulInsideWindowIsData, legacy SSE encoding.
+// (Pcmpestr_helper is fuzz-validated bit-exact against x86 hardware across
+// all 128 control bytes including zero/negative/saturating lengths.)
+TEST_F(CpuRuntimeTest, Arm64_Pcmpestri_NulInsideWindowIsData) {
+    const u8 program[] = {
+        0xb8, 0x01, 0x00, 0x00, 0x00,                 // mov eax, 1
+        0xba, 0x04, 0x00, 0x00, 0x00,                 // mov edx, 4
+        0x66, 0x0f, 0x3a, 0x61, 0xca, 0x00,           // pcmpestri xmm1, xmm2, 0x00
+        0xc3,
+    };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x78ULL;                  // a = {'x'}
+    st.ymm[XmmChunk(2,0)] = 0x0000000042427800ULL;    // b = {0,'x',0x42,0x42}
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 1ULL) << "null at b[0] is data under explicit length";
+    EXPECT_TRUE(st.rflags & (1ULL<<0))   << "CF";
+    EXPECT_TRUE(st.rflags & (1ULL<<6))   << "ZF: |EDX| < 16";
+    EXPECT_TRUE(st.rflags & (1ULL<<7))   << "SF: |EAX| < 16";
+    EXPECT_FALSE(st.rflags & (1ULL<<11)) << "OF";
+}
+
+// f64->i32 on the arm64 software path. The killer case: a LEGITIMATE
+// 2147483647.0 (exactly representable in f64, converts to INT_MAX) sitting
+// next to a NaN (must become 0x80000000). A result==INT_MAX fixup heuristic
+// — valid for the f32 path — would wrongly clobber lane 1 here; the lowering
+// uses an ordered bounds compare instead. Expectations hardware-captured.
+TEST_F(CpuRuntimeTest, Arm64_Cvttpd2dq_LegitIntMaxNextToNaN) {
+    const u8 program[] = { 0x66, 0x0f, 0xe6, 0xca, 0xc3 };   // cvttpd2dq xmm1, xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(2,0)] = 0x7FF8000000000000ULL;           // NaN
+    st.ymm[XmmChunk(2,1)] = 0x41DFFFFFFFC00000ULL;           // 2147483647.0 exactly
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x7FFFFFFF80000000ULL)
+        << "NaN -> indefinite; 2147483647.0 -> INT_MAX legitimately";
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Arm64_Cvtpd2dq_NearestEven) {
+    const u8 program[] = { 0xf2, 0x0f, 0xe6, 0xca, 0xc3 };   // cvtpd2dq xmm1, xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(2,0)] = 0x4004000000000000ULL;           // 2.5
+    st.ymm[XmmChunk(2,1)] = 0x400C000000000000ULL;           // 3.5
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x0000000400000002ULL) << "2.5 -> 2, 3.5 -> 4";
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0ULL);
+}
+
+// Saturating pack via the NEON path (sqxtun 8H->8B/16B). Same data as the
+// x86 vpackuswb test; legacy encoding routes through EmitVpack's folded-2-op
+// shape, which the previous packusdw-only emitter did not handle.
+TEST_F(CpuRuntimeTest, Arm64_Packuswb_Saturation) {
+    const u8 program[] = { 0x66, 0x0f, 0x67, 0xca, 0xc3 };  // packuswb xmm1, xmm2
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x010000FF0000FFFFULL;
+    st.ymm[XmmChunk(1,1)] = 0x00017FFF8000012CULL;
+    st.ymm[XmmChunk(2,0)] = 0x0044004300420041ULL;
+    st.ymm[XmmChunk(2,1)] = 0x0048004700460045ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x01FF00FFFFFF0000ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0x4847464544434241ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,2)], 0ULL); EXPECT_EQ(st.ymm[XmmChunk(1,3)], 0ULL);
+}
+
+// Half-register move on the arm64 path (pure ldr/str): legacy movlps load,
+// the preserve-other-half case that distinguishes it from a full 128 load.
+TEST_F(CpuRuntimeTest, Arm64_Movlps_LegacyLoad_PreservesHighHalf) {
+    const u8 program[] = { 0x0f, 0x12, 0x09, 0xc3 };        // movlps xmm1, [rcx]
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(buf) = 0x0102030405060708ULL;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[1] = reinterpret_cast<u64>(buf);
+    st.ymm[XmmChunk(1,0)] = 0xAAAAAAAAAAAAAAAAULL;
+    st.ymm[XmmChunk(1,1)] = 0xBBBBBBBBBBBBBBBBULL;          // MUST survive
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x0102030405060708ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0xBBBBBBBBBBBBBBBBULL);
 }
 
 // VRCPPS / VRSQRTPS are fast approximations. The x86 host estimate is ~12-bit
