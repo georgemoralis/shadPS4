@@ -3385,6 +3385,62 @@ TEST_F(CpuRuntimeTest, Rdtscp_AlsoWritesAuxToEcxZeroExtended) {
     EXPECT_NE(r.state.gpr[0] | (r.state.gpr[2] << 32), 0ULL);
 }
 
+// ============================================================================
+// LAHF / SAHF -- AH <-> flags byte (first hit: CUSA log, libc internals;
+// 7837 blocks compiled, lahf the single unsupported insn in the title).
+// ============================================================================
+
+// LAHF composes AH = SF:ZF:0:AF:0:PF:1:CF and must leave every other
+// byte of RAX untouched. cmp rbx,rbx gives a fully determined flag
+// image (ZF=1 PF=1, AF=0 since x-x has no nibble borrow), so AH must
+// read exactly 0x46 (ZF|PF|bit1).
+TEST_F(CpuRuntimeTest, Lahf_ComposesFlagByteInAhPreservingRax) {
+    const u8 program[] = {
+        0x48, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // mov rax, 0x1122334455667788
+        0x48, 0x39, 0xdb,                                           // cmp rbx, rbx  (ZF=1 PF=1)
+        0x9f,                                                       // lahf
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ((r.state.gpr[0] >> 8) & 0xFF, 0x46ULL) << "AH = ZF|PF|bit1";
+    EXPECT_EQ(r.state.gpr[0] & ~0xFF00ULL, 0x1122334455660088ULL)
+        << "LAHF must not disturb RAX outside AH";
+}
+
+// SAHF writes SF/ZF/AF/PF/CF from AH and must NOT touch OF. Overflow
+// is set first (0x7F+1), then AH=0x01 (CF only) is stored: the five
+// low flags must become exactly CF=1, while OF stays set.
+TEST_F(CpuRuntimeTest, Sahf_WritesArithFlagsButPreservesOf) {
+    const u8 program[] = {
+        0xb0, 0x7f,        // mov al, 0x7F
+        0x04, 0x01,        // add al, 1     -> OF=1 SF=1
+        0xb4, 0x01,        // mov ah, 0x01  (CF)
+        0x9e,              // sahf
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0xD5ULL, 0x01ULL)
+        << "SAHF: only CF set among SF/ZF/AF/PF/CF";
+    EXPECT_EQ(r.state.rflags & (1ULL << 11), 1ULL << 11)
+        << "SAHF must preserve OF";
+}
+
+// Save/restore is the real-world LAHF/SAHF idiom: capture flags, run
+// flag-clobbering work, restore. INC destroys ZF/PF; SAHF must bring
+// the cmp image (ZF=1 PF=1, CF=0) back.
+TEST_F(CpuRuntimeTest, Lahf_Sahf_RoundTripRestoresFlags) {
+    const u8 program[] = {
+        0x48, 0x39, 0xdb,  // cmp rbx, rbx  (ZF=1 PF=1 CF=0)
+        0x9f,              // lahf
+        0x48, 0xff, 0xc3,  // inc rbx       (ZF=0 PF=0; CF untouched)
+        0x9e,              // sahf
+        0xc3,
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.rflags & 0xD5ULL, 0x44ULL)
+        << "round trip restores ZF|PF, CF clear";
+}
+
 // Brand string leaves concatenated must reconstruct
 // "AMD Custom Jaguar 8-Core APU" + trailing space padding + NUL.
 // Calls CPUID three times back-to-back and stashes each result into

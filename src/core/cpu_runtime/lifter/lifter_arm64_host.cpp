@@ -6796,6 +6796,38 @@ bool EmitRdtsc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
     return true;
 }
 
+
+/// LAHF / SAHF -- AH <-> low flags byte. Mirrors the x86 backend:
+/// straight byte traffic between state.rflags and the AH byte of the
+/// guest RAX slot. 0xD5 (SF|ZF|AF|PF|CF) is not encodable as an
+/// AArch64 logical immediate (not a rotated run of ones), so it is
+/// materialized in a scratch register -- which makes the SAHF
+/// slot-clear a single BIC against that same register. AF fidelity
+/// note as on x86: helper-computed flag paths leave AF=0.
+bool EmitLahf(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    (void)insn; (void)ops;
+    c.ldr(XReg(9), ptr(kState, Offsets::Rflags));
+    c.mov(WReg(10), 0xD5);                           // SF|ZF|AF|PF|CF
+    c.and_(WReg(9), WReg(9), WReg(10));
+    c.orr(WReg(9), WReg(9), 0x02);                   // bit 1 reads as 1
+    c.strb(WReg(9), ptr(kState, GprOffset(0) + 1));  // AH of guest RAX
+    return true;
+}
+
+bool EmitSahf(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+              CodeGenerator& c) {
+    (void)insn; (void)ops;
+    c.ldrb(WReg(9), ptr(kState, GprOffset(0) + 1));  // AH of guest RAX
+    c.mov(WReg(10), 0xD5);
+    c.and_(XReg(9), XReg(9), XReg(10));              // only SF|ZF|AF|PF|CF transfer
+    c.ldr(XReg(11), ptr(kState, Offsets::Rflags));
+    c.bic(XReg(11), XReg(11), XReg(10));             // clear the five bits, keep OF/DF/...
+    c.orr(XReg(11), XReg(11), XReg(9));
+    c.str(XReg(11), ptr(kState, Offsets::Rflags));
+    return true;
+}
+
 bool EmitCpuid(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                CodeGenerator& c) {
     (void)insn; (void)ops;
@@ -7934,6 +7966,8 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_RDTSC:  handled = EmitRdtsc(insn, ops, c, /*with_aux=*/false); break;
         case ZYDIS_MNEMONIC_RDTSCP: handled = EmitRdtsc(insn, ops, c, /*with_aux=*/true); break;
         case ZYDIS_MNEMONIC_CPUID:  handled = EmitCpuid(insn, ops, c); break;
+        case ZYDIS_MNEMONIC_LAHF:   handled = EmitLahf(insn, ops, c); break; // flags
+        case ZYDIS_MNEMONIC_SAHF:   handled = EmitSahf(insn, ops, c); break; // flags
         case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, ops, c); break;
         case ZYDIS_MNEMONIC_STMXCSR: case ZYDIS_MNEMONIC_LDMXCSR:
         case ZYDIS_MNEMONIC_VSTMXCSR: case ZYDIS_MNEMONIC_VLDMXCSR:

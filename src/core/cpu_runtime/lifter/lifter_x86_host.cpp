@@ -9123,6 +9123,50 @@ bool EmitRdtsc(const ZydisDecodedInstruction& insn,
     return true;
 }
 
+
+/// LAHF / SAHF -- AH <-> low flags byte.
+///
+/// LAHF composes AH = SF:ZF:0:AF:0:PF:1:CF from state.rflags; SAHF
+/// writes those five flag bits from AH back into state.rflags,
+/// preserving OF (bit 11), DF, and everything else above bit 7. Both
+/// are direct byte operations against the guest RAX slot's AH byte
+/// (GprOffset(0)+1) -- no full-register round trip, and no host-flag
+/// round trip (the and/or here clobber only HOST flags, which carry
+/// no guest state between emitted sequences).
+///
+/// AF fidelity: the helper-computed flag paths skip AF (see the flag
+/// model comment above RflagsBits), so LAHF reports AF=0 after ops
+/// lifted through those helpers but a real AF after emitters that
+/// capture host flags via pushfq (mask 0x8D5 includes AF). Same
+/// tradeoff the rest of the JIT already makes; LAHF consumers in the
+/// wild use it for CF/ZF save-restore, not AF.
+bool EmitLahf(const ZydisDecodedInstruction& insn,
+              const ZydisDecodedOperand* ops,
+              Xbyak::CodeGenerator& c) {
+    (void)insn;
+    (void)ops;
+    c.mov(rdx, qword[r13 + Offsets::Rflags]);
+    c.and_(edx, 0xD5);                            // SF|ZF|AF|PF|CF
+    c.or_(edx, 0x02);                             // bit 1 reads as 1
+    c.mov(byte[r13 + GprOffset(0) + 1], dl);      // AH of guest RAX
+    return true;
+}
+
+bool EmitSahf(const ZydisDecodedInstruction& insn,
+              const ZydisDecodedOperand* ops,
+              Xbyak::CodeGenerator& c) {
+    (void)insn;
+    (void)ops;
+    c.movzx(edx, byte[r13 + GprOffset(0) + 1]);   // AH of guest RAX
+    c.and_(edx, 0xD5);                            // only SF|ZF|AF|PF|CF transfer
+    // imm32 sign-extends: clears bits 0,2,4,6,7 and preserves all
+    // higher bits (OF, DF, ...) -- same encoding trick as
+    // EmitStoreArithFlags.
+    c.and_(qword[r13 + Offsets::Rflags], static_cast<Xbyak::uint32>(~0xD5u));
+    c.or_(qword[r13 + Offsets::Rflags], rdx);
+    return true;
+}
+
 bool EmitCpuid(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                Xbyak::CodeGenerator& c) {
@@ -9970,6 +10014,12 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
                 break;
             case ZYDIS_MNEMONIC_CPUID: // system
                 handled = EmitCpuid(insn, ops, c);
+                break;
+            case ZYDIS_MNEMONIC_LAHF: // flags
+                handled = EmitLahf(insn, ops, c);
+                break;
+            case ZYDIS_MNEMONIC_SAHF: // flags
+                handled = EmitSahf(insn, ops, c);
                 break;
             default:
                 handled = false;
