@@ -3903,7 +3903,7 @@ bool EmitVScalarArith(const ZydisDecodedInstruction& insn,
 
     // Load src2 low element into v1 (from reg lane or memory).
     if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int s2  = ZydisVecToIndex(ops[merge3 ? 2 : 1].reg.value);
+        const int s2  = ZydisVecToIndex(ops[2].reg.value);
         if (s2 < 0) return false;
         if (dbl) c.ldr(DReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
         else     c.ldr(SReg(1), ptr(kState, YmmChunkOffset(s2, 0)));
@@ -4005,7 +4005,7 @@ bool EmitVmovss(const ZydisDecodedInstruction& insn,
     if (merge3 || merge2) {
         const int dst = ZydisVecToIndex(ops[0].reg.value);
         const int s1  = merge3 ? ZydisVecToIndex(ops[1].reg.value) : dst;
-        const int s2  = ZydisVecToIndex(ops[2].reg.value);
+        const int s2  = ZydisVecToIndex(ops[merge3 ? 2 : 1].reg.value);
         if (dst < 0 || s1 < 0 || s2 < 0) return false;
         if (sd) {
             c.ldr(kScratch0, ptr(kState, YmmChunkOffset(s2, 0)));  // chunk0 = src2.chunk0
