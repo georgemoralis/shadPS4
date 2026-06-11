@@ -3334,6 +3334,57 @@ TEST_F(CpuRuntimeTest, Cpuid_Leaf7_NonzeroSubleafReturnsZero) {
     EXPECT_EQ(r.state.gpr[2], 0ULL);
 }
 
+// ---- RDTSC / RDTSCP ---------------------------------------------------
+//
+// Host-counter passthrough (TSC on x86 hosts, CNTVCT_EL0 on arm64), so
+// values aren't predictable -- the invariants are shape and monotonicity:
+// upper 32 bits of RAX/RDX cleared, and a second read >= the first.
+
+TEST_F(CpuRuntimeTest, Rdtsc_WritesEdxEaxZeroExtended) {
+    const u8 program[] = {
+        // mov rax, 0xDEADBEEFDEADBEEF; mov rdx, 0xCAFEBABECAFEBABE --
+        // pre-pollute so the upper-half clearing is observable.
+        0x48, 0xb8, 0xef, 0xbe, 0xad, 0xde, 0xef, 0xbe, 0xad, 0xde,
+        0x48, 0xba, 0xbe, 0xba, 0xfe, 0xca, 0xbe, 0xba, 0xfe, 0xca,
+        0x0f, 0x31,                               // rdtsc
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0ULL) << "RAX upper half must be zero";
+    EXPECT_EQ(r.state.gpr[2] >> 32, 0ULL) << "RDX upper half must be zero";
+    // A live counter is nonzero in practice; both halves zero would mean
+    // the emitter stored nothing.
+    EXPECT_NE(r.state.gpr[0] | (r.state.gpr[2] << 32), 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Rdtsc_BackToBackReadsAreMonotonic) {
+    const u8 program[] = {
+        0x0f, 0x31,                               // rdtsc      (1st)
+        0x48, 0x89, 0xc3,                         // mov rbx, rax (low1)
+        0x48, 0x89, 0xd6,                         // mov rsi, rdx (high1)
+        0x0f, 0x31,                               // rdtsc      (2nd)
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    const u64 t1 = (r.state.gpr[6] << 32) | r.state.gpr[3];   // rsi:rbx
+    const u64 t2 = (r.state.gpr[2] << 32) | r.state.gpr[0];   // rdx:rax
+    EXPECT_GE(t2, t1) << "counter must not move backwards within a block";
+}
+
+TEST_F(CpuRuntimeTest, Rdtscp_AlsoWritesAuxToEcxZeroExtended) {
+    const u8 program[] = {
+        // pre-pollute rcx so the aux write (and its zero-extension) shows.
+        0x48, 0xb9, 0xef, 0xbe, 0xad, 0xde, 0xef, 0xbe, 0xad, 0xde,
+        0x0f, 0x01, 0xf9,                         // rdtscp
+        0xc3,                                     // ret
+    };
+    const auto r = RunProgram(program, sizeof(program), mem);
+    EXPECT_EQ(r.state.gpr[0] >> 32, 0ULL);
+    EXPECT_EQ(r.state.gpr[2] >> 32, 0ULL);
+    EXPECT_EQ(r.state.gpr[1] >> 32, 0ULL) << "RCX upper half must be zero";
+    EXPECT_NE(r.state.gpr[0] | (r.state.gpr[2] << 32), 0ULL);
+}
+
 // Brand string leaves concatenated must reconstruct
 // "AMD Custom Jaguar 8-Core APU" + trailing space padding + NUL.
 // Calls CPUID three times back-to-back and stashes each result into
@@ -13645,6 +13696,47 @@ TEST_F(CpuRuntimeTest, Ldmxcsr_LoadsIntoGuestMxcsr) {
 // Round-trip: ldmxcsr [src] ; stmxcsr [dst] copies the value through the guest
 // MXCSR field. (Models the conversion routine's save/modify/restore around an
 // SSE op.)
+// VEX-encoded forms: vstmxcsr/vldmxcsr decode to distinct mnemonics but
+// must hit the same emitter with identical semantics. Seen in the wild in
+// libSceNgs2 (CUSA02394, vstmxcsr at 0x8086894ca).
+TEST_F(CpuRuntimeTest, Vstmxcsr_VexFormStoresGuestMxcsr) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    slot[0] = 0xAAAAAAAA;
+    slot[1] = 0xBBBBBBBB;
+
+    const u8 program[] = {0xc5, 0xf8, 0xae, 0x1b, 0xc3}; // vstmxcsr [rbx] ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(slot);
+    st.mxcsr = 0x00001F80;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(slot[0], 0x00001F80u) << "VEX store must mirror legacy STMXCSR";
+    EXPECT_EQ(slot[1], 0xBBBBBBBBu) << "4-byte store must not spill";
+}
+
+TEST_F(CpuRuntimeTest, Vldmxcsr_VexFormLoadsIntoGuestMxcsr) {
+    u32* slot = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
+    *slot = 0x00009F80;
+
+    const u8 program[] = {0xc5, 0xf8, 0xae, 0x13, 0xc3}; // vldmxcsr [rbx] ; ret
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop() - 8;
+    *reinterpret_cast<u64*>(guest_rsp) = kReturnSentinel;
+    GuestState st{};
+    st.rip = reinterpret_cast<u64>(mem.CodePtr());
+    st.gpr[4] = reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = reinterpret_cast<u64>(slot);
+    st.mxcsr = 0x00001F80;
+
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.mxcsr, 0x00009F80u) << "VEX load must mirror legacy LDMXCSR";
+}
+
 TEST_F(CpuRuntimeTest, Mxcsr_RoundTripsThroughGuestField) {
     u32* src = reinterpret_cast<u32*>(mem.CodePtr() + 0x100);
     u32* dst = reinterpret_cast<u32*>(mem.CodePtr() + 0x110);

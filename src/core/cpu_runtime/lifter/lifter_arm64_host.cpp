@@ -6765,6 +6765,37 @@ bool EmitVpackusdw(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
 // cpuid — spoof an AMD Jaguar (PS4 APU). Reads leaf in EAX, subleaf in ECX;
 // writes EAX/EBX/ECX/EDX (guest slots 0/3/1/2), zero-extended. Mirrors the x86
 // host's canned values exactly.
+/// RDTSC / RDTSCP -- CNTVCT_EL0 passthrough.
+///
+/// Guest shape: counter low 32 -> EAX slot, high 32 -> EDX slot, both
+/// zero-extended; RDTSCP additionally writes TSC_AUX -> ECX (we report
+/// core 0). No flags.
+///
+/// The virtual counter is the arm64 analogue of the host-TSC
+/// passthrough on x86: monotonic, user-readable, and the same source
+/// the kernel HLE's clock plumbing reads on this host, so rdtsc deltas
+/// and sceKernelGetTscFrequency stay mutually consistent. KNOWN
+/// RESIDUAL: CNTFRQ (commonly 24 MHz / 1 GHz) differs from a Jaguar
+/// TSC (~1.6 GHz); any guest that HARDCODES the PS4 TSC frequency
+/// instead of calibrating will run its rdtsc-based timing at the wrong
+/// rate. If a title trips on that, the fix is a scale factor here and
+/// in the kernel TSC HLE together, never one side alone.
+bool EmitRdtsc(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               CodeGenerator& c, bool with_aux) {
+    (void)insn; (void)ops;
+    // mrs x9, CNTVCT_EL0  (op0=3, op1=3, CRn=14, CRm=0, op2=2)
+    c.mrs(XReg(9), 3, 3, 14, 0, 2);
+    c.ubfx(XReg(10), XReg(9), 0, 32);            // low 32, zero-extended
+    c.lsr(XReg(11), XReg(9), 32);                // high 32, zero-extended
+    c.str(XReg(10), ptr(kState, GprOffset(0)));  // RAX
+    c.str(XReg(11), ptr(kState, GprOffset(2)));  // RDX
+    if (with_aux) {
+        c.mov(XReg(10), 0);                       // TSC_AUX: core 0
+        c.str(XReg(10), ptr(kState, GprOffset(1))); // RCX
+    }
+    return true;
+}
+
 bool EmitCpuid(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                CodeGenerator& c) {
     (void)insn; (void)ops;
@@ -6867,7 +6898,10 @@ bool EmitXgetbv(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 // hardware, which those lowerings can then honor.
 bool EmitMxcsr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                u64 next_rip, CodeGenerator& c) {
-    const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR);
+    // VEX forms (VSTMXCSR/VLDMXCSR) are identical in behavior to the
+    // legacy encodings; they only differ in Zydis mnemonic.
+    const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR ||
+                        insn.mnemonic == ZYDIS_MNEMONIC_VSTMXCSR);
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
     const u32 off = static_cast<u32>(offsetof(GuestState, mxcsr));
@@ -7897,9 +7931,12 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_PREFETCHT2:  case ZYDIS_MNEMONIC_PREFETCHW:
             handled = true;  // memory hints: architecturally no-ops.
             break;
+        case ZYDIS_MNEMONIC_RDTSC:  handled = EmitRdtsc(insn, ops, c, /*with_aux=*/false); break;
+        case ZYDIS_MNEMONIC_RDTSCP: handled = EmitRdtsc(insn, ops, c, /*with_aux=*/true); break;
         case ZYDIS_MNEMONIC_CPUID:  handled = EmitCpuid(insn, ops, c); break;
         case ZYDIS_MNEMONIC_XGETBV: handled = EmitXgetbv(insn, ops, c); break;
         case ZYDIS_MNEMONIC_STMXCSR: case ZYDIS_MNEMONIC_LDMXCSR:
+        case ZYDIS_MNEMONIC_VSTMXCSR: case ZYDIS_MNEMONIC_VLDMXCSR:
             handled = EmitMxcsr(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_FNSTCW: case ZYDIS_MNEMONIC_FLDCW:
             handled = EmitFnstcw(insn, ops, next_rip, c); break;

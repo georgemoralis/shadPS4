@@ -5932,8 +5932,13 @@ bool EmitMxcsr(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                u64 next_rip,
                Xbyak::CodeGenerator& c) {
-    const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR);
-    const bool load  = (insn.mnemonic == ZYDIS_MNEMONIC_LDMXCSR);
+    // VEX-encoded forms (VSTMXCSR/VLDMXCSR) are behaviorally identical to
+    // the legacy ones -- same m32 operand, same semantics -- they just
+    // decode to distinct Zydis mnemonics.
+    const bool store = (insn.mnemonic == ZYDIS_MNEMONIC_STMXCSR ||
+                        insn.mnemonic == ZYDIS_MNEMONIC_VSTMXCSR);
+    const bool load  = (insn.mnemonic == ZYDIS_MNEMONIC_LDMXCSR ||
+                        insn.mnemonic == ZYDIS_MNEMONIC_VLDMXCSR);
     if (!store && !load) return false;
     if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
     if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
@@ -9089,6 +9094,35 @@ bool EmitStringOp(const ZydisDecodedInstruction& insn,
 /// (extended features — BMI1 only), and 0x80000002..4 (brand string
 /// "AMD Custom Jaguar 8-Core APU"). Every other leaf — and leaf 7
 /// with a non-zero subleaf — returns all zeros.
+/// RDTSC / RDTSCP -- host passthrough.
+///
+/// Guest semantics: TSC low 32 -> EAX, high 32 -> EDX, upper halves of
+/// RAX/RDX zeroed; RDTSCP additionally writes IA32_TSC_AUX -> ECX. No
+/// flags. The host instruction produces exactly this shape, so the
+/// values stream straight into the guest slots.
+///
+/// Passthrough (rather than a synthesized counter) is deliberate: the
+/// kernel HLE exposes the host TSC via sceKernelReadTsc /
+/// sceKernelGetTscFrequency, and game calibration loops compare rdtsc
+/// deltas against those -- the two MUST read the same counter or
+/// guest timing code diverges.
+bool EmitRdtsc(const ZydisDecodedInstruction& insn,
+               const ZydisDecodedOperand* ops,
+               Xbyak::CodeGenerator& c,
+               bool with_aux) {
+    (void)insn;
+    (void)ops;
+    if (with_aux) {
+        c.rdtscp();  // edx:eax = TSC, ecx = TSC_AUX
+        c.mov(qword[r13 + GprOffset(1)], rcx);
+    } else {
+        c.rdtsc();   // edx:eax = TSC
+    }
+    c.mov(qword[r13 + GprOffset(0)], rax);
+    c.mov(qword[r13 + GprOffset(2)], rdx);
+    return true;
+}
+
 bool EmitCpuid(const ZydisDecodedInstruction& insn,
                const ZydisDecodedOperand* ops,
                Xbyak::CodeGenerator& c) {
@@ -9897,8 +9931,10 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             case ZYDIS_MNEMONIC_FNSTCW: // x87
                 handled = EmitFnstcw(insn, ops, next_rip, c);
                 break;
-            case ZYDIS_MNEMONIC_STMXCSR: // SSE
-            case ZYDIS_MNEMONIC_LDMXCSR: // SSE
+            case ZYDIS_MNEMONIC_STMXCSR:  // SSE
+            case ZYDIS_MNEMONIC_LDMXCSR:  // SSE
+            case ZYDIS_MNEMONIC_VSTMXCSR: // AVX (VEX-encoded, same semantics)
+            case ZYDIS_MNEMONIC_VLDMXCSR: // AVX (VEX-encoded, same semantics)
                 handled = EmitMxcsr(insn, ops, next_rip, c);
                 break;
             case ZYDIS_MNEMONIC_FILD: // x87
@@ -9925,6 +9961,12 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             case ZYDIS_MNEMONIC_VPCMPISTRM: // AVX
             case ZYDIS_MNEMONIC_PCMPISTRM: // SSE
                 handled = EmitVpcmpistrm(insn, ops, next_rip, c);
+                break;
+            case ZYDIS_MNEMONIC_RDTSC: // system
+                handled = EmitRdtsc(insn, ops, c, /*with_aux=*/false);
+                break;
+            case ZYDIS_MNEMONIC_RDTSCP: // system
+                handled = EmitRdtsc(insn, ops, c, /*with_aux=*/true);
                 break;
             case ZYDIS_MNEMONIC_CPUID: // system
                 handled = EmitCpuid(insn, ops, c);
