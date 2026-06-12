@@ -20078,9 +20078,11 @@ TEST_F(CpuRuntimeTest, Or_Mem64_Imm_TitleShape) {
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
     GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
-    u64* slot = reinterpret_cast<u64*>(mem.DataPtr() + 0x40);
+    // Data buffer carved from the code page past the program bytes —
+    // the fixture's established idiom (no separate data accessor).
+    u64* slot = reinterpret_cast<u64*>(mem.CodePtr() + 0x100 + 0x40);
     *slot = 0x0000000000000041ULL;
-    st.gpr[3] = reinterpret_cast<u64>(mem.DataPtr());     // rbx
+    st.gpr[3] = reinterpret_cast<u64>(mem.CodePtr() + 0x100);     // rbx
     Runtime rt; rt.Run(st);
     EXPECT_EQ(*slot, 0x00000000000001C1ULL) << "0x41 | 0x180";
     EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear (nonzero result)";
@@ -20108,9 +20110,9 @@ TEST_F(CpuRuntimeTest, Xor_Mem32_Imm_WidthExactStore) {
     std::memcpy(mem.CodePtr(), program, sizeof(program));
     u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
     GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
-    u64* slot = reinterpret_cast<u64*>(mem.DataPtr() + 8);
+    u64* slot = reinterpret_cast<u64*>(mem.CodePtr() + 0x100 + 8);
     *slot = 0xDEADBEEF00000F0FULL;                        // hi dword = canary
-    st.gpr[3] = reinterpret_cast<u64>(mem.DataPtr());
+    st.gpr[3] = reinterpret_cast<u64>(mem.CodePtr() + 0x100);
     Runtime rt; rt.Run(st);
     EXPECT_EQ(*slot, 0xDEADBEEF00000FF0ULL)
         << "low dword xored, high dword untouched by the 32-bit store";
