@@ -670,10 +670,21 @@ bool EmitMovsxd(const ZydisDecodedInstruction& insn,
 //
 // We compute five of the six "arithmetic" flags: ZF (zero), SF
 // (sign), CF (carry/borrow), OF (signed overflow), PF (parity of
-// low byte). AF (auxiliary carry, decimal-arithmetic helper) is
-// deliberately skipped — modern code essentially never reads it,
-// and the only consumer is the `JP/JPE/JPO` family for parity,
-// which uses PF not AF.
+// low byte).
+//
+// CONTRACT — AF (auxiliary carry, bit 4) is deliberately NOT computed
+// by these lazy helpers. There is no conditional jump on AF; its only
+// architectural consumers are BCD instructions (invalid in 64-bit
+// mode) and direct flag reads (pushfq/lahf). Computing it would cost
+// ~5 host instructions on every w64 add/sub/cmp — the hottest
+// instructions there are — for a bit nothing observes. Consequence:
+// after a w64 lazy-flag op, guest AF is stale; after a narrow
+// (8/16/32) op, AF is exact (those round-trip real host flags).
+// The audit harness encodes exactly this contract (AF masked for the
+// lazy tier only). If a title is ever shown to read AF (lahf-based
+// flag save/restore that round-trips into arithmetic), the fix is
+// AF = ((lhs ^ rhs ^ result) >> 4) & 1 in both helpers — ten minutes,
+// known cost, flip when proven needed. (2026-06-12 audit.)
 //
 // Input register convention for these helpers:
 //   rcx = lhs (original destination value before the op)
@@ -1273,6 +1284,11 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              u64 next_rip,
              Xbyak::CodeGenerator& c) {
+    // Dispatch contract: sub-64 widths route to EmitNarrowArith8/16/32
+    // (host-flag round-trip — width-correct by construction). Only w64
+    // reaches here. Gate it so a routing change fails loudly instead of
+    // reviving dispatch-dead lazy-flag paths (2026-06-12 audit).
+    if (insn.operand_width != 64) return false;
     const auto& dst = ops[0];
     const auto& src = ops[1];
 
@@ -1299,18 +1315,6 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
             return true;
         }
 
-        if (insn.operand_width == 32) {
-            c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-            c.mov(ecx, dword[r13 + GprOffset(src_idx)]);
-            c.xor_(eax, ecx);
-            // Storing rax as qword writes the zero-extended 64-bit value.
-            c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-            // Width matters here: ZF/PF survive zero-extension, but SF must
-            // come from bit 31 of the 32-bit result, not bit 63 of rax.
-            EmitFlagsFromBitwise(c, 32);
-            return true;
-        }
-
         return false;
     }
 
@@ -1328,14 +1332,6 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
             EmitFlagsFromBitwise(c);
             return true;
         }
-        if (insn.operand_width == 32) {
-            const u32 imm = static_cast<u32>(src.imm.value.u & 0xFFFFFFFFu);
-            c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-            c.xor_(eax, imm);                          // zero-extends rax
-            c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-            EmitFlagsFromBitwise(c, 32);
-            return true;
-        }
         return false;
     }
 
@@ -1348,15 +1344,6 @@ bool EmitXor(const ZydisDecodedInstruction& insn,
             c.xor_(rax, rcx);
             c.mov(qword[r13 + GprOffset(dst_idx)], rax);
             EmitFlagsFromBitwise(c);
-            return true;
-        }
-        if (insn.operand_width == 32) {
-            if (!EmitEffectiveAddress(src.mem, next_rip, c)) return false;
-            c.mov(ecx, dword[rdx]);
-            c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-            c.xor_(eax, ecx);
-            c.mov(qword[r13 + GprOffset(dst_idx)], rax);   // zero-extend
-            EmitFlagsFromBitwise(c, 32);
             return true;
         }
         return false;
@@ -1392,59 +1379,21 @@ bool EmitBitwise64RegReg(const ZydisDecodedOperand& dst,
     return true;
 }
 
-/// Like the 64-bit version but for 32-bit width. Writing to a 32-bit
-/// destination implicitly zeros the upper 32 of the guest GPR.
-template <typename HostOp>
-bool EmitBitwise32RegReg(const ZydisDecodedOperand& dst,
-                         const ZydisDecodedOperand& src,
-                         Xbyak::CodeGenerator& c,
-                         HostOp host_op) {
-    if (dst.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    if (src.type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
-    const int dst_idx = ZydisGprToIndex(dst.reg.value);
-    const int src_idx = ZydisGprToIndex(src.reg.value);
-    if (dst_idx < 0 || src_idx < 0) return false;
-
-    c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-    c.mov(ecx, dword[r13 + GprOffset(src_idx)]);
-    host_op(eax, ecx);                                  // 32-bit op zero-extends rax
-    c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-    EmitFlagsFromBitwise(c, 32);
-    return true;
-}
-
 /// AND — bitwise and. Supported: r64,r64; r32,r32; r32,imm; r64,imm;
 /// and r64,[mem] (reg destination, memory source).
 bool EmitAnd(const ZydisDecodedInstruction& insn,
              const ZydisDecodedOperand* ops,
              u64 next_rip,
              Xbyak::CodeGenerator& c) {
-    // Memory destination (64/32-bit, register or immediate source) —
+    // Dispatch contract: sub-64 widths route to EmitNarrowArith8/16/32;
+    // only w64 reaches here (see EmitXor's gate note).
+    if (insn.operand_width != 64) return false;
+    // Memory destination (64-bit, register or immediate source) —
     // shared bitwise mem-dst path.
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
         return EmitBitwiseMemDst(insn, ops, next_rip, c,
             [&](Xbyak::CodeGenerator& g, bool is64) {
                 if (is64) g.and_(rax, rcx); else g.and_(eax, ecx); });
-
-    // 32-bit register destination with immediate source: very common
-    // masking idiom (`and eax, 0xFF`, `and ecx, 0x3F`, etc.). Mirrors
-    // the 32-bit reg-reg path's flag-handling: EmitFlagsFromBitwise
-    // produces the same lazy flag computation, so behavior matches
-    // the existing 32-bit AND.
-    if (insn.operand_width == 32 &&
-        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-        const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-        if (dst_idx < 0) return false;
-        // Zydis sign-extends imm8 forms into a u64 for us; truncate to
-        // u32 — the bit pattern is preserved for the masking case.
-        const u32 imm = static_cast<u32>(ops[1].imm.value.u & 0xFFFFFFFFu);
-        c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-        c.and_(eax, imm);                          // 32-bit op zero-extends rax
-        c.mov(qword[r13 + GprOffset(dst_idx)], rax);
-        EmitFlagsFromBitwise(c, 32);
-        return true;
-    }
 
     // 64-bit register destination with immediate source: `and r64, imm`.
     // Zydis presents the (sign-extended) value as s64; the architecture
@@ -1483,27 +1432,11 @@ bool EmitAnd(const ZydisDecodedInstruction& insn,
             EmitFlagsFromBitwise(c);
             return true;
         }
-        if (insn.operand_width == 32) {
-            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-            c.mov(ecx, dword[rdx]);
-            c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-            c.and_(eax, ecx);
-            c.mov(qword[r13 + GprOffset(dst_idx)], rax);   // zero-extend
-            EmitFlagsFromBitwise(c, 32);
-            return true;
-        }
         return false;
     }
 
-    if (insn.operand_width == 64) {
-        return EmitBitwise64RegReg(ops[0], ops[1], c,
-            [&](Xbyak::Reg64 a, Xbyak::Reg64 b) { c.and_(a, b); });
-    }
-    if (insn.operand_width == 32) {
-        return EmitBitwise32RegReg(ops[0], ops[1], c,
-            [&](Xbyak::Reg32 a, Xbyak::Reg32 b) { c.and_(a, b); });
-    }
-    return false;
+    return EmitBitwise64RegReg(ops[0], ops[1], c,
+        [&](Xbyak::Reg64 a, Xbyak::Reg64 b) { c.and_(a, b); });
 }
 
 /// OR — bitwise or. Same forms as AND, plus `or qword[mem], r64`
@@ -1514,7 +1447,10 @@ bool EmitOr(const ZydisDecodedInstruction& insn,
             const ZydisDecodedOperand* ops,
             u64 next_rip,
             Xbyak::CodeGenerator& c) {
-    // Memory destination (64/32-bit, register or immediate source) —
+    // Dispatch contract: sub-64 widths route to EmitNarrowArith8/16/32;
+    // only w64 reaches here (see EmitXor's gate note).
+    if (insn.operand_width != 64) return false;
+    // Memory destination (64-bit, register or immediate source) —
     // shared bitwise mem-dst path. The `or qword[mem], imm` form blocked
     // Adore (CUSA43357) at 0x8001fa5e6.
     if (ops[0].type == ZYDIS_OPERAND_TYPE_MEMORY)
@@ -1550,35 +1486,6 @@ bool EmitOr(const ZydisDecodedInstruction& insn,
         }
         return EmitBitwise64RegReg(ops[0], ops[1], c,
             [&](Xbyak::Reg64 a, Xbyak::Reg64 b) { c.or_(a, b); });
-    }
-    if (insn.operand_width == 32) {
-        // Immediate source: `or r32, imm`.
-        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
-            const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-            if (dst_idx < 0) return false;
-            c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-            c.mov(ecx, static_cast<u32>(ops[1].imm.value.u & 0xFFFFFFFFu));
-            c.or_(eax, ecx);
-            c.mov(qword[r13 + GprOffset(dst_idx)], rax);  // zero-extend
-            EmitFlagsFromBitwise(c, 32);
-            return true;
-        }
-        // Memory source: `or r32, dword[mem]`.
-        if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-            const int dst_idx = ZydisGprToIndex(ops[0].reg.value);
-            if (dst_idx < 0) return false;
-            if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-            c.mov(ecx, dword[rdx]);
-            c.mov(eax, dword[r13 + GprOffset(dst_idx)]);
-            c.or_(eax, ecx);
-            c.mov(qword[r13 + GprOffset(dst_idx)], rax);  // zero-extend
-            EmitFlagsFromBitwise(c, 32);
-            return true;
-        }
-        return EmitBitwise32RegReg(ops[0], ops[1], c,
-            [&](Xbyak::Reg32 a, Xbyak::Reg32 b) { c.or_(a, b); });
     }
     return false;
 }
