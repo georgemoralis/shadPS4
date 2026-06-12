@@ -4909,11 +4909,22 @@ bool EmitVcvtPdPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOpe
 // zero-extends. We slice directly out of the guest register file via GPR.
 bool EmitVpextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                 u64 next_rip, CodeGenerator& c) {
-    const bool q = (insn.mnemonic == ZYDIS_MNEMONIC_VPEXTRQ);
+    // Element width in bytes (1/2/4/8); legacy mnemonics share semantics.
+    int w;
+    switch (insn.mnemonic) {
+    case ZYDIS_MNEMONIC_VPEXTRB: case ZYDIS_MNEMONIC_PEXTRB: w = 1; break;
+    case ZYDIS_MNEMONIC_VPEXTRW: case ZYDIS_MNEMONIC_PEXTRW: w = 2; break;
+    case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_PEXTRD:
+    case ZYDIS_MNEMONIC_VEXTRACTPS:                           w = 4; break;
+    case ZYDIS_MNEMONIC_VPEXTRQ: case ZYDIS_MNEMONIC_PEXTRQ:  w = 8; break;
+    default: return false;
+    }
     // ops: [0]=dst (gpr or mem), [1]=src xmm, [2]=imm8 lane.
     const int src = ZydisVecToIndex(ops[1].reg.value);
     if (src < 0) return false;
-    const int lane = static_cast<int>(ops[2].imm.value.u) & (q ? 1 : 3);
+    const int lane = static_cast<int>(ops[2].imm.value.u) & (16 / w - 1);
+    const int per_q = 8 / w;                       // elements per 64-bit chunk
+    const int shift = (lane % per_q) * w * 8;
 
     // For a memory dest, compute the effective address FIRST (EA clobbers x9),
     // stash it, then load the lane value — otherwise the lane value in x9 is
@@ -4924,17 +4935,17 @@ bool EmitVpextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
         c.mov(kScratch1, kAddr);
     }
 
-    if (q) {
-        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, lane)));
-    } else {
-        c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, lane / 2)));
-        if (lane & 1) c.lsr(kScratch0, kScratch0, 32);
-        c.and_(kScratch0, kScratch0, 0xFFFFFFFFull);
-    }
+    c.ldr(kScratch0, ptr(kState, YmmChunkOffset(src, lane / per_q)));
+    if (shift) c.lsr(kScratch0, kScratch0, shift);
+    if (w < 8) c.and_(kScratch0, kScratch0, (1ull << (w * 8)) - 1);
 
     if (memDst) {
-        if (q) c.str(kScratch0, ptr(kScratch1));
-        else   c.str(WReg(9), ptr(kScratch1));
+        switch (w) {
+        case 1: c.strb(WReg(9), ptr(kScratch1)); break;
+        case 2: c.strh(WReg(9), ptr(kScratch1)); break;
+        case 4: c.str(WReg(9), ptr(kScratch1));  break;
+        default: c.str(kScratch0, ptr(kScratch1)); break;
+        }
     } else if (ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int gi = ZydisGprToIndex(ops[0].reg.value);
         if (gi < 0) return false;
@@ -4949,20 +4960,25 @@ bool EmitVpextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 // dword lane (imm&3) with the 32-bit GPR/mem source. Upper 128 zeroed.
 bool EmitVpinsrd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                  u64 next_rip, CodeGenerator& c) {
-    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
-        ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
-    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    // Legacy 3-op fold (pinsrd xmm, r/m32, imm): src1 = dst.
+    const bool vex4 = (insn.operand_count_visible == 4);
+    if (!vex4 && insn.operand_count_visible != 3) return false;
+    const int s1 = vex4 ? ZydisVecToIndex(ops[1].reg.value) : dst;
     if (dst < 0 || s1 < 0) return false;
-    const int lane = static_cast<int>(ops[3].imm.value.u) & 3;
+    const ZydisDecodedOperand& val = ops[vex4 ? 2 : 1];
+    const ZydisDecodedOperand& imo = ops[vex4 ? 3 : 2];
+    if (imo.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+    const int lane = static_cast<int>(imo.imm.value.u) & 3;
 
     // Load the 32-bit value -> w9 (zero-ext into x9).
-    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int gi = ZydisGprToIndex(ops[2].reg.value);
+    if (val.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(val.reg.value);
         if (gi < 0) return false;
         c.ldr(WReg(9), ptr(kState, GprOffset(gi)));
-    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+    } else if (val.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(val.mem, next_rip, c)) return false;
         c.ldr(WReg(9), ptr(kAddr));
     } else {
         return false;
@@ -5600,20 +5616,38 @@ bool EmitVblendvps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
 // 8 for ymm).
 bool EmitVbroadcastss(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                       u64 next_rip, CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const bool sd   = (m == ZYDIS_MNEMONIC_VBROADCASTSD);
+    const bool b128 = (m == ZYDIS_MNEMONIC_VBROADCASTF128 ||
+                       m == ZYDIS_MNEMONIC_VBROADCASTI128);
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
     if (dst < 0) return false;
     const bool ymm = (ops[0].size == 256);
+    if ((sd || b128) && !ymm) return false;   // YMM-dest-only forms
 
     if (ops[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(ops[1].mem, next_rip, c)) return false;
-        c.ldr(WReg(9), ptr(kAddr));
-        c.dup(VReg4S(0), WReg(9));
+        if (b128) {
+            c.ldr(QReg(0), ptr(kAddr));       // 16 bytes -> both halves below
+        } else if (sd) {
+            c.ldr(XReg(9), ptr(kAddr));
+            c.dup(VReg2D(0), XReg(9));
+        } else {
+            c.ldr(WReg(9), ptr(kAddr));
+            c.dup(VReg4S(0), WReg(9));
+        }
     } else if (ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (b128) return false;               // no register-source form
         const int src = ZydisVecToIndex(ops[1].reg.value);
         if (src < 0) return false;
-        c.ldr(WReg(9), ptr(kState, YmmChunkOffset(src, 0)));
-        c.dup(VReg4S(0), WReg(9));
+        if (sd) {
+            c.ldr(XReg(9), ptr(kState, YmmChunkOffset(src, 0)));
+            c.dup(VReg2D(0), XReg(9));
+        } else {
+            c.ldr(WReg(9), ptr(kState, YmmChunkOffset(src, 0)));
+            c.dup(VReg4S(0), WReg(9));
+        }
     } else {
         return false;
     }
@@ -6016,22 +6050,29 @@ bool EmitVpinsrBW(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
         ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
-    const int s1  = ZydisVecToIndex(ops[1].reg.value);
+    // Legacy 3-op fold: src1 is dst itself; value at ops[1], imm at ops[2].
+    const bool vex4 = (insn.operand_count_visible == 4);
+    if (!vex4 && insn.operand_count_visible != 3) return false;
+    const int s1 = vex4 ? ZydisVecToIndex(ops[1].reg.value) : dst;
     if (dst < 0 || s1 < 0) return false;
-    const bool byte = (insn.mnemonic == ZYDIS_MNEMONIC_VPINSRB);
-    const int lane = static_cast<int>(ops[3].imm.value.u) & (byte ? 15 : 7);
+    const ZydisDecodedOperand& val = ops[vex4 ? 2 : 1];
+    const ZydisDecodedOperand& imo = ops[vex4 ? 3 : 2];
+    if (imo.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+    const bool byte = (insn.mnemonic == ZYDIS_MNEMONIC_VPINSRB ||
+                       insn.mnemonic == ZYDIS_MNEMONIC_PINSRB);
+    const int lane = static_cast<int>(imo.imm.value.u) & (byte ? 15 : 7);
 
     // Stage src1's low 128 into v0.
     c.add(kScratch0, kState, YmmChunkOffset(s1, 0));
     c.ldr(QReg(0), ptr(kScratch0));
 
     // Fetch the value into w9 (only the low 8/16 bits matter).
-    if (ops[2].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-        const int gi = ZydisGprToIndex(ops[2].reg.value);
+    if (val.type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        const int gi = ZydisGprToIndex(val.reg.value);
         if (gi < 0) return false;
         c.ldr(kWScratch0, ptr(kState, GprOffset(gi)));
-    } else if (ops[2].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-        if (!EmitEffectiveAddress(ops[2].mem, next_rip, c)) return false;
+    } else if (val.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(val.mem, next_rip, c)) return false;
         if (byte) c.ldrb(kWScratch0, ptr(kAddr));
         else      c.ldrh(kWScratch0, ptr(kAddr));
     } else {
@@ -8236,9 +8277,13 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VCVTTPD2DQ: case ZYDIS_MNEMONIC_CVTTPD2DQ:
             handled = EmitVcvtPdPacked(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPEXTRD: case ZYDIS_MNEMONIC_VPEXTRQ:
+        case ZYDIS_MNEMONIC_VPEXTRB: case ZYDIS_MNEMONIC_VPEXTRW:
+        case ZYDIS_MNEMONIC_PEXTRB:  case ZYDIS_MNEMONIC_PEXTRW:
+        case ZYDIS_MNEMONIC_PEXTRD:  case ZYDIS_MNEMONIC_PEXTRQ:
         case ZYDIS_MNEMONIC_VEXTRACTPS:
             handled = EmitVpextr(insn, ops, next_rip, c); break;
-        case ZYDIS_MNEMONIC_VPINSRD:    handled = EmitVpinsrd(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VPINSRD: case ZYDIS_MNEMONIC_PINSRD:
+            handled = EmitVpinsrd(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VINSERTPS:  handled = EmitVinsertps(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VINSERTF128:  handled = EmitVinsertf128(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VEXTRACTF128: handled = EmitVextractf128(insn, ops, next_rip, c); break;
@@ -8266,7 +8311,9 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VBLENDVPS:
         case ZYDIS_MNEMONIC_VBLENDVPD: case ZYDIS_MNEMONIC_VPBLENDVB:
             handled = EmitVblendvps(insn, ops, next_rip, c); break;
-        case ZYDIS_MNEMONIC_VBROADCASTSS: handled = EmitVbroadcastss(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VBROADCASTSS: case ZYDIS_MNEMONIC_VBROADCASTSD:
+        case ZYDIS_MNEMONIC_VBROADCASTF128: case ZYDIS_MNEMONIC_VBROADCASTI128:
+            handled = EmitVbroadcastss(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VROUNDSS: case ZYDIS_MNEMONIC_VROUNDSD:
             handled = EmitVround(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VROUNDPS: handled = EmitVroundPacked(insn, ops, next_rip, false, c); break;
@@ -8303,6 +8350,7 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VSQRTPD:   handled = EmitVsqrtPacked(insn, ops, next_rip, true, c); break;
         case ZYDIS_MNEMONIC_VMOVDDUP:  handled = EmitVmovddup(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPINSRB: case ZYDIS_MNEMONIC_VPINSRW:
+        case ZYDIS_MNEMONIC_PINSRB:  case ZYDIS_MNEMONIC_PINSRW:
             handled = EmitVpinsrBW(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPHADDD:   handled = EmitVphaddd(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_PCMPISTRI:
@@ -8395,6 +8443,9 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_PREFETCH:    case ZYDIS_MNEMONIC_PREFETCHNTA:
         case ZYDIS_MNEMONIC_PREFETCHT0:  case ZYDIS_MNEMONIC_PREFETCHT1:
         case ZYDIS_MNEMONIC_PREFETCHT2:  case ZYDIS_MNEMONIC_PREFETCHW:
+        // CLFLUSH/CLFLUSHOPT: guest flushes for PS4 bus visibility; host
+        // coherence covers our ordinary cacheable stores. No-op, like prefetch.
+        case ZYDIS_MNEMONIC_CLFLUSH:     case ZYDIS_MNEMONIC_CLFLUSHOPT:
             handled = true;  // memory hints: architecturally no-ops.
             break;
         case ZYDIS_MNEMONIC_RDTSC:  handled = EmitRdtsc(insn, ops, c, /*with_aux=*/false); break;

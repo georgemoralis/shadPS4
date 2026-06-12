@@ -19718,6 +19718,154 @@ TEST_F(CpuRuntimeTest, RepMovsd_StringForm_StillCopies) {
     EXPECT_EQ(st.gpr[1], 0ULL) << "rcx exhausted";
 }
 
+// ============================================================================
+// (V)PEXTRB/W + legacy PEXTR*/PINSR* — byte/word lane extracts and the
+// legacy folded insert shapes. vpextrb reg,reg landed in 13 Sentinels
+// (CUSA19620) RenderDL threads at 0x8005f7608/0x8005ecc19.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpextrb_Lane5_ZeroExtends) {
+    const u8 program[] = { 0xc4, 0xe3, 0x79, 0x14, 0xc1, 0x05, 0xc3 }; // vpextrb ecx,xmm0,5
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x88776655443322A9ULL;   // byte 5 = 0x66
+    st.ymm[XmmChunk(0,1)] = 0x1111111111111111ULL;
+    st.gpr[1] = 0xFFFFFFFFFFFFFFFFULL;               // must be fully replaced
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0x66ULL) << "byte 5, zero-extended to 64";
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0x88776655443322A9ULL) << "src untouched";
+}
+
+TEST_F(CpuRuntimeTest, Vpextrw_Lane7_HighWord) {
+    const u8 program[] = { 0xc5, 0xf9, 0xc5, 0xd1, 0x07, 0xc3 };       // vpextrw edx,xmm1,7
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(1,0)] = 0x1111111111111111ULL;
+    st.ymm[XmmChunk(1,1)] = 0xBEEF555544443333ULL;   // word 7 = 0xBEEF
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[2], 0xBEEFULL) << "word 7 of the register";
+}
+
+TEST_F(CpuRuntimeTest, Pinsrw_LegacyFold_InsertsWord) {
+    // 66 0f c4 c0 03: pinsrw xmm0, eax, 3 — legacy 3-op fold (src1 = dst).
+    const u8 program[] = { 0x66, 0x0f, 0xc4, 0xc0, 0x03, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x1111222233334444ULL;
+    st.ymm[XmmChunk(0,1)] = 0x5555666677778888ULL;   // preserved (fold merge)
+    st.gpr[0] = 0xFFFFFFFFFFFFCAFEULL;               // low word = 0xCAFE
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(0,0)], 0xCAFE222233334444ULL)
+        << "word lane 3 replaced, rest of low qword preserved";
+    EXPECT_EQ(st.ymm[XmmChunk(0,1)], 0x5555666677778888ULL)
+        << "legacy fold preserves the high qword from dst";
+}
+
+TEST_F(CpuRuntimeTest, Arm64_Vpextrb_Lane12) {
+    const u8 program[] = { 0xc4, 0xe3, 0x79, 0x14, 0xc1, 0x0c, 0xc3 }; // vpextrb ecx,xmm0,12
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(0,0)] = 0x1111111111111111ULL;
+    st.ymm[XmmChunk(0,1)] = 0xFFEEDDCCBBAA9988ULL;   // byte 12 = 0xCC
+    st.gpr[1] = ~0ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0xCCULL) << "byte 12 (high qword, lane%8=4)";
+}
+
+// ============================================================================
+// VBROADCASTF128/SD — 128-bit and qword memory broadcasts into YMM. The
+// f128 form blocked 13 Sentinels (CUSA19620) at 0x8006394e3 after the
+// pextr batch cleared its earlier wall.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vbroadcastf128_FillsBothHalves) {
+    // vbroadcastf128 ymm1, [rax] — note 5-byte VEX, matches the title's length=5.
+    const u8 program[] = { 0xc4, 0xe2, 0x7d, 0x1a, 0x08, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* src = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(src)     = 0x1122334455667788ULL;
+    *reinterpret_cast<u64*>(src + 8) = 0x99AABBCCDDEEFF00ULL;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = reinterpret_cast<u64>(src);
+    st.ymm[XmmChunk(1,2)] = ~0ULL; st.ymm[XmmChunk(1,3)] = ~0ULL;  // must be overwritten
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x1122334455667788ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0x99AABBCCDDEEFF00ULL);
+    EXPECT_EQ(st.ymm[XmmChunk(1,2)], 0x1122334455667788ULL) << "same 128 bits in the upper half";
+    EXPECT_EQ(st.ymm[XmmChunk(1,3)], 0x99AABBCCDDEEFF00ULL);
+}
+
+TEST_F(CpuRuntimeTest, Vbroadcastsd_AllFourLanes) {
+    const u8 program[] = { 0xc4, 0xe2, 0x7d, 0x19, 0x10, 0xc3 };  // vbroadcastsd ymm2,[rax]
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* src = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(src) = 0x3FF0000000000000ULL;          // 1.0
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = reinterpret_cast<u64>(src);
+    Runtime rt; rt.Run(st);
+    for (int chunk = 0; chunk < 4; ++chunk)
+        EXPECT_EQ(st.ymm[XmmChunk(2,chunk)], 0x3FF0000000000000ULL) << "chunk " << chunk;
+}
+
+// ============================================================================
+// 16-bit IMUL (2-op and 3-op). The 2-op mem form blocked 13 Sentinels
+// (CUSA19620) at 0x80063cfd6. Narrow forms preserve bits 63:16 of the
+// destination, set CF/OF on signed-16 overflow, and must load exactly
+// two bytes from a memory source.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Imul16_TwoOpMem_PreservesUpperAndSetsOverflow) {
+    // imul bx, word [rax] — 0x200 * 0x200 = 0x40000: low word 0, CF=OF=1.
+    const u8 program[] = { 0x66, 0x0f, 0xaf, 0x18, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* src = mem.StackTop()-64;
+    *reinterpret_cast<u16*>(src) = 0x0200;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = reinterpret_cast<u64>(src);
+    st.gpr[3] = 0xCAFEBABE12340200ULL;          // bx = 0x200, upper bits canary
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[3], 0xCAFEBABE12340000ULL) << "bx = low16 of 0x40000; 63:16 preserved";
+    EXPECT_TRUE(st.rflags & (1ULL << 0))  << "CF on signed-16 overflow";
+    EXPECT_TRUE(st.rflags & (1ULL << 11)) << "OF on signed-16 overflow";
+}
+
+TEST_F(CpuRuntimeTest, Imul16_ThreeOpImm_FitsClearsOverflow) {
+    // imul cx, dx, 0x123 — 3 * 0x123 = 0x369 fits: CF=OF=0.
+    const u8 program[] = { 0x66, 0x69, 0xca, 0x23, 0x01, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[2] = 0xFFFFFFFFFFFF0003ULL;          // dx = 3
+    st.gpr[1] = 0x1111222233334444ULL;          // rcx upper bits canary
+    st.rflags = (1ULL << 0) | (1ULL << 11);     // stale CF/OF must clear
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[1], 0x1111222233330369ULL) << "cx = 0x369; 63:16 preserved";
+    EXPECT_FALSE(st.rflags & (1ULL << 0));
+    EXPECT_FALSE(st.rflags & (1ULL << 11));
+}
+
+TEST_F(CpuRuntimeTest, Clflush_NoOp_ExecutionContinues) {
+    // clflush [rax+0x10] (0f ae 78 10) followed by mov rbx, 7 — the flush
+    // must be consumed as a hint (no fault even with rax garbage) and the
+    // block must keep decoding past it. Blocked 13 Sentinels at 0x8000e5756.
+    const u8 program[] = { 0x0f, 0xae, 0x78, 0x10,
+                           0x48, 0xc7, 0xc3, 0x07, 0x00, 0x00, 0x00, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xDEADBEEF00000000ULL;   // bogus flush address: must not matter
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.exit_reason), static_cast<u32>(ExitReason::BlockEnd));
+    EXPECT_EQ(st.gpr[3], 7ULL) << "instruction after clflush executed";
+}
+
 // VRCPPS / VRSQRTPS are fast approximations. The x86 host estimate is ~12-bit
 // and the arm64 frecpe/frsqrte estimate is ~8-bit, so the two backends produce
 // DIFFERENT bit patterns by design. These tests therefore assert each lane is
