@@ -826,6 +826,223 @@ TEST_F(DiffTest, Fuzz_RandomGprMatrix) {
     // Gaps are coverage information, not failures; mismatches already failed above.
 }
 
+// ============================================================================
+// Memory-operand matrix: random addressing shapes (base + optional index*scale
+// + disp) x {load, store, RMW, movzx/movsx} x widths. EA bugs are silent
+// wrong-address corruption — this samples the SIB/disp encoding space the
+// curated EA tests only touch at three points. rsi anchors the arena data
+// region; index registers are seeded small so every EA stays inside the
+// volatile region the harness diffs.
+// ============================================================================
+namespace fuzzgen {
+
+inline std::vector<u8> MakeMemSnippet(int op, u32 w, int kind, int idx_reg, int scale,
+                                      int disp, std::string& desc) {
+    Xbyak::CodeGenerator g(64);
+    using namespace Xbyak::util;
+    auto addr = [&]() {
+        Xbyak::RegExp e = rsi + disp;
+        if (idx_reg >= 0) e = e + Xbyak::Reg64(idx_reg) * scale;
+        return e;
+    };
+    char buf[120];
+    const char* opn[] = {"mov", "add", "or", "xor", "cmp", "movzx", "movsx"};
+    if (op == 0) {
+        if (kind == 0) {
+            if (w == 64) g.mov(rdx, g.ptr[addr()]);
+            else if (w == 32) g.mov(edx, g.ptr[addr()]);
+            else if (w == 16) g.mov(dx, g.ptr[addr()]);
+            else g.mov(dl, g.ptr[addr()]);
+            std::snprintf(buf, sizeof buf, "mov r2_w%u, [rsi+i%d*%d+%#x]", w, idx_reg, scale, disp);
+        } else {
+            if (w == 64) g.mov(g.ptr[addr()], rdx);
+            else if (w == 32) g.mov(g.ptr[addr()], edx);
+            else if (w == 16) g.mov(g.ptr[addr()], dx);
+            else g.mov(g.ptr[addr()], dl);
+            std::snprintf(buf, sizeof buf, "mov [rsi+i%d*%d+%#x], r2_w%u", idx_reg, scale, disp, w);
+        }
+    } else if (op >= 1 && op <= 4) {
+        auto bin = [&](auto&& f) {
+            if (w == 64) f(g.ptr[addr()], rdx);
+            else if (w == 32) f(g.ptr[addr()], edx);
+            else if (w == 16) f(g.ptr[addr()], dx);
+            else f(g.ptr[addr()], dl);
+        };
+        switch (op) {
+        case 1: bin([&](auto a, auto b) { g.add(a, b); }); break;
+        case 2: bin([&](auto a, auto b) { g.or_(a, b); }); break;
+        case 3: bin([&](auto a, auto b) { g.xor_(a, b); }); break;
+        default: bin([&](auto a, auto b) { g.cmp(a, b); }); break;
+        }
+        std::snprintf(buf, sizeof buf, "%s [rsi+i%d*%d+%#x], r2_w%u", opn[op], idx_reg, scale, disp, w);
+    } else {
+        if (op == 5) { if (w == 16) g.movzx(rdx, g.word[addr()]); else g.movzx(rdx, g.byte[addr()]); }
+        else         { if (w == 16) g.movsx(rdx, g.word[addr()]); else g.movsx(rdx, g.byte[addr()]); }
+        std::snprintf(buf, sizeof buf, "%s rdx, %s[rsi+i%d*%d+%#x]", opn[op],
+                      w == 16 ? "word" : "byte", idx_reg, scale, disp);
+    }
+    desc = buf;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+inline std::vector<u8> MakeShiftClSnippet(int op, u32 w, int d_reg, std::string& desc) {
+    Xbyak::CodeGenerator g(32);
+    using namespace Xbyak::util;
+    auto R64 = [&](int i) { return Xbyak::Reg64(i); };
+    auto R32 = [&](int i) { return Xbyak::Reg32(i); };
+    auto R16 = [&](int i) { return Xbyak::Reg16(i); };
+    auto R8 = [&](int i) { return Xbyak::Reg8(i, i >= 4 && i <= 7); };
+    const char* nm[] = {"shl", "shr", "sar", "rol", "ror"};
+#define FUZZ_S(fn)                                                                       \
+    do {                                                                                 \
+        if (w == 64) g.fn(R64(d_reg), cl);                                               \
+        else if (w == 32) g.fn(R32(d_reg), cl);                                          \
+        else if (w == 16) g.fn(R16(d_reg), cl);                                          \
+        else g.fn(R8(d_reg), cl);                                                        \
+    } while (0)
+    switch (op) {
+    case 0: FUZZ_S(shl); break;
+    case 1: FUZZ_S(shr); break;
+    case 2: FUZZ_S(sar); break;
+    case 3: FUZZ_S(rol); break;
+    default: FUZZ_S(ror); break;
+    }
+#undef FUZZ_S
+    char buf[64];
+    std::snprintf(buf, sizeof buf, "%s r%d_w%u, cl", nm[op], d_reg, w);
+    desc = buf;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+inline std::vector<u8> MakeChainSnippet(int prod, int cons_kind, int cc, std::string& desc) {
+    Xbyak::CodeGenerator g(64);
+    using namespace Xbyak::util;
+    const char* pn[] = {"add", "sub", "cmp", "test", "and", "inc", "dec", "neg", "shl1"};
+    switch (prod) {
+    case 0: g.add(rax, rcx); break;
+    case 1: g.sub(rax, rcx); break;
+    case 2: g.cmp(rax, rcx); break;
+    case 3: g.test(rax, rcx); break;
+    case 4: g.and_(rax, rcx); break;
+    case 5: g.inc(rax); break;
+    case 6: g.dec(rax); break;
+    case 7: g.neg(rax); break;
+    default: g.shl(rax, 1); break;
+    }
+    char buf[80];
+    if (cons_kind == 0) {       // setcc dl
+        g.db(0x0F); g.db(0x90 + cc); g.db(0xC2);
+        std::snprintf(buf, sizeof buf, "%s; set%02x dl", pn[prod], cc);
+    } else if (cons_kind == 1) { // cmovcc rbx, rdi
+        g.db(0x48); g.db(0x0F); g.db(0x40 + cc); g.db(0xDF);
+        std::snprintf(buf, sizeof buf, "%s; cmov%02x rbx,rdi", pn[prod], cc);
+    } else if (cons_kind == 2) {
+        g.adc(rsi, r8);
+        std::snprintf(buf, sizeof buf, "%s; adc rsi,r8", pn[prod]);
+    } else {
+        g.sbb(rsi, r8);
+        std::snprintf(buf, sizeof buf, "%s; sbb rsi,r8", pn[prod]);
+    }
+    desc = buf;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+} // namespace fuzzgen
+
+TEST_F(DiffTest, Fuzz_MemOperandMatrix) {
+    std::mt19937_64 rng(0x4EA4EA4E);
+    long covered = 0, gaps = 0;
+    for (int sn = 0; sn < 500; ++sn) {
+        int op = static_cast<int>(rng() % 7);
+        u32 w;
+        int kind = 0;
+        if (op >= 5) w = (rng() % 2) ? 16 : 8;
+        else { w = std::array<u32, 4>{8, 16, 32, 64}[rng() % 4]; if (op == 0) kind = static_cast<int>(rng() % 2); }
+        const int ir = std::array<int, 5>{-1, 1, 3, 9, 14}[rng() % 5];
+        const int sc = std::array<int, 4>{1, 2, 4, 8}[rng() % 4];
+        const int disp = static_cast<int>(rng() % 0x200);
+        std::string desc;
+        const auto snippet = fuzzgen::MakeMemSnippet(op, w, kind, ir, sc, disp, desc);
+
+        bool ok = true;
+        for (int it = 0; it < 10 && ok; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            in.gpr[6] = arena.data_addr();                       // rsi = data base
+            if (ir >= 0) in.gpr[ir] = rng() % 16;                // small index
+            in.rflags = rng() & kStatusMask;
+            // Seed the addressed memory so loads see entropy, not zeros.
+            *reinterpret_cast<u64*>(arena.data_addr() + (rng() % 0x300)) = rng();
+            ok = Probe(desc.c_str(), snippet, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    std::printf("[fuzz-mem] %ld covered, %ld coverage gaps of 500 shapes\n", covered, gaps);
+}
+
+TEST_F(DiffTest, Fuzz_ShiftRotateByCl) {
+    std::mt19937_64 rng(0x5C1F75);
+    const u8 counts[] = {0, 1, 2, 7, 8, 15, 16, 31, 32, 63, 64, 0xFF};
+    long covered = 0, gaps = 0;
+    for (int sn = 0; sn < 300; ++sn) {
+        const int op = static_cast<int>(rng() % 5); // shl shr sar rol ror
+        const u32 w = std::array<u32, 4>{8, 16, 32, 64}[rng() % 4];
+        int d = static_cast<int>(rng() % 16);
+        if (d == 4 || d == 1) d = 3; // not RSP (stack), not RCX (the count)
+        std::string desc;
+        const auto snippet = fuzzgen::MakeShiftClSnippet(op, w, d, desc);
+
+        bool ok = true;
+        for (size_t ci = 0; ci < sizeof counts && ok; ++ci) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            in.gpr[1] = (in.gpr[1] & ~0xFFULL) | counts[ci];     // cl = targeted count
+            in.rflags = rng() & kStatusMask;
+            // Flag definedness depends on the EFFECTIVE count at runtime:
+            //   0       -> nothing written, all flags preserved (full compare)
+            //   1       -> all modeled flags defined (full compare)
+            //   >1      -> OF architecturally undefined (masked)
+            //   >=width -> CF undefined too on sub-64 widths (masked)
+            // Rotates never write ZF/SF/PF, so those compare as preserved.
+            const u64 eff = counts[ci] & (w == 64 ? 63u : 31u);
+            u64 mask = kStatusMask;
+            if (eff > 1) mask &= ~diff::OF;
+            if (eff >= w && w < 64) mask &= ~diff::CF;
+            ok = Probe(desc.c_str(), snippet, in, 0xFFFF, mask);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    std::printf("[fuzz-shf] %ld covered, %ld coverage gaps of 300 shapes\n", covered, gaps);
+}
+
+TEST_F(DiffTest, Fuzz_FlagTransport) {
+    // Producer ; consumer pairs: stresses the flag READ path (setcc/cmov/adc
+    // consuming materialized guest flags) — a surface single-instruction
+    // differential tests never exercise.
+    std::mt19937_64 rng(0xF1A65);
+    long covered = 0, gaps = 0;
+    for (int sn = 0; sn < 400; ++sn) {
+        const int prod = static_cast<int>(rng() % 9);
+        const int cons = static_cast<int>(rng() % 4);
+        const int cc = static_cast<int>(rng() % 16);
+        std::string desc;
+        const auto snippet = fuzzgen::MakeChainSnippet(prod, cons, cc, desc);
+        bool ok = true;
+        for (int it = 0; it < 12 && ok; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            if (it % 3 == 0) in.gpr[1] = in.gpr[0];   // force ZF-interesting cases
+            in.rflags = rng() & kStatusMask;
+            ok = Probe(desc.c_str(), snippet, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    std::printf("[fuzz-chain] %ld covered, %ld coverage gaps of 400 pairs\n", covered, gaps);
+}
+
 TEST_F(DiffTest, Fuzz_FlagSensitive) {
     const std::vector<FuzzOp> ops = {
         {"adc rax,rcx",   {0x48,0x11,0xC8},      0xFFFF, F_ALL},
