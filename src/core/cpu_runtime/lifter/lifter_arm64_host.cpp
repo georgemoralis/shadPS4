@@ -2714,7 +2714,7 @@ bool EmitCmpxchg16b(const ZydisDecodedInstruction& insn, const ZydisDecodedOpera
     c.L(done);
     // ZF via the side-band: SUB(diff, 0) — self-consistent triple, ZF exact.
     c.str(XReg(12), ptr(kState, Offsets::FlagLhs));
-    c.str(xzr,      ptr(kState, Offsets::FlagRhs));
+    c.str(XReg(31), ptr(kState, Offsets::FlagRhs));   // x31 = xzr in Rt position
     c.str(XReg(12), ptr(kState, Offsets::FlagResult));
     c.mov(kWScratch3, FLAG_OP_SUB);
     c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
@@ -5841,27 +5841,27 @@ bool EmitVdpps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
         if (pd) {
             c.fmul(VReg2D(0), VReg2D(0), VReg2D(1));
             for (int i = 0; i < 2; ++i)
-                if (!(imm & (0x10u << i))) c.ins(VReg2D(0)[i], xzr);
+                if (!(imm & (0x10u << i))) c.ins(VReg2D(0)[i], XReg(31));  // zr
             c.faddp(DReg(0), VReg2D(0));            // d0 = t0 + t1
             c.dup(VReg2D(0), VReg2D(0)[0]);
             for (int i = 0; i < 2; ++i)
-                if (!(imm & (1u << i))) c.ins(VReg2D(0)[i], xzr);
+                if (!(imm & (1u << i))) c.ins(VReg2D(0)[i], XReg(31));     // zr
         } else {
             c.fmul(VReg4S(0), VReg4S(0), VReg4S(1));
             for (int i = 0; i < 4; ++i)
-                if (!(imm & (0x10u << i))) c.ins(VReg4S(0)[i], wzr);
+                if (!(imm & (0x10u << i))) c.ins(VReg4S(0)[i], WReg(31));  // zr
             // (t0+t1)+(t2+t3): two pairwise passes, SDM association.
             c.faddp(VReg4S(0), VReg4S(0), VReg4S(0));
             c.faddp(SReg(0), VReg2S(0));
             c.dup(VReg4S(0), VReg4S(0)[0]);
             for (int i = 0; i < 4; ++i)
-                if (!(imm & (1u << i))) c.ins(VReg4S(0)[i], wzr);
+                if (!(imm & (1u << i))) c.ins(VReg4S(0)[i], WReg(31));     // zr
         }
         c.str(QReg(0), ptr(kState, YmmChunkOffset(dst, chunk)));
     }
     if (!ymm) {
-        c.str(xzr, ptr(kState, YmmChunkOffset(dst, 2)));
-        c.str(xzr, ptr(kState, YmmChunkOffset(dst, 3)));
+        c.str(XReg(31), ptr(kState, YmmChunkOffset(dst, 2)));   // x31 = xzr
+        c.str(XReg(31), ptr(kState, YmmChunkOffset(dst, 3)));
     }
     return true;
 }
