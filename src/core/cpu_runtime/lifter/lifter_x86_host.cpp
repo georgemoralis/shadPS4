@@ -684,7 +684,10 @@ bool EmitMovsxd(const ZydisDecodedInstruction& insn,
 // lazy tier only). If a title is ever shown to read AF (lahf-based
 // flag save/restore that round-trips into arithmetic), the fix is
 // AF = ((lhs ^ rhs ^ result) >> 4) & 1 in both helpers — ten minutes,
-// known cost, flip when proven needed. (2026-06-12 audit.)
+// known cost, flip when proven needed. Note the backend asymmetry:
+// the arm64 materializer DOES compute AF (one shared derivation for
+// all widths made it free there); differential tooling comparing the
+// backends must mask AF after w64 lazy-tier ops. (2026-06-12 audit.)
 //
 // Input register convention for these helpers:
 //   rcx = lhs (original destination value before the op)

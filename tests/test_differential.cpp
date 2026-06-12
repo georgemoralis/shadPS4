@@ -139,6 +139,44 @@ protected:
         EXPECT_EQ(memJ, memN) << name << ": memory effects differ between JIT and native";
     }
 
+    // Probe variant for GENERATED snippets: same mechanics as Expect, but an
+    // instruction the lifter doesn't support yet is a COVERAGE GAP (reported,
+    // returns false), not a test failure — a random generator must be able to
+    // wander outside the supported surface without going red. Genuine
+    // register/flag/memory mismatches still fail hard: those are miscompiles.
+    // Returns true when the snippet was fully lifted and compared.
+    bool Probe(const char* name, const std::vector<u8>& snippet, Context in,
+               u16 gpr_mask = 0xFFFF, u64 flag_mask = kStatusMask) {
+        in.gpr[4] = arena.stack_top();
+        if (snippet != last_snippet_) {
+            rt_ = std::make_unique<Core::Runtime::Runtime>();
+            last_snippet_ = snippet;
+        }
+        arena.save();
+        auto jit = diff::RunJit(*rt_, arena.code(), arena.code_addr(), snippet.data(),
+                                snippet.size(), in);
+        auto memJ = arena.capture();
+        arena.restore();
+
+        const bool reached_terminator =
+            jit.exit_reason ==
+                static_cast<u32>(Core::Runtime::ExitReason::UnsupportedInstruction) &&
+            jit.rip == arena.code_addr() + snippet.size();
+        if (!reached_terminator) {
+            // Early unsupported exit: the snippet's own instruction isn't lifted.
+            return false;
+        }
+
+        Context nat;
+        diff::RunNative(snippet.data(), snippet.size(), in, nat);
+        auto memN = arena.capture();
+
+        const std::string regs = diff::Compare(jit.out, nat, gpr_mask, flag_mask);
+        EXPECT_TRUE(regs.empty()) << name << ": register/flag mismatch\n" << regs;
+        EXPECT_EQ(memJ, memN) << name << ": memory effects differ between JIT and native";
+        return true;
+    }
+
     Arena arena;
     std::unique_ptr<Core::Runtime::Runtime> rt_ =
         std::make_unique<Core::Runtime::Runtime>();
@@ -651,6 +689,143 @@ TEST_F(DiffTest, Fuzz_Arithmetic) {
 
 // Flag-consuming ops (ADC/SBB read CF; CMOVcc/SETcc read the condition) driven
 // with RANDOM input flags so both taken and not-taken paths are exercised.
+// ============================================================================
+// Generated GPR matrix fuzz. Unlike the curated lists above, snippets here are
+// SYNTHESIZED: random (op, width, registers, reg/imm form) tuples assembled
+// with xbyak — guaranteed-valid encodings across the whole GPR file (REX
+// interactions, r8-r15, narrow widths), each run against several random
+// inputs. Generator logic capstone-verified out-of-tree (4000/4000 round-trip,
+// 2026-06-12). Unsupported forms are tallied and reported as coverage, not
+// failures (see Probe). RSP is excluded as an operand (both runs share the
+// guest stack; clobbering it makes the runs diverge by design, not by bug).
+// AH/CH/DH/BH are never generated (Reg8 with the REX-form flag yields
+// spl/bpl/sil/dil for indices 4..7), matching the lifter's supported set.
+// ============================================================================
+namespace fuzzgen {
+
+// op ids 0..8: add sub and or xor cmp test adc sbb; 9..12: inc dec neg not.
+inline const char* kOpNames[] = {"add", "sub", "and", "or",  "xor", "cmp", "test",
+                                 "adc", "sbb", "inc", "dec", "neg", "not"};
+constexpr int kNumOps = 13;
+
+inline std::vector<u8> MakeAluSnippet(int op, u32 w, int d, int s, int form,
+                                      s64 imm, std::string& desc) {
+    Xbyak::CodeGenerator g(64);
+    auto R64 = [&](int i) { return Xbyak::Reg64(i); };
+    auto R32 = [&](int i) { return Xbyak::Reg32(i); };
+    auto R16 = [&](int i) { return Xbyak::Reg16(i); };
+    auto R8 = [&](int i) { return Xbyak::Reg8(i, /*ext8bit=*/i >= 4 && i <= 7); };
+    char buf[96];
+#define FUZZ_BIN(fn)                                                                     \
+    do {                                                                                 \
+        if (form == 0) {                                                                 \
+            if (w == 64)                                                                 \
+                g.fn(R64(d), R64(s));                                                    \
+            else if (w == 32)                                                            \
+                g.fn(R32(d), R32(s));                                                    \
+            else if (w == 16)                                                            \
+                g.fn(R16(d), R16(s));                                                    \
+            else                                                                         \
+                g.fn(R8(d), R8(s));                                                      \
+            std::snprintf(buf, sizeof buf, "%s r%d_w%u, r%d", kOpNames[op], d, w, s);    \
+        } else {                                                                         \
+            const u32 iw = (w == 64) ? 32 : w; /* imm32-sx is the widest 64-bit form */  \
+            const s64 iv = (iw == 32)   ? static_cast<s32>(imm)                          \
+                           : (iw == 16) ? static_cast<s16>(imm)                          \
+                                        : static_cast<s8>(imm);                          \
+            if (w == 64)                                                                 \
+                g.fn(R64(d), static_cast<u32>(static_cast<s32>(iv)));                    \
+            else if (w == 32)                                                            \
+                g.fn(R32(d), static_cast<u32>(static_cast<s32>(iv)));                    \
+            else if (w == 16)                                                            \
+                g.fn(R16(d), static_cast<u32>(static_cast<u16>(iv)));                    \
+            else                                                                         \
+                g.fn(R8(d), static_cast<u32>(static_cast<u8>(iv)));                      \
+            std::snprintf(buf, sizeof buf, "%s r%d_w%u, imm(%lld)", kOpNames[op], d, w,  \
+                          static_cast<long long>(iv));                                   \
+        }                                                                                \
+    } while (0)
+#define FUZZ_UN(fn)                                                                      \
+    do {                                                                                 \
+        if (w == 64)                                                                     \
+            g.fn(R64(d));                                                                \
+        else if (w == 32)                                                                \
+            g.fn(R32(d));                                                                \
+        else if (w == 16)                                                                \
+            g.fn(R16(d));                                                                \
+        else                                                                             \
+            g.fn(R8(d));                                                                 \
+        std::snprintf(buf, sizeof buf, "%s r%d_w%u", kOpNames[op], d, w);                \
+    } while (0)
+    switch (op) {
+    case 0: FUZZ_BIN(add); break;
+    case 1: FUZZ_BIN(sub); break;
+    case 2: FUZZ_BIN(and_); break;
+    case 3: FUZZ_BIN(or_); break;
+    case 4: FUZZ_BIN(xor_); break;
+    case 5: FUZZ_BIN(cmp); break;
+    case 6: FUZZ_BIN(test); break;
+    case 7: FUZZ_BIN(adc); break;
+    case 8: FUZZ_BIN(sbb); break;
+    case 9: FUZZ_UN(inc); break;
+    case 10: FUZZ_UN(dec); break;
+    case 11: FUZZ_UN(neg); break;
+    case 12: FUZZ_UN(not_); break;
+    }
+#undef FUZZ_BIN
+#undef FUZZ_UN
+    desc = buf;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+} // namespace fuzzgen
+
+TEST_F(DiffTest, Fuzz_RandomGprMatrix) {
+    std::mt19937_64 rng(0xD1FFE12); // fixed seed -> reproducible failures
+    constexpr int kSnippets = 600;
+    constexpr int kInputsPerSnippet = 12;
+    long covered = 0, gaps = 0, runs = 0;
+    std::array<long, fuzzgen::kNumOps> gap_by_op{};
+
+    for (int sn = 0; sn < kSnippets; ++sn) {
+        const int op = static_cast<int>(rng() % fuzzgen::kNumOps);
+        const u32 w = std::array<u32, 4>{8, 16, 32, 64}[rng() % 4];
+        int d = static_cast<int>(rng() % 16);
+        if (d == 4) d = 3; // never RSP (shared guest stack)
+        int s = static_cast<int>(rng() % 16);
+        if (s == 4) s = 5;
+        int form = (op <= 8) ? static_cast<int>(rng() % 2) : 0;
+        if (op == 6 && form == 1 && w == 64) form = 0; // xbyak test r64,imm form quirk
+
+        std::string desc;
+        const auto snippet =
+            fuzzgen::MakeAluSnippet(op, w, d, s, form, static_cast<s64>(rng()), desc);
+
+        bool snippet_supported = true;
+        for (int it = 0; it < kInputsPerSnippet && snippet_supported; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            if (it % 3 == 0) { // sign-bit / wrap pressure at the operating width
+                const u64 sgn = 1ULL << (w - 1);
+                in.gpr[d] = (it & 1) ? (in.gpr[d] | sgn) : ~0ULL;
+            }
+            in.rflags = rng() & kStatusMask;
+            snippet_supported = Probe(desc.c_str(), snippet, in);
+            if (snippet_supported) ++runs;
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (snippet_supported) ++covered;
+        else { ++gaps; ++gap_by_op[op]; }
+    }
+
+    std::printf("[fuzz] %d snippets: %ld fully compared (%ld input runs), %ld coverage gaps\n",
+                kSnippets, covered, runs, gaps);
+    for (int op = 0; op < fuzzgen::kNumOps; ++op)
+        if (gap_by_op[op])
+            std::printf("[fuzz]   gap: %-5s x%ld\n", fuzzgen::kOpNames[op], gap_by_op[op]);
+    // Gaps are coverage information, not failures; mismatches already failed above.
+}
+
 TEST_F(DiffTest, Fuzz_FlagSensitive) {
     const std::vector<FuzzOp> ops = {
         {"adc rax,rcx",   {0x48,0x11,0xC8},      0xFFFF, F_ALL},

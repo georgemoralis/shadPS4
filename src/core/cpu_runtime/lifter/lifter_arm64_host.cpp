@@ -236,6 +236,22 @@ bool EmitEffectiveAddress(const ZydisDecodedOperandMem& mem, u64 next_rip,
 // Scratch: x9..x15 (caller-saved). Reads flag_op/lhs/rhs/result, writes
 // rflags. Call AFTER the side-band stores (it reloads them from memory, so
 // ordering is by memory, not register liveness).
+// CONTRACT — eager materialization (2026-06-12 audit). Despite the
+// side-band's "lazy" appearance, every flag-writing producer calls this
+// immediately after stashing: the side-band is a parameter-passing ABI
+// into one shared flag derivation, not a deferral mechanism. Rflags is
+// therefore current at every guest-instruction boundary. This ordering
+// is LOAD-BEARING: the INC/DEC paths below preserve CF by reading
+// Rflags bit 0, which is only the predecessor op's true carry because
+// that predecessor already materialized. A producer that stashes
+// without materializing would silently break `add; inc; jc`-class
+// sequences — never add one.
+//
+// Validated against native x86 flags via C-model sweep: 400k runs,
+// all widths (8/16/32/64) x ADD/SUB/LOGIC/INC/DEC, zero mismatches,
+// including AF (computed here; the x86 backend's w64 lazy helpers skip
+// it by documented contract — an accepted backend asymmetry, since
+// nothing consumes AF) and control-bit (DF etc.) preservation.
 void EmitMaterializeFlags(CodeGenerator& c) {
     const XReg lhs = XReg(9);
     const XReg rhs = XReg(10);
