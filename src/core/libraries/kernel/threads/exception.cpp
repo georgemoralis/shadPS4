@@ -17,6 +17,12 @@
 #endif
 #include <unordered_set>
 
+#ifdef SHADPS4_USES_RUNTIME
+#include <memory>
+#include "core/cpu_runtime/guest_state.h"
+#include "core/cpu_runtime/runtime.h"
+#endif
+
 namespace Libraries::Kernel {
 
 #ifdef _WIN32
@@ -187,6 +193,140 @@ s32 OrbisToNativeSignal(s32 s) {
 #endif
 
 std::array<OrbisKernelExceptionHandler, 130> Handlers{};
+
+#ifdef SHADPS4_USES_RUNTIME
+namespace {
+
+// ============================================================================
+// Guest signal-handler invocation under SHADPS4_CPU_BACKEND=runtime.
+//
+// The old blocker here assumed the hard problem: a host signal lands in the
+// middle of a JIT block, so the guest context must be recovered by reverse-
+// mapping the host RIP and un-hoisting values from host registers. The
+// no-IR load-op-store JIT does not have that problem: nothing guest-visible
+// lives in a host register across a guest-instruction boundary, so the
+// in-memory GuestState IS the guest register file, exact to within the one
+// guest instruction that was executing when delivery preempted the thread.
+// (Real hardware has the same window, just narrower.) That is precisely the
+// context a stop-the-world GC suspend handler — the dominant user of this
+// path, e.g. Unity/Boehm raising SIGUSR1-class signals via pthread_kill —
+// needs: registers to scan for roots plus the stack pointer.
+//
+// Invocation is synchronous, right here in the delivery context (POSIX
+// signal handler / Windows special user APC, both running ON the target
+// thread). This is sound because:
+//   - The interrupted JIT/HLE frames sit beneath us on the host stack and
+//     resume exactly where they were when we return; the kernel/APC
+//     dispatch preserves the interrupted register context, and the nested
+//     Run() goes through the gateway, which saves/restores host
+//     callee-saved registers.
+//   - Run() supports nesting by design (the HLE -> guest-callback pattern):
+//     tl_active_runtime / tl_current_guest_state are saved and restored.
+//   - Guest and host share one address space, so handing guest code a
+//     pointer to the stack-local Ucontext works exactly as it does for the
+//     native-backend call below.
+//
+// Known, deliberate limitations (tracked in GUEST_ENTRY_STATUS.md):
+//   - mcontext edits made by the handler are NOT applied on return. The
+//     interrupted block resumes at its exact host instruction and would
+//     race any GuestState rewrite. GC suspend handlers read, never write;
+//     signal-driven coroutines (setcontext-from-handler) need the deferred
+//     block-boundary delivery design. We warn if the handler edited rip.
+//   - On POSIX this runs guest code (and possibly the lifter, which
+//     allocates) inside a real signal handler. Not async-signal-safe by
+//     the letter; it is the same bargain Boehm-style collectors strike on
+//     real systems, and the alternative (deferral) has a liveness hole
+//     when the target thread is blocked in HLE. Accepted, documented.
+//
+// The handler runs on a per-thread scratch stack rather than the
+// interrupted guest RSP: a handler stack overflow then cannot corrupt the
+// interrupted frame. Deliveries can nest (special APCs are not masked), so
+// the scratch region is carved by depth.
+// ============================================================================
+
+void FillMcontextFromGuestState(Mcontext& mc, const Core::Runtime::GuestState& gs) {
+    // Canonical AMD64 GPR order in GuestState:
+    // rax rcx rdx rbx rsp rbp rsi rdi = 0..7, r8..r15 = 8..15.
+    mc.mc_rax = gs.gpr[0];
+    mc.mc_rcx = gs.gpr[1];
+    mc.mc_rdx = gs.gpr[2];
+    mc.mc_rbx = gs.gpr[3];
+    mc.mc_rsp = gs.gpr[4];
+    mc.mc_rbp = gs.gpr[5];
+    mc.mc_rsi = gs.gpr[6];
+    mc.mc_rdi = gs.gpr[7];
+    mc.mc_r8 = gs.gpr[8];
+    mc.mc_r9 = gs.gpr[9];
+    mc.mc_r10 = gs.gpr[10];
+    mc.mc_r11 = gs.gpr[11];
+    mc.mc_r12 = gs.gpr[12];
+    mc.mc_r13 = gs.gpr[13];
+    mc.mc_r14 = gs.gpr[14];
+    mc.mc_r15 = gs.gpr[15];
+    mc.mc_rip = gs.rip;
+    mc.mc_rflags = gs.rflags;
+    mc.mc_fsbase = gs.fs_base;
+    mc.mc_gsbase = gs.gs_base;
+}
+
+void InvokeGuestSignalHandlerViaRuntime(OrbisKernelExceptionHandler handler, s32 orbis_sig,
+                                        Ucontext* ctx) {
+    using Core::Runtime::GuestState;
+    using Core::Runtime::Runtime;
+
+    // Overwrite the host-derived register fields with the guest's: under
+    // the runtime backend the host context is JIT machinery (RIP in the
+    // code cache, scratch registers), meaningless to the guest. mc_addr
+    // (faulting address, filled from siginfo for sync signals) is kept.
+    GuestState* live = Runtime::CurrentGuestState();
+    if (live != nullptr) {
+        FillMcontextFromGuestState(ctx->uc_mcontext, *live);
+    } else {
+        // Thread signaled while not executing guest code (pure host thread
+        // or before its first Run). There is no guest register file to
+        // report; the handler still runs (a GC suspend must get its ack or
+        // the world stops forever) and sees a zeroed context.
+        LOG_WARNING(Lib_Kernel,
+                    "Guest signal {} delivered to a thread with no live guest "
+                    "context; handler will see a zeroed register context",
+                    orbis_sig);
+    }
+
+    // Per-thread scratch stacks, carved by nesting depth.
+    constexpr int kMaxNestedDeliveries = 4;
+    constexpr size_t kPerDeliveryStack = 256 * 1024;
+    static thread_local std::unique_ptr<u8[]> stacks;
+    static thread_local int depth = 0;
+    if (!stacks) {
+        stacks = std::make_unique<u8[]>(kPerDeliveryStack * kMaxNestedDeliveries);
+    }
+    if (depth >= kMaxNestedDeliveries) {
+        LOG_CRITICAL(Lib_Kernel,
+                     "Guest signal {}: delivery nesting exceeds {}; dropping",
+                     orbis_sig, kMaxNestedDeliveries);
+        return;
+    }
+    u8* const stack_top = stacks.get() + kPerDeliveryStack * (depth + 1);
+    ++depth;
+
+    const u64 rip_handed_to_handler = ctx->uc_mcontext.mc_rip;
+    // Same 2-argument (signum, ucontext*) convention as the native-backend
+    // invocation below — sceKernelInstallExceptionHandler handlers.
+    Runtime::Instance().CallGuestSimple(reinterpret_cast<VAddr>(handler), stack_top,
+                                        static_cast<u64>(orbis_sig),
+                                        reinterpret_cast<u64>(ctx));
+    --depth;
+
+    if (ctx->uc_mcontext.mc_rip != rip_handed_to_handler) {
+        LOG_WARNING(Lib_Kernel,
+                    "Guest signal {} handler modified mcontext rip ({:#x} -> {:#x}); "
+                    "context edits are not applied under the runtime backend yet",
+                    orbis_sig, rip_handed_to_handler, ctx->uc_mcontext.mc_rip);
+    }
+}
+
+} // namespace
+#endif // SHADPS4_USES_RUNTIME
 Sigset g_sigintr{};
 
 #ifndef _WIN64
@@ -262,32 +402,12 @@ void SigactionHandler(int native_signum, siginfo_t* inf, ucontext_t* raw_context
         ctx.uc_mcontext.mc_addr = reinterpret_cast<uint64_t>(inf->si_addr);
 #endif
 #ifdef SHADPS4_USES_RUNTIME
-        // Signal handling under SHADPS4_CPU_BACKEND=runtime is NOT
-        // implemented. Invoking the guest handler natively here would
-        // bypass the JIT and run guest x86_64 bytes directly, which is
-        // exactly what the runtime exists to prevent.
-        //
-        // Doing it correctly requires (see GUEST_ENTRY_STATUS.md):
-        //   1. Reverse-mapping the host RIP in `raw_context` back to a
-        //      guest RIP via Runtime::HostToGuestMap.
-        //   2. Translating host mcontext fields back to guest
-        //      GuestState fields (since the JIT may have hoisted values
-        //      out of GuestState into host registers mid-block).
-        //   3. Calling the guest handler through Runtime::CallGuest in
-        //      a signal-safe way (sigaltstack, no malloc).
-        //
-        // None of that is built yet. Aborting deliberately rather than
-        // calling the native handler is the safer failure mode: it tells
-        // the developer "your game uses signal handlers, signal-handler
-        // support requires PR 1.5c work" instead of running guest bytes
-        // natively (which would mostly work but eventually fault in
-        // hard-to-diagnose ways).
-        LOG_CRITICAL(Lib_Kernel,
-                     "Guest signal handler invocation not implemented under "
-                     "SHADPS4_CPU_BACKEND=runtime (signal {}). See "
-                     "documents/GUEST_ENTRY_STATUS.md for design and tracking.",
-                     native_signum);
-        UNREACHABLE_MSG("Guest signal handler under SHADPS4_USES_RUNTIME");
+        // Invoke the guest handler through the CPU runtime: overwrite the
+        // host-derived register fields above with the guest's GuestState
+        // (the host context is JIT machinery under this backend) and call
+        // the handler as lifted guest code on a scratch stack. Rationale
+        // and limitations: see InvokeGuestSignalHandlerViaRuntime.
+        InvokeGuestSignalHandlerViaRuntime(handler, NativeToOrbisSignal(native_signum), &ctx);
 #else
         handler(NativeToOrbisSignal(native_signum), &ctx);
 #endif
@@ -322,15 +442,11 @@ void ExceptionHandler(void* arg1, void* arg2, void* arg3, PCONTEXT context) {
         ctx.uc_mcontext.mc_fs = context->SegFs;
         ctx.uc_mcontext.mc_gs = context->SegGs;
 #ifdef SHADPS4_USES_RUNTIME
-        // Same caveat as the POSIX SigactionHandler above. Guest signal
-        // handler invocation through the runtime is not implemented;
-        // abort rather than fall through to native invocation.
-        LOG_CRITICAL(Lib_Kernel,
-                     "Guest exception handler invocation not implemented under "
-                     "SHADPS4_CPU_BACKEND=runtime (signal {}). See "
-                     "documents/GUEST_ENTRY_STATUS.md.",
-                     native_signum);
-        UNREACHABLE_MSG("Guest exception handler under SHADPS4_USES_RUNTIME");
+        // Invoke the guest handler through the CPU runtime; the host
+        // CONTEXT captured above is JIT machinery under this backend and
+        // is overwritten with the guest's GuestState. See
+        // InvokeGuestSignalHandlerViaRuntime for rationale and limits.
+        InvokeGuestSignalHandlerViaRuntime(handler, NativeToOrbisSignal(native_signum), &ctx);
 #else
         handler(NativeToOrbisSignal(native_signum), &ctx);
 #endif
