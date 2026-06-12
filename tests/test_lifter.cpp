@@ -19866,6 +19866,125 @@ TEST_F(CpuRuntimeTest, Clflush_NoOp_ExecutionContinues) {
     EXPECT_EQ(st.gpr[3], 7ULL) << "instruction after clflush executed";
 }
 
+// ============================================================================
+// CMPXCHG16B / CMPXCHG8B — 16/8-byte atomic compare-exchange. Blocked a new
+// title at 0x800979944 (lock-free queue / atomic<__int128> territory).
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Cmpxchg16b_Match_StoresPairSetsZF) {
+    // lock cmpxchg16b [rsi]
+    const u8 program[] = { 0xf0, 0x48, 0x0f, 0xc7, 0x0e, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;     // StackTop is 16-aligned; -64 keeps it
+    *reinterpret_cast<u64*>(buf)     = 0x1111111111111111ULL;
+    *reinterpret_cast<u64*>(buf + 8) = 0x2222222222222222ULL;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(buf);     // rsi
+    st.gpr[0] = 0x1111111111111111ULL;          // rax matches lo
+    st.gpr[2] = 0x2222222222222222ULL;          // rdx matches hi
+    st.gpr[3] = 0xAAAAAAAAAAAAAAAAULL;          // rbx -> new lo
+    st.gpr[1] = 0xBBBBBBBBBBBBBBBBULL;          // rcx -> new hi
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf),     0xAAAAAAAAAAAAAAAAULL);
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf + 8), 0xBBBBBBBBBBBBBBBBULL);
+    EXPECT_EQ(st.gpr[0], 0x1111111111111111ULL) << "accumulator untouched on match";
+    EXPECT_EQ(st.gpr[2], 0x2222222222222222ULL);
+    EXPECT_TRUE(st.rflags & (1ULL << 6)) << "ZF set";
+}
+
+TEST_F(CpuRuntimeTest, Cmpxchg16b_Mismatch_LoadsPairClearsZF) {
+    const u8 program[] = { 0xf0, 0x48, 0x0f, 0xc7, 0x0e, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(buf)     = 0x1111111111111111ULL;
+    *reinterpret_cast<u64*>(buf + 8) = 0x2222222222222222ULL;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(buf);
+    st.gpr[0] = 0x1111111111111111ULL;          // lo matches...
+    st.gpr[2] = 0xDEADDEADDEADDEADULL;          // ...hi does not
+    st.gpr[3] = 0xAAAAAAAAAAAAAAAAULL;
+    st.gpr[1] = 0xBBBBBBBBBBBBBBBBULL;
+    st.rflags = (1ULL << 6);                    // stale ZF must clear
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf),     0x1111111111111111ULL) << "memory unchanged";
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf + 8), 0x2222222222222222ULL);
+    EXPECT_EQ(st.gpr[0], 0x1111111111111111ULL) << "rdx:rax <- memory";
+    EXPECT_EQ(st.gpr[2], 0x2222222222222222ULL);
+    EXPECT_EQ(st.gpr[3], 0xAAAAAAAAAAAAAAAAULL) << "rbx/rcx never written";
+    EXPECT_EQ(st.gpr[1], 0xBBBBBBBBBBBBBBBBULL);
+    EXPECT_FALSE(st.rflags & (1ULL << 6)) << "ZF clear";
+}
+
+TEST_F(CpuRuntimeTest, Cmpxchg8b_Match_StoresEcxEbx) {
+    // lock cmpxchg8b [rsi] — 32-bit pair form; high halves of the guest
+    // qword slots are junk the instruction must ignore.
+    const u8 program[] = { 0xf0, 0x0f, 0xc7, 0x0e, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    u8* buf = mem.StackTop()-64;
+    *reinterpret_cast<u64*>(buf) = 0x4444444433333333ULL;   // EDX:EAX layout
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[6] = reinterpret_cast<u64>(buf);
+    st.gpr[0] = 0xFFFFFFFF33333333ULL;          // eax matches, junk hi32
+    st.gpr[2] = 0xEEEEEEEE44444444ULL;          // edx matches, junk hi32
+    st.gpr[3] = 0x9999999955555555ULL;          // ebx -> new lo dword
+    st.gpr[1] = 0x8888888866666666ULL;          // ecx -> new hi dword
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*reinterpret_cast<u64*>(buf), 0x6666666655555555ULL) << "ECX:EBX stored";
+    EXPECT_TRUE(st.rflags & (1ULL << 6));
+}
+
+TEST_F(CpuRuntimeTest, Vpinsrq_Lane1_FromGpr) {
+    // vpinsrq xmm1, xmm2, rax, 1 — VEX.W1 4-op; blocked Adore (CUSA43357)
+    // at 0x8010f64e5. Lane 1 gets rax, lane 0 comes from src1, upper zeroes.
+    const u8 program[] = { 0xc4, 0xe3, 0xe9, 0x22, 0xc8, 0x01, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[0] = 0xFEEDFACECAFEBEEFULL;                    // value
+    st.ymm[XmmChunk(2,0)] = 0x1010101010101010ULL;        // src1
+    st.ymm[XmmChunk(2,1)] = 0x2020202020202020ULL;
+    st.ymm[XmmChunk(1,2)] = ~0ULL; st.ymm[XmmChunk(1,3)] = ~0ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0x1010101010101010ULL) << "lane 0 from src1";
+    EXPECT_EQ(st.ymm[XmmChunk(1,1)], 0xFEEDFACECAFEBEEFULL) << "lane 1 = rax";
+    EXPECT_EQ(st.ymm[XmmChunk(1,2)], 0ULL) << "upper 128 zeroed";
+    EXPECT_EQ(st.ymm[XmmChunk(1,3)], 0ULL);
+}
+
+// ============================================================================
+// Non-locked BTR/BTS register forms — blocked Adore (CUSA43357) at
+// 0x8012f45dd during IL2CPP metadata init (btr reg,reg width=32).
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Btr32_RegReg_ClearsBitSetsCF) {
+    // btr ebx, ecx — exactly the title's 3-byte shape. Bit 5 set -> CF=1,
+    // bit cleared, and the 32-bit write zero-extends the guest slot.
+    const u8 program[] = { 0x0f, 0xb3, 0xcb, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[3] = 0xDEADBEEF00000020ULL;   // ebx bit5 set; upper junk that w32 write must clear
+    st.gpr[1] = 0xFFFFFF45ULL;           // ecx: index 0x45 & 31 = 5
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[3], 0ULL) << "bit 5 cleared; 32-bit write zero-extends";
+    EXPECT_TRUE(st.rflags & 1ULL) << "CF = pre-update bit";
+}
+
+TEST_F(CpuRuntimeTest, Bts64_Imm_SetsBitClearsCF) {
+    const u8 program[] = { 0x48, 0x0f, 0xba, 0xea, 0x09, 0xc3 };  // bts rdx, 9
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.gpr[2] = 0x8000000000000001ULL;   // bit 9 clear
+    st.rflags = 1ULL;                    // stale CF must clear
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[2], 0x8000000000000201ULL);
+    EXPECT_FALSE(st.rflags & 1ULL) << "CF = pre-update bit (was 0)";
+}
+
 // VRCPPS / VRSQRTPS are fast approximations. The x86 host estimate is ~12-bit
 // and the arm64 frecpe/frsqrte estimate is ~8-bit, so the two backends produce
 // DIFFERENT bit patterns by design. These tests therefore assert each lane is

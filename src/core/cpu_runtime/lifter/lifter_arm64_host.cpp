@@ -2065,6 +2065,10 @@ bool EmitBextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* o
 
 // guest: bt src, index -> CF = bit (index mod width) of src. Only CF affected;
 //   all other flags preserved (per test). ops[0]=src (reg), ops[1]=imm or reg.
+// BT / BTS / BTR / BTC, REGISTER destination (non-locked; LOCK'd memory
+// forms go through the atomic emitter). CF gets the PRE-update bit on all
+// four; the modifying trio then orr/bic/eor the bit and write back with
+// register-width semantics (w32 zero-extends, w16 splices low16).
 bool EmitBt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
             CodeGenerator& c) {
     const u32 w = insn.operand_width;
@@ -2072,6 +2076,7 @@ bool EmitBt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int s = ZydisGprToIndex(ops[0].reg.value);
     if (s < 0) return false;
+    const ZydisMnemonic m = insn.mnemonic;
     const u32 modmask = (w == 64) ? 0x3F : (w == 32 ? 0x1F : 0x0F);
     const XReg src = kScratch0, idx = kScratch1, bit = kScratch2;
     c.ldr(src, ptr(kState, GprOffset(s)));
@@ -2087,13 +2092,39 @@ bool EmitBt(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
     }
     c.lsr(bit, src, idx);
     c.and_(bit, bit, 1);
-    // CF = bit; preserve all other flags.
+    // CF = pre-update bit; preserve all other flags.
     const XReg fl = XReg(14), t = XReg(15);
     c.ldr(fl, ptr(kState, Offsets::Rflags));
     c.mov(t, ~1ull);
     c.and_(fl, fl, t);
     c.orr(fl, fl, bit);
     c.str(fl, ptr(kState, Offsets::Rflags));
+    if (m == ZYDIS_MNEMONIC_BT) return true;
+
+    // mask = 1 << idx; apply, then width-aware writeback.
+    const XReg msk = XReg(13);
+    c.mov(msk, 1);
+    c.lsl(msk, msk, idx);
+    switch (m) {
+    case ZYDIS_MNEMONIC_BTS: c.orr(src, src, msk); break;
+    case ZYDIS_MNEMONIC_BTR: c.bic(src, src, msk); break;
+    case ZYDIS_MNEMONIC_BTC: c.eor(src, src, msk); break;
+    default: return false;
+    }
+    if (w == 64) {
+        c.str(src, ptr(kState, GprOffset(s)));
+    } else if (w == 32) {
+        c.and_(src, src, 0xFFFFFFFFull);        // 32-bit write zero-extends
+        c.str(src, ptr(kState, GprOffset(s)));
+    } else {
+        // 16-bit write preserves bits 63:16 of the guest slot.
+        c.ldr(t, ptr(kState, GprOffset(s)));
+        c.mov(XReg(14), ~0xFFFFull);
+        c.and_(t, t, XReg(14));
+        c.and_(src, src, 0xFFFF);
+        c.orr(t, t, src);
+        c.str(t, ptr(kState, GprOffset(s)));
+    }
     return true;
 }
 
@@ -2589,6 +2620,90 @@ bool EmitCmpxchg(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
         c.str(newDst, ptr(kState, GprOffset(d)));
     }
     c.str(newAcc, ptr(kState, GprOffset(RAX_IDX)));
+    EmitMaterializeFlags(c);
+    return true;
+}
+
+// CMPXCHG8B / CMPXCHG16B — 8/16-byte atomic compare-exchange against memory.
+// Compare EDX:EAX / RDX:RAX with [mem]; on match store ECX:EBX / RCX:RBX and
+// set ZF, else load [mem] into the accumulator pair and clear ZF. LSE caspal
+// needs even/odd register pairing, so this uses the universal ldaxp/stlxp
+// (ldaxr/stlxr for 8B) retry loop instead — acquire+release matches the
+// x86-LOCK strength mapping used by the LSE emitter below.
+//
+// Flags: the architecture defines ZF only and leaves the rest UNAFFECTED.
+// The lazy side-band has no passthrough mode, so this encodes SUB(diff, 0)
+// at width 64: ZF is exact (diff==0 iff the full compare matched); SF/CF/OF/
+// AF/PF come out as the materialization of that synthetic compare rather
+// than surviving from before — a known simplification (same family as the
+// 2-op/3-op IMUL flag note). Nothing real tests anything but ZF here.
+bool EmitCmpxchg16b(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+                    u64 next_rip, CodeGenerator& c) {
+    const bool is16 = (insn.mnemonic == ZYDIS_MNEMONIC_CMPXCHG16B);
+    if (!is16 && insn.mnemonic != ZYDIS_MNEMONIC_CMPXCHG8B) return false;
+    if (ops[0].type != ZYDIS_OPERAND_TYPE_MEMORY) return false;
+    if (!EmitEffectiveAddress(ops[0].mem, next_rip, c)) return false;
+
+    const XReg exp_lo = XReg(4), exp_hi = XReg(5), new_lo = XReg(6), new_hi = XReg(7);
+    if (is16) {
+        c.ldr(exp_lo, ptr(kState, GprOffset(0)));   // RAX
+        c.ldr(exp_hi, ptr(kState, GprOffset(2)));   // RDX
+        c.ldr(new_lo, ptr(kState, GprOffset(3)));   // RBX
+        c.ldr(new_hi, ptr(kState, GprOffset(1)));   // RCX
+    } else {
+        // m64 layout: low dword = EAX/EBX side, high dword = EDX/ECX side.
+        c.ldr(WReg(4), ptr(kState, GprOffset(0)));  // zero-extends
+        c.ldr(WReg(5), ptr(kState, GprOffset(2)));
+        c.orr(exp_lo, exp_lo, exp_hi, LSL, 32);     // exp = EDX:EAX
+        c.ldr(WReg(6), ptr(kState, GprOffset(3)));
+        c.ldr(WReg(7), ptr(kState, GprOffset(1)));
+        c.orr(new_lo, new_lo, new_hi, LSL, 32);     // new = ECX:EBX
+    }
+
+    Label retry, mismatch, done;
+    c.L(retry);
+    if (is16) {
+        c.ldaxp(kScratch0, kScratch1, ptr(kAddr));  // x9 = [mem].lo, x10 = .hi
+        c.cmp(kScratch0, exp_lo);
+        c.ccmp(kScratch1, exp_hi, 0, EQ);           // nzcv=0 (ZF clear) on skip
+        c.b(NE, mismatch);
+        c.stlxp(WReg(8), new_lo, new_hi, ptr(kAddr));
+        c.cbnz(WReg(8), retry);
+    } else {
+        c.ldaxr(kScratch0, ptr(kAddr));
+        c.cmp(kScratch0, exp_lo);
+        c.b(NE, mismatch);
+        c.stlxr(WReg(8), new_lo, ptr(kAddr));
+        c.cbnz(WReg(8), retry);
+    }
+    c.mov(XReg(12), 0);                             // diff = 0 -> ZF=1
+    c.b(done);
+
+    c.L(mismatch);
+    c.clrex(15);                                    // drop the exclusive monitor
+    // diff first (it reads exp_*), then the accumulator writeback.
+    c.eor(XReg(12), kScratch0, exp_lo);
+    if (is16) {
+        c.eor(XReg(13), kScratch1, exp_hi);
+        c.orr(XReg(12), XReg(12), XReg(13));
+        c.str(kScratch0, ptr(kState, GprOffset(0)));
+        c.str(kScratch1, ptr(kState, GprOffset(2)));
+    } else {
+        c.and_(XReg(13), kScratch0, 0xFFFFFFFFull); // EAX (zero-extended write)
+        c.str(XReg(13), ptr(kState, GprOffset(0)));
+        c.lsr(XReg(13), kScratch0, 32);             // EDX
+        c.str(XReg(13), ptr(kState, GprOffset(2)));
+    }
+
+    c.L(done);
+    // ZF via the side-band: SUB(diff, 0) — self-consistent triple, ZF exact.
+    c.str(XReg(12), ptr(kState, Offsets::FlagLhs));
+    c.str(xzr,      ptr(kState, Offsets::FlagRhs));
+    c.str(XReg(12), ptr(kState, Offsets::FlagResult));
+    c.mov(kWScratch3, FLAG_OP_SUB);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_op))));
+    c.mov(kWScratch3, 64);
+    c.str(kWScratch3, ptr(kState, static_cast<u32>(offsetof(GuestState, flag_width))));
     EmitMaterializeFlags(c);
     return true;
 }
@@ -4960,6 +5075,8 @@ bool EmitVpextr(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* 
 // dword lane (imm&3) with the 32-bit GPR/mem source. Upper 128 zeroed.
 bool EmitVpinsrd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                  u64 next_rip, CodeGenerator& c) {
+    const bool q = (insn.mnemonic == ZYDIS_MNEMONIC_VPINSRQ ||
+                    insn.mnemonic == ZYDIS_MNEMONIC_PINSRQ);
     if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
     const int dst = ZydisVecToIndex(ops[0].reg.value);
     // Legacy 3-op fold (pinsrd xmm, r/m32, imm): src1 = dst.
@@ -4970,18 +5087,31 @@ bool EmitVpinsrd(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
     const ZydisDecodedOperand& val = ops[vex4 ? 2 : 1];
     const ZydisDecodedOperand& imo = ops[vex4 ? 3 : 2];
     if (imo.type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
-    const int lane = static_cast<int>(imo.imm.value.u) & 3;
+    const int lane = static_cast<int>(imo.imm.value.u) & (q ? 1 : 3);
 
-    // Load the 32-bit value -> w9 (zero-ext into x9).
+    // Load the value -> x9 (32-bit form zero-extends via the w-load).
     if (val.type == ZYDIS_OPERAND_TYPE_REGISTER) {
         const int gi = ZydisGprToIndex(val.reg.value);
         if (gi < 0) return false;
-        c.ldr(WReg(9), ptr(kState, GprOffset(gi)));
+        if (q) c.ldr(XReg(9), ptr(kState, GprOffset(gi)));
+        else   c.ldr(WReg(9), ptr(kState, GprOffset(gi)));
     } else if (val.type == ZYDIS_OPERAND_TYPE_MEMORY) {
         if (!EmitEffectiveAddress(val.mem, next_rip, c)) return false;
-        c.ldr(WReg(9), ptr(kAddr));
+        if (q) c.ldr(XReg(9), ptr(kAddr));
+        else   c.ldr(WReg(9), ptr(kAddr));
     } else {
         return false;
+    }
+    if (q) {
+        // Qword insert: the value IS the chunk. Store it at chunk=lane,
+        // copy the other chunk from src1, zero the upper 128.
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, lane)));
+        c.ldr(kScratch1, ptr(kState, YmmChunkOffset(s1, lane ^ 1)));
+        c.str(kScratch1, ptr(kState, YmmChunkOffset(dst, lane ^ 1)));
+        c.mov(kScratch0, 0);
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(kScratch0, ptr(kState, YmmChunkOffset(dst, 3)));
+        return true;
     }
     // Copy src1 chunk0/1 to dst, then patch the target chunk's half.
     const int chunk = lane / 2;
@@ -8133,6 +8263,7 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             handled = EmitBextr(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_BT:
+        case ZYDIS_MNEMONIC_BTS: case ZYDIS_MNEMONIC_BTR: case ZYDIS_MNEMONIC_BTC:
             handled = EmitBt(insn, ops, c);
             break;
         case ZYDIS_MNEMONIC_LZCNT:
@@ -8283,6 +8414,7 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VEXTRACTPS:
             handled = EmitVpextr(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VPINSRD: case ZYDIS_MNEMONIC_PINSRD:
+        case ZYDIS_MNEMONIC_VPINSRQ: case ZYDIS_MNEMONIC_PINSRQ:
             handled = EmitVpinsrd(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VINSERTPS:  handled = EmitVinsertps(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VINSERTF128:  handled = EmitVinsertf128(insn, ops, next_rip, c); break;
@@ -8534,6 +8666,10 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
             break;
         case ZYDIS_MNEMONIC_CMPXCHG:
             handled = EmitCmpxchg(insn, ops, next_rip, c);
+            break;
+        case ZYDIS_MNEMONIC_CMPXCHG8B:
+        case ZYDIS_MNEMONIC_CMPXCHG16B:
+            handled = EmitCmpxchg16b(insn, ops, next_rip, c);
             break;
         case ZYDIS_MNEMONIC_POP:
             handled = EmitPop(insn, ops, c);
