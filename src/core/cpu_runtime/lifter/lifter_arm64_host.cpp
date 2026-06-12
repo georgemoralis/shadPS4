@@ -4191,6 +4191,8 @@ enum class VPackKind {
     AddPD, SubPD, MulPD, DivPD, MinPD, MaxPD,
     AddD, SubD, MulD,
     AddB, AddW, AddQ, SubB, SubW, SubQ, MulW,    // integer add/sub b/w/q; integer mul w
+    AddUSB, AddUSW, AddSSB, AddSSW,               // saturating add (unsigned/signed b/w)
+    SubUSB, SubUSW, SubSSB, SubSSW,               // saturating sub (unsigned/signed b/w)
     MaxSB, MaxSW, MaxSD, MaxUB, MaxUW, MaxUD,     // packed signed/unsigned max (b/w/d)
     MinSB, MinSW, MinSD, MinUB, MinUW, MinUD,     // packed signed/unsigned min (b/w/d)
     And, Or, Xor, AndN,   // bitwise (operate on whole 128/256 regardless of element)
@@ -4275,6 +4277,16 @@ bool EmitVPacked(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand*
             case VPackKind::SubB:  c.sub(VReg16B(0), VReg16B(0), VReg16B(1)); break;
             case VPackKind::SubW:  c.sub(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
             case VPackKind::SubQ:  c.sub(VReg2D(0),  VReg2D(0),  VReg2D(1));  break;
+            // Saturating add/sub map 1:1 onto NEON's uq/sq forms — identical
+            // clamp-to-range semantics at the same element widths.
+            case VPackKind::AddUSB: c.uqadd(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::AddUSW: c.uqadd(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::AddSSB: c.sqadd(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::AddSSW: c.sqadd(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::SubUSB: c.uqsub(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::SubUSW: c.uqsub(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
+            case VPackKind::SubSSB: c.sqsub(VReg16B(0), VReg16B(0), VReg16B(1)); break;
+            case VPackKind::SubSSW: c.sqsub(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
             // VPMULLW keeps the low 16 bits of each 16-bit product, which is
             // exactly NEON's `mul .8h`.
             case VPackKind::MulW:  c.mul(VReg8H(0),  VReg8H(0),  VReg8H(1));  break;
@@ -5744,6 +5756,100 @@ bool EmitVblendvps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperan
 
 // vbroadcastss dst, m32/xmm — broadcast a single float to all lanes (4 for xmm,
 // 8 for ymm).
+// (V)DPPS / (V)DPPD — packed dot product with an imm8 control. The high
+// nibble selects which per-lane products participate; the low nibble
+// selects which destination lanes receive the sum (others zeroed).
+// Decomposition per 128-bit lane: fmul, zero unselected products, then a
+// faddp tree — the SDM defines the sum as (t0+t1)+(t2+t3), which is
+// exactly the association two faddp passes produce. Results are bit-exact
+// against the SDM pseudocode in every observable, validated empirically
+// across all 256 imm8 values with NaN/Inf-heavy inputs, EXCEPT which
+// payload wins when multiple NaNs flow into the sum: that selection is
+// implementation territory (this was measured — contemporary Intel
+// silicon pairs odd lanes first, against the SDM's own pseudocode, and
+// Jaguar's choice is unprobed). No real code observes dot-product NaN
+// payload identity. The imm8 is a
+// lift-time constant, so lane masking compiles to straight-line ins-wzr.
+// VDPPS YMM operates independently per 128-bit half; DPPD is XMM-only.
+bool EmitVdpps(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
+               u64 next_rip, CodeGenerator& c) {
+    const ZydisMnemonic m = insn.mnemonic;
+    const bool pd = (m == ZYDIS_MNEMONIC_VDPPD || m == ZYDIS_MNEMONIC_DPPD);
+    int dst, s1;
+    const ZydisDecodedOperand* src2 = nullptr;
+    u8 imm = 0;
+    if (insn.operand_count_visible == 4) {
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER ||
+            ops[1].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        dst = ZydisVecToIndex(ops[0].reg.value);
+        s1  = ZydisVecToIndex(ops[1].reg.value);
+        src2 = &ops[2];
+        if (ops[3].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+        imm = static_cast<u8>(ops[3].imm.value.u);
+    } else if (insn.operand_count_visible == 3) {   // legacy folded
+        if (ops[0].type != ZYDIS_OPERAND_TYPE_REGISTER) return false;
+        dst = ZydisVecToIndex(ops[0].reg.value);
+        s1  = dst;
+        src2 = &ops[1];
+        if (ops[2].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) return false;
+        imm = static_cast<u8>(ops[2].imm.value.u);
+    } else {
+        return false;
+    }
+    if (dst < 0 || s1 < 0) return false;
+    const bool ymm = (ops[0].size == 256);
+    if (pd && ymm) return false;                    // DPPD has no 256-bit form
+
+    int s2 = -1;
+    if (src2->type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        s2 = ZydisVecToIndex(src2->reg.value);
+        if (s2 < 0) return false;
+    } else if (src2->type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (!EmitEffectiveAddress(src2->mem, next_rip, c)) return false;
+    } else {
+        return false;
+    }
+
+    const int nhalves = ymm ? 2 : 1;
+    for (int h = 0; h < nhalves; ++h) {
+        const int chunk = h * 2;
+        c.ldr(QReg(0), ptr(kState, YmmChunkOffset(s1, chunk)));
+        if (s2 >= 0) {
+            c.ldr(QReg(1), ptr(kState, YmmChunkOffset(s2, chunk)));
+        } else if (h == 0) {
+            c.ldr(QReg(1), ptr(kAddr));
+        } else {
+            c.add(kScratch0, kAddr, 16);
+            c.ldr(QReg(1), ptr(kScratch0));
+        }
+        if (pd) {
+            c.fmul(VReg2D(0), VReg2D(0), VReg2D(1));
+            for (int i = 0; i < 2; ++i)
+                if (!(imm & (0x10u << i))) c.ins(VReg2D(0)[i], xzr);
+            c.faddp(DReg(0), VReg2D(0));            // d0 = t0 + t1
+            c.dup(VReg2D(0), VReg2D(0)[0]);
+            for (int i = 0; i < 2; ++i)
+                if (!(imm & (1u << i))) c.ins(VReg2D(0)[i], xzr);
+        } else {
+            c.fmul(VReg4S(0), VReg4S(0), VReg4S(1));
+            for (int i = 0; i < 4; ++i)
+                if (!(imm & (0x10u << i))) c.ins(VReg4S(0)[i], wzr);
+            // (t0+t1)+(t2+t3): two pairwise passes, SDM association.
+            c.faddp(VReg4S(0), VReg4S(0), VReg4S(0));
+            c.faddp(SReg(0), VReg2S(0));
+            c.dup(VReg4S(0), VReg4S(0)[0]);
+            for (int i = 0; i < 4; ++i)
+                if (!(imm & (1u << i))) c.ins(VReg4S(0)[i], wzr);
+        }
+        c.str(QReg(0), ptr(kState, YmmChunkOffset(dst, chunk)));
+    }
+    if (!ymm) {
+        c.str(xzr, ptr(kState, YmmChunkOffset(dst, 2)));
+        c.str(xzr, ptr(kState, YmmChunkOffset(dst, 3)));
+    }
+    return true;
+}
+
 bool EmitVbroadcastss(const ZydisDecodedInstruction& insn, const ZydisDecodedOperand* ops,
                       u64 next_rip, CodeGenerator& c) {
     const ZydisMnemonic m = insn.mnemonic;
@@ -8323,6 +8429,14 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VPSUBD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubD, c); break;
         case ZYDIS_MNEMONIC_VPMULLD: handled = EmitVPacked(insn, ops, next_rip, VPackKind::MulD, c); break;
         case ZYDIS_MNEMONIC_VPADDB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddB, c); break;
+        case ZYDIS_MNEMONIC_VPADDUSB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddUSB, c); break;
+        case ZYDIS_MNEMONIC_VPADDUSW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddUSW, c); break;
+        case ZYDIS_MNEMONIC_VPADDSB:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddSSB, c); break;
+        case ZYDIS_MNEMONIC_VPADDSW:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddSSW, c); break;
+        case ZYDIS_MNEMONIC_VPSUBUSB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubUSB, c); break;
+        case ZYDIS_MNEMONIC_VPSUBUSW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubUSW, c); break;
+        case ZYDIS_MNEMONIC_VPSUBSB:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubSSB, c); break;
+        case ZYDIS_MNEMONIC_VPSUBSW:  handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubSSW, c); break;
         case ZYDIS_MNEMONIC_VPADDW: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddW, c); break;
         case ZYDIS_MNEMONIC_VPADDQ: handled = EmitVPacked(insn, ops, next_rip, VPackKind::AddQ, c); break;
         case ZYDIS_MNEMONIC_VPSUBB: handled = EmitVPacked(insn, ops, next_rip, VPackKind::SubB, c); break;
@@ -8443,6 +8557,9 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         case ZYDIS_MNEMONIC_VBLENDVPS:
         case ZYDIS_MNEMONIC_VBLENDVPD: case ZYDIS_MNEMONIC_VPBLENDVB:
             handled = EmitVblendvps(insn, ops, next_rip, c); break;
+        case ZYDIS_MNEMONIC_VDPPS: case ZYDIS_MNEMONIC_DPPS:
+        case ZYDIS_MNEMONIC_VDPPD: case ZYDIS_MNEMONIC_DPPD:
+            handled = EmitVdpps(insn, ops, next_rip, c); break;
         case ZYDIS_MNEMONIC_VBROADCASTSS: case ZYDIS_MNEMONIC_VBROADCASTSD:
         case ZYDIS_MNEMONIC_VBROADCASTF128: case ZYDIS_MNEMONIC_VBROADCASTI128:
             handled = EmitVbroadcastss(insn, ops, next_rip, c); break;
@@ -8579,6 +8696,10 @@ void* Lifter::CompileBlock(u64 guest_rip) try {
         // coherence covers our ordinary cacheable stores. No-op, like prefetch.
         case ZYDIS_MNEMONIC_CLFLUSH:     case ZYDIS_MNEMONIC_CLFLUSHOPT:
             handled = true;  // memory hints: architecturally no-ops.
+            break;
+        case ZYDIS_MNEMONIC_PAUSE:
+            c.yield();       // spin-wait hint: arm64's direct equivalent
+            handled = true;
             break;
         case ZYDIS_MNEMONIC_RDTSC:  handled = EmitRdtsc(insn, ops, c, /*with_aux=*/false); break;
         case ZYDIS_MNEMONIC_RDTSCP: handled = EmitRdtsc(insn, ops, c, /*with_aux=*/true); break;

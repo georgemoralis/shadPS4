@@ -19985,6 +19985,137 @@ TEST_F(CpuRuntimeTest, Bts64_Imm_SetsBitClearsCF) {
     EXPECT_FALSE(st.rflags & 1ULL) << "CF = pre-update bit (was 0)";
 }
 
+// ============================================================================
+// VDPPS — packed single dot product; blocked Adore (CUSA43357) at
+// 0x8011a4b82 (Unity Vector3/Vector4.Dot codegen). PAUSE rode along
+// (spin hint at 0x801063cbc).
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vdpps_Imm71_Vector3Dot) {
+    // vdpps xmm1, xmm2, xmm3, 0x71 — multiply lanes 0..2, sum into lane 0
+    // only (the canonical Vector3.Dot shape). 6-byte VEX matching the
+    // title's length.
+    const u8 program[] = { 0xc4, 0xe3, 0x69, 0x40, 0xcb, 0x71, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    // src1 = [1, 2, 3, 100], src2 = [4, 5, 6, 100] -> dot3 = 4+10+18 = 32.
+    const float a[4] = {1.f, 2.f, 3.f, 100.f}, b[4] = {4.f, 5.f, 6.f, 100.f};
+    std::memcpy(&st.ymm[XmmChunk(2,0)], a, 16);
+    std::memcpy(&st.ymm[XmmChunk(3,0)], b, 16);
+    st.ymm[XmmChunk(1,2)] = ~0ULL; st.ymm[XmmChunk(1,3)] = ~0ULL;
+    Runtime rt; rt.Run(st);
+    float out[4]; std::memcpy(out, &st.ymm[XmmChunk(1,0)], 16);
+    EXPECT_EQ(out[0], 32.0f) << "dot of xyz lanes";
+    EXPECT_EQ(out[1], 0.0f) << "unselected dest lanes zeroed (lane-3 products excluded)";
+    EXPECT_EQ(out[2], 0.0f);
+    EXPECT_EQ(out[3], 0.0f);
+    EXPECT_EQ(st.ymm[XmmChunk(1,2)], 0ULL) << "upper 128 zeroed";
+    EXPECT_EQ(st.ymm[XmmChunk(1,3)], 0ULL);
+}
+
+TEST_F(CpuRuntimeTest, Pause_Hint_ExecutionContinues) {
+    const u8 program[] = { 0xf3, 0x90,                                  // pause
+                           0x48, 0xc7, 0xc3, 0x07, 0x00, 0x00, 0x00,   // mov rbx, 7
+                           0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(static_cast<u32>(st.exit_reason), static_cast<u32>(ExitReason::BlockEnd));
+    EXPECT_EQ(st.gpr[3], 7ULL) << "instruction after pause executed";
+}
+
+// ============================================================================
+// Saturating packed add/sub family — blocked Adore (CUSA43357) at
+// 0x801111c14 (vpaddusw). All eight US/SS x B/W x add/sub forms landed.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Vpaddusw_SaturatesToFFFF) {
+    // vpaddusw xmm1, xmm2, xmm3 — 4-byte VEX matching the title's length.
+    const u8 program[] = { 0xc5, 0xe9, 0xdd, 0xcb, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    // words: [0xF000, 0x8000, 0x0001, 0x7FFF] + [0x2000, 0x8000, 0x0002, 0x8001]
+    //      = [0xFFFF(sat), 0xFFFF(sat), 0x0003, 0xFFFF(sat)]
+    st.ymm[XmmChunk(2,0)] = 0x7FFF0001'8000F000ULL;
+    st.ymm[XmmChunk(3,0)] = 0x80010002'80002000ULL;
+    st.ymm[XmmChunk(2,1)] = 0; st.ymm[XmmChunk(3,1)] = 0;
+    st.ymm[XmmChunk(1,2)] = ~0ULL; st.ymm[XmmChunk(1,3)] = ~0ULL;
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(1,0)], 0xFFFF0003'FFFFFFFFULL) << "unsigned word saturation";
+    EXPECT_EQ(st.ymm[XmmChunk(1,2)], 0ULL) << "upper 128 zeroed";
+}
+
+TEST_F(CpuRuntimeTest, Psubsb_Legacy_SaturatesSigned) {
+    // psubsb xmm2, xmm5 — legacy 2-op fold. -128 - 1 -> -128 (sat),
+    // 127 - (-1) -> 127 (sat), 5 - 3 -> 2.
+    const u8 program[] = { 0x66, 0x0f, 0xe8, 0xd5, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    st.ymm[XmmChunk(2,0)] = 0x0000000000057F80ULL;   // bytes: 80 7F 05 ...
+    st.ymm[XmmChunk(5,0)] = 0x000000000003FF01ULL;   // bytes: 01 FF 03 ...
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.ymm[XmmChunk(2,0)], 0x0000000000027F80ULL)
+        << "byte0 sat at -128, byte1 sat at 127, byte2 = 2";
+}
+
+// ============================================================================
+// Bitwise mem-destination matrix + the 32-bit SF flag fix — blocked Adore
+// (CUSA43357) at 0x8001fa5e6 (`or qword[mem], imm`). The audit it triggered
+// found every 32-bit bitwise path computing SF from bit 63 of the
+// zero-extended result (always 0) instead of bit 31 — a latent miscompile
+// for any `or/and/xor r32` + `js` sequence.
+// ============================================================================
+
+TEST_F(CpuRuntimeTest, Or_Mem64_Imm_TitleShape) {
+    // or qword [rbx+0x40], 0x180 — 11-byte REX.W 81 /1 form matching the
+    // title's length exactly.
+    const u8 program[] = { 0x48, 0x81, 0x8B, 0x40, 0x00, 0x00, 0x00,
+                           0x80, 0x01, 0x00, 0x00, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    u64* slot = reinterpret_cast<u64*>(mem.DataPtr() + 0x40);
+    *slot = 0x0000000000000041ULL;
+    st.gpr[3] = reinterpret_cast<u64>(mem.DataPtr());     // rbx
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*slot, 0x00000000000001C1ULL) << "0x41 | 0x180";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear (nonzero result)";
+    EXPECT_EQ(st.rflags & (1ULL<<0), 0ULL) << "CF cleared by bitwise op";
+}
+
+TEST_F(CpuRuntimeTest, Or32_RegReg_NegativeSetsSF) {
+    // mov eax, 0x80000000 ; or eax, eax — before the width fix, SF was
+    // computed from bit 63 of the zero-extended result and came out 0;
+    // guest `js` would never branch on 32-bit sign checks.
+    const u8 program[] = { 0xB8, 0x00, 0x00, 0x00, 0x80, 0x09, 0xC0, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(st.gpr[0], 0x0000000080000000ULL) << "zero-extended into rax";
+    EXPECT_NE(st.rflags & (1ULL<<7), 0ULL) << "SF set from bit 31 of the 32-bit result";
+    EXPECT_EQ(st.rflags & (1ULL<<6), 0ULL) << "ZF clear";
+}
+
+TEST_F(CpuRuntimeTest, Xor_Mem32_Imm_WidthExactStore) {
+    // xor dword [rbx+8], 0xFF — the dword store must touch exactly four
+    // bytes; the adjacent qword half is a canary.
+    const u8 program[] = { 0x81, 0x73, 0x08, 0xFF, 0x00, 0x00, 0x00, 0xc3 };
+    std::memcpy(mem.CodePtr(), program, sizeof(program));
+    u8* guest_rsp = mem.StackTop()-8; *reinterpret_cast<u64*>(guest_rsp)=kReturnSentinel;
+    GuestState st{}; st.rip=reinterpret_cast<u64>(mem.CodePtr()); st.gpr[4]=reinterpret_cast<u64>(guest_rsp);
+    u64* slot = reinterpret_cast<u64*>(mem.DataPtr() + 8);
+    *slot = 0xDEADBEEF00000F0FULL;                        // hi dword = canary
+    st.gpr[3] = reinterpret_cast<u64>(mem.DataPtr());
+    Runtime rt; rt.Run(st);
+    EXPECT_EQ(*slot, 0xDEADBEEF00000FF0ULL)
+        << "low dword xored, high dword untouched by the 32-bit store";
+}
+
 // VRCPPS / VRSQRTPS are fast approximations. The x86 host estimate is ~12-bit
 // and the arm64 frecpe/frsqrte estimate is ~8-bit, so the two backends produce
 // DIFFERENT bit patterns by design. These tests therefore assert each lane is
