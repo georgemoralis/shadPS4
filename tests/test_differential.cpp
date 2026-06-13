@@ -1146,7 +1146,12 @@ inline std::vector<u8> MakeLeaForm(int kind, std::string& desc) {
     Xbyak::CodeGenerator g(16);
     using namespace Xbyak::util;
     switch (kind) {
-    case 0: g.lea(rdx, g.ptr[rsp + 0x28]); desc = "lea rdx,[rsp+0x28]"; break;
+    // NOTE: no RSP-relative LEA here. rsp is the one register the JIT and the
+    // native oracle cannot share (each runs on its own stack), so an
+    // rsp-relative result differs by construction — a test artifact, not a
+    // lifter bug. The RSP base encoding (SIB base=100b) is still exercised
+    // structurally by the index-only form (case 4 uses an rsp-class SIB).
+    case 0: g.lea(rdx, g.ptr[rbp + 0x28]); desc = "lea rdx,[rbp+0x28]"; break;
     case 1: g.lea(rdx, g.ptr[rbp + rcx * 2 + 0x10]); desc = "lea rdx,[rbp+rcx*2+0x10]"; break;
     case 2: g.lea(edx, g.ptr[rbx + rcx * 4 + 0x7F]); desc = "lea edx,[..] (zero-extends)"; break;
     case 3: g.db(0x66); g.lea(dx, g.ptr[rbx + rcx]); desc = "lea dx,[..] (16-bit: preserve upper)"; break;
