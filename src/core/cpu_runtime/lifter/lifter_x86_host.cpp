@@ -2530,7 +2530,19 @@ bool EmitXchg(const ZydisDecodedInstruction& insn,
         const int a_off = reg_off(ops[0].reg.value);
         const int b_off = reg_off(ops[1].reg.value);
         if (a_off < 0 || b_off < 0) return false;
-        if (a_off == b_off) return true;   // same location — no-op
+        if (a_off == b_off) {
+            // Same slot (e.g. `xchg eax,eax`, 0x87 0xC0). The VALUE is
+            // unchanged, but a 32-bit xchg is still a 32-bit WRITE and must
+            // zero-extend bits 63:32 — it is NOT a no-op. (The true no-op
+            // 0x90 decodes as NOP, a different mnemonic, and never lands
+            // here.) w8/w16 same-slot leave the upper bits untouched by
+            // definition; w64 has none to clear.
+            if (w == 32) {
+                c.mov(eax, dword[r13 + a_off]);       // load low 32
+                c.mov(qword[r13 + a_off], rax);       // store zero-extended
+            }
+            return true;
+        }
         switch (w) {
             case 8:
                 c.mov(al, byte[r13 + a_off]); c.mov(cl, byte[r13 + b_off]);
