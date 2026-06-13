@@ -260,16 +260,6 @@ if (APPLE OR ${CMAKE_SYSTEM_NAME} STREQUAL "FreeBSD")
     endif()
 endif()
 
-# Apple-only dependencies
-if (APPLE)
-    # MoltenVK
-    if (NOT TARGET MoltenVK)
-        set(MVK_EXCLUDE_SPIRV_TOOLS ON)
-        set(MVK_USE_METAL_PRIVATE_API ON)
-        add_subdirectory(MoltenVK)
-    endif()
-endif()
-
 #windows only
 if (WIN32)
 add_subdirectory(ext-wepoll)
@@ -294,6 +284,16 @@ if (NOT TARGET CLI11::CLI11)
     set(CLI11_BUILD_TESTS OFF CACHE BOOL "" FORCE)
     set(CLI11_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     add_subdirectory(CLI11)
+endif()
+
+# miniupnpc
+if (NOT TARGET miniupnpc::miniupnpc)
+set(UPNPC_BUILD_STATIC ON CACHE BOOL "" FORCE)
+set(UPNPC_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+set(UPNPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(UPNPC_BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
+set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
+add_subdirectory(miniupnp/miniupnpc)
 endif()
 
 # minimp3
