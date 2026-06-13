@@ -438,7 +438,7 @@ if (SHADPS4_CPU_BACKEND_RESOLVED STREQUAL "runtime")
     # areas, and THREADS_PREFER_PTHREAD_FLAG applies -pthread at compile+link.
     set(THREADS_PREFER_PTHREAD_FLAG ON)
     find_package(Threads REQUIRED)
-    foreach(area runtime lifter differential concurrency)
+    foreach(area runtime lifter differential concurrency differential_sonic)
         add_executable(shadps4_cpu_${area}_test test_${area}.cpp)
         target_link_libraries(shadps4_cpu_${area}_test PRIVATE
             shadps4_cpu_runtime_test_support
