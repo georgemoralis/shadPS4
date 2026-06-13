@@ -1043,6 +1043,249 @@ TEST_F(DiffTest, Fuzz_FlagTransport) {
     std::printf("[fuzz-chain] %ld covered, %ld coverage gaps of 400 pairs\n", covered, gaps);
 }
 
+// ============================================================================
+// Round three: classically-miscompiled x86 edges.
+// ============================================================================
+namespace fuzzgen {
+
+// cmp rax,rcx ; cmovcc bx/ebx/rbx, di/edi/rdi. The 32-bit NOT-TAKEN case is
+// the famous trap: real hardware zero-extends the destination's upper 32 even
+// when the move does not happen. Falls out of the GPR compare automatically
+// when rbx is seeded with high bits.
+inline std::vector<u8> MakeCmovWidth(int cc, u32 w, std::string& desc) {
+    Xbyak::CodeGenerator g(32);
+    using namespace Xbyak::util;
+    g.cmp(rax, rcx);
+    if (w == 64) g.db(0x48); else if (w == 16) g.db(0x66);
+    g.db(0x0F); g.db(0x40 + cc); g.db(0xDF);
+    char b[64];
+    std::snprintf(b, sizeof b, "cmp; cmov%02x bx_w%u,di", cc, w);
+    desc = b;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+// producer ; pushfq ; pop rdx ; rdx &= status-mask ; scrub the stack slot.
+// The scrub matters: the pushed qword carries host-only bits natively (IF,
+// reserved bit 1) vs the guest representation in the JIT — without zeroing
+// [rsp-8] after the pop, the harness memory diff false-fails on bits that are
+// not part of the modeled contract. The trailing xor sets identical flags on
+// both sides, keeping the final flag compare deterministic.
+inline std::vector<u8> MakePushfChain(int prod, std::string& desc) {
+    Xbyak::CodeGenerator g(64);
+    using namespace Xbyak::util;
+    const char* pn[] = {"add", "sub", "cmp", "and", "inc", "shl1"};
+    switch (prod) {
+    case 0: g.add(rax, rcx); break;
+    case 1: g.sub(rax, rcx); break;
+    case 2: g.cmp(rax, rcx); break;
+    case 3: g.and_(rax, rcx); break;
+    case 4: g.inc(rax); break;
+    default: g.shl(rax, 1); break;
+    }
+    g.pushfq();
+    g.pop(rdx);
+    g.mov(rcx, 0x8D5);
+    g.and_(rdx, rcx);
+    g.xor_(rcx, rcx);
+    g.mov(g.ptr[rsp - 8], rcx);   // scrub the popped slot (see above)
+    char b[64];
+    std::snprintf(b, sizeof b, "%s; pushfq; pop; mask; scrub", pn[prod]);
+    desc = b;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+// push rdx ; popfq ; setcc bl ; cmovcc rsi,rdi — the deserialization leg:
+// flags LOADED from a register value, then consumed.
+inline std::vector<u8> MakePopfChain(int cc, std::string& desc) {
+    Xbyak::CodeGenerator g(48);
+    using namespace Xbyak::util;
+    g.push(rdx);
+    g.popfq();
+    g.db(0x0F); g.db(0x90 + cc); g.db(0xC3);              // setcc bl
+    g.db(0x48); g.db(0x0F); g.db(0x40 + cc); g.db(0xF7);  // cmovcc rsi,rdi
+    char b[64];
+    std::snprintf(b, sizeof b, "push rdx; popfq; set%02x; cmov", cc);
+    desc = b;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+// One-operand MUL/IMUL/DIV/IDIV at all widths. The 8-bit forms use AH:AL,
+// not DX:AX — the implicit high half moving INTO the accumulator is a
+// classic lifter pitfall, caught by the plain GPR compare.
+inline std::vector<u8> MakeMulDiv(int op, u32 w, std::string& desc) {
+    Xbyak::CodeGenerator g(16);
+    using namespace Xbyak::util;
+    const char* nm[] = {"mul", "imul1", "div", "idiv"};
+    switch (op) {
+    case 0: if (w==64) g.mul(rcx); else if (w==32) g.mul(ecx); else if (w==16) g.mul(cx); else g.mul(cl); break;
+    case 1: if (w==64) g.imul(rcx); else if (w==32) g.imul(ecx); else if (w==16) g.imul(cx); else g.imul(cl); break;
+    case 2: if (w==64) g.div(rcx); else if (w==32) g.div(ecx); else if (w==16) g.div(cx); else g.div(cl); break;
+    default: if (w==64) g.idiv(rcx); else if (w==32) g.idiv(ecx); else if (w==16) g.idiv(cx); else g.idiv(cl); break;
+    }
+    char b[48];
+    std::snprintf(b, sizeof b, "%s c_w%u", nm[op], w);
+    desc = b;
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+inline std::vector<u8> MakeXchgForm(int kind, std::string& desc) {
+    Xbyak::CodeGenerator g(16);
+    using namespace Xbyak::util;
+    switch (kind) {
+    case 0: g.db(0x90); desc = "0x90 (xchg rax,rax = NOP: rax UNCHANGED)"; break;
+    case 1: g.xchg(rax, r9); desc = "xchg rax,r9 (short 90+r form)"; break;
+    case 2: g.xchg(rbx, rdx); desc = "xchg rbx,rdx (87 form)"; break;
+    case 3: g.xchg(g.ptr[rsi], rdx); desc = "xchg [rsi],rdx"; break;
+    case 4: g.db(0x87); g.db(0xC0); desc = "xchg eax,eax (87 C0: real op, zero-extends)"; break;
+    default: g.xchg(eax, ebx); desc = "xchg eax,ebx (both zero-extend)"; break;
+    }
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+inline std::vector<u8> MakeLeaForm(int kind, std::string& desc) {
+    Xbyak::CodeGenerator g(16);
+    using namespace Xbyak::util;
+    switch (kind) {
+    case 0: g.lea(rdx, g.ptr[rsp + 0x28]); desc = "lea rdx,[rsp+0x28]"; break;
+    case 1: g.lea(rdx, g.ptr[rbp + rcx * 2 + 0x10]); desc = "lea rdx,[rbp+rcx*2+0x10]"; break;
+    case 2: g.lea(edx, g.ptr[rbx + rcx * 4 + 0x7F]); desc = "lea edx,[..] (zero-extends)"; break;
+    case 3: g.db(0x66); g.lea(dx, g.ptr[rbx + rcx]); desc = "lea dx,[..] (16-bit: preserve upper)"; break;
+    case 4: g.db(0x67); g.lea(rdx, g.ptr[rbx + rcx]); desc = "lea rdx,[ebx+ecx] (addr32 EA)"; break;
+    default: g.lea(rdx, g.ptr[rcx * 8 + 0x40]); desc = "lea rdx,[rcx*8+0x40] (no base)"; break;
+    }
+    return std::vector<u8>(g.getCode(), g.getCode() + g.getSize());
+}
+
+} // namespace fuzzgen
+
+TEST_F(DiffTest, Fuzz_CmovWidthMatrix) {
+    std::mt19937_64 rng(0xC404C404);
+    long covered = 0, gaps = 0;
+    for (int cc = 0; cc < 16; ++cc)
+        for (u32 w : {16u, 32u, 64u}) {
+            std::string desc;
+            const auto snippet = fuzzgen::MakeCmovWidth(cc, w, desc);
+            bool ok = true;
+            for (int it = 0; it < 16 && ok; ++it) {
+                Context in;
+                for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+                if (it & 1) in.gpr[1] = in.gpr[0];        // force both branch outcomes
+                in.gpr[3] |= 0xFFFFFFFF00000000ULL;       // rbx high bits: the w32 trap
+                in.rflags = rng() & kStatusMask;
+                ok = Probe(desc.c_str(), snippet, in);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
+            if (ok) ++covered; else ++gaps;
+        }
+    std::printf("[fuzz-cmovw] %ld covered, %ld gaps of 48\n", covered, gaps);
+}
+
+TEST_F(DiffTest, Fuzz_FlagSerialization) {
+    std::mt19937_64 rng(0xF1A65E12);
+    long covered = 0, gaps = 0;
+    for (int p = 0; p < 6; ++p) {
+        std::string desc;
+        const auto snippet = fuzzgen::MakePushfChain(p, desc);
+        bool ok = true;
+        for (int it = 0; it < 30 && ok; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            in.rflags = rng() & kStatusMask;
+            ok = Probe(desc.c_str(), snippet, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    for (int cc = 0; cc < 16; ++cc) {
+        std::string desc;
+        const auto snippet = fuzzgen::MakePopfChain(cc, desc);
+        bool ok = true;
+        for (int it = 0; it < 20 && ok; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            in.gpr[2] = rng() & kStatusMask;              // rdx = flags to load
+            in.rflags = rng() & kStatusMask;
+            ok = Probe(desc.c_str(), snippet, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    std::printf("[fuzz-flagser] %ld covered, %ld gaps of 22\n", covered, gaps);
+}
+
+TEST_F(DiffTest, Fuzz_MulDivMatrix) {
+    std::mt19937_64 rng(0x3D1B1D);
+    long covered = 0, gaps = 0;
+    for (int op = 0; op < 4; ++op)
+        for (u32 w : {8u, 16u, 32u, 64u}) {
+            std::string desc;
+            const auto snippet = fuzzgen::MakeMulDiv(op, w, desc);
+            const u64 flag_mask = (op <= 1) ? F_CF_OF : 0; // div/idiv: all undefined
+            bool ok = true;
+            for (int it = 0; it < 40 && ok; ++it) {
+                Context in;
+                for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+                if (op >= 2) {
+                    // Constrain inputs so DIV/IDIV cannot fault (#DE): zero the
+                    // high half of the dividend, nonzero (positive for idiv)
+                    // divisor; idiv also keeps the dividend non-negative.
+                    if (w == 8) in.gpr[0] &= ~0xFF00ULL;            // AH = 0
+                    else if (w == 16) in.gpr[2] &= ~0xFFFFULL;      // DX = 0
+                    else if (w == 32) in.gpr[2] &= ~0xFFFFFFFFULL;  // EDX = 0
+                    else in.gpr[2] = 0;                             // RDX = 0
+                    const u64 wm = (w == 64) ? ~0ULL : ((1ULL << w) - 1);
+                    u64 div = (rng() % 200) + 1;
+                    in.gpr[1] = (in.gpr[1] & ~wm) | div;
+                    if (op == 3) {                                  // idiv: keep positive
+                        const u64 sgn = 1ULL << (w - 1);
+                        in.gpr[0] &= ~sgn;
+                        if (w >= 16) in.gpr[0] &= ((sgn - 1) | ~wm);
+                    }
+                }
+                in.rflags = rng() & kStatusMask;
+                ok = Probe(desc.c_str(), snippet, in, 0xFFFF, flag_mask);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
+            if (ok) ++covered; else ++gaps;
+        }
+    std::printf("[fuzz-muldiv] %ld covered, %ld gaps of 16\n", covered, gaps);
+}
+
+TEST_F(DiffTest, Fuzz_XchgLeaForms) {
+    std::mt19937_64 rng(0x7C9A7C9A);
+    long covered = 0, gaps = 0;
+    for (int k = 0; k < 6; ++k) {
+        std::string desc;
+        const auto snippet = fuzzgen::MakeXchgForm(k, desc);
+        bool ok = true;
+        for (int it = 0; it < 20 && ok; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            in.gpr[6] = arena.data_addr();                // rsi for the mem form
+            *reinterpret_cast<u64*>(arena.data_addr()) = rng();
+            in.rflags = rng() & kStatusMask;
+            ok = Probe(desc.c_str(), snippet, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    for (int k = 0; k < 6; ++k) {
+        std::string desc;
+        const auto snippet = fuzzgen::MakeLeaForm(k, desc);
+        bool ok = true;
+        for (int it = 0; it < 20 && ok; ++it) {
+            Context in;
+            for (int r = 0; r < 16; ++r) in.gpr[r] = rng();
+            in.gpr[2] |= 0xFFFF000000000000ULL;           // rdx high bits: narrow-dest traps
+            in.rflags = rng() & kStatusMask;
+            ok = Probe(desc.c_str(), snippet, in);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+        if (ok) ++covered; else ++gaps;
+    }
+    std::printf("[fuzz-xchglea] %ld covered, %ld gaps of 12\n", covered, gaps);
+}
+
 TEST_F(DiffTest, Fuzz_FlagSensitive) {
     const std::vector<FuzzOp> ops = {
         {"adc rax,rcx",   {0x48,0x11,0xC8},      0xFFFF, F_ALL},
