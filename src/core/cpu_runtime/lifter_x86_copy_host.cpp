@@ -147,9 +147,13 @@ bool EmitSegFsGs(Xbyak::CodeGenerator& c, const ZydisDecodedInstruction& insn,
 //                         store the slot back (if written);
 //   * RIP-relative mem -> materialize the absolute target (next_rip + disp) into
 //                         the scratch and rewrite the operand to [scratch].
+// Virt reg operands of any width (64/32/16/8) are handled by substituting the
+// width-matching scratch sub-register; the full 64-bit slot is preloaded when the
+// operand is read or a partial (8/16-bit) write, and the full 64-bit scratch is
+// stored back on writes (a 32-bit write zero-extends; 8/16-bit relies on preload).
 // The instruction then runs verbatim (flags match the guest). At most two scratch
 // needs total. Bails (return false -> UnsupportedInstruction) on: >2 scratch
-// needs, sub-64-bit virt operands, or FS/GS memory combined with a reserved reg.
+// needs, or FS/GS memory combined with a reserved reg.
 bool EmitVirtReg(Xbyak::CodeGenerator& c, const ZydisDecodedInstruction& insn,
                  const ZydisDecodedOperand* ops, u64 rip) {
     constexpr ZyanU8 kRead  = ZYDIS_OPERAND_ACTION_READ  | ZYDIS_OPERAND_ACTION_CONDREAD;
@@ -157,27 +161,37 @@ bool EmitVirtReg(Xbyak::CodeGenerator& c, const ZydisDecodedInstruction& insn,
     auto encl = [](ZydisRegister r) -> int { return r==ZYDIS_REGISTER_NONE ? -1 : IdxOf(r); };
     const u64 next_rip = rip + insn.length;
 
-    struct Bind { int gi; bool rd, wr, is_rip; u64 abs; };
+    struct Bind { int gi; bool rd, wr, narrow_wr, is_rip; u64 abs; };
     Bind binds[2]; int nb=0; bool found=false;
     const Xbyak::Reg64* scratch[2]   = {&r14,&r15};
     const ZydisRegister scratch_z[2] = {ZYDIS_REGISTER_R14, ZYDIS_REGISTER_R15};
-    auto bindGpr = [&](int gi,bool r,bool w)->int{
-        for(int k=0;k<nb;k++) if(!binds[k].is_rip && binds[k].gi==gi){ binds[k].rd|=r; binds[k].wr|=w; return k; }
+    // width-matching scratch sub-register: k selects r14/r15 family, width in bits
+    auto scratch_sub = [](int k, int width) -> ZydisRegister {
+        static const ZydisRegister tab[2][4] = {
+            {ZYDIS_REGISTER_R14B, ZYDIS_REGISTER_R14W, ZYDIS_REGISTER_R14D, ZYDIS_REGISTER_R14},
+            {ZYDIS_REGISTER_R15B, ZYDIS_REGISTER_R15W, ZYDIS_REGISTER_R15D, ZYDIS_REGISTER_R15},
+        };
+        const int idx = (width==8)?0:(width==16)?1:(width==32)?2:3;
+        return tab[k][idx];
+    };
+    auto bindGpr = [&](int gi,bool r,bool w,bool narrow)->int{
+        for(int k=0;k<nb;k++) if(!binds[k].is_rip && binds[k].gi==gi){ binds[k].rd|=r; binds[k].wr|=w; binds[k].narrow_wr|=narrow; return k; }
         if(nb>=2) return -1;
-        binds[nb]={gi,r,w,false,0}; return nb++;
+        binds[nb]={gi,r,w,narrow,false,0}; return nb++;
     };
     auto bindRip = [&](u64 abs)->int{
         for(int k=0;k<nb;k++) if(binds[k].is_rip) return k;
         if(nb>=2) return -1;
-        binds[nb]={-1,true,false,true,abs}; return nb++;
+        binds[nb]={-1,true,false,false,true,abs}; return nb++;
     };
 
     for (ZyanU8 i=0;i<insn.operand_count_visible;i++){
         const auto& op = ops[i];
         if (op.type==ZYDIS_OPERAND_TYPE_REGISTER){
             if (cj::detail::IsReservedEnclosing(op.reg.value)){
-                if (ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, op.reg.value)!=64) return false;
-                if (bindGpr(encl(op.reg.value), (op.actions&kRead)!=0, (op.actions&kWrite)!=0)<0) return false;
+                const int  w   = ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, op.reg.value);
+                const bool isr = (op.actions&kRead)!=0, isw = (op.actions&kWrite)!=0;
+                if (bindGpr(encl(op.reg.value), isr, isw, isw && w<32)<0) return false;
                 found=true;
             }
         } else if (op.type==ZYDIS_OPERAND_TYPE_MEMORY){
@@ -186,22 +200,31 @@ bool EmitVirtReg(Xbyak::CodeGenerator& c, const ZydisDecodedInstruction& insn,
                 found=true;
             } else {
                 if (op.mem.segment==ZYDIS_REGISTER_FS || op.mem.segment==ZYDIS_REGISTER_GS) return false;
-                if (cj::detail::IsReservedEnclosing(op.mem.base)){  if(bindGpr(encl(op.mem.base), true,false)<0)return false; found=true; }
-                if (cj::detail::IsReservedEnclosing(op.mem.index)){ if(bindGpr(encl(op.mem.index),true,false)<0)return false; found=true; }
+                if (cj::detail::IsReservedEnclosing(op.mem.base)){  if(bindGpr(encl(op.mem.base), true,false,false)<0)return false; found=true; }
+                if (cj::detail::IsReservedEnclosing(op.mem.index)){ if(bindGpr(encl(op.mem.index),true,false,false)<0)return false; found=true; }
             }
         }
     }
     if (!found) return false;  // reserved reg only in a hidden/implicit operand (e.g. pushfq) -> defer
 
     for (int k=0;k<nb;k++){
-        if (binds[k].is_rip)   c.mov(*scratch[k], binds[k].abs);
-        else if (binds[k].rd)  c.mov(*scratch[k], qword[r13+Offsets::GprSlot(binds[k].gi)]);
+        if (binds[k].is_rip)                          c.mov(*scratch[k], binds[k].abs);
+        else if (binds[k].rd || binds[k].narrow_wr)   c.mov(*scratch[k], qword[r13+Offsets::GprSlot(binds[k].gi)]);
     }
 
     ZydisEncoderRequest req;
     if (!ZYAN_SUCCESS(ZydisEncoderDecodedInstructionToEncoderRequest(&insn,ops,insn.operand_count_visible,&req)))
         return false;
-    auto substReg = [&](ZydisRegister& reg){
+    // register operands: substitute the width-matching scratch sub-register.
+    auto substRegOp = [&](ZydisRegister& reg){
+        if (reg==ZYDIS_REGISTER_NONE) return;
+        const int gi=IdxOf(reg);
+        for (int k=0;k<nb;k++) if(!binds[k].is_rip && binds[k].gi==gi){
+            reg = scratch_sub(k, ZydisRegisterGetWidth(ZYDIS_MACHINE_MODE_LONG_64, reg)); return;
+        }
+    };
+    // SIB base/index are 64-bit address registers: substitute the 64-bit scratch.
+    auto substAddr = [&](ZydisRegister& reg){
         if (reg==ZYDIS_REGISTER_NONE) return;
         const int gi=IdxOf(reg);
         for (int k=0;k<nb;k++) if(!binds[k].is_rip && binds[k].gi==gi){ reg=scratch_z[k]; return; }
@@ -209,11 +232,11 @@ bool EmitVirtReg(Xbyak::CodeGenerator& c, const ZydisDecodedInstruction& insn,
     int rip_k=-1; for(int k=0;k<nb;k++) if(binds[k].is_rip) rip_k=k;
     for (ZyanU8 j=0;j<req.operand_count;j++){
         auto& o=req.operands[j];
-        if (o.type==ZYDIS_OPERAND_TYPE_REGISTER) substReg(o.reg.value);
+        if (o.type==ZYDIS_OPERAND_TYPE_REGISTER) substRegOp(o.reg.value);
         else if (o.type==ZYDIS_OPERAND_TYPE_MEMORY){
             if ((o.mem.base==ZYDIS_REGISTER_RIP || o.mem.base==ZYDIS_REGISTER_EIP) && rip_k>=0){
                 o.mem.base=scratch_z[rip_k]; o.mem.index=ZYDIS_REGISTER_NONE; o.mem.scale=0; o.mem.displacement=0;
-            } else { substReg(o.mem.base); substReg(o.mem.index); }
+            } else { substAddr(o.mem.base); substAddr(o.mem.index); }
         }
     }
     ZyanU8 buf[ZYDIS_MAX_INSTRUCTION_LENGTH]; ZyanUSize n=sizeof buf;
