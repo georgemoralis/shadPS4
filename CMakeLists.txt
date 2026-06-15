@@ -37,6 +37,16 @@ option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 
+# Guest CPU execution backend (build-time; one strategy per binary).
+#   native         no JIT (RunMainEntry jmps into guest code)
+#   runtime_copy   x86_64->x86_64 verbatim block-copy + mangler
+#   runtime_lifter x86_64->x86_64 load-op-store lifter (legacy)
+# Wiring is below, right after the shadps4 target is created.
+set(SHADPS4_CPU_BACKEND "runtime_copy" CACHE STRING
+    "Guest CPU execution backend: native | runtime_copy | runtime_lifter")
+set_property(CACHE SHADPS4_CPU_BACKEND PROPERTY STRINGS
+    native runtime_copy runtime_lifter)
+
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
     set(BASE_ARCHITECTURE "${CMAKE_OSX_ARCHITECTURES}")
@@ -1184,6 +1194,61 @@ add_executable(shadps4
     src/sdl_window.h
     src/sdl_window.cpp
 )
+
+# ============================================================================
+# CPU backend wiring (SHADPS4_CPU_BACKEND declared near the other options).
+# Uses the normalized ARCHITECTURE variable set above. The two runtime_*
+# backends emit x86_64 host code and re-encode operands via the Zydis encoder.
+# ============================================================================
+string(TOLOWER "${SHADPS4_CPU_BACKEND}" SHADPS4_CPU_BACKEND)
+set(_SHADPS4_BACKENDS native runtime_copy runtime_lifter)
+if (NOT SHADPS4_CPU_BACKEND IN_LIST _SHADPS4_BACKENDS)
+    message(FATAL_ERROR "SHADPS4_CPU_BACKEND='${SHADPS4_CPU_BACKEND}' invalid; choose: ${_SHADPS4_BACKENDS}")
+endif()
+# macOS arm64 runs as an x86_64 process under Rosetta => native only.
+if (APPLE AND ARCHITECTURE STREQUAL "arm64" AND NOT SHADPS4_CPU_BACKEND STREQUAL "native")
+    message(WARNING "macOS arm64 supports only the native backend; forcing native.")
+    set(SHADPS4_CPU_BACKEND "native" CACHE STRING "" FORCE)
+endif()
+# The JIT backends emit x86_64 host code and need an x86_64 host.
+if (SHADPS4_CPU_BACKEND MATCHES "^runtime_" AND NOT ARCHITECTURE STREQUAL "x86_64")
+    message(FATAL_ERROR "SHADPS4_CPU_BACKEND=${SHADPS4_CPU_BACKEND} requires an x86_64 host; use native.")
+endif()
+message(STATUS "shadPS4 CPU backend: ${SHADPS4_CPU_BACKEND}")
+
+set(_CPU_RT ${CMAKE_CURRENT_SOURCE_DIR}/src/core/cpu_runtime)
+if (SHADPS4_CPU_BACKEND STREQUAL "native")
+    target_compile_definitions(shadps4 PRIVATE SHADPS4_CPU_BACKEND_NATIVE)
+elseif (SHADPS4_CPU_BACKEND STREQUAL "runtime_copy")
+    target_compile_definitions(shadps4 PRIVATE SHADPS4_CPU_BACKEND_RUNTIME_COPY)
+    target_sources(shadps4 PRIVATE
+        ${_CPU_RT}/guest_state.h
+        ${_CPU_RT}/cpu_backend.h
+        ${_CPU_RT}/copy_gate.h
+        ${_CPU_RT}/code_cache.h
+        ${_CPU_RT}/code_cache.cpp
+        ${_CPU_RT}/runtime.h
+        ${_CPU_RT}/runtime.cpp
+        ${_CPU_RT}/lifter_x86_copy_host.cpp)
+elseif (SHADPS4_CPU_BACKEND STREQUAL "runtime_lifter")
+    target_compile_definitions(shadps4 PRIVATE SHADPS4_CPU_BACKEND_RUNTIME_LIFTER)
+    target_sources(shadps4 PRIVATE
+        ${_CPU_RT}/guest_state.h
+        ${_CPU_RT}/cpu_backend.h
+        ${_CPU_RT}/code_cache.h
+        ${_CPU_RT}/code_cache.cpp
+        ${_CPU_RT}/runtime.h
+        ${_CPU_RT}/runtime.cpp
+        ${_CPU_RT}/lifter_x86_host.cpp)
+endif()
+if (SHADPS4_CPU_BACKEND MATCHES "^runtime_")
+    if (DEFINED ZYDIS_MINIMAL_MODE AND ZYDIS_MINIMAL_MODE)
+        message(FATAL_ERROR "ZYDIS_MINIMAL_MODE disables the Zydis encoder needed by ${SHADPS4_CPU_BACKEND}.")
+    endif()
+    if (DEFINED ZYDIS_FEATURE_ENCODER AND NOT ZYDIS_FEATURE_ENCODER)
+        message(FATAL_ERROR "${SHADPS4_CPU_BACKEND} requires the Zydis encoder; set ZYDIS_FEATURE_ENCODER=ON.")
+    endif()
+endif()
 
 create_target_directory_groups(shadps4)
 

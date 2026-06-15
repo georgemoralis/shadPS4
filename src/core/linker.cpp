@@ -12,6 +12,7 @@
 #include "common/thread.h"
 #include "core/aerolib/aerolib.h"
 #include "core/aerolib/stubs.h"
+#include "core/cpu_runtime/runtime.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/kernel.h"
@@ -35,6 +36,16 @@ static PS4_SYSV_ABI void ProgramExitFunc() {
 
 #ifdef ARCH_X86_64
 static PS4_SYSV_ABI void* RunMainEntry [[noreturn]] (EntryParams* params) {
+#if SHADPS4_HAVE_JIT
+    // A JIT backend is built: hand the guest entry to the runtime dispatcher
+    // rather than jumping straight into guest code. EnterDispatcher reproduces
+    // the native stack setup below inside the initial GuestState, registers the
+    // guest address ranges, and runs the dispatch loop. It never returns.
+    Runtime::EnterDispatcher(params->entry_addr, params,
+                             reinterpret_cast<VAddr>(ProgramExitFunc));
+    UNREACHABLE();
+#else
+    // Native (no JIT): jump straight into guest code.
     // Start shared library modules
     asm volatile("andq $-16, %%rsp\n" // Align to 16 bytes
                  "subq $8, %%rsp\n"   // videoout_basic expects the stack to be misaligned
@@ -54,6 +65,7 @@ static PS4_SYSV_ABI void* RunMainEntry [[noreturn]] (EntryParams* params) {
                  : "r"(params->entry_addr), "r"(params), "r"(ProgramExitFunc)
                  : "rax", "rsi", "rdi");
     UNREACHABLE();
+#endif
 }
 #endif
 

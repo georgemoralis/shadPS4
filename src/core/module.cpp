@@ -10,6 +10,7 @@
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
 #include "core/cpu_patches.h"
+#include "core/cpu_runtime/runtime.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
 #include "core/memory.h"
@@ -98,7 +99,13 @@ Module::~Module() = default;
 s32 Module::Start(u64 args, const void* argp, void* param) {
     LOG_INFO(Core_Linker, "Module started : {}", name);
     const VAddr addr = dynamic_info.init_virtual_addr + GetBaseAddress();
+#if SHADPS4_HAVE_JIT
+    // JIT build: module_start is guest code, so run it through the dispatcher
+    // (host->guest call-and-return) instead of calling it natively.
+    return Runtime::CallGuestEntry(addr, args, argp, param);
+#else
     return reinterpret_cast<EntryFunc>(addr)(args, argp, param);
+#endif
 }
 
 void Module::LoadModuleToMemory(u32& max_tls_index) {
