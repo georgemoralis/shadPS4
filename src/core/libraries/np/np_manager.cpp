@@ -6,7 +6,6 @@
 #include <deque>
 #include <map>
 #include <mutex>
-#include <variant>
 
 #include <core/user_settings.h>
 #include "common/elf_info.h"
@@ -749,18 +748,13 @@ static std::deque<PendingNpStateEvent> g_np_state_events;
 
 static void QueueNpStateEvent(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpState state) {
-    const auto* user = UserManagement.GetUserByID(user_id);
-    if (user == nullptr) {
-        return;
-    }
-
     PendingNpStateEvent event{};
     event.user_id = user_id;
     event.state = state;
     event.has_np_id = state == OrbisNpState::SignedIn;
     if (event.has_np_id) {
-        std::strncpy(event.np_id.handle.data, user->user_name.c_str(),
-                     sizeof(event.np_id.handle.data) - 1);
+        // NpId is built from the user's shadnet_npid at login; GetNpId returns by value.
+        event.np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
     }
 
     std::scoped_lock lk{g_np_state_events_mutex};
@@ -769,11 +763,13 @@ static void QueueNpStateEvent(Libraries::UserService::OrbisUserServiceUserId use
 
 void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceEventType event_type,
                                        Libraries::UserService::OrbisUserServiceUserId user_id) {
+    // When shadNet is enabled, NpHandler is the authority for NP sign-in state and feeds
+    // the queue directly (see the bridge in RegisterLib); avoid double events here.
+    if (g_shadnet_enabled) {
+        return;
+    }
     switch (event_type) {
     case Libraries::UserService::OrbisUserServiceEventType::Login:
-        QueueNpStateEvent(user_id,
-                          g_shadnet_enabled ? OrbisNpState::SignedIn : OrbisNpState::SignedOut);
-        break;
     case Libraries::UserService::OrbisUserServiceEventType::Logout:
         QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
         break;
@@ -869,6 +865,8 @@ static void DispatchPendingNpStateCallbacks() {
 
 s32 PS4_SYSV_ABI sceNpCheckCallback() {
     LOG_DEBUG(Lib_NpManager, "called");
+    DispatchPendingNpStateCallbacks();
+
     std::scoped_lock lk{g_np_callbacks_mutex};
     for (auto& [key, cb] : g_np_callbacks) {
         cb();
@@ -898,65 +896,14 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void* userdata) {
-    LOG_DEBUG(Lib_NpManager, "called");
-    NpStateCb.func = callback;
-    NpStateCb.userdata = userdata;
-    // Register with NpHandler so it fires on live state changes.
-    // The non-A variant additionally passes an OrbisNpId* built from the user's
-    // shadnet_npid or nullptr when signing out.
-    return Libraries::Np::NpHandler::GetInstance().RegisterStateCallback(
-        [callback, userdata](Libraries::UserService::OrbisUserServiceUserId uid,
-                             Libraries::Np::NpManager::OrbisNpState state) {
-            // Use NpHandler's cached NpId — built from shadnet_npid at login.
-            const OrbisNpId& cached = Libraries::Np::NpHandler::GetInstance().GetNpId(uid);
-            OrbisNpId* np_id_ptr =
-                (state == OrbisNpState::SignedIn && cached.handle.data[0] != '\0')
-                    ? const_cast<OrbisNpId*>(&cached)
-                    : nullptr;
-            callback(uid, state, np_id_ptr, userdata);
-        },
-        userdata);
-}
-
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
-    LOG_DEBUG(Lib_NpManager, "called");
-    if (callback == nullptr) {
-        LOG_ERROR(Lib_NpManager, "callback is nullptr");
-        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
-    }
-    if (std::holds_alternative<OrbisNpStateCallbackA>(NpStateCb.func) &&
-        std::get<OrbisNpStateCallbackA>(NpStateCb.func) != nullptr) {
-        LOG_ERROR(Lib_NpManager, "Callback already registered, cannot register multiple");
-        return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
-    }
-    NpStateCb.func = callback;
-    NpStateCb.userdata = userdata;
-    // Register with NpHandler so the callback fires on live connection state changes.
-    return Libraries::Np::NpHandler::GetInstance().RegisterStateCallback(
-        [callback, userdata](Libraries::UserService::OrbisUserServiceUserId uid,
-                             Libraries::Np::NpManager::OrbisNpState state) {
-            callback(uid, state, userdata);
-        },
-        userdata);
+    LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
+    return RegisterStateCallbackA(callback, userdata);
 }
 
 s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackA(s32 callback_id) {
-    if (callback_id <= 0) {
-        LOG_ERROR(Lib_NpManager, "invalid callback_id {}", callback_id);
-        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
-    }
-
-    // Check if this handle was actually registered before unregistering
-    if (!std::holds_alternative<OrbisNpStateCallbackA>(NpStateCb.func) ||
-        std::get<OrbisNpStateCallbackA>(NpStateCb.func) == nullptr) {
-        LOG_ERROR(Lib_NpManager, "callback with id {} not registered", callback_id);
-        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
-    }
-    Libraries::Np::NpHandler::GetInstance().UnregisterStateCallback(callback_id);
-    NpStateCb.func = OrbisNpStateCallbackA{};
-    NpStateCb.userdata = nullptr;
-    return ORBIS_OK;
+    LOG_INFO(Lib_NpManager, "called, callback_id = {}", callback_id);
+    return UnregisterStateCallbackAById(callback_id);
 }
 
 struct NpReachabilityStateCallback {
@@ -1016,6 +963,15 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
     g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();
+
+    // Route live NP state changes from NpHandler into the dispatch queue so they are
+    // delivered on the game's thread during sceNpCheckCallback (single delivery path).
+    // Registered before Initialize() so the initial SignedIn events are captured.
+    Libraries::Np::NpHandler::GetInstance().RegisterStateCallback(
+        [](Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpState state) {
+            QueueNpStateEvent(user_id, state);
+        },
+        nullptr);
     Libraries::Np::NpHandler::GetInstance().Initialize();
 
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
