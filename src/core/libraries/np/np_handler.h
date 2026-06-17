@@ -45,10 +45,10 @@ public:
     bool IsAnySignedIn() const;
 
     /// Full NP ID for this user, built once from shadnet_npid after login.
-    const OrbisNpId& GetNpId(s32 user_id) const;
+    OrbisNpId GetNpId(s32 user_id) const;
 
     /// The Online ID embedded in the NP ID (npid.handle).
-    const OrbisNpOnlineId& GetOnlineId(s32 user_id) const;
+    OrbisNpOnlineId GetOnlineId(s32 user_id) const;
 
     // Avatar URL returned by the server.
     std::string GetAvatarUrl(s32 user_id) const;
@@ -184,8 +184,6 @@ private:
     std::map<s32, std::shared_ptr<ShadNet::ShadNetClient>> m_clients;
     // Per-user NP ID built once from shadnet_npid after login.
     std::map<s32, OrbisNpId> m_np_ids;
-    // Returned by GetNpId/GetOnlineId when user_id is not connected.
-    static const OrbisNpId s_empty_np_id;
 
     // Score requests awaiting a reply, keyed by the submit packet id.
     struct PendingScoreRequest {

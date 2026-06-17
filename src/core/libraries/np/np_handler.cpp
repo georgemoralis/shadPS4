@@ -15,9 +15,6 @@
 
 namespace Libraries::Np {
 
-// Static empty NpId returned when user_id is not connected.
-const OrbisNpId NpHandler::s_empty_np_id{};
-
 NpHandler& NpHandler::GetInstance() {
     static NpHandler s_instance;
     return s_instance;
@@ -216,13 +213,13 @@ bool NpHandler::IsAnySignedIn() const {
     return false;
 }
 
-const OrbisNpId& NpHandler::GetNpId(s32 user_id) const {
+OrbisNpId NpHandler::GetNpId(s32 user_id) const {
     std::lock_guard lock(m_mutex_clients);
     auto it = m_np_ids.find(user_id);
-    return it != m_np_ids.end() ? it->second : s_empty_np_id;
+    return it != m_np_ids.end() ? it->second : OrbisNpId{};
 }
 
-const OrbisNpOnlineId& NpHandler::GetOnlineId(s32 user_id) const {
+OrbisNpOnlineId NpHandler::GetOnlineId(s32 user_id) const {
     return GetNpId(user_id).handle;
 }
 
