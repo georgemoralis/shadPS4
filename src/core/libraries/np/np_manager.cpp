@@ -701,6 +701,29 @@ sceNpGetUserIdByAccountId(u64 account_id, Libraries::UserService::OrbisUserServi
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpGetUserIdByOnlineId(const OrbisNpOnlineId* online_id,
+                                          Libraries::UserService::OrbisUserServiceUserId* user_id) {
+    if (online_id == nullptr || user_id == nullptr) {
+        LOG_ERROR(Lib_NpManager, "invalid argument");
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (!g_shadnet_enabled)
+        return ORBIS_NP_ERROR_SIGNED_OUT;
+
+    const s32 found = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
+    if (found == -1)
+        return ORBIS_NP_ERROR_SIGNED_OUT;
+
+    // Verify the resolved user_id is actually a logged-in local user
+    const User* u = UserManagement.GetUserByID(found);
+    if (!u || !u->logged_in)
+        return ORBIS_NP_ERROR_USER_NOT_FOUND;
+
+    *user_id = found;
+    LOG_DEBUG(Lib_NpManager, "returns user_id={}", *user_id);
+    return ORBIS_OK;
+}
+
 s32 PS4_SYSV_ABI sceNpHasSignedUp(Libraries::UserService::OrbisUserServiceUserId user_id,
                                   bool* has_signed_up) {
     LOG_DEBUG(Lib_NpManager, "called");
@@ -1110,6 +1133,9 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("XDncXQIJUSk", "libSceNpManager", 1, "libSceNpManager", sceNpGetOnlineId);
     LIB_FUNCTION("eQH7nWPcAgc", "libSceNpManager", 1, "libSceNpManager", sceNpGetState);
     LIB_FUNCTION("VgYczPGB5ss", "libSceNpManager", 1, "libSceNpManager", sceNpGetUserIdByAccountId);
+    LIB_FUNCTION("F6E4ycq9Dbg", "libSceNpManager", 1, "libSceNpManager", sceNpGetUserIdByOnlineId);
+    LIB_FUNCTION("A2CQ3kgSopQ", "libSceNpManager", 1, "libSceNpManager", sceNpSetContentRestriction);
+    LIB_FUNCTION("Ec63y59l9tw", "libSceNpManager", 1, "libSceNpManager", sceNpSetNpTitleId);
     LIB_FUNCTION("Oad3rvY-NJQ", "libSceNpManager", 1, "libSceNpManager", sceNpHasSignedUp);
     LIB_FUNCTION("3Zl8BePTh9Y", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallback);
     LIB_FUNCTION("JELHf4xPufo", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallbackForLib);
