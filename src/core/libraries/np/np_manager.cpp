@@ -812,15 +812,20 @@ void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceE
                                        Libraries::UserService::OrbisUserServiceUserId user_id) {
     switch (event_type) {
     case Libraries::UserService::OrbisUserServiceEventType::Login:
-        // On login, NpHandler fires SignedIn when shadNet connects; only synthesize a
-        // SignedOut here when shadNet is off (no connection will ever come up).
-        if (!g_shadnet_enabled) {
+        if (g_shadnet_enabled) {
+            // Handler connects the user and fires SignedIn via the bridge on success.
+            Libraries::Np::NpHandler::GetInstance().OnUserLoggedIn(user_id);
+        } else {
             QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
         }
         break;
     case Libraries::UserService::OrbisUserServiceEventType::Logout:
-        // NpHandler does not disconnect on user logout, so always emit SignedOut here.
-        QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
+        if (g_shadnet_enabled) {
+            // Handler disconnects the user and fires SignedOut via the bridge.
+            Libraries::Np::NpHandler::GetInstance().OnUserLoggedOut(user_id);
+        } else {
+            QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
+        }
         break;
     default:
         break;

@@ -12,6 +12,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "common/types.h"
@@ -37,6 +38,10 @@ public:
 
     // Disconnect all clients, stop worker threads, fire SignedOut for each.
     void Shutdown();
+
+    // Connect/disconnect a single user in response to a user service login/logout event.
+    void OnUserLoggedIn(s32 user_id);
+    void OnUserLoggedOut(s32 user_id);
 
     // True if this specific user is authenticated to the shadNet server.
     bool IsPsnSignedIn(s32 user_id) const;
@@ -158,6 +163,15 @@ private:
     /// Connect one user.  Blocks until connected+authenticated or failed.
     bool ConnectUser(s32 user_id, const std::string& host, u16 port, const std::string& npid,
                      const std::string& password, const std::string& token);
+
+    // Connect a single logged-in user by id (looks up credentials, parses server).
+    bool ConnectUserById(s32 user_id);
+
+    // Parse the configured shadNet server "host:port" (default port 31313).
+    std::pair<std::string, u16> ParseServerAddress() const;
+
+    // Start the health-monitor worker thread if not already running (idempotent).
+    void StartWorker();
 
     // Disconnect and remove one user's client.
     void DisconnectUser(s32 user_id);

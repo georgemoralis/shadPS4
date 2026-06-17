@@ -20,18 +20,7 @@ NpHandler& NpHandler::GetInstance() {
     return s_instance;
 }
 
-void NpHandler::Initialize() {
-    if (m_initialized.exchange(true)) {
-        LOG_WARNING(NpHandler, "Initialize called more than once");
-        return;
-    }
-
-    if (!EmulatorSettings.IsShadNetEnabled()) {
-        LOG_INFO(NpHandler, "shadNet disabled globally we are in offline mode");
-        return;
-    }
-
-    // Parse server address from GeneralSettings
+std::pair<std::string, u16> NpHandler::ParseServerAddress() const {
     const std::string server_str = EmulatorSettings.GetShadNetServer();
     std::string host = server_str;
     u16 port = 31313; // default port
@@ -43,30 +32,63 @@ void NpHandler::Initialize() {
         } catch (...) {
         }
     }
+    return {host, port};
+}
+
+bool NpHandler::ConnectUserById(s32 user_id) {
+    if (!EmulatorSettings.IsShadNetEnabled())
+        return false;
+
+    {
+        std::lock_guard lock(m_mutex_clients);
+        if (m_clients.find(user_id) != m_clients.end())
+            return false; // already connected
+    }
+
+    const User* u = UserManagement.GetUserByID(user_id);
+    if (!u)
+        return false;
+    if (!u->shadnet_enabled) {
+        LOG_DEBUG(NpHandler, "user_id={} ('{}') shadNet disabled,skipping", u->user_id,
+                  u->user_name);
+        return false;
+    }
+    if (u->shadnet_npid.empty() || u->shadnet_password.empty()) {
+        LOG_WARNING(NpHandler, "user_id={} ('{}') shadNet enabled but credentials missing,skipping",
+                    u->user_id, u->user_name);
+        return false;
+    }
+
+    const auto [host, port] = ParseServerAddress();
+    return ConnectUser(u->user_id, host, port, u->shadnet_npid, u->shadnet_password,
+                       u->shadnet_token);
+}
+
+void NpHandler::StartWorker() {
+    bool expected = false;
+    if (m_worker_running.compare_exchange_strong(expected, true)) {
+        m_worker_thread = std::thread(&NpHandler::WorkerThread, this);
+    }
+}
+
+void NpHandler::Initialize() {
+    if (m_initialized.exchange(true)) {
+        LOG_WARNING(NpHandler, "Initialize called more than once");
+        return;
+    }
+
+    if (!EmulatorSettings.IsShadNetEnabled()) {
+        LOG_INFO(NpHandler, "shadNet disabled globally we are in offline mode");
+        return;
+    }
 
     const auto logged_in = UserManagement.GetLoggedInUsers(); // get all login users
     int connected_count = 0;
-
     for (int i = 0; i < Libraries::UserService::ORBIS_USER_SERVICE_MAX_LOGIN_USERS; ++i) {
         const User* u = logged_in[i];
         if (!u)
             continue;
-        // skip users that has shadnet disabled
-        if (!u->shadnet_enabled) {
-            LOG_DEBUG(NpHandler, "user_id={} ('{}') shadNet disabled,skipping", u->user_id,
-                      u->user_name);
-            continue;
-        }
-        // skip also users that doesn't have npid or password empty
-        if (u->shadnet_npid.empty() || u->shadnet_password.empty()) {
-            LOG_WARNING(NpHandler,
-                        "user_id={} ('{}') shadNet enabled but credentials missing,skipping",
-                        u->user_id, u->user_name);
-            continue;
-        }
-
-        if (ConnectUser(u->user_id, host, port, u->shadnet_npid, u->shadnet_password,
-                        u->shadnet_token))
+        if (ConnectUserById(u->user_id))
             ++connected_count;
     }
 
@@ -75,9 +97,7 @@ void NpHandler::Initialize() {
         return;
     }
 
-    // Start the health-monitor worker
-    m_worker_running = true;
-    m_worker_thread = std::thread(&NpHandler::WorkerThread, this);
+    StartWorker();
 }
 
 void NpHandler::Shutdown() {
@@ -174,6 +194,15 @@ void NpHandler::DisconnectUser(s32 user_id) {
     client->Stop();
     FireStateCallback(user_id, NpManager::OrbisNpState::SignedOut);
     LOG_INFO(NpHandler, "user_id={} disconnected", user_id);
+}
+
+void NpHandler::OnUserLoggedIn(s32 user_id) {
+    if (ConnectUserById(user_id))
+        StartWorker();
+}
+
+void NpHandler::OnUserLoggedOut(s32 user_id) {
+    DisconnectUser(user_id);
 }
 
 void NpHandler::WorkerThread() {
