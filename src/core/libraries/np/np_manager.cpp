@@ -366,6 +366,40 @@ s32 PS4_SYSV_ABI sceNpAbortRequest(s32 req_id) {
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpSetTimeout(s32 req_id, s32 resolve_retry, u32 resolve_timeout,
+                                 u32 conn_timeout, u32 send_timeout, u32 recv_timeout) {
+    LOG_DEBUG(Lib_NpManager, "called req_id = {:#x}", req_id);
+
+    if (req_id <= 0) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    // SCE_NP_TIMEOUT_NO_EFFECT (0) is allowed per field (use default) but not for every field.
+    // resolveRetry >= 0; resolveTimeout 0 or >= 1s; conn/send/recv 0 or >= 10s (microseconds).
+    const auto unset_or_at_least = [](u32 v, u32 min_us) { return v == 0 || v >= min_us; };
+    const bool all_zero = resolve_retry == 0 && resolve_timeout == 0 && conn_timeout == 0 &&
+                          send_timeout == 0 && recv_timeout == 0;
+    if (all_zero || resolve_retry < 0 || !unset_or_at_least(resolve_timeout, 1'000'000) ||
+        !unset_or_at_least(conn_timeout, 10'000'000) ||
+        !unset_or_at_least(send_timeout, 10'000'000) ||
+        !unset_or_at_least(recv_timeout, 10'000'000)) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lk{g_request_mutex};
+
+    s32 req_index = req_id - ORBIS_NP_MANAGER_REQUEST_ID_OFFSET - 1;
+    if (g_active_requests == 0 || req_index < 0 ||
+        req_index >= static_cast<s32>(g_requests.size()) ||
+        g_requests[req_index].state == NpRequestState::None) {
+        return ORBIS_NP_ERROR_REQUEST_NOT_FOUND;
+    }
+
+    // shadNet performs no real network I/O, so the timeouts are validated and accepted but
+    // not applied.
+    return ORBIS_OK;
+}
+
 s32 PS4_SYSV_ABI sceNpWaitAsync(s32 req_id, s32* result) {
     if (result == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
@@ -776,14 +810,16 @@ static void QueueNpStateEvent(Libraries::UserService::OrbisUserServiceUserId use
 
 void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceEventType event_type,
                                        Libraries::UserService::OrbisUserServiceUserId user_id) {
-    // When shadNet is enabled, NpHandler is the authority for NP sign-in state and feeds
-    // the queue directly (see the bridge in RegisterLib); avoid double events here.
-    if (g_shadnet_enabled) {
-        return;
-    }
     switch (event_type) {
     case Libraries::UserService::OrbisUserServiceEventType::Login:
+        // On login, NpHandler fires SignedIn when shadNet connects; only synthesize a
+        // SignedOut here when shadNet is off (no connection will ever come up).
+        if (!g_shadnet_enabled) {
+            QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
+        }
+        break;
     case Libraries::UserService::OrbisUserServiceEventType::Logout:
+        // NpHandler does not disconnect on user logout, so always emit SignedOut here.
         QueueNpStateEvent(user_id, OrbisNpState::SignedOut);
         break;
     default:
@@ -934,6 +970,16 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpUnregisterStateCallback() {
+    std::scoped_lock lk{g_np_state_callbacks_mutex};
+    if (LegacyNpStateCb.func == nullptr) {
+        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+    }
+    LegacyNpStateCb.func = nullptr;
+    LegacyNpStateCb.userdata = nullptr;
+    return ORBIS_OK;
+}
+
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
     LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
     return RegisterStateCallbackA(callback, userdata);
@@ -985,6 +1031,16 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpT
     return ORBIS_OK;
 }
 
+s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackForToolkit() {
+    std::scoped_lock lk{g_np_state_callbacks_mutex};
+    if (NpStateCbForNp.func == nullptr) {
+        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+    }
+    NpStateCbForNp.func = nullptr;
+    NpStateCbForNp.userdata = nullptr;
+    return ORBIS_OK;
+}
+
 void RegisterNpCallback(std::string key, std::function<void()> cb) {
     std::scoped_lock lk{g_np_callbacks_mutex};
     LOG_DEBUG(Lib_NpManager, "registering callback processing for {}", key);
@@ -1025,6 +1081,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("m9L3O6yst-U", "libSceNpManager", 1, "libSceNpManager",
                  sceNpGetParentalControlInfoA);
     LIB_FUNCTION("OzKvTvg3ZYU", "libSceNpManager", 1, "libSceNpManager", sceNpAbortRequest);
+    LIB_FUNCTION("-QglDeRr8D8", "libSceNpManager", 1, "libSceNpManager", sceNpSetTimeout);
     LIB_FUNCTION("jyi5p9XWUSs", "libSceNpManager", 1, "libSceNpManager", sceNpWaitAsync);
     LIB_FUNCTION("uqcPJLWL08M", "libSceNpManager", 1, "libSceNpManager", sceNpPollAsync);
     LIB_FUNCTION("S7QTn72PrDw", "libSceNpManager", 1, "libSceNpManager", sceNpDeleteRequest);
@@ -1053,6 +1110,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("JELHf4xPufo", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallbackForLib);
     LIB_FUNCTION("VfRSmPmj8Q8", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterStateCallback);
+    LIB_FUNCTION("mjjTXh+NHWY", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpUnregisterStateCallback);
     LIB_FUNCTION("qQJfO8HAiaY", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterStateCallbackA);
     LIB_FUNCTION("M3wFXbYQtAA", "libSceNpManager", 1, "libSceNpManager",
@@ -1065,6 +1124,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpCheckCallbackForLib);
     LIB_FUNCTION("0c7HbXRKUt4", "libSceNpManagerForToolkit", 1, "libSceNpManager",
                  sceNpRegisterStateCallbackForToolkit);
+    LIB_FUNCTION("YIvqqvJyjEc", "libSceNpManagerForToolkit", 1, "libSceNpManager",
+                 sceNpUnregisterStateCallbackForToolkit);
 
     LIB_FUNCTION("2rsFmlGWleQ", "libSceNpManagerCompat", 1, "libSceNpManager",
                  sceNpCheckNpAvailability);
