@@ -610,7 +610,7 @@ s32 PS4_SYSV_ABI sceNpGetNpReachabilityState(Libraries::UserService::OrbisUserSe
     }
 
     if (user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
-        if (g_firmware_version < 0 || g_firmware_version >= Common::ElfInfo::FW_400) {
+        if (g_firmware_version < 0 || g_firmware_version >= Common::ElfInfo::FW_40) {
             return ORBIS_NP_ERROR_INVALID_ARGUMENT;
         }
     }
@@ -629,7 +629,7 @@ s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId us
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
     if (user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
-        if (g_firmware_version < 0 || g_firmware_version >= Common::ElfInfo::FW_900) {
+        if (g_firmware_version < 0 || g_firmware_version >= Common::ElfInfo::FW_90) {
             return ORBIS_NP_ERROR_INVALID_ARGUMENT;
         }
     }
@@ -681,7 +681,7 @@ s32 PS4_SYSV_ABI sceNpHasSignedUp(Libraries::UserService::OrbisUserServiceUserId
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
     if (user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
-        if (g_firmware_version < 0 || g_firmware_version >= Common::ElfInfo::FW_900) {
+        if (g_firmware_version < 0 || g_firmware_version >= Common::ElfInfo::FW_90) {
             return ORBIS_NP_ERROR_INVALID_ARGUMENT;
         }
     }
