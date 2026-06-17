@@ -868,15 +868,11 @@ static void DispatchPendingNpStateCallbacks() {
 }
 
 s32 PS4_SYSV_ABI sceNpCheckCallback() {
-    LOG_DEBUG(Lib_NpManager, "(STUBBED) called");
-    DispatchPendingNpStateCallbacks();
-
+    LOG_DEBUG(Lib_NpManager, "called");
     std::scoped_lock lk{g_np_callbacks_mutex};
-
-    for (auto i : g_np_callbacks) {
-        (i.second)();
+    for (auto& [key, cb] : g_np_callbacks) {
+        cb();
     }
-
     return ORBIS_OK;
 }
 
@@ -902,29 +898,65 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpUnregisterStateCallback(s32 callback_id) {
-    LOG_INFO(Lib_NpManager, "called, callback_id = {}", callback_id);
-    if (callback_id != 0) {
-        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
-    }
-
-    std::scoped_lock lk{g_np_state_callbacks_mutex};
-    if (LegacyNpStateCb.func == nullptr) {
-        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
-    }
-
-    LegacyNpStateCb = {};
-    return ORBIS_OK;
+s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void* userdata) {
+    LOG_DEBUG(Lib_NpManager, "called");
+    NpStateCb.func = callback;
+    NpStateCb.userdata = userdata;
+    // Register with NpHandler so it fires on live state changes.
+    // The non-A variant additionally passes an OrbisNpId* built from the user's
+    // shadnet_npid or nullptr when signing out.
+    return Libraries::Np::NpHandler::GetInstance().RegisterStateCallback(
+        [callback, userdata](Libraries::UserService::OrbisUserServiceUserId uid,
+                             Libraries::Np::NpManager::OrbisNpState state) {
+            // Use NpHandler's cached NpId — built from shadnet_npid at login.
+            const OrbisNpId& cached = Libraries::Np::NpHandler::GetInstance().GetNpId(uid);
+            OrbisNpId* np_id_ptr =
+                (state == OrbisNpState::SignedIn && cached.handle.data[0] != '\0')
+                    ? const_cast<OrbisNpId*>(&cached)
+                    : nullptr;
+            callback(uid, state, np_id_ptr, userdata);
+        },
+        userdata);
 }
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
-    LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
-    return RegisterStateCallbackA(callback, userdata);
+    LOG_DEBUG(Lib_NpManager, "called");
+    if (callback == nullptr) {
+        LOG_ERROR(Lib_NpManager, "callback is nullptr");
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (std::holds_alternative<OrbisNpStateCallbackA>(NpStateCb.func) &&
+        std::get<OrbisNpStateCallbackA>(NpStateCb.func) != nullptr) {
+        LOG_ERROR(Lib_NpManager, "Callback already registered, cannot register multiple");
+        return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
+    }
+    NpStateCb.func = callback;
+    NpStateCb.userdata = userdata;
+    // Register with NpHandler so the callback fires on live connection state changes.
+    return Libraries::Np::NpHandler::GetInstance().RegisterStateCallback(
+        [callback, userdata](Libraries::UserService::OrbisUserServiceUserId uid,
+                             Libraries::Np::NpManager::OrbisNpState state) {
+            callback(uid, state, userdata);
+        },
+        userdata);
 }
 
 s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackA(s32 callback_id) {
-    LOG_INFO(Lib_NpManager, "called, callback_id = {}", callback_id);
-    return UnregisterStateCallbackAById(callback_id);
+    if (callback_id <= 0) {
+        LOG_ERROR(Lib_NpManager, "invalid callback_id {}", callback_id);
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    // Check if this handle was actually registered before unregistering
+    if (!std::holds_alternative<OrbisNpStateCallbackA>(NpStateCb.func) ||
+        std::get<OrbisNpStateCallbackA>(NpStateCb.func) == nullptr) {
+        LOG_ERROR(Lib_NpManager, "callback with id {} not registered", callback_id);
+        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+    }
+    Libraries::Np::NpHandler::GetInstance().UnregisterStateCallback(callback_id);
+    NpStateCb.func = OrbisNpStateCallbackA{};
+    NpStateCb.userdata = nullptr;
+    return ORBIS_OK;
 }
 
 struct NpReachabilityStateCallback {
@@ -937,53 +969,46 @@ NpReachabilityStateCallback NpReachabilityCb;
 s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback(OrbisNpReachabilityStateCallback callback,
                                                           void* userdata) {
     if (callback == nullptr) {
+        LOG_ERROR(Lib_NpManager, "callback is nullptr");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-
-    std::scoped_lock lk{g_np_state_callbacks_mutex};
     if (NpReachabilityCb.func != nullptr) {
+        LOG_ERROR(Lib_NpManager, "callback already registered, cannot register multiple");
         return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
     }
-
-    LOG_INFO(Lib_NpManager, "called");
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     NpReachabilityCb.func = callback;
     NpReachabilityCb.userdata = userdata;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpUnregisterNpReachabilityStateCallback() {
-    std::scoped_lock lk{g_np_state_callbacks_mutex};
     if (NpReachabilityCb.func == nullptr) {
+        LOG_ERROR(Lib_NpManager, "callback not registered");
         return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
     }
-
-    NpReachabilityCb = {};
+    NpReachabilityCb.func = nullptr;
+    NpReachabilityCb.userdata = nullptr;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpToolkit callback,
                                                       void* userdata) {
-    static s32 id = 0;
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    std::scoped_lock lk{g_np_state_callbacks_mutex};
     NpStateCbForNp.func = callback;
     NpStateCbForNp.userdata = userdata;
-    return id;
+    return ORBIS_OK;
 }
 
 void RegisterNpCallback(std::string key, std::function<void()> cb) {
     std::scoped_lock lk{g_np_callbacks_mutex};
-
     LOG_DEBUG(Lib_NpManager, "registering callback processing for {}", key);
-
     g_np_callbacks.emplace(key, cb);
 }
 
 void DeregisterNpCallback(std::string key) {
     std::scoped_lock lk{g_np_callbacks_mutex};
-
     LOG_DEBUG(Lib_NpManager, "deregistering callback processing for {}", key);
-
     g_np_callbacks.erase(key);
 }
 
@@ -991,6 +1016,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
     g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();
+    Libraries::Np::NpHandler::GetInstance().Initialize();
 
     LIB_FUNCTION("GpLQDNKICac", "libSceNpManager", 1, "libSceNpManager", sceNpCreateRequest);
     LIB_FUNCTION("eiqMCt9UshI", "libSceNpManager", 1, "libSceNpManager", sceNpCreateAsyncRequest);
@@ -1029,16 +1055,10 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("eQH7nWPcAgc", "libSceNpManager", 1, "libSceNpManager", sceNpGetState);
     LIB_FUNCTION("VgYczPGB5ss", "libSceNpManager", 1, "libSceNpManager", sceNpGetUserIdByAccountId);
     LIB_FUNCTION("Oad3rvY-NJQ", "libSceNpManager", 1, "libSceNpManager", sceNpHasSignedUp);
-    LIB_FUNCTION("A2CQ3kgSopQ", "libSceNpManager", 1, "libSceNpManager",
-                 sceNpSetContentRestriction);
-    LIB_FUNCTION("Ec63y59l9tw", "libSceNpManager", 1, "libSceNpManager", sceNpSetNpTitleId);
-
     LIB_FUNCTION("3Zl8BePTh9Y", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallback);
     LIB_FUNCTION("JELHf4xPufo", "libSceNpManager", 1, "libSceNpManager", sceNpCheckCallbackForLib);
     LIB_FUNCTION("VfRSmPmj8Q8", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterStateCallback);
-    LIB_FUNCTION("mjjTXh+NHWY", "libSceNpManager", 1, "libSceNpManager",
-                 sceNpUnregisterStateCallback);
     LIB_FUNCTION("qQJfO8HAiaY", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterStateCallbackA);
     LIB_FUNCTION("M3wFXbYQtAA", "libSceNpManager", 1, "libSceNpManager",
