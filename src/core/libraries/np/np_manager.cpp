@@ -6,6 +6,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include <core/user_settings.h>
 #include "common/elf_info.h"
@@ -737,6 +738,18 @@ struct NpStateCallbackAEntry {
 
 static std::array<NpStateCallbackAEntry, ORBIS_NP_STATE_CALLBACK_MAX> g_np_state_callbacks{};
 
+struct NpReachabilityStateCallback {
+    OrbisNpReachabilityStateCallback func;
+    void* userdata;
+};
+
+NpReachabilityStateCallback NpReachabilityCb;
+
+// Last reachability state delivered to NpReachabilityCb, per user. Keeps the reachability
+// callback edge-triggered: it fires only when the derived state changes for that user.
+static std::map<Libraries::UserService::OrbisUserServiceUserId, OrbisNpReachabilityState>
+    g_np_reachability_last;
+
 struct PendingNpStateEvent {
     Libraries::UserService::OrbisUserServiceUserId user_id;
     OrbisNpState state;
@@ -828,7 +841,10 @@ static void DispatchPendingNpStateCallbacks() {
     std::deque<PendingNpStateEvent> pending_events;
     LegacyNpStateCallback legacy_callback{};
     NpStateCallbackForNpToolkit toolkit_callback{};
+    NpReachabilityStateCallback reachability_callback{};
     std::array<NpStateCallbackAEntry, ORBIS_NP_STATE_CALLBACK_MAX> callbacks;
+    std::vector<std::pair<Libraries::UserService::OrbisUserServiceUserId, OrbisNpReachabilityState>>
+        reachability_changes;
     {
         std::scoped_lock lk{g_np_state_events_mutex, g_np_state_callbacks_mutex};
         if (g_np_state_events.empty()) {
@@ -838,6 +854,23 @@ static void DispatchPendingNpStateCallbacks() {
         legacy_callback = LegacyNpStateCb;
         callbacks = g_np_state_callbacks;
         toolkit_callback = NpStateCbForNp;
+        reachability_callback = NpReachabilityCb;
+
+        // Derive reachability transitions from the queued state events. Reachability mirrors
+        // shadNet connectivity here: SignedIn => Reachable, otherwise Unavailable. Edge-
+        // triggered per user via g_np_reachability_last.
+        if (reachability_callback.func != nullptr) {
+            for (const auto& event : pending_events) {
+                const OrbisNpReachabilityState reach =
+                    event.state == OrbisNpState::SignedIn ? OrbisNpReachabilityState::Reachable
+                                                          : OrbisNpReachabilityState::Unavailable;
+                auto it = g_np_reachability_last.find(event.user_id);
+                if (it == g_np_reachability_last.end() || it->second != reach) {
+                    g_np_reachability_last[event.user_id] = reach;
+                    reachability_changes.emplace_back(event.user_id, reach);
+                }
+            }
+        }
     }
 
     for (auto& event : pending_events) {
@@ -860,6 +893,11 @@ static void DispatchPendingNpStateCallbacks() {
         if (toolkit_callback.func != nullptr) {
             toolkit_callback.func(event.user_id, event.state, toolkit_callback.userdata);
         }
+    }
+
+    // Reachability callback fires only on a change, after the state callbacks.
+    for (const auto& [user_id, reach] : reachability_changes) {
+        reachability_callback.func(user_id, reach, reachability_callback.userdata);
     }
 }
 
@@ -906,42 +944,42 @@ s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackA(s32 callback_id) {
     return UnregisterStateCallbackAById(callback_id);
 }
 
-struct NpReachabilityStateCallback {
-    OrbisNpReachabilityStateCallback func;
-    void* userdata;
-};
-
-NpReachabilityStateCallback NpReachabilityCb;
-
 s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback(OrbisNpReachabilityStateCallback callback,
                                                           void* userdata) {
     if (callback == nullptr) {
         LOG_ERROR(Lib_NpManager, "callback is nullptr");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
+
+    std::scoped_lock lk{g_np_state_callbacks_mutex};
     if (NpReachabilityCb.func != nullptr) {
         LOG_ERROR(Lib_NpManager, "callback already registered, cannot register multiple");
         return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
     }
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+    LOG_INFO(Lib_NpManager, "called");
     NpReachabilityCb.func = callback;
     NpReachabilityCb.userdata = userdata;
+    // Reset the per-user cache so the next state transition reports fresh.
+    g_np_reachability_last.clear();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpUnregisterNpReachabilityStateCallback() {
+    std::scoped_lock lk{g_np_state_callbacks_mutex};
     if (NpReachabilityCb.func == nullptr) {
         LOG_ERROR(Lib_NpManager, "callback not registered");
         return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
     }
     NpReachabilityCb.func = nullptr;
     NpReachabilityCb.userdata = nullptr;
+    g_np_reachability_last.clear();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpToolkit callback,
                                                       void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+    std::scoped_lock lk{g_np_state_callbacks_mutex};
     NpStateCbForNp.func = callback;
     NpStateCbForNp.userdata = userdata;
     return ORBIS_OK;
