@@ -1069,6 +1069,134 @@ s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackForToolkit() {
     return ORBIS_OK;
 }
 
+// ---- Game presence + PS Plus ----
+// shadNet has no live game-presence or PS Plus event source, so registered callbacks are
+// stored but never invoked, and SetGamePresenceOnline is accepted without effect. The exact
+// callback prototypes are not verified; only the pointer is stored, so the ABI is unaffected.
+using OrbisNpGamePresenceCallback = PS4_SYSV_ABI void (*)(const OrbisNpOnlineId* online_id,
+                                                          void* userdata);
+using OrbisNpPlusEventCallback = PS4_SYSV_ABI void (*)(
+    Libraries::UserService::OrbisUserServiceUserId user_id, s32 event, void* userdata);
+
+static std::mutex g_presence_plus_mutex;
+
+static OrbisNpGamePresenceCallback g_game_presence_cb = nullptr;
+static void* g_game_presence_cb_userdata = nullptr;
+
+struct GamePresenceCallbackEntry {
+    s32 handle;
+    OrbisNpGamePresenceCallback func;
+    void* userdata;
+    bool in_use;
+};
+static std::array<GamePresenceCallbackEntry, ORBIS_NP_STATE_CALLBACK_MAX> g_game_presence_cbs_a{};
+static s32 g_game_presence_next_handle = 0;
+
+static OrbisNpPlusEventCallback g_plus_event_cb = nullptr;
+static void* g_plus_event_cb_userdata = nullptr;
+
+s32 PS4_SYSV_ABI sceNpSetGamePresenceOnline(s32 req_id, const OrbisNpOnlineId* online_id,
+                                            u32 presence) {
+    if (req_id == 0 || online_id == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lk{g_request_mutex};
+    s32 req_index = req_id - ORBIS_NP_MANAGER_REQUEST_ID_OFFSET - 1;
+    if (g_active_requests == 0 || req_index < 0 ||
+        req_index >= static_cast<s32>(g_requests.size()) ||
+        g_requests[req_index].state == NpRequestState::None) {
+        return ORBIS_NP_ERROR_REQUEST_NOT_FOUND;
+    }
+
+    // No live presence service under shadNet; accept and report success.
+    LOG_DEBUG(Lib_NpManager, "(STUBBED) called req_id = {:#x}", req_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpSetGamePresenceOnlineA(s32 req_id,
+                                             Libraries::UserService::OrbisUserServiceUserId user_id,
+                                             u32 presence) {
+    if (user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    const OrbisNpOnlineId online_id = Libraries::Np::NpHandler::GetInstance().GetOnlineId(user_id);
+    return sceNpSetGamePresenceOnline(req_id, &online_id, presence);
+}
+
+void PS4_SYSV_ABI sceNpRegisterGamePresenceCallback(OrbisNpGamePresenceCallback callback,
+                                                    void* userdata) {
+    // Matches the decompile: stores unconditionally and returns void.
+    std::scoped_lock lk{g_presence_plus_mutex};
+    g_game_presence_cb = callback;
+    g_game_presence_cb_userdata = userdata;
+}
+
+s32 PS4_SYSV_ABI sceNpRegisterGamePresenceCallbackA(OrbisNpGamePresenceCallback callback,
+                                                    void* userdata) {
+    if (callback == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    std::scoped_lock lk{g_presence_plus_mutex};
+    for (auto& entry : g_game_presence_cbs_a) {
+        if (entry.in_use) {
+            continue;
+        }
+        entry.handle = ++g_game_presence_next_handle;
+        entry.func = callback;
+        entry.userdata = userdata;
+        entry.in_use = true;
+        return entry.handle;
+    }
+    return ORBIS_NP_ERROR_CALLBACK_MAX;
+}
+
+s32 PS4_SYSV_ABI sceNpUnregisterGamePresenceCallbackA(s32 callback_id) {
+    std::scoped_lock lk{g_presence_plus_mutex};
+    for (auto& entry : g_game_presence_cbs_a) {
+        if (entry.in_use && entry.handle == callback_id) {
+            entry = {};
+            return ORBIS_OK;
+        }
+    }
+    return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+}
+
+s32 PS4_SYSV_ABI sceNpIsPlusMember(Libraries::UserService::OrbisUserServiceUserId user_id,
+                                   bool* result) {
+    if (result == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // shadNet has no PS Plus concept; report not a Plus member.
+    *result = false;
+    LOG_DEBUG(Lib_NpManager, "user_id {} -> not a Plus member", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpRegisterPlusEventCallback(OrbisNpPlusEventCallback callback, void* userdata) {
+    if (callback == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    std::scoped_lock lk{g_presence_plus_mutex};
+    if (g_plus_event_cb != nullptr) {
+        return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
+    }
+    g_plus_event_cb = callback;
+    g_plus_event_cb_userdata = userdata;
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpUnregisterPlusEventCallback() {
+    std::scoped_lock lk{g_presence_plus_mutex};
+    if (g_plus_event_cb == nullptr) {
+        return ORBIS_NP_ERROR_CALLBACK_NOT_REGISTERED;
+    }
+    g_plus_event_cb = nullptr;
+    g_plus_event_cb_userdata = nullptr;
+    return ORBIS_OK;
+}
+
 void RegisterNpCallback(std::string key, std::function<void()> cb) {
     std::scoped_lock lk{g_np_callbacks_mutex};
     LOG_DEBUG(Lib_NpManager, "registering callback processing for {}", key);
@@ -1124,6 +1252,21 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpGetGamePresenceStatus);
     LIB_FUNCTION("oPO9U42YpgI", "libSceNpManager", 1, "libSceNpManager",
                  sceNpGetGamePresenceStatusA);
+    LIB_FUNCTION("KO+11cgC7N0", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpSetGamePresenceOnline);
+    LIB_FUNCTION("C0gNCiRIi4U", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpSetGamePresenceOnlineA);
+    LIB_FUNCTION("uFJpaKNBAj4", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterGamePresenceCallback);
+    LIB_FUNCTION("KswxLxk4c1Y", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterGamePresenceCallbackA);
+    LIB_FUNCTION("aJZyCcHxzu4", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpUnregisterGamePresenceCallbackA);
+    LIB_FUNCTION("Ybu6AxV6S0o", "libSceNpManager", 1, "libSceNpManager", sceNpIsPlusMember);
+    LIB_FUNCTION("GImICnh+boA", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterPlusEventCallback);
+    LIB_FUNCTION("xViqJdDgKl0", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpUnregisterPlusEventCallback);
     LIB_FUNCTION("e-ZuhGEoeC4", "libSceNpManager", 1, "libSceNpManager",
                  sceNpGetNpReachabilityState);
 
