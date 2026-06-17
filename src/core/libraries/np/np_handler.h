@@ -23,6 +23,16 @@ public:
     // Returns -1 if no connected user has that Online ID.
     s32 GetUserIdByOnlineId(const OrbisNpOnlineId& online_id) const;
 
+    // Reverse lookup: server account_id to local user_id.
+    // Returns -1 if no connected user owns that account_id.
+    s32 GetUserIdByAccountId(u64 account_id) const;
+
+    /// Full NP ID for this user, built once from shadnet_npid after login.
+    const OrbisNpId& GetNpId(s32 user_id) const;
+
+    /// The Online ID embedded in the NP ID (npid.handle).
+    const OrbisNpOnlineId& GetOnlineId(s32 user_id) const;
+
 private:
     NpHandler() = default;
     ~NpHandler() = default;

@@ -529,11 +529,13 @@ s32 PS4_SYSV_ABI sceNpGetAccountId(OrbisNpOnlineId* online_id, u64* account_id) 
     if (online_id == nullptr || account_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled) {
+    const s32 user_id = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
+    if (!g_shadnet_enabled || user_id == -1 ||
+        !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         *account_id = 0;
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
-    *account_id = 0xFEEDFACE;
+    *account_id = Libraries::Np::NpHandler::GetInstance().GetAccountId(user_id);
     return ORBIS_OK;
 }
 
@@ -543,51 +545,58 @@ s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUser
     if (account_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (UserManagement.GetUserByID(user_id) == nullptr) {
-        *account_id = 0;
-        return ORBIS_NP_ERROR_USER_NOT_FOUND;
-    }
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         *account_id = 0;
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
-    *account_id = 0xFEEDFACE;
+    *account_id = Libraries::Np::NpHandler::GetInstance().GetAccountId(user_id);
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpId* np_id) {
     LOG_DEBUG(Lib_NpManager, "user_id {}", user_id);
+    if (user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
+        return (g_firmware_version >= 0 && g_firmware_version < Common::ElfInfo::FW_90)
+                   ? ORBIS_NP_ERROR_USER_NOT_FOUND
+                   : ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
     if (np_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    const auto* user = UserManagement.GetUserByID(user_id);
-    if (user == nullptr) {
-        return ORBIS_NP_ERROR_USER_NOT_FOUND;
-    }
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+        LOG_WARNING(Lib_NpManager,
+                    "sceNpGetNpId: SIGNED_OUT (user_id={} shadnet_enabled={} signed_in={})",
+                    user_id, g_shadnet_enabled,
+                    Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id));
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
-    memset(np_id, 0, sizeof(OrbisNpId));
-    strncpy(np_id->handle.data, user->user_name.c_str(), sizeof(np_id->handle.data) - 1);
+    *np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user_id);
+    LOG_INFO(Lib_NpManager, "sceNpGetNpId: user_id={} handle.data='{}' (strnlen={})", user_id,
+             np_id->handle.data, strnlen(np_id->handle.data, sizeof(np_id->handle.data)));
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id,
                                   OrbisNpOnlineId* online_id) {
     LOG_DEBUG(Lib_NpManager, "user_id {}", user_id);
+    if (user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
+        return (g_firmware_version >= 0 && g_firmware_version < Common::ElfInfo::FW_90)
+                   ? ORBIS_NP_ERROR_USER_NOT_FOUND
+                   : ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
     if (online_id == nullptr) {
+        LOG_ERROR(Lib_NpManager, "invalid argument: online_id is null");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    const auto* user = UserManagement.GetUserByID(user_id);
-    if (user == nullptr) {
-        return ORBIS_NP_ERROR_USER_NOT_FOUND;
-    }
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+        LOG_INFO(Lib_NpManager,
+                 "sceNpGetOnlineId: SIGNED_OUT (user_id={} shadnet_enabled={} signed_in={})",
+                 user_id, g_shadnet_enabled,
+                 Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id));
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
-    memset(online_id, 0, sizeof(OrbisNpOnlineId));
-    strncpy(online_id->data, user->user_name.c_str(), sizeof(online_id->data) - 1);
+    *online_id = Libraries::Np::NpHandler::GetInstance().GetOnlineId(user_id);
     return ORBIS_OK;
 }
 
@@ -639,14 +648,24 @@ s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId us
 
 s32 PS4_SYSV_ABI
 sceNpGetUserIdByAccountId(u64 account_id, Libraries::UserService::OrbisUserServiceUserId* user_id) {
-    if (user_id == nullptr) {
+    if (account_id == 0 || user_id == nullptr) {
+        LOG_ERROR(Lib_NpManager, "invalid argument: account_id={}", account_id);
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled) {
+    if (!g_shadnet_enabled)
         return ORBIS_NP_ERROR_SIGNED_OUT;
-    }
-    *user_id = 1000;
-    LOG_DEBUG(Lib_NpManager, "userid({}) = {}", account_id, *user_id);
+
+    const s32 found = Libraries::Np::NpHandler::GetInstance().GetUserIdByAccountId(account_id);
+    if (found == -1)
+        return ORBIS_NP_ERROR_SIGNED_OUT;
+
+    // Verify the resolved user_id is actually a logged-in local user
+    const User* u = UserManagement.GetUserByID(found);
+    if (!u || !u->logged_in)
+        return ORBIS_NP_ERROR_USER_NOT_FOUND;
+
+    *user_id = found;
+    LOG_DEBUG(Lib_NpManager, "account_id={} returns user_id={}", account_id, *user_id);
     return ORBIS_OK;
 }
 

@@ -31,4 +31,16 @@ s32 NpHandler::GetUserIdByOnlineId(const OrbisNpOnlineId& online_id) const {
     return user_manager.GetDefaultUser().user_id; // dummy return default user id for now //TODO
 }
 
+s32 NpHandler::GetUserIdByAccountId(u64 account_id) const {
+    return s32();
+}
+
+const OrbisNpId& NpHandler::GetNpId(s32 user_id) const {
+    // TODO: insert return statement here
+}
+
+const OrbisNpOnlineId& NpHandler::GetOnlineId(s32 user_id) const {
+    // TODO: insert return statement here
+}
+
 } // namespace Libraries::Np
