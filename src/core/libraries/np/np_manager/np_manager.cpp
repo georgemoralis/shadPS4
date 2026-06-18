@@ -8,6 +8,13 @@
 
 namespace Libraries::NpManager {
 
+// Game-presence and Plus callbacks are stored but never invoked (no live source);
+// only the pointer is kept, so the exact prototype does not affect the ABI.
+using OrbisNpGamePresenceCallback = PS4_SYSV_ABI void (*)(const OrbisNpOnlineId* online_id,
+                                                          void* userdata);
+using OrbisNpPlusEventCallback = PS4_SYSV_ABI void (*)(
+    Libraries::UserService::OrbisUserServiceUserId user_id, s32 event, void* userdata);
+
 s32 PS4_SYSV_ABI Func_EF4378573542A508() {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
@@ -618,8 +625,8 @@ s32 PS4_SYSV_ABI _ZThn8_N3sce2np11NpHttpTransD1Ev() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpAbortRequest() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpAbortRequest(s32 req_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
@@ -878,27 +885,27 @@ s32 PS4_SYSV_ABI sceNpCheckCallbackForLib() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpCheckNpAvailability() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpCheckNpAvailability(s32 req_id, OrbisNpOnlineId* online_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpCheckNpAvailabilityA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpCheckNpAvailabilityA(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, user_id = {}", req_id, user_id);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpCheckNpReachability() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpCheckNpReachability(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, user_id = {}", req_id, user_id);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpCheckPlus() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* param, OrbisNpCheckPlusResult* result) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpCreateAsyncRequest() {
+s32 PS4_SYSV_ABI sceNpCreateAsyncRequest(const OrbisNpCreateAsyncRequestParameter* param) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -908,8 +915,8 @@ s32 PS4_SYSV_ABI sceNpCreateRequest() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpDeleteRequest() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpDeleteRequest(s32 req_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
@@ -918,38 +925,38 @@ s32 PS4_SYSV_ABI sceNpGetAccountAge() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetAccountCountry() {
+s32 PS4_SYSV_ABI sceNpGetAccountCountry(OrbisNpOnlineId* online_id, OrbisNpCountryCode* country_code) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetAccountCountryA() {
+s32 PS4_SYSV_ABI sceNpGetAccountCountryA(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpCountryCode* country_code) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetAccountDateOfBirth(OrbisNpOnlineId* online_id, OrbisNpDate* date_of_birth) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetAccountDateOfBirth() {
+s32 PS4_SYSV_ABI sceNpGetAccountDateOfBirthA(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpDate* date_of_birth) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetAccountId(OrbisNpOnlineId* online_id, u64* account_id) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetAccountDateOfBirthA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUserId user_id, u64* account_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetAccountId() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetAccountIdA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetAccountLanguage() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpGetAccountLanguage(s32 req_id, OrbisNpOnlineId* online_id, OrbisNpLanguageCode* language) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
@@ -958,63 +965,63 @@ s32 PS4_SYSV_ABI sceNpGetAccountLanguage2() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetAccountLanguageA() {
+s32 PS4_SYSV_ABI sceNpGetAccountLanguageA(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpLanguageCode* language) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, user_id = {}", req_id, user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetGamePresenceStatus(OrbisNpOnlineId* online_id, OrbisNpGamePresenseStatus* game_status) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetGamePresenceStatus() {
+s32 PS4_SYSV_ABI sceNpGetGamePresenceStatusA(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpGamePresenseStatus* game_status) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpId* np_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetNpReachabilityState(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpReachabilityState* state) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpOnlineId* online_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetParentalControlInfo(s32 req_id, OrbisNpOnlineId* online_id, s8* age, OrbisNpParentalControlInfo* info) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetParentalControlInfoA(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id, s8* age, OrbisNpParentalControlInfo* info) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, user_id = {}", req_id, user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId user_id, OrbisNpState* state) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetUserIdByAccountId(u64 account_id, Libraries::UserService::OrbisUserServiceUserId* user_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: account_id = {}", account_id);
+    return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI sceNpGetUserIdByOnlineId(const OrbisNpOnlineId* online_id, Libraries::UserService::OrbisUserServiceUserId* user_id) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpGetGamePresenceStatusA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetNpId() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetNpReachabilityState() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetOnlineId() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetParentalControlInfo() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetParentalControlInfoA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetState() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetUserIdByAccountId() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpGetUserIdByOnlineId() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpHasSignedUp() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpHasSignedUp(Libraries::UserService::OrbisUserServiceUserId user_id, bool* has_signed_up) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
     return ORBIS_OK;
 }
 
@@ -1138,8 +1145,8 @@ s32 PS4_SYSV_ABI sceNpIntRegisterGamePresenceCallback() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpIsPlusMember() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpIsPlusMember(Libraries::UserService::OrbisUserServiceUserId user_id, bool* result) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: user_id = {}", user_id);
     return ORBIS_OK;
 }
 
@@ -1723,8 +1730,8 @@ s32 PS4_SYSV_ABI sceNpNotifyPlusFeature() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpPollAsync() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpPollAsync(s32 req_id, s32* result) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
@@ -1913,32 +1920,31 @@ s32 PS4_SYSV_ABI sceNpPushUnsetNpCommunicationId() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterGamePresenceCallback() {
+void PS4_SYSV_ABI sceNpRegisterGamePresenceCallback(OrbisNpGamePresenceCallback callback, void* userdata) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+}
+
+s32 PS4_SYSV_ABI sceNpRegisterGamePresenceCallbackA(OrbisNpGamePresenceCallback callback, void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterGamePresenceCallbackA() {
+s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback(OrbisNpReachabilityStateCallback callback, void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback() {
+s32 PS4_SYSV_ABI sceNpRegisterPlusEventCallback(OrbisNpPlusEventCallback callback, void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterPlusEventCallback() {
+s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterStateCallback() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
-    return ORBIS_OK;
-}
-
-s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA() {
+s32 PS4_SYSV_ABI sceNpRegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -1958,22 +1964,22 @@ s32 PS4_SYSV_ABI sceNpSetAdditionalScope() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpSetContentRestriction() {
+s32 PS4_SYSV_ABI sceNpSetContentRestriction(const OrbisNpContentRestriction* restriction) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpSetGamePresenceOnline() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpSetGamePresenceOnline(s32 req_id, const OrbisNpOnlineId* online_id, u32 presence) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, presence = {}", req_id, presence);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpSetGamePresenceOnlineA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpSetGamePresenceOnlineA(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id, u32 presence) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, user_id = {}, presence = {}", req_id, user_id, presence);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpSetNpTitleId() {
+s32 PS4_SYSV_ABI sceNpSetNpTitleId(const OrbisNpTitleId* title_id, const OrbisNpTitleSecret* title_secret) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
@@ -1983,13 +1989,13 @@ s32 PS4_SYSV_ABI sceNpSetNpTitleIdVsh() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpSetTimeout() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpSetTimeout(s32 req_id, s32 resolve_retry, u32 resolve_timeout, u32 conn_timeout, u32 send_timeout, u32 recv_timeout) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}, resolve_retry = {}, resolve_timeout = {}, conn_timeout = {}, send_timeout = {}, recv_timeout = {}", req_id, resolve_retry, resolve_timeout, conn_timeout, send_timeout, recv_timeout);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpUnregisterGamePresenceCallbackA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpUnregisterGamePresenceCallbackA(s32 callback_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: callback_id = {}", callback_id);
     return ORBIS_OK;
 }
 
@@ -2008,13 +2014,13 @@ s32 PS4_SYSV_ABI sceNpUnregisterStateCallback() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackA() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackA(s32 callback_id) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: callback_id = {}", callback_id);
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpWaitAsync() {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+s32 PS4_SYSV_ABI sceNpWaitAsync(s32 req_id, s32* result) {
+    LOG_ERROR(Lib_NpManager, "(STUBBED) called: req_id = {}", req_id);
     return ORBIS_OK;
 }
 
@@ -2503,7 +2509,7 @@ s32 PS4_SYSV_ABI Func_FF966E4351E564D6() {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit() {
+s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpToolkit callback, void* userdata) {
     LOG_ERROR(Lib_NpManager, "(STUBBED) called");
     return ORBIS_OK;
 }
