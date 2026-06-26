@@ -6,6 +6,7 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_web_api/np_web_api.h"
 #include "core/libraries/np/np_web_api/np_web_api_internal.h"
 
@@ -137,11 +138,11 @@ s32 PS4_SYSV_ABI sceNpWebApiAbortRequest(s64 requestId) {
 
 s32 PS4_SYSV_ABI sceNpWebApiAddHttpRequestHeader(s64 requestId, const char* pFieldName,
                                                  const char* pValue) {
-    LOG_ERROR(Lib_NpWebApi,
-              "called (STUBBED) : requestId = {:#x}, "
-              "pFieldName = '{}', pValue = '{}'",
-              requestId, (pFieldName ? pFieldName : "null"), (pValue ? pValue : "null"));
-    return ORBIS_OK;
+    LOG_INFO(Lib_NpWebApi, "called : requestId = {:#x}, pFieldName = '{}', pValue = '{}'", requestId,
+             (pFieldName ? pFieldName : "null"), (pValue ? pValue : "null"));
+    if (pFieldName == nullptr || pValue == nullptr)
+        return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+    return addHttpRequestHeaderInternal(requestId, pFieldName, pValue);
 }
 
 s32 PS4_SYSV_ABI sceNpWebApiAddMultipartPart(s64 requestId,
@@ -292,26 +293,27 @@ s32 PS4_SYSV_ABI sceNpWebApiGetConnectionStats(s32 userCtxId, const char* pApiGr
 }
 
 s32 PS4_SYSV_ABI sceNpWebApiGetErrorCode() {
-    LOG_ERROR(Lib_NpWebApi, "(STUBBED) called");
-    return ORBIS_OK;
+    const s32 code = getLastWebApiError();
+    LOG_INFO(Lib_NpWebApi, "called : lastErrorCode = {:#x}", code);
+    return code;
 }
 
 s32 PS4_SYSV_ABI sceNpWebApiGetHttpResponseHeaderValue(s64 requestId, const char* pFieldName,
                                                        char* pValue, u64 valueSize) {
-    LOG_ERROR(Lib_NpWebApi,
-              "called (STUBBED) : requestId = {:#x}, "
-              "pFieldName = '{}', pValue = {}, valueSize = {}",
-              requestId, (pFieldName ? pFieldName : "null"), fmt::ptr(pValue), valueSize);
-    return ORBIS_OK;
+    LOG_INFO(Lib_NpWebApi, "called : requestId = {:#x}, pFieldName = '{}', valueSize = {}",
+             requestId, (pFieldName ? pFieldName : "null"), valueSize);
+    if (pFieldName == nullptr || pValue == nullptr || valueSize == 0)
+        return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+    return getHttpResponseHeaderValueInternal(requestId, pFieldName, pValue, valueSize, nullptr);
 }
 
 s32 PS4_SYSV_ABI sceNpWebApiGetHttpResponseHeaderValueLength(s64 requestId, const char* pFieldName,
                                                              u64* pValueLength) {
-    LOG_ERROR(Lib_NpWebApi,
-              "called (STUBBED) : requestId = {:#x}, "
-              "pFieldName = '{}', pValueLength = {}",
-              requestId, (pFieldName ? pFieldName : "null"), fmt::ptr(pValueLength));
-    return ORBIS_OK;
+    LOG_INFO(Lib_NpWebApi, "called : requestId = {:#x}, pFieldName = '{}'", requestId,
+             (pFieldName ? pFieldName : "null"));
+    if (pFieldName == nullptr || pValueLength == nullptr)
+        return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+    return getHttpResponseHeaderValueInternal(requestId, pFieldName, nullptr, 0, pValueLength);
 }
 
 s32 PS4_SYSV_ABI sceNpWebApiGetHttpStatusCode(s64 requestId, s32* out_status_code) {
@@ -813,6 +815,10 @@ s32 PS4_SYSV_ABI Func_F9A32E8685627436() {
 }
 
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
+    // Drain queued push events on the game's thread during sceNpCheckCallback, so
+    // registered push-event callbacks fire on a guest thread (see DrainPushEvents).
+    Libraries::Np::RegisterNpCallback("npwebapi_push", DrainPushEvents);
+
     LIB_FUNCTION("x1Y7yiYSk7c", "libSceNpWebApiCompat", 1, "libSceNpWebApi",
                  sceNpWebApiCreateContext);
     LIB_FUNCTION("y5Ta5JCzQHY", "libSceNpWebApiCompat", 1, "libSceNpWebApi",

@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <deque>
+#include <string>
+#include <string_view>
 #include <magic_enum/magic_enum.hpp>
 #include "common/elf_info.h"
 #include "core/emulator_settings.h"
@@ -16,6 +23,16 @@ namespace Libraries::Np::NpWebApi {
 static std::recursive_mutex g_global_mutex;
 static std::map<s32, OrbisNpWebApiContext*> g_contexts;
 static s32 g_library_context_count = 0;
+
+// Last WebApi error code parsed from an error response body, per calling thread.
+// The real lib sources sceNpWebApiGetErrorCode() from sceNpServerErrorJson* global
+// state; we don't have that subsystem, so we capture it from the error body the game
+// reads via sceNpWebApiReadData (the common usage pattern). See captureWebApiError.
+static thread_local s32 g_last_webapi_error = ORBIS_OK;
+
+// Defined further down; parses a WebApi error code out of an error response body,
+// records it for sceNpWebApiGetErrorCode(), and returns it (0 if none parsed).
+static s32 captureWebApiError(const char* body, u64 len);
 static s32 g_user_context_count = 0;
 static s32 g_handle_count = 0;
 static s32 g_push_event_filter_count = 0;
@@ -568,7 +585,7 @@ void checkRequestTimeout(OrbisNpWebApiRequest* request) {
 }
 
 s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s8 flag,
-                const OrbisNpWebApiResponseInformationOption* pRespInfoOption) {
+                OrbisNpWebApiResponseInformationOption* pRespInfoOption) {
     OrbisNpWebApiContext* context = findAndValidateContext(requestId >> 0x30);
     if (context == nullptr) {
         return ORBIS_NP_WEBAPI_ERROR_LIB_CONTEXT_NOT_FOUND;
@@ -710,6 +727,14 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
                         "be unauthenticated (expect 401 from server)",
                         user_context->userId, request->userPath);
         }
+
+        // Replay app-supplied headers (sceNpWebApiAddHttpRequestHeader) after the
+        // lib-managed Content-Type/Authorization so callers can set Accept, custom
+        // X-* headers, etc. (mode 0 = add).
+        for (const auto& [hname, hvalue] : request->userHeaders) {
+            Libraries::Http::sceHttpAddRequestHeader(req_id, hname.c_str(), hvalue.c_str(),
+                                                     /*mode=*/0);
+        }
     }
 
     setRequestState(request, 4);
@@ -729,10 +754,61 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
              requestId, request->userApiGroup, request->userPath,
              magic_enum::enum_name(request->userMethod), request->http_request_id);
 
+    // SendRequest2 / SendMultipartRequest2 (flag != 0): capture the response status
+    // into the option (if any), and on an error response (>=400) read the error body,
+    // copy it into the option's buffer, and surface its code. Mirrors FUN_0100bee0:
+    // errorObjectSize is the buffer capacity (in), copy is bounded to capacity-1 and
+    // NUL-terminated, responseDataSize gets the total error-body length. On an HTTP
+    // error, v2 also RETURNS a synthesised error: 0x82000000|code for a parsed NP code
+    // (shadNet emits PSN-style codes < 0xc00000, e.g. 2105358), else 0x82f00000|status
+    // (status 100-599) / 0x82ffffff. v1 (flag 0) is unchanged: it returns OK and
+    // leaves the body for sceNpWebApiReadData, which captures the code itself.
+    s32 sendResult = ORBIS_OK;
+    if (flag != 0) {
+        s32 status = 0;
+        if (Libraries::Http::sceHttpGetStatusCode(request->http_request_id, &status) >= 0) {
+            if (pRespInfoOption != nullptr) {
+                pRespInfoOption->httpStatus = status;
+            }
+            if (status >= 400) {
+                std::string errBody;
+                char buf[256];
+                for (;;) {
+                    const s32 n = Libraries::Http::sceHttpReadData(request->http_request_id, buf,
+                                                                   sizeof(buf));
+                    if (n <= 0)
+                        break;
+                    errBody.append(buf, static_cast<size_t>(n));
+                    if (errBody.size() > 64u * 1024u)
+                        break; // sanity cap on a runaway error body
+                }
+                if (pRespInfoOption != nullptr) {
+                    pRespInfoOption->responseDataSize = errBody.size();
+                    char* const dst = pRespInfoOption->pErrorObject;
+                    const u64 cap = pRespInfoOption->errorObjectSize;
+                    if (dst != nullptr && cap > 0) {
+                        const u64 n = std::min<u64>(errBody.size(), cap - 1);
+                        if (n > 0)
+                            std::memcpy(dst, errBody.data(), n);
+                        dst[n] = '\0';
+                    }
+                }
+                const s32 npErr = captureWebApiError(errBody.data(), errBody.size());
+                if (npErr > 0 && npErr < 0xc00000) {
+                    sendResult = static_cast<s32>(0x82000000u | static_cast<u32>(npErr));
+                } else if (status >= 100 && status < 600) {
+                    sendResult = static_cast<s32>(0x82f00000u | static_cast<u32>(status));
+                } else {
+                    sendResult = static_cast<s32>(0x82ffffffu);
+                }
+            }
+        }
+    }
+
     releaseRequest(request);
     releaseUserContext(user_context);
     releaseContext(context);
-    return ORBIS_OK;
+    return sendResult;
 }
 
 s32 abortRequestInternal(OrbisNpWebApiContext* context, OrbisNpWebApiUserContext* userContext,
@@ -1499,6 +1575,166 @@ s32 PS4_SYSV_ABI getHttpRequestIdFromRequest(OrbisNpWebApiRequest* request)
     return request->http_request_id;
 }
 
+// --- Request/response header support -----------------------------------------
+
+namespace {
+
+bool iEquals(const char* a, u64 aLen, const char* b) {
+    u64 i = 0;
+    for (; i < aLen && b[i]; ++i) {
+        if (std::tolower((unsigned char)a[i]) != std::tolower((unsigned char)b[i]))
+            return false;
+    }
+    return i == aLen && b[i] == '\0';
+}
+
+// Locate `field`'s value in a raw HTTP response header block (CRLF-separated
+// "Name: Value" lines, possibly led by a status line). Returns false if absent.
+bool findHeaderValue(const char* block, u64 blockLen, const char* field, std::string& outValue) {
+    u64 i = 0;
+    while (i < blockLen) {
+        u64 lineStart = i;
+        while (i < blockLen && block[i] != '\n')
+            ++i;
+        u64 lineEnd = i; // points at '\n' or end
+        if (i < blockLen)
+            ++i; // step past '\n'
+        // Trim a trailing '\r'.
+        if (lineEnd > lineStart && block[lineEnd - 1] == '\r')
+            --lineEnd;
+        // Split on the first ':'.
+        u64 colon = lineStart;
+        while (colon < lineEnd && block[colon] != ':')
+            ++colon;
+        if (colon >= lineEnd)
+            continue; // no colon (status line / blank)
+        u64 nameLen = colon - lineStart;
+        if (!iEquals(block + lineStart, nameLen, field))
+            continue;
+        u64 vs = colon + 1;
+        while (vs < lineEnd && (block[vs] == ' ' || block[vs] == '\t'))
+            ++vs;
+        outValue.assign(block + vs, lineEnd - vs);
+        return true;
+    }
+    return false;
+}
+
+// Best-effort extraction of the numeric WebApi error code from an error JSON body
+// (e.g. {"error":{"code":2240512,...}} or {"code":...}). Returns true on success.
+bool parseErrorCode(const char* body, u64 len, s32& out) {
+    std::string_view sv(body, len);
+    size_t k = sv.find("\"code\"");
+    if (k == std::string_view::npos)
+        return false;
+    k += 6;
+    while (k < sv.size() && (sv[k] == ' ' || sv[k] == ':' || sv[k] == '"'))
+        ++k;
+    bool neg = false;
+    if (k < sv.size() && (sv[k] == '-' || sv[k] == '+')) {
+        neg = sv[k] == '-';
+        ++k;
+    }
+    if (k >= sv.size() || !std::isdigit((unsigned char)sv[k]))
+        return false;
+    long long v = 0;
+    while (k < sv.size() && std::isdigit((unsigned char)sv[k])) {
+        v = v * 10 + (sv[k] - '0');
+        ++k;
+    }
+    out = static_cast<s32>(neg ? -v : v);
+    return true;
+}
+
+} // namespace
+
+static s32 captureWebApiError(const char* body, u64 len) {
+    s32 code = 0;
+    if (body != nullptr && len > 0 && parseErrorCode(body, len, code)) {
+        g_last_webapi_error = code;
+        return code;
+    }
+    return 0;
+}
+
+s32 getLastWebApiError() {
+    return g_last_webapi_error;
+}
+
+s32 addHttpRequestHeaderInternal(s64 requestId, const char* pFieldName, const char* pValue) {
+    OrbisNpWebApiContext* context = findAndValidateContext(requestId >> 0x30);
+    if (context == nullptr) {
+        return ORBIS_NP_WEBAPI_ERROR_LIB_CONTEXT_NOT_FOUND;
+    }
+    OrbisNpWebApiUserContext* user_context = findUserContext(context, requestId >> 0x20);
+    if (user_context == nullptr) {
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_USER_CONTEXT_NOT_FOUND;
+    }
+    OrbisNpWebApiRequest* request = findRequest(user_context, requestId);
+    if (request == nullptr) {
+        releaseUserContext(user_context);
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_REQUEST_NOT_FOUND;
+    }
+    request->userHeaders.emplace_back(pFieldName, pValue);
+    releaseRequest(request);
+    releaseUserContext(user_context);
+    releaseContext(context);
+    return ORBIS_OK;
+}
+
+// Shared backing for both public response-header getters (mirrors the real lib).
+// value != nullptr -> copy the value into [value, valueSize); valueLength != nullptr
+// -> write the value's byte length (excluding NUL). Absent header: length 0 / empty
+// string + ORBIS_OK (FUN_0100b270's exact not-found code isn't decompiled; this is
+// the least-surprising contract for callers that size-then-read).
+s32 getHttpResponseHeaderValueInternal(s64 requestId, const char* pFieldName, char* pValue,
+                                       u64 valueSize, u64* pValueLength) {
+    OrbisNpWebApiContext* context = findAndValidateContext(requestId >> 0x30);
+    if (context == nullptr) {
+        return ORBIS_NP_WEBAPI_ERROR_LIB_CONTEXT_NOT_FOUND;
+    }
+    OrbisNpWebApiUserContext* user_context = findUserContext(context, requestId >> 0x20);
+    if (user_context == nullptr) {
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_USER_CONTEXT_NOT_FOUND;
+    }
+    OrbisNpWebApiRequest* request = findRequestAndMarkBusy(user_context, requestId);
+    if (request == nullptr) {
+        releaseUserContext(user_context);
+        releaseContext(context);
+        return ORBIS_NP_WEBAPI_ERROR_REQUEST_NOT_FOUND;
+    }
+
+    char* block = nullptr;
+    u64 blockSize = 0;
+    const s32 httpReqId = getHttpRequestIdFromRequest(request);
+    const s32 err = Libraries::Http::sceHttpGetAllResponseHeaders(httpReqId, &block, &blockSize);
+
+    s32 result = ORBIS_OK;
+    if (err < 0) {
+        result = err;
+    } else {
+        std::string value;
+        const bool found =
+            block != nullptr && findHeaderValue(block, blockSize, pFieldName, value);
+        if (pValueLength != nullptr)
+            *pValueLength = found ? value.size() : 0;
+        if (pValue != nullptr && valueSize > 0) {
+            const u64 n = found ? std::min<u64>(value.size(), valueSize - 1) : 0;
+            if (n > 0)
+                std::memcpy(pValue, value.data(), n);
+            pValue[n] = '\0';
+        }
+    }
+
+    releaseRequest(request);
+    releaseUserContext(user_context);
+    releaseContext(context);
+    return result;
+}
+
 s32 PS4_SYSV_ABI getHttpStatusCodeInternal(s64 requestId, s32* out_status_code) {
     s32 status_code;
     OrbisNpWebApiContext* context = findAndValidateContext(requestId >> 0x30);
@@ -1640,6 +1876,16 @@ s32 PS4_SYSV_ABI readDataInternal(s64 requestId, void* pData, u64 size) {
         result = ORBIS_NP_WEBAPI_ERROR_ABORTED;
     } else {
         result = offset;
+        // Surface the server error code for sceNpWebApiGetErrorCode() when the body
+        // just read belongs to an error response (best-effort, single-read JSON).
+        if (offset > 0) {
+            s32 sc = 0;
+            if (Libraries::Http::sceHttpGetStatusCode(getHttpRequestIdFromRequest(request), &sc) >=
+                    0 &&
+                sc >= 400) {
+                captureWebApiError(reinterpret_cast<const char*>(pData), offset);
+            }
+        }
     }
 
     unlockContext(context);
@@ -1653,4 +1899,163 @@ s32 PS4_SYSV_ABI readDataInternal(s64 requestId, void* pData, u64 size) {
     return result;
 }
 
+// --- Push-event delivery -----------------------------------------------------
+//
+// Mirrors the native lib: notificationCallbackFunc -> FUN_0100e220 (extended) and the
+// service dispatch, with matching done by FUN_010049c0. Natively this is driven by the
+// NP manager's push listener thread (mnp:usr:npweblis), which invokes the app callback
+// inline on that thread while holding the context lock, after routing by the
+// notification's target account id and matching dataType by exact string equality.
+//
+// shadPS4 has no guest npweblis thread, and a guest PS4_SYSV_ABI callback can only run
+// on a guest thread; the sole guest-thread delivery point for NP callbacks here is
+// sceNpCheckCallback (NpManager drains g_np_callbacks there). So the host network thread
+// that receives the shadNet notification (EnqueuePushEvent) only hands the event off,
+// and the faithful dispatch runs from the sceNpCheckCallback drain (DrainPushEvents,
+// registered via RegisterNpCallback). That hand-off is the only emulation accommodation;
+// routing, matching and invocation reproduce the decompile.
+
+namespace {
+
+using ServiceCb = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
+                                        const OrbisNpWebApiPushEventDataType*, const char*, u64,
+                                        void*);
+using ExtdCbA = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
+                                      const OrbisNpPeerAddressA*, const OrbisNpOnlineId*,
+                                      const OrbisNpPeerAddressA*, const OrbisNpOnlineId*,
+                                      const OrbisNpWebApiPushEventDataType*, const char*, u64,
+                                      const OrbisNpWebApiExtdPushEventExtdData*, u64, void*);
+
+std::mutex g_push_mutex;
+std::deque<PushEventInput> g_push_queue;
+
+// Mirrors FUN_010049c0: service-name gate, then EXACT dataType equality.
+//  - "catch-all" filter (empty service name + label 0xffffffff) matches only a
+//    notification that itself carries no service name;
+//  - a named filter requires the notification's service name to equal the filter's;
+//  - dataType must exactly equal one registered param; no params => no match.
+// (The native filter+0xc "skip service gate" flag is not modelled; the common
+// filter+0xc == 0 path is reproduced.)
+template <typename Filter>
+bool filterMatches(const Filter* flt, const std::string& evServiceName, bool evHasServiceName,
+                   const std::string& evDataType) {
+    const bool catch_all = flt->npServiceName.empty() && flt->npServiceLabel == 0xffffffffu;
+    if (catch_all) {
+        if (evHasServiceName) {
+            return false;
+        }
+    } else if (!evHasServiceName || flt->npServiceName != evServiceName) {
+        return false;
+    }
+    for (const auto& p : flt->filterParams) {
+        if (evDataType == p.dataType.val) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
+
+// Network-thread hand-off only; the event is dispatched later from DrainPushEvents.
+void EnqueuePushEvent(const PushEventInput& ev) {
+    std::scoped_lock lk{g_push_mutex};
+    g_push_queue.push_back(ev);
+}
+
+// Runs on the game thread from sceNpCheckCallback. Reproduces notificationCallbackFunc:
+// route by target account/user id, then dispatch under the context lock using the match
+// and invocation from FUN_0100e220 / FUN_010049c0.
+void DrainPushEvents() {
+    std::deque<PushEventInput> local;
+    {
+        std::scoped_lock lk{g_push_mutex};
+        if (g_push_queue.empty()) {
+            return;
+        }
+        local.swap(g_push_queue);
+    }
+
+    for (const PushEventInput& ev : local) {
+        const bool ev_has_service = !ev.npServiceName.empty();
+        OrbisNpWebApiPushEventDataType dt{};
+        std::snprintf(dt.val, sizeof(dt.val), "%s", ev.dataType.c_str());
+        const OrbisNpOnlineId* from_p = ev.hasFrom ? &ev.fromOnlineId : nullptr;
+        const OrbisNpOnlineId* to_p = ev.hasTo ? &ev.toOnlineId : nullptr;
+
+        std::scoped_lock gl{g_global_mutex};
+        for (auto& [libId, context] : g_contexts) {
+            if (context == nullptr) {
+                continue;
+            }
+            // Held across the callback, as native holds lockContext during invocation;
+            // the context lock is recursive, so a re-entrant API call from the callback
+            // is safe.
+            std::scoped_lock cl{context->contextLock};
+            for (auto& [ucKey, uc] : context->userContexts) {
+                if (uc == nullptr) {
+                    continue;
+                }
+                // Native routes by sceNpManagerIntGetAccountId(userId) == target account;
+                // in shadPS4 the user context is keyed to the local user the notification
+                // was delivered for.
+                if (uc->userId != ev.targetUserId) {
+                    continue;
+                }
+                const s32 title_user_ctx_id = ucKey;
+
+                // Extended push (A) -- FUN_0100e220.
+                for (auto& [cbId, cb] : uc->extendedPushEventCallbacks) {
+                    if (cb == nullptr || cb->cbFuncA == nullptr) {
+                        continue;
+                    }
+                    auto fit = context->extendedPushEventFilters.find(cb->filterId);
+                    if (fit == context->extendedPushEventFilters.end()) {
+                        continue;
+                    }
+                    const OrbisNpWebApiExtendedPushEventFilter* flt = fit->second;
+                    if (!filterMatches(flt, ev.npServiceName, ev_has_service, ev.dataType)) {
+                        continue;
+                    }
+                    std::vector<OrbisNpWebApiExtdPushEventExtdData> exarr;
+                    exarr.reserve(ev.extdData.size());
+                    for (auto& [k, v] : ev.extdData) {
+                        OrbisNpWebApiExtdPushEventExtdData e{};
+                        std::snprintf(e.extdDataKey.val, sizeof(e.extdDataKey.val), "%s", k.c_str());
+                        e.pData = const_cast<char*>(v.data());
+                        e.dataLen = v.size();
+                        exarr.push_back(e);
+                    }
+                    // Service name/label come from the FILTER (FUN_01004980 / FUN_010049b0).
+                    const char* svc =
+                        flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
+                    reinterpret_cast<ExtdCbA>(reinterpret_cast<void (*)()>(cb->cbFuncA))(
+                        title_user_ctx_id, cbId, svc, flt->npServiceLabel, nullptr, to_p, nullptr,
+                        from_p, &dt, ev.data.data(), ev.data.size(), exarr.data(), exarr.size(),
+                        cb->pUserArg);
+                }
+
+                // Service push -- FUN_0100db70 / FUN_0100d6b0 (same matcher).
+                for (auto& [cbId, cb] : uc->servicePushEventCallbacks) {
+                    if (cb == nullptr || cb->cbFunc == nullptr) {
+                        continue;
+                    }
+                    auto fit = context->servicePushEventFilters.find(cb->filterId);
+                    if (fit == context->servicePushEventFilters.end()) {
+                        continue;
+                    }
+                    const OrbisNpWebApiServicePushEventFilter* flt = fit->second;
+                    if (!filterMatches(flt, ev.npServiceName, ev_has_service, ev.dataType)) {
+                        continue;
+                    }
+                    const char* svc =
+                        flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
+                    reinterpret_cast<ServiceCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
+                        title_user_ctx_id, cbId, svc, flt->npServiceLabel, &dt, ev.data.data(),
+                        ev.data.size(), cb->pUserArg);
+                }
+            }
+        }
+    }
+}
 }; // namespace Libraries::Np::NpWebApi

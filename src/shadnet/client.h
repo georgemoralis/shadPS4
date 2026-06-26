@@ -86,6 +86,21 @@ enum class CommandType : u16 {
     GetScoreAccountId = 37,
     GetScoreGameDataByAccId = 38,
     GetToken = 39,
+    GetAuthCode = 40,
+    // Title User Storage (TUS)
+    TusSetData = 50,
+    TusGetData = 51,
+    TusSetMultiSlotVariable = 52,
+    TusGetMultiSlotVariable = 53,
+    TusAddAndGetVariable = 54,
+    TusGetMultiSlotDataStatus = 55,
+    TusGetMultiUserDataStatus = 56,
+    TusGetFriendsDataStatus = 57,
+    TusDeleteMultiSlotData = 58,
+    TusGetMultiUserVariable = 59,
+    TusTryAndSetVariable = 60,
+    TusGetFriendsVariable = 61,
+    TusDeleteMultiSlotVariable = 62,
 };
 
 enum class NotificationType : u16 {
@@ -93,6 +108,7 @@ enum class NotificationType : u16 {
     FriendNew = 6,
     FriendLost = 7,
     FriendStatus = 8,
+    WebApiPushEvent = 17, // Generic NP WebApi push event (forwarded to libSceNpWebApi callbacks)
 };
 
 enum class ErrorType : uint8_t {
@@ -179,6 +195,14 @@ struct NotifyFriendStatus {
     bool online = false;
     u64 timestamp = 0;
 };
+struct NotifyWebApiPushEvent {
+    std::string npServiceName;  // may be empty (catch-all listeners match any)
+    u32 npServiceLabel = 0;
+    std::string dataType;       // e.g. "np:service:..."
+    std::string data;           // raw event body (typically PSN-format JSON)
+    std::string fromNpid;       // may be empty
+    std::string toNpid;         // may be empty
+};
 
 // ShadNetClient
 
@@ -208,12 +232,18 @@ public:
 
     std::string GetBearerToken() const;
 
+    // Mint a single-use NP authorization code over the authenticated socket
+    // (CommandType::GetAuthCode). Blocks until the reply arrives or a short
+    // timeout elapses; returns the code, or an empty string on failure/timeout.
+    std::string RequestAuthCode();
+
     // Callbacks
     std::function<void(const LoginResult&)> onLoginResult;
     std::function<void(const NotifyFriendQuery&)> onFriendQuery;
     std::function<void(const NotifyFriendNew&)> onFriendNew;
     std::function<void(const NotifyFriendLost&)> onFriendLost;
     std::function<void(const NotifyFriendStatus&)> onFriendStatus;
+    std::function<void(const NotifyWebApiPushEvent&)> onWebApiPushEvent;
     // Async reply callback.
     //   cmd    —command this reply is for (matches the request's cmd)
     //   pkt_id —packet id echoed back from the original request header
@@ -245,6 +275,7 @@ private:
     void DispatchPacket(PacketType type, u16 cmd_raw, u64 pkt_id, const std::vector<u8>& payload);
     void HandleLoginReply(const std::vector<u8>& payload);
     void HandleGetTokenReply(const std::vector<u8>& payload);
+    void HandleGetAuthCodeReply(const std::vector<u8>& payload);
     void HandleNotification(u16 cmd_raw, const std::vector<u8>& payload);
 
     // Helper: read a u32-LE-prefixed proto blob from a byte vector at pos.
@@ -287,6 +318,13 @@ private:
     u64 m_user_id = 0;
     mutable std::mutex m_mutex_bearer;
     std::string m_bearer_token;
+
+    // GetAuthCode request/reply rendezvous (single in-flight; callers serialized
+    // upstream by libSceNpAuth's request lock).
+    std::mutex m_mutex_authcode;
+    std::condition_variable m_cv_authcode;
+    std::string m_auth_code;
+    bool m_auth_code_ready = false;
     std::atomic<u32> m_addr_local{0};
 
     mutable std::mutex m_mutex_friends;

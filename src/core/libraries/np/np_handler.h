@@ -21,6 +21,8 @@
 #include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_score/np_score.h"
 #include "core/libraries/np/np_score/np_score_ctx.h"
+#include "core/libraries/np/np_tus.h"
+#include "core/libraries/np/np_tus_ctx.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/rtc/rtc.h"
 #include "core/libraries/system/userservice.h"
@@ -135,6 +137,153 @@ public:
                          Libraries::Rtc::OrbisRtcTick* lastSortDate, u32* totalRecord,
                          std::shared_ptr<NpScore::ScoreRequestCtx> req);
 
+    // --- Title User Storage (TUS) ---
+    // Each submits to shadNet non-blocking; OnTusReply fills the caller's output
+    // buffers and signals ctx. Return value is the submit result (<0 = not sent).
+    s32 TusSetData(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                   const std::string& virtualUser, s32 slotId, const void* data, u64 dataSize,
+                   const void* info, u64 infoSize, const std::string& authorNpId, bool hasAuthor,
+                   bool hasDate, u64 date, std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusSetDataA(s32 user_id, s32 service_label, s64 ownerAccountId,
+                    const std::string& virtualUser, s32 slotId, const void* data, u64 dataSize,
+                    const void* info, u64 infoSize, bool hasAuthor, s64 authorAccountId,
+                    bool hasDate, u64 date, std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetData(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                   const std::string& virtualUser, s32 slotId,
+                   NpTus::OrbisNpTusDataStatus* statusOut, void* dataOut, u64 dataCap,
+                   std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetDataA(s32 user_id, s32 service_label, s64 ownerAccountId,
+                    const std::string& virtualUser, s32 slotId,
+                    NpTus::OrbisNpTusDataStatusA* statusOut, void* dataOut, u64 dataCap,
+                    std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetDataCS(s32 user_id, s32 service_label, s64 ownerAccountId,
+                     const std::string& virtualUser, s32 slotId,
+                     NpTus::OrbisNpTusDataStatusForCrossSave* statusOut, void* dataOut, u64 dataCap,
+                     std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusSetMultiSlotVariable(s32 user_id, s32 service_label, s64 ownerAccountId,
+                                const std::string& virtualUser, const std::vector<s32>& slotIds,
+                                const std::vector<s64>& values,
+                                std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiSlotVariable(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                                const std::string& virtualUser, const std::vector<s32>& slotIds,
+                                NpTus::OrbisNpTusVariable* variablesOut, u64 arrayNum,
+                                std::shared_ptr<NpTus::TusRequestCtx> ctx,
+                                s64* rawValuesOut = nullptr);
+    s32 TusAddAndGetVariable(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                             const std::string& virtualUser, s32 slotId, s64 inValue,
+                             const std::string& authorNpId, bool hasAuthor, bool hasDate, u64 date,
+                             NpTus::OrbisNpTusVariable* variableOut,
+                             std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    // Account-variant variable reads. Target by account id (0 = self) OR virtual user
+    // (non-empty wins); output is OrbisNpTusVariableA.
+    s32 TusGetMultiSlotVariableA(s32 user_id, s32 service_label, s64 ownerAccountId,
+                                 const std::string& virtualUser, const std::vector<s32>& slotIds,
+                                 NpTus::OrbisNpTusVariableA* variablesOut, u64 arrayNum,
+                                 std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiSlotVariableCS(s32 user_id, s32 service_label, s64 ownerAccountId,
+                                 const std::string& virtualUser, const std::vector<s32>& slotIds,
+                                 NpTus::OrbisNpTusVariableForCrossSave* variablesOut, u64 arrayNum,
+                                 std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserVariable(s32 user_id, s32 service_label, s32 slotId,
+                                const std::vector<std::string>& ownerNpIds,
+                                const std::vector<std::string>& virtualUsers,
+                                NpTus::OrbisNpTusVariable* variablesOut, u64 arrayNum,
+                                std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserVariableA(s32 user_id, s32 service_label, s32 slotId,
+                                 const std::vector<s64>& ownerAccountIds,
+                                 const std::vector<std::string>& virtualUsers,
+                                 NpTus::OrbisNpTusVariableA* variablesOut, u64 arrayNum,
+                                 std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserVariableCS(s32 user_id, s32 service_label, s32 slotId,
+                                 const std::vector<s64>& ownerAccountIds,
+                                 const std::vector<std::string>& virtualUsers,
+                                 NpTus::OrbisNpTusVariableForCrossSave* variablesOut, u64 arrayNum,
+                                 std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusAddAndGetVariableA(s32 user_id, s32 service_label, s64 ownerAccountId,
+                              const std::string& virtualUser, s32 slotId, s64 inValue,
+                              bool hasAuthor, s64 authorId, bool hasDate, u64 date,
+                              NpTus::OrbisNpTusVariableA* variableOut,
+                              std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusAddAndGetVariableCS(s32 user_id, s32 service_label, s64 ownerAccountId,
+                              const std::string& virtualUser, s32 slotId, s64 inValue,
+                              bool hasAuthor, s64 authorId, bool hasDate, u64 date,
+                              NpTus::OrbisNpTusVariableForCrossSave* variableOut,
+                              std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusTryAndSetVariable(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                             const std::string& virtualUser, s32 slotId, s32 opeType, s64 value,
+                             bool hasCompare, s64 compareValue, const std::string& authorNpId,
+                             bool hasAuthor, bool hasDate, u64 date,
+                             NpTus::OrbisNpTusVariable* variableOut,
+                             std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusTryAndSetVariableA(s32 user_id, s32 service_label, s64 ownerAccountId,
+                              const std::string& virtualUser, s32 slotId, s32 opeType, s64 value,
+                              bool hasCompare, s64 compareValue, bool hasAuthor, s64 authorId,
+                              bool hasDate, u64 date, NpTus::OrbisNpTusVariableA* variableOut,
+                              std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusTryAndSetVariableCS(s32 user_id, s32 service_label, s64 ownerAccountId,
+                              const std::string& virtualUser, s32 slotId, s32 opeType, s64 value,
+                              bool hasCompare, s64 compareValue, bool hasAuthor, s64 authorId,
+                              bool hasDate, u64 date, NpTus::OrbisNpTusVariableForCrossSave* variableOut,
+                              std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiSlotDataStatus(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                                  const std::vector<s32>& slotIds,
+                                  NpTus::OrbisNpTusDataStatus* statusOut, u64 arrayNum,
+                                  std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiSlotDataStatusA(s32 user_id, s32 service_label, s64 ownerAccountId,
+                                   const std::string& virtualUser, const std::vector<s32>& slotIds,
+                                   NpTus::OrbisNpTusDataStatusA* statusOut, u64 arrayNum,
+                                   std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiSlotDataStatusCS(s32 user_id, s32 service_label, s64 ownerAccountId,
+                                    const std::string& virtualUser, const std::vector<s32>& slotIds,
+                                    NpTus::OrbisNpTusDataStatusForCrossSave* statusOut, u64 arrayNum,
+                                    std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserDataStatus(s32 user_id, s32 service_label, s32 slotId,
+                                  const std::vector<std::string>& ownerNpIds,
+                                  NpTus::OrbisNpTusDataStatus* statusOut, u64 arrayNum,
+                                  std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserDataStatusVUser(s32 user_id, s32 service_label, s32 slotId,
+                                       const std::vector<std::string>& virtualUsers,
+                                       NpTus::OrbisNpTusDataStatus* statusOut, u64 arrayNum,
+                                       std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserDataStatusA(s32 user_id, s32 service_label, s32 slotId,
+                                   const std::vector<s64>& ownerAccountIds,
+                                   const std::vector<std::string>& virtualUsers,
+                                   NpTus::OrbisNpTusDataStatusA* statusOut, u64 arrayNum,
+                                   std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetMultiUserDataStatusCS(s32 user_id, s32 service_label, s32 slotId,
+                                    const std::vector<s64>& ownerAccountIds,
+                                    const std::vector<std::string>& virtualUsers,
+                                    NpTus::OrbisNpTusDataStatusForCrossSave* statusOut, u64 arrayNum,
+                                    std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetFriendsDataStatus(s32 user_id, s32 service_label, s32 slotId, bool includeSelf,
+                                s32 sortType, u32 max, NpTus::OrbisNpTusDataStatus* statusOut,
+                                u64 arrayCap, u32* totalOut,
+                                std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetFriendsDataStatusA(s32 user_id, s32 service_label, s32 slotId, bool includeSelf,
+                                 s32 sortType, u32 max, NpTus::OrbisNpTusDataStatusA* statusOut,
+                                 u64 arrayNum, std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetFriendsDataStatusCS(s32 user_id, s32 service_label, s32 slotId, bool includeSelf,
+                                  s32 sortType, u32 max,
+                                  NpTus::OrbisNpTusDataStatusForCrossSave* statusOut, u64 arrayNum,
+                                  std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetFriendsVariable(s32 user_id, s32 service_label, s32 slotId, bool includeSelf,
+                              s32 sortType, u32 max, NpTus::OrbisNpTusVariable* variablesOut,
+                              u64 arrayNum, std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetFriendsVariableA(s32 user_id, s32 service_label, s32 slotId, bool includeSelf,
+                               s32 sortType, u32 max, NpTus::OrbisNpTusVariableA* variablesOut,
+                               u64 arrayNum, std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusGetFriendsVariableCS(s32 user_id, s32 service_label, s32 slotId, bool includeSelf,
+                                s32 sortType, u32 max,
+                                NpTus::OrbisNpTusVariableForCrossSave* variablesOut, u64 arrayNum,
+                                std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusDeleteMultiSlotData(s32 user_id, s32 service_label, s64 ownerAccountId,
+                               const std::string& virtualUser, const std::vector<s32>& slotIds,
+                               std::shared_ptr<NpTus::TusRequestCtx> ctx);
+    s32 TusDeleteMultiSlotVariable(s32 user_id, s32 service_label, const std::string& ownerNpId,
+                                   s64 ownerAccountId, const std::string& virtualUser,
+                                   const std::vector<s32>& slotIds,
+                                   std::shared_ptr<NpTus::TusRequestCtx> ctx);
+
     // Submit a GetRankingByRange request to the shadNet server.
     s32 GetRankingByRange(s32 user_id, s32 service_label, u32 boardId, u32 startSerialRank,
                           u32 arrayNum, NpScore::OrbisNpScoreRankData* rankArray,
@@ -213,12 +362,17 @@ private:
     void OnFriendNew(s32 user_id, const ShadNet::NotifyFriendNew& n);
     void OnFriendLost(s32 user_id, const ShadNet::NotifyFriendLost& n);
     void OnFriendStatus(s32 user_id, const ShadNet::NotifyFriendStatus& n);
+    void OnWebApiPushEvent(s32 user_id, const ShadNet::NotifyWebApiPushEvent& n);
     void OnLoginResult(s32 user_id, const ShadNet::LoginResult& res);
 
     // Async reply dispatch for score commands. Called from the per-user
     // ShadNetClient on the reader thread.
     void OnScoreReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
                       const std::vector<u8>& body);
+
+    // Async reply dispatch for TUS commands.
+    void OnTusReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
+                    const std::vector<u8>& body);
 
     // 12-byte NP Communication ID
     std::string GetNpCommId(s32 service_label) const;
@@ -251,6 +405,26 @@ private:
     };
     mutable std::mutex m_mutex_pending_score;
     std::map<u64, PendingScoreRequest> m_pending_score;
+
+    // TUS requests awaiting a reply, keyed by the submit packet id.
+    struct PendingTusRequest {
+        std::shared_ptr<NpTus::TusRequestCtx> req;
+        ShadNet::CommandType cmd;
+        // Only the fields relevant to `cmd` are set.
+        NpTus::OrbisNpTusVariable* variableArray = nullptr;   // variable gets / add
+        s64* variableValuesOut = nullptr; // raw-int64 variable get (base GetMultiSlotVariable)
+        NpTus::OrbisNpTusVariableA* variableArrayA = nullptr; // account-variant variable gets
+        NpTus::OrbisNpTusVariableForCrossSave* variableArrayCS = nullptr; // cross-save variant
+        NpTus::OrbisNpTusDataStatus* statusArray = nullptr; // data get / status families
+        NpTus::OrbisNpTusDataStatusA* statusArrayA = nullptr; // account-variant data status
+        NpTus::OrbisNpTusDataStatusForCrossSave* statusArrayCS = nullptr; // cross-save data status
+        void* dataOut = nullptr;                            // GetData payload
+        u64 dataCap = 0;                                    // GetData buffer capacity
+        u32* totalOut = nullptr;                            // friends total
+        u64 arrayNum = 0;                                   // expected entry count
+    };
+    mutable std::mutex m_mutex_pending_tus;
+    std::map<u64, PendingTusRequest> m_pending_tus;
 
     // Worker thread
     std::atomic<bool> m_initialized{false};
