@@ -1429,12 +1429,16 @@ s32 createExtendedPushEventFilterInternal(
 
     filter->npServiceLabel = npServiceLabel;
 
+    LOG_INFO(Lib_NpWebApi,
+             "createExtdPushEventFilter: filterId={} service='{}' label={:#x} dataTypeParams={}",
+             filterId, pNpServiceName ? pNpServiceName : "null", npServiceLabel, filterParamNum);
     if (pFilterParam != nullptr && filterParamNum != 0) {
         for (u64 param_idx = 0; param_idx < filterParamNum; param_idx++) {
             OrbisNpWebApiExtdPushEventFilterParameter copy =
                 OrbisNpWebApiExtdPushEventFilterParameter{};
             memcpy(&copy, &pFilterParam[param_idx],
                    sizeof(OrbisNpWebApiExtdPushEventFilterParameter));
+            LOG_INFO(Lib_NpWebApi, "  filterParam[{}] dataType='{}'", param_idx, copy.dataType.val);
             filter->filterParams.emplace_back(copy);
             // TODO: Every parameter is registered with an extended data filter through
             // sceNpPushRegisterExtendedDataFilter
@@ -2004,9 +2008,20 @@ void DrainPushEvents() {
                 }
                 const s32 title_user_ctx_id = ucKey;
 
-                // Extended push (A) -- FUN_0100e220.
+                // Extended push -- FUN_0100e220. Native stores one cb_func and invokes
+                // it with the A-shaped signature; the emulator split it into cbFunc
+                // (non-A registration, e.g. CUSA00552) and cbFuncA (A registration). Both
+                // take the same args here -- peers are passed as nullptr, so the
+                // OrbisNpPeerAddress vs ...A pointee type is irrelevant -- so dispatch
+                // whichever is set.
                 for (auto& [cbId, cb] : uc->extendedPushEventCallbacks) {
-                    if (cb == nullptr || cb->cbFuncA == nullptr) {
+                    if (cb == nullptr) {
+                        continue;
+                    }
+                    void (*raw)() = cb->cbFuncA  ? reinterpret_cast<void (*)()>(cb->cbFuncA)
+                                    : cb->cbFunc ? reinterpret_cast<void (*)()>(cb->cbFunc)
+                                                 : nullptr;
+                    if (raw == nullptr) {
                         continue;
                     }
                     auto fit = context->extendedPushEventFilters.find(cb->filterId);
@@ -2029,7 +2044,7 @@ void DrainPushEvents() {
                     // Service name/label come from the FILTER (FUN_01004980 / FUN_010049b0).
                     const char* svc =
                         flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
-                    reinterpret_cast<ExtdCbA>(reinterpret_cast<void (*)()>(cb->cbFuncA))(
+                    reinterpret_cast<ExtdCbA>(raw)(
                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, nullptr, to_p, nullptr,
                         from_p, &dt, ev.data.data(), ev.data.size(), exarr.data(), exarr.size(),
                         cb->pUserArg);
