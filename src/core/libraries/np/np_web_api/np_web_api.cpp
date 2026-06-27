@@ -817,7 +817,7 @@ s32 PS4_SYSV_ABI Func_F9A32E8685627436() {
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     // Drain queued push events on the game's thread during sceNpCheckCallback, so
     // registered push-event callbacks fire on a guest thread (see DrainPushEvents).
-    Libraries::Np::RegisterNpCallback("npwebapi_push", DrainPushEvents);
+    Libraries::Np::NpManager::RegisterNpCallback("npwebapi_push", DrainPushEvents);
 
     LIB_FUNCTION("x1Y7yiYSk7c", "libSceNpWebApiCompat", 1, "libSceNpWebApi",
                  sceNpWebApiCreateContext);
