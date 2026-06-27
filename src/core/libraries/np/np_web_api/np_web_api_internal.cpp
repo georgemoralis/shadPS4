@@ -1098,10 +1098,13 @@ s32 createPushEventFilterInternal(OrbisNpWebApiContext* context,
     filter->parentContext = context;
     filter->filterId = filterId;
 
+    LOG_INFO(Lib_NpWebApi, "createPushEventFilter: filterId={} dataTypeParams={}", filterId,
+             filterParamNum);
     if (pFilterParam != nullptr && filterParamNum != 0) {
         for (u64 param_idx = 0; param_idx < filterParamNum; param_idx++) {
             OrbisNpWebApiPushEventFilterParameter copy = OrbisNpWebApiPushEventFilterParameter{};
             memcpy(&copy, &pFilterParam[param_idx], sizeof(OrbisNpWebApiPushEventFilterParameter));
+            LOG_INFO(Lib_NpWebApi, "  filterParam[{}] dataType='{}'", param_idx, copy.dataType.val);
             filter->filterParams.emplace_back(copy);
         }
     }
@@ -1892,6 +1895,13 @@ s32 PS4_SYSV_ABI readDataInternal(s64 requestId, void* pData, u64 size) {
         }
     }
 
+    // TEMP(diagnostic): dump the first 256 bytes handed to the game so the body the
+    // WebApi returns can be compared against the shadNet route output. Remove after use.
+    if (result > 0) {
+        LOG_INFO(Lib_NpWebApi, "readData reqId={:#x} -> {} bytes: {:.256s}", requestId, result,
+                 std::string(reinterpret_cast<const char*>(pData), std::min<u64>(result, 256)));
+    }
+
     unlockContext(context);
 
     // Cleanup
@@ -1924,6 +1934,19 @@ namespace {
 using ServiceCb = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
                                         const OrbisNpWebApiPushEventDataType*, const char*, u64,
                                         void*);
+// Basic push callback (sceNpWebApiRegisterPushEventCallback). Reverse-engineered from a
+// real title (CUSA00207): the callback reads pData from arg5 (r8) and its registered
+// pUserArg from arg8 ([rbp+0x18]); it strncmp's pData against the dataType string and, on
+// match, sets a dirty flag on pUserArg. So the call is EIGHT args with pData at slot 5 and
+// pUserArg at slot 8, and pData must be the dataType string (the body is just a trigger).
+// pFrom/pTo are pointers to a 24-byte { char onlineId[16]; u32; u32; } struct.
+struct BasicPushPeer {
+    char onlineId[16];
+    u32 a;
+    u32 b;
+};
+using BasicCb = PS4_SYSV_ABI void (*)(s32, s32, const void*, const void*, const char*, u64,
+                                      const void*, void*);
 using ExtdCbA = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
                                       const OrbisNpPeerAddressA*, const OrbisNpOnlineId*,
                                       const OrbisNpPeerAddressA*, const OrbisNpOnlineId*,
@@ -2044,6 +2067,10 @@ void DrainPushEvents() {
                     // Service name/label come from the FILTER (FUN_01004980 / FUN_010049b0).
                     const char* svc =
                         flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
+                    // TEMP(diagnostic): confirm the listener callback fires. Remove after use.
+                    LOG_INFO(Lib_NpWebApi,
+                             "DrainPushEvents: invoking extd cb ctx={:#x} cbId={} dataType='{}'",
+                             title_user_ctx_id, cbId, ev.dataType);
                     reinterpret_cast<ExtdCbA>(raw)(
                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, nullptr, to_p, nullptr,
                         from_p, &dt, ev.data.data(), ev.data.size(), exarr.data(), exarr.size(),
@@ -2068,6 +2095,56 @@ void DrainPushEvents() {
                     reinterpret_cast<ServiceCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, &dt, ev.data.data(),
                         ev.data.size(), cb->pUserArg);
+                }
+
+                // Basic push -- sceNpWebApiRegisterPushEventCallback (e.g. CUSA00207).
+                // The basic filter is service-less (no npServiceName/Label), so it only
+                // matches service-less notifications, by exact dataType. Native dispatches
+                // this in the serviceName==null branch (FUN_01009d10 / FUN_0100d6b0).
+                if (!ev_has_service) {
+                    for (auto& [cbId, cb] : uc->pushEventCallbacks) {
+                        if (cb == nullptr || cb->cbFunc == nullptr) {
+                            continue;
+                        }
+                        auto fit = context->pushEventFilters.find(cb->filterId);
+                        if (fit == context->pushEventFilters.end()) {
+                            continue;
+                        }
+                        const OrbisNpWebApiPushEventFilter* flt = fit->second;
+                        bool matched = false;
+                        for (const auto& p : flt->filterParams) {
+                            if (ev.dataType == p.dataType.val) {
+                                matched = true;
+                                break;
+                            }
+                        }
+                        if (!matched) {
+                            continue;
+                        }
+                        // TEMP(diagnostic): confirm the basic listener fires. Remove after use.
+                        LOG_INFO(Lib_NpWebApi,
+                                 "DrainPushEvents: invoking basic cb ctx={:#x} cbId={} "
+                                 "dataType='{}'",
+                                 title_user_ctx_id, cbId, ev.dataType);
+                        // Native shape (RE'd from CUSA00207): cb(userCtxId, callbackId, pFrom,
+                        // pTo, pData, dataLen, pNpServiceName, pUserArg). pData must be the
+                        // dataType string -- the title strncmp's it to decide which list to mark
+                        // dirty; the body itself is just a trigger. pFrom/pTo are non-null so the
+                        // title never dereferences a null peer.
+                        BasicPushPeer from_peer{};
+                        BasicPushPeer to_peer{};
+                        if (ev.hasFrom) {
+                            std::memcpy(from_peer.onlineId, ev.fromOnlineId.data,
+                                        sizeof(from_peer.onlineId));
+                        }
+                        if (ev.hasTo) {
+                            std::memcpy(to_peer.onlineId, ev.toOnlineId.data,
+                                        sizeof(to_peer.onlineId));
+                        }
+                        reinterpret_cast<BasicCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
+                            title_user_ctx_id, cbId, &from_peer, &to_peer, ev.dataType.c_str(),
+                            ev.dataType.size(), nullptr, cb->pUserArg);
+                    }
                 }
             }
         }

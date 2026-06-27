@@ -453,7 +453,7 @@ void NpHandler::OnFriendStatus(s32 user_id, const ShadNet::NotifyFriendStatus& n
 }
 
 void NpHandler::OnWebApiPushEvent(s32 user_id, const ShadNet::NotifyWebApiPushEvent& n) {
-    LOG_DEBUG(NpHandler, "user_id={} WebApiPushEvent svc='{}' type='{}' bytes={}", user_id,
+    LOG_INFO(NpHandler, "user_id={} WebApiPushEvent svc='{}' type='{}' bytes={}", user_id,
               n.npServiceName, n.dataType, n.data.size());
     // Forward verbatim to the libSceNpWebApi push-event dispatch; it queues the event
     // and delivers it on the game's thread during sceNpCheckCallback to any registered

@@ -17,6 +17,38 @@ namespace Libraries::Np::NpWebApi {
 static bool g_is_initialized = false;
 static s32 g_active_library_contexts = 0;
 
+static std::string DecodeBase64(std::string_view in) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z')
+            return c - 'A';
+        if (c >= 'a' && c <= 'z')
+            return c - 'a' + 26;
+        if (c >= '0' && c <= '9')
+            return c - '0' + 52;
+        if (c == '+')
+            return 62;
+        if (c == '/')
+            return 63;
+        return -1;
+    };
+    std::string out;
+    int buf = 0, bits = 0;
+    for (char c : in) {
+        if (c == '=' || c == '\0')
+            break;
+        const int v = val(c);
+        if (v < 0)
+            continue; // skip whitespace / invalid chars
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<char>((buf >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
 s32 PS4_SYSV_ABI sceNpWebApiCreateContext(s32 libCtxId, OrbisNpOnlineId* onlineId) {
     if (libCtxId >= 0x8000) {
         return ORBIS_NP_WEBAPI_ERROR_INVALID_LIB_CONTEXT_ID;
@@ -572,9 +604,38 @@ s32 PS4_SYSV_ABI sceNpWebApiUnregisterExtdPushEventCallback(s32 titleUserCtxId, 
 
 s32 PS4_SYSV_ABI sceNpWebApiUtilityParseNpId(const char* pJsonNpId,
                                              Libraries::Np::OrbisNpId* pNpId) {
-    LOG_ERROR(Lib_NpWebApi, "(STUBBED) called");
+    if (pJsonNpId == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // Decode and parse the serialized npId. Format: "<handle>@<seg>[/<seg>][.<seg>]".
+    // The part before '@' is the online-id handle (<=16 bytes); the segments after,
+    // with their '/' and '.' separators removed, concatenate into the 8-byte opt
+    const std::string decoded = DecodeBase64(pJsonNpId);
+    std::string handle;
+    std::string opt;
+    const size_t at = decoded.find('@');
+    if (at == std::string::npos) {
+        handle = decoded;
+    } else {
+        handle = decoded.substr(0, at);
+        for (size_t i = at + 1; i < decoded.size(); ++i) {
+            const char c = decoded[i];
+            if (c != '/' && c != '.') {
+                opt.push_back(c);
+            }
+        }
+    }
+    if (pNpId != nullptr) {
+        std::memset(pNpId, 0, sizeof(Libraries::Np::OrbisNpId));
+        std::memcpy(pNpId->handle.data, handle.data(),
+                    std::min<size_t>(handle.size(), ORBIS_NP_ONLINEID_MAX_LENGTH));
+        std::memcpy(pNpId->opt, opt.data(), std::min<size_t>(opt.size(), sizeof(pNpId->opt)));
+        pNpId->reserved[0] = 0x01; // valid-handle flag, as the PRX sets
+    }
+    LOG_INFO(Lib_NpWebApi, "parsed npId -> handle='{}' opt='{}'", handle, opt);
     return ORBIS_OK;
 }
+
 
 s32 PS4_SYSV_ABI sceNpWebApiVshInitialize(s32 libHttpCtxId, u64 poolSize) {
     LOG_INFO(Lib_NpWebApi, "called libHttpCtxId = {:#x}, poolSize = {:#x} bytes", libHttpCtxId,

@@ -780,7 +780,7 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
         n.fromNpid = ExtractBlob(payload, off);
         off += 4 + static_cast<int>(n.fromNpid.size());
         n.toNpid = ExtractBlob(payload, off);
-        LOG_DEBUG(ShadNet, "WebApiPushEvent svc='{}' type='{}' from='{}' bytes={}",
+        LOG_INFO(ShadNet, "WebApiPushEvent svc='{}' type='{}' from='{}' bytes={}",
                   n.npServiceName, n.dataType, n.fromNpid, n.data.size());
         if (onWebApiPushEvent)
             onWebApiPushEvent(n);
