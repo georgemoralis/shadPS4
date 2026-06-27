@@ -1426,12 +1426,11 @@ s32 createExtendedPushEventFilterInternal(
             memcpy(&copy, &pFilterParam[param_idx],
                    sizeof(OrbisNpWebApiExtdPushEventFilterParameter));
             LOG_INFO(Lib_NpWebApi, "  filterParam[{}] dataType='{}' extdKeys={}", param_idx,
-                     copy.dataType.val, copy.extdDataKeyNum);
-            // TEMP(diagnostic): reveal the literal extended-data keys a title subscribes to
-            // (e.g. the friendlist:friend trigger key). Guest pointer, valid during this call.
+                     copy.dataType.val, copy.extdDataKeyNum); // debug
             if (copy.pExtdDataKey != nullptr) {
                 for (u64 k = 0; k < copy.extdDataKeyNum; k++) {
-                    LOG_INFO(Lib_NpWebApi, "    extdDataKey[{}]='{}'", k, copy.pExtdDataKey[k].val);
+                    LOG_INFO(Lib_NpWebApi, "    extdDataKey[{}]='{}'", k,
+                             copy.pExtdDataKey[k].val); // debug
                 }
             }
             filter->filterParams.emplace_back(copy);
@@ -1574,9 +1573,7 @@ s32 PS4_SYSV_ABI getHttpRequestIdFromRequest(OrbisNpWebApiRequest* request)
     return request->http_request_id;
 }
 
-// --- Request/response header support -----------------------------------------
-
-namespace {
+// Request/response header support
 
 bool iEquals(const char* a, u64 aLen, const char* b) {
     u64 i = 0;
@@ -1619,7 +1616,7 @@ bool findHeaderValue(const char* block, u64 blockLen, const char* field, std::st
     return false;
 }
 
-// Best-effort extraction of the numeric WebApi error code from an error JSON body
+// extraction of the numeric WebApi error code from an error JSON body
 // (e.g. {"error":{"code":2240512,...}} or {"code":...}). Returns true on success.
 bool parseErrorCode(const char* body, u64 len, s32& out) {
     std::string_view sv(body, len);
@@ -1644,8 +1641,6 @@ bool parseErrorCode(const char* body, u64 len, s32& out) {
     out = static_cast<s32>(neg ? -v : v);
     return true;
 }
-
-} // namespace
 
 static s32 captureWebApiError(const char* body, u64 len) {
     s32 code = 0;
@@ -1683,11 +1678,6 @@ s32 addHttpRequestHeaderInternal(s64 requestId, const char* pFieldName, const ch
     return ORBIS_OK;
 }
 
-// Shared backing for both public response-header getters (mirrors the real lib).
-// value != nullptr -> copy the value into [value, valueSize); valueLength != nullptr
-// -> write the value's byte length (excluding NUL). Absent header: length 0 / empty
-// string + ORBIS_OK (FUN_0100b270's exact not-found code isn't decompiled; this is
-// the least-surprising contract for callers that size-then-read).
 s32 getHttpResponseHeaderValueInternal(s64 requestId, const char* pFieldName, char* pValue,
                                        u64 valueSize, u64* pValueLength) {
     OrbisNpWebApiContext* context = findAndValidateContext(requestId >> 0x30);
@@ -1875,7 +1865,7 @@ s32 PS4_SYSV_ABI readDataInternal(s64 requestId, void* pData, u64 size) {
     } else {
         result = offset;
         // Surface the server error code for sceNpWebApiGetErrorCode() when the body
-        // just read belongs to an error response (best-effort, single-read JSON).
+        // just read belongs to an error response
         if (offset > 0) {
             s32 sc = 0;
             if (Libraries::Http::sceHttpGetStatusCode(getHttpRequestIdFromRequest(request), &sc) >=
@@ -1886,11 +1876,10 @@ s32 PS4_SYSV_ABI readDataInternal(s64 requestId, void* pData, u64 size) {
         }
     }
 
-    // TEMP(diagnostic): dump the first 256 bytes handed to the game so the body the
-    // WebApi returns can be compared against the shadNet route output. Remove after use.
     if (result > 0) {
         LOG_INFO(Lib_NpWebApi, "readData reqId={:#x} -> {} bytes: {:.256s}", requestId, result,
-                 std::string(reinterpret_cast<const char*>(pData), std::min<u64>(result, 256)));
+                 std::string(reinterpret_cast<const char*>(pData),
+                             std::min<u64>(result, 256))); // debug to be removed
     }
 
     unlockContext(context);
@@ -1908,31 +1897,11 @@ s32 PS4_SYSV_ABI readDataInternal(s64 requestId, void* pData, u64 size) {
 //
 // Mirrors the native lib: notificationCallbackFunc -> FUN_0100e220 (extended) and the
 // service dispatch, with matching done by FUN_010049c0. Natively this is driven by the
-// NP manager's push listener thread (mnp:usr:npweblis), which invokes the app callback
-// inline on that thread while holding the context lock, after routing by the
-// notification's target account id and matching dataType by exact string equality.
-//
-// shadPS4 has no guest npweblis thread, and a guest PS4_SYSV_ABI callback can only run
-// on a guest thread; the sole guest-thread delivery point for NP callbacks here is
-// sceNpCheckCallback (NpManager drains g_np_callbacks there). So the host network thread
-// that receives the shadNet notification (EnqueuePushEvent) only hands the event off,
-// and the faithful dispatch runs from the sceNpCheckCallback drain (DrainPushEvents,
-// registered via RegisterNpCallback). That hand-off is the only emulation accommodation;
-// routing, matching and invocation reproduce the decompile.
-
-namespace {
+// NP manager's push listener thread (mnp:usr:npweblis)
 
 using ServiceCb = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
                                         const OrbisNpWebApiPushEventDataType*, const char*, u64,
                                         void*);
-// SceNpWebApiPushEventCallback (basic push) -- exact SDK signature (8 args):
-//   (s32 userCtxId, s32 callbackId, const SceNpPeerAddress* pTo,
-//    const SceNpPeerAddress* pFrom, const SceNpWebApiPushEventDataType* pDataType,
-//    const char* pData, size_t dataLen, void* pUserArg)
-// pTo = user notified (self), pFrom = user that caused the event; pData/dataLen are NULL/0
-// when the event carries no payload. NB: SceNpPeerAddress is { SceNpOnlineId; platform }
-// (24 bytes) -- NOT shadPS4's OrbisNpPeerAddressA (accountId-based, 16 bytes) -- so use a
-// local struct with the correct layout.
 struct PushPeerAddress {
     OrbisNpOnlineId onlineId;
     s32 platform;
@@ -1949,13 +1918,6 @@ using ExtdCbA = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel
 std::mutex g_push_mutex;
 std::deque<PushEventInput> g_push_queue;
 
-// Mirrors FUN_010049c0: service-name gate, then EXACT dataType equality.
-//  - "catch-all" filter (empty service name + label 0xffffffff) matches only a
-//    notification that itself carries no service name;
-//  - a named filter requires the notification's service name to equal the filter's;
-//  - dataType must exactly equal one registered param; no params => no match.
-// (The native filter+0xc "skip service gate" flag is not modelled; the common
-// filter+0xc == 0 path is reproduced.)
 template <typename Filter>
 bool filterMatches(const Filter* flt, const std::string& evServiceName, bool evHasServiceName,
                    const std::string& evDataType) {
@@ -1975,17 +1937,13 @@ bool filterMatches(const Filter* flt, const std::string& evServiceName, bool evH
     return false;
 }
 
-} // namespace
-
-// Network-thread hand-off only; the event is dispatched later from DrainPushEvents.
+// Network-thread hand-off only,the event is dispatched later from DrainPushEvents.
 void EnqueuePushEvent(const PushEventInput& ev) {
     std::scoped_lock lk{g_push_mutex};
     g_push_queue.push_back(ev);
 }
 
-// Runs on the game thread from sceNpCheckCallback. Reproduces notificationCallbackFunc:
-// route by target account/user id, then dispatch under the context lock using the match
-// and invocation from FUN_0100e220 / FUN_010049c0.
+// Runs on the game thread from sceNpCheckCallback
 void DrainPushEvents() {
     std::deque<PushEventInput> local;
     {
@@ -2008,28 +1966,16 @@ void DrainPushEvents() {
             if (context == nullptr) {
                 continue;
             }
-            // Held across the callback, as native holds lockContext during invocation;
-            // the context lock is recursive, so a re-entrant API call from the callback
-            // is safe.
             std::scoped_lock cl{context->contextLock};
             for (auto& [ucKey, uc] : context->userContexts) {
                 if (uc == nullptr) {
                     continue;
                 }
-                // Native routes by sceNpManagerIntGetAccountId(userId) == target account;
-                // in shadPS4 the user context is keyed to the local user the notification
-                // was delivered for.
                 if (uc->userId != ev.targetUserId) {
                     continue;
                 }
                 const s32 title_user_ctx_id = ucKey;
 
-                // Extended push -- FUN_0100e220. Native stores one cb_func and invokes
-                // it with the A-shaped signature; the emulator split it into cbFunc
-                // (non-A registration, e.g. CUSA00552) and cbFuncA (A registration). Both
-                // take the same args here -- peers are passed as nullptr, so the
-                // OrbisNpPeerAddress vs ...A pointee type is irrelevant -- so dispatch
-                // whichever is set.
                 for (auto& [cbId, cb] : uc->extendedPushEventCallbacks) {
                     if (cb == nullptr) {
                         continue;
@@ -2058,24 +2004,26 @@ void DrainPushEvents() {
                         e.dataLen = v.size();
                         exarr.push_back(e);
                     }
-                    // Service name/label come from the FILTER (FUN_01004980 / FUN_010049b0).
+                    // Service name/label come from the FILTER
                     const char* svc =
                         flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
-                    // SDK contract: pData/pExtdData are NULL (and the counts 0) when the event
+                    // pData/pExtdData are NULL (and the counts 0) when the event
                     // carries no payload / no matching extended data.
                     const char* ext_data = ev.data.empty() ? nullptr : ev.data.data();
                     const OrbisNpWebApiExtdPushEventExtdData* ext_arr =
                         exarr.empty() ? nullptr : exarr.data();
-                    // TEMP(diagnostic): confirm the listener callback fires. Remove after use.
-                    LOG_INFO(Lib_NpWebApi,
-                             "DrainPushEvents: invoking extd cb ctx={:#x} cbId={} dataType='{}'",
-                             title_user_ctx_id, cbId, ev.dataType);
+
+                    LOG_INFO(
+                        Lib_NpWebApi,
+                        "DrainPushEvents: invoking extd cb ctx={:#x} cbId={} dataType='{}'",
+                        title_user_ctx_id, cbId,
+                        ev.dataType); // debug confirm the listener callback fires. to be removed
                     reinterpret_cast<ExtdCbA>(raw)(
                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, nullptr, to_p, nullptr,
                         from_p, &dt, ext_data, ev.data.size(), ext_arr, exarr.size(), cb->pUserArg);
                 }
 
-                // Service push -- FUN_0100db70 / FUN_0100d6b0 (same matcher).
+                // Service push
                 for (auto& [cbId, cb] : uc->servicePushEventCallbacks) {
                     if (cb == nullptr || cb->cbFunc == nullptr) {
                         continue;
@@ -2096,10 +2044,7 @@ void DrainPushEvents() {
                         ev.data.size(), cb->pUserArg);
                 }
 
-                // Basic push -- sceNpWebApiRegisterPushEventCallback (e.g. CUSA00207).
-                // The basic filter is service-less (no npServiceName/Label), so it only
-                // matches service-less notifications, by exact dataType. Native dispatches
-                // this in the serviceName==null branch (FUN_01009d10 / FUN_0100d6b0).
+                // Basic push
                 if (!ev_has_service) {
                     for (auto& [cbId, cb] : uc->pushEventCallbacks) {
                         if (cb == nullptr || cb->cbFunc == nullptr) {
@@ -2120,15 +2065,12 @@ void DrainPushEvents() {
                         if (!matched) {
                             continue;
                         }
-                        // TEMP(diagnostic): confirm the basic listener fires. Remove after use.
                         LOG_INFO(Lib_NpWebApi,
                                  "DrainPushEvents: invoking basic cb ctx={:#x} cbId={} "
                                  "dataType='{}'",
-                                 title_user_ctx_id, cbId, ev.dataType);
-                        // SDK order: (userCtxId, callbackId, pTo, pFrom, pDataType, pData,
-                        // dataLen, pUserArg). pDataType is what the title matches on; pData/
-                        // dataLen are NULL/0 for a payload-less trigger. Peers are non-null so
-                        // a title that reads pTo/pFrom never hits a null.
+                                 title_user_ctx_id, cbId,
+                                 ev.dataType); // debug confirm the listener callback fires. to be
+                                               // removed
                         PushPeerAddress to_peer{};   // notified user (self)
                         PushPeerAddress from_peer{}; // user that caused the event
                         if (ev.hasTo) {

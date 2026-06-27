@@ -201,17 +201,15 @@ bool isRequestBusy(OrbisNpWebApiRequest* request);           // FUN_0100c1b0
 s32 setRequestTimeout(s64 requestId, u32 timeout);           // FUN_01003610
 void startRequestTimer(OrbisNpWebApiRequest* request);       // FUN_0100c0d0
 void checkRequestTimeout(OrbisNpWebApiRequest* request);     // FUN_0100c130
-s32 sendRequest(
-    s64 requestId, s32 partIndex, const void* data, u64 dataSize, s8 flag,
-    OrbisNpWebApiResponseInformationOption* pResponseInformationOption); // FUN_01001c50
+s32 sendRequest(s64 requestId, s32 partIndex, const void* data, u64 dataSize, s8 flag,
+                OrbisNpWebApiResponseInformationOption* pResponseInformationOption); // FUN_01001c50
 s32 abortRequestInternal(OrbisNpWebApiContext* context, OrbisNpWebApiUserContext* userContext,
                          OrbisNpWebApiRequest* request); // FUN_01001b70
 s32 abortRequest(s64 requestId);                         // FUN_01002c70
 void releaseRequest(OrbisNpWebApiRequest* request);      // FUN_01009fb0
 s32 deleteRequest(s64 requestId);                        // FUN_010019a0
 
-// Request/response header helpers (mirror the real lib: one shared response-header
-// internal services both the value and length public getters).
+// Request/response header helpers
 s32 addHttpRequestHeaderInternal(s64 requestId, const char* pFieldName, const char* pValue);
 s32 getHttpResponseHeaderValueInternal(s64 requestId, const char* pFieldName, char* pValue,
                                        u64 valueSize, u64* pValueLength);
