@@ -1934,19 +1934,21 @@ namespace {
 using ServiceCb = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
                                         const OrbisNpWebApiPushEventDataType*, const char*, u64,
                                         void*);
-// Basic push callback (sceNpWebApiRegisterPushEventCallback). Reverse-engineered from a
-// real title (CUSA00207): the callback reads pData from arg5 (r8) and its registered
-// pUserArg from arg8 ([rbp+0x18]); it strncmp's pData against the dataType string and, on
-// match, sets a dirty flag on pUserArg. So the call is EIGHT args with pData at slot 5 and
-// pUserArg at slot 8, and pData must be the dataType string (the body is just a trigger).
-// pFrom/pTo are pointers to a 24-byte { char onlineId[16]; u32; u32; } struct.
-struct BasicPushPeer {
-    char onlineId[16];
-    u32 a;
-    u32 b;
+// SceNpWebApiPushEventCallback (basic push) -- exact SDK signature (8 args):
+//   (s32 userCtxId, s32 callbackId, const SceNpPeerAddress* pTo,
+//    const SceNpPeerAddress* pFrom, const SceNpWebApiPushEventDataType* pDataType,
+//    const char* pData, size_t dataLen, void* pUserArg)
+// pTo = user notified (self), pFrom = user that caused the event; pData/dataLen are NULL/0
+// when the event carries no payload. NB: SceNpPeerAddress is { SceNpOnlineId; platform }
+// (24 bytes) -- NOT shadPS4's OrbisNpPeerAddressA (accountId-based, 16 bytes) -- so use a
+// local struct with the correct layout.
+struct PushPeerAddress {
+    OrbisNpOnlineId onlineId;
+    s32 platform;
 };
-using BasicCb = PS4_SYSV_ABI void (*)(s32, s32, const void*, const void*, const char*, u64,
-                                      const void*, void*);
+using BasicCb = PS4_SYSV_ABI void (*)(s32, s32, const PushPeerAddress*, const PushPeerAddress*,
+                                      const OrbisNpWebApiPushEventDataType*, const char*, u64,
+                                      void*);
 using ExtdCbA = PS4_SYSV_ABI void (*)(s32, s32, const char*, OrbisNpServiceLabel,
                                       const OrbisNpPeerAddressA*, const OrbisNpOnlineId*,
                                       const OrbisNpPeerAddressA*, const OrbisNpOnlineId*,
@@ -2126,24 +2128,22 @@ void DrainPushEvents() {
                                  "DrainPushEvents: invoking basic cb ctx={:#x} cbId={} "
                                  "dataType='{}'",
                                  title_user_ctx_id, cbId, ev.dataType);
-                        // Native shape (RE'd from CUSA00207): cb(userCtxId, callbackId, pFrom,
-                        // pTo, pData, dataLen, pNpServiceName, pUserArg). pData must be the
-                        // dataType string -- the title strncmp's it to decide which list to mark
-                        // dirty; the body itself is just a trigger. pFrom/pTo are non-null so the
-                        // title never dereferences a null peer.
-                        BasicPushPeer from_peer{};
-                        BasicPushPeer to_peer{};
-                        if (ev.hasFrom) {
-                            std::memcpy(from_peer.onlineId, ev.fromOnlineId.data,
-                                        sizeof(from_peer.onlineId));
-                        }
+                        // SDK order: (userCtxId, callbackId, pTo, pFrom, pDataType, pData,
+                        // dataLen, pUserArg). pDataType is what the title matches on; pData/
+                        // dataLen are NULL/0 for a payload-less trigger. Peers are non-null so
+                        // a title that reads pTo/pFrom never hits a null.
+                        PushPeerAddress to_peer{};   // notified user (self)
+                        PushPeerAddress from_peer{}; // user that caused the event
                         if (ev.hasTo) {
-                            std::memcpy(to_peer.onlineId, ev.toOnlineId.data,
-                                        sizeof(to_peer.onlineId));
+                            to_peer.onlineId = ev.toOnlineId;
                         }
+                        if (ev.hasFrom) {
+                            from_peer.onlineId = ev.fromOnlineId;
+                        }
+                        const char* p_data = ev.data.empty() ? nullptr : ev.data.data();
                         reinterpret_cast<BasicCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
-                            title_user_ctx_id, cbId, &from_peer, &to_peer, ev.dataType.c_str(),
-                            ev.dataType.size(), nullptr, cb->pUserArg);
+                            title_user_ctx_id, cbId, &to_peer, &from_peer, &dt, p_data,
+                            ev.data.size(), cb->pUserArg);
                     }
                 }
             }
