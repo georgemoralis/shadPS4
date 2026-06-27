@@ -2069,13 +2069,18 @@ void DrainPushEvents() {
                     // Service name/label come from the FILTER (FUN_01004980 / FUN_010049b0).
                     const char* svc =
                         flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
+                    // SDK contract: pData/pExtdData are NULL (and the counts 0) when the event
+                    // carries no payload / no matching extended data.
+                    const char* ext_data = ev.data.empty() ? nullptr : ev.data.data();
+                    const OrbisNpWebApiExtdPushEventExtdData* ext_arr =
+                        exarr.empty() ? nullptr : exarr.data();
                     // TEMP(diagnostic): confirm the listener callback fires. Remove after use.
                     LOG_INFO(Lib_NpWebApi,
                              "DrainPushEvents: invoking extd cb ctx={:#x} cbId={} dataType='{}'",
                              title_user_ctx_id, cbId, ev.dataType);
                     reinterpret_cast<ExtdCbA>(raw)(
                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, nullptr, to_p, nullptr,
-                        from_p, &dt, ev.data.data(), ev.data.size(), exarr.data(), exarr.size(),
+                        from_p, &dt, ext_data, ev.data.size(), ext_arr, exarr.size(),
                         cb->pUserArg);
                 }
 
@@ -2094,8 +2099,9 @@ void DrainPushEvents() {
                     }
                     const char* svc =
                         flt->npServiceName.empty() ? nullptr : flt->npServiceName.c_str();
+                    const char* svc_data = ev.data.empty() ? nullptr : ev.data.data();
                     reinterpret_cast<ServiceCb>(reinterpret_cast<void (*)()>(cb->cbFunc))(
-                        title_user_ctx_id, cbId, svc, flt->npServiceLabel, &dt, ev.data.data(),
+                        title_user_ctx_id, cbId, svc, flt->npServiceLabel, &dt, svc_data,
                         ev.data.size(), cb->pUserArg);
                 }
 
