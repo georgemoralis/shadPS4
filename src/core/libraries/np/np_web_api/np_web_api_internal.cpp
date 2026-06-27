@@ -1441,7 +1441,15 @@ s32 createExtendedPushEventFilterInternal(
                 OrbisNpWebApiExtdPushEventFilterParameter{};
             memcpy(&copy, &pFilterParam[param_idx],
                    sizeof(OrbisNpWebApiExtdPushEventFilterParameter));
-            LOG_INFO(Lib_NpWebApi, "  filterParam[{}] dataType='{}'", param_idx, copy.dataType.val);
+            LOG_INFO(Lib_NpWebApi, "  filterParam[{}] dataType='{}' extdKeys={}", param_idx,
+                     copy.dataType.val, copy.extdDataKeyNum);
+            // TEMP(diagnostic): reveal the literal extended-data keys a title subscribes to
+            // (e.g. the friendlist:friend trigger key). Guest pointer, valid during this call.
+            if (copy.pExtdDataKey != nullptr) {
+                for (u64 k = 0; k < copy.extdDataKeyNum; k++) {
+                    LOG_INFO(Lib_NpWebApi, "    extdDataKey[{}]='{}'", k, copy.pExtdDataKey[k].val);
+                }
+            }
             filter->filterParams.emplace_back(copy);
             // TODO: Every parameter is registered with an extended data filter through
             // sceNpPushRegisterExtendedDataFilter
