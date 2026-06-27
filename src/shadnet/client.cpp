@@ -505,9 +505,6 @@ void ShadNetClient::DispatchPacket(PacketType type, u16 cmd_raw, u64 pkt_id,
         case CommandType::GetToken:
             HandleGetTokenReply(payload);
             break;
-        case CommandType::GetAuthCode:
-            HandleGetAuthCodeReply(payload);
-            break;
         default:
             if (onAsyncReply) {
                 // Every reply body starts with an ErrorType byte.
@@ -651,47 +648,6 @@ void ShadNetClient::HandleGetTokenReply(const std::vector<u8>& payload) {
     m_sem_authenticated.release();
 }
 
-std::string ShadNetClient::RequestAuthCode() {
-    if (!m_authenticated.load()) {
-        LOG_WARNING(ShadNet, "RequestAuthCode called while unauthenticated");
-        return {};
-    }
-    {
-        std::lock_guard lock(m_mutex_authcode);
-        m_auth_code.clear();
-        m_auth_code_ready = false;
-    }
-    SubmitRequest(CommandType::GetAuthCode, {});
-
-    std::unique_lock lock(m_mutex_authcode);
-    if (!m_cv_authcode.wait_for(lock, std::chrono::seconds(5),
-                                [this] { return m_auth_code_ready; })) {
-        LOG_ERROR(ShadNet, "RequestAuthCode timed out waiting for reply");
-        return {};
-    }
-    return m_auth_code;
-}
-
-void ShadNetClient::HandleGetAuthCodeReply(const std::vector<u8>& payload) {
-    std::string code;
-    if (payload.empty()) {
-        LOG_ERROR(ShadNet, "Empty GetAuthCode reply");
-    } else {
-        const ErrorType err = static_cast<ErrorType>(payload[0]);
-        if (err == ErrorType::NoError) {
-            code = ExtractBlob(payload, 1);
-        } else {
-            LOG_WARNING(ShadNet, "GetAuthCode returned error={}", static_cast<int>(err));
-        }
-    }
-    {
-        std::lock_guard lock(m_mutex_authcode);
-        m_auth_code = std::move(code);
-        m_auth_code_ready = true;
-    }
-    m_cv_authcode.notify_all();
-}
-
 // Notifications
 
 void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& payload) {
@@ -699,7 +655,7 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
     const std::string blob = ExtractBlob(payload, 0);
     if (blob.empty() &&
         static_cast<NotificationType>(cmd_raw) != NotificationType::WebApiPushEvent) {
-        // WebApiPushEvent is multi-field; its first field (service name) may be empty
+        // WebApiPushEvent is multi-field,its first field (service name) may be empty
         // legitimately, so it parses its own payload below rather than relying on blob.
         LOG_WARNING(ShadNet, "Empty notification payload type={}", cmd_raw);
         return;
@@ -780,8 +736,8 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
         n.fromNpid = ExtractBlob(payload, off);
         off += 4 + static_cast<int>(n.fromNpid.size());
         n.toNpid = ExtractBlob(payload, off);
-        LOG_INFO(ShadNet, "WebApiPushEvent svc='{}' type='{}' from='{}' bytes={}",
-                  n.npServiceName, n.dataType, n.fromNpid, n.data.size());
+        LOG_INFO(ShadNet, "WebApiPushEvent svc='{}' type='{}' from='{}' bytes={}", n.npServiceName,
+                 n.dataType, n.fromNpid, n.data.size());
         if (onWebApiPushEvent)
             onWebApiPushEvent(n);
         break;

@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
-#include <cstring>
 #include <chrono>
+#include <cstring>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -167,8 +167,7 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
     };
     client->onAsyncReply = [this, user_id](ShadNet::CommandType cmd, u64 pkt_id,
                                            ShadNet::ErrorType err, const std::vector<u8>& body) {
-            OnScoreReply(user_id, cmd, pkt_id, err, body);
-
+        OnScoreReply(user_id, cmd, pkt_id, err, body);
     };
     client->onLoginResult = [this, user_id](const ShadNet::LoginResult& res) {
         OnLoginResult(user_id, res);
@@ -454,8 +453,8 @@ void NpHandler::OnFriendStatus(s32 user_id, const ShadNet::NotifyFriendStatus& n
 
 void NpHandler::OnWebApiPushEvent(s32 user_id, const ShadNet::NotifyWebApiPushEvent& n) {
     LOG_INFO(NpHandler, "user_id={} WebApiPushEvent svc='{}' type='{}' bytes={}", user_id,
-              n.npServiceName, n.dataType, n.data.size());
-    // Forward verbatim to the libSceNpWebApi push-event dispatch; it queues the event
+             n.npServiceName, n.dataType, n.data.size());
+    // Forward verbatim to the libSceNpWebApi push-event dispatch.it queues the event
     // and delivers it on the game's thread during sceNpCheckCallback to any registered
     // (and filter-matching) push-event callback.
     NpWebApi::PushEventInput ev;
@@ -1889,8 +1888,5 @@ void NpHandler::OnScoreReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
         break;
     }
 }
-
-
-
 
 } // namespace Libraries::Np

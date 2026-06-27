@@ -220,10 +220,6 @@ private:
     void OnScoreReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
                       const std::vector<u8>& body);
 
-    // Async reply dispatch for TUS commands.
-    void OnTusReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
-                    const std::vector<u8>& body);
-
     // 12-byte NP Communication ID
     std::string GetNpCommId(s32 service_label) const;
 
