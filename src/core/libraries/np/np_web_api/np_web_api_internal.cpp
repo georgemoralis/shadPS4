@@ -24,14 +24,9 @@ static std::recursive_mutex g_global_mutex;
 static std::map<s32, OrbisNpWebApiContext*> g_contexts;
 static s32 g_library_context_count = 0;
 
-// Last WebApi error code parsed from an error response body, per calling thread.
-// The real lib sources sceNpWebApiGetErrorCode() from sceNpServerErrorJson* global
-// state; we don't have that subsystem, so we capture it from the error body the game
-// reads via sceNpWebApiReadData (the common usage pattern). See captureWebApiError.
+// Last WebApi error code parsed from an error response body
 static thread_local s32 g_last_webapi_error = ORBIS_OK;
 
-// Defined further down; parses a WebApi error code out of an error response body,
-// records it for sceNpWebApiGetErrorCode(), and returns it (0 if none parsed).
 static s32 captureWebApiError(const char* body, u64 len);
 static s32 g_user_context_count = 0;
 static s32 g_handle_count = 0;
@@ -728,9 +723,7 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
                         user_context->userId, request->userPath);
         }
 
-        // Replay app-supplied headers (sceNpWebApiAddHttpRequestHeader) after the
-        // lib-managed Content-Type/Authorization so callers can set Accept, custom
-        // X-* headers, etc. (mode 0 = add).
+        // Replay app-supplied headers
         for (const auto& [hname, hvalue] : request->userHeaders) {
             Libraries::Http::sceHttpAddRequestHeader(req_id, hname.c_str(), hvalue.c_str(),
                                                      /*mode=*/0);
@@ -754,15 +747,6 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
              requestId, request->userApiGroup, request->userPath,
              magic_enum::enum_name(request->userMethod), request->http_request_id);
 
-    // SendRequest2 / SendMultipartRequest2 (flag != 0): capture the response status
-    // into the option (if any), and on an error response (>=400) read the error body,
-    // copy it into the option's buffer, and surface its code. Mirrors FUN_0100bee0:
-    // errorObjectSize is the buffer capacity (in), copy is bounded to capacity-1 and
-    // NUL-terminated, responseDataSize gets the total error-body length. On an HTTP
-    // error, v2 also RETURNS a synthesised error: 0x82000000|code for a parsed NP code
-    // (shadNet emits PSN-style codes < 0xc00000, e.g. 2105358), else 0x82f00000|status
-    // (status 100-599) / 0x82ffffff. v1 (flag 0) is unchanged: it returns OK and
-    // leaves the body for sceNpWebApiReadData, which captures the code itself.
     s32 sendResult = ORBIS_OK;
     if (flag != 0) {
         s32 status = 0;
@@ -1732,8 +1716,7 @@ s32 getHttpResponseHeaderValueInternal(s64 requestId, const char* pFieldName, ch
         result = err;
     } else {
         std::string value;
-        const bool found =
-            block != nullptr && findHeaderValue(block, blockSize, pFieldName, value);
+        const bool found = block != nullptr && findHeaderValue(block, blockSize, pFieldName, value);
         if (pValueLength != nullptr)
             *pValueLength = found ? value.size() : 0;
         if (pValue != nullptr && valueSize > 0) {
@@ -2069,7 +2052,8 @@ void DrainPushEvents() {
                     exarr.reserve(ev.extdData.size());
                     for (auto& [k, v] : ev.extdData) {
                         OrbisNpWebApiExtdPushEventExtdData e{};
-                        std::snprintf(e.extdDataKey.val, sizeof(e.extdDataKey.val), "%s", k.c_str());
+                        std::snprintf(e.extdDataKey.val, sizeof(e.extdDataKey.val), "%s",
+                                      k.c_str());
                         e.pData = const_cast<char*>(v.data());
                         e.dataLen = v.size();
                         exarr.push_back(e);
@@ -2088,8 +2072,7 @@ void DrainPushEvents() {
                              title_user_ctx_id, cbId, ev.dataType);
                     reinterpret_cast<ExtdCbA>(raw)(
                         title_user_ctx_id, cbId, svc, flt->npServiceLabel, nullptr, to_p, nullptr,
-                        from_p, &dt, ext_data, ev.data.size(), ext_arr, exarr.size(),
-                        cb->pUserArg);
+                        from_p, &dt, ext_data, ev.data.size(), ext_arr, exarr.size(), cb->pUserArg);
                 }
 
                 // Service push -- FUN_0100db70 / FUN_0100d6b0 (same matcher).

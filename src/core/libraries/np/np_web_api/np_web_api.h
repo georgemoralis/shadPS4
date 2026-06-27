@@ -130,17 +130,14 @@ using OrbisNpWebApiNotificationCallback = PS4_SYSV_ABI void (*)(); // dummy
 // --- Push-event delivery (emulator-internal) ---------------------------------
 // A producer (NpHandler / shadNet notification ingress) calls EnqueuePushEvent from
 // any thread. The event is queued and dispatched to registered push-event callbacks
-// on the game's thread during sceNpCheckCallback (see DrainPushEvents, wired into the
-// NpManager callback pump). This mirrors the real lib, where push events arrive via
-// the NP push/notification subsystem and are pumped on the callback-check thread.
+// on the game's thread during sceNpCheckCallback.This mirrors the real lib, where push events
+// arrive via the NP push/notification subsystem and are pumped on the callback-check thread.
 struct PushEventInput {
-    // Local user the notification was delivered for; used to route to that user's
-    // contexts (native matches the notification's target account id per user context).
     Libraries::UserService::OrbisUserServiceUserId targetUserId = 0;
-    std::string npServiceName;            // e.g. "np:service:..."; empty for basic push
+    std::string npServiceName; // e.g. "np:service:..."; empty for basic push
     OrbisNpServiceLabel npServiceLabel = 0;
-    std::string dataType;                 // OrbisNpWebApiPushEventDataType value
-    std::string data;                     // payload bytes
+    std::string dataType; // OrbisNpWebApiPushEventDataType value
+    std::string data;     // payload bytes
     OrbisNpOnlineId fromOnlineId{};
     bool hasFrom = false;
     OrbisNpOnlineId toOnlineId{};
