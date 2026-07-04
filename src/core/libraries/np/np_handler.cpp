@@ -8,6 +8,7 @@
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/network/net_upnp.h"
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_matching2/np_matching2_mm.h"
@@ -174,6 +175,12 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
         OnLoginResult(user_id, res);
     };
 
+    // Seed the current Appear-Offline preference so the login packet carries it (the send
+    // is suppressed pre-auth; it just caches on the client).
+    client->SetAppearOffline(m_appear_offline.load());
+    if (EmulatorSettings.IsUPnPEnabled()) {
+        Net::UPnPClient::Instance().Start();
+    }
     client->Start(host, port, npid, password, token);
 
     const ShadNet::ShadNetState conn_state = client->WaitForConnection();
@@ -208,6 +215,15 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
 
     FireStateCallback(user_id, NpManager::OrbisNpState::SignedIn);
     return true;
+}
+
+void NpHandler::SetAppearOffline(bool enable) {
+    m_appear_offline = enable;
+    std::lock_guard lock(m_mutex_clients);
+    for (auto& [uid, client] : m_clients) {
+        if (client)
+            client->SetAppearOffline(enable); // sends the toggle to connected sessions
+    }
 }
 
 void NpHandler::DisconnectUser(s32 user_id) {
@@ -474,6 +490,7 @@ void NpHandler::OnWebApiPushEvent(s32 user_id, const ShadNet::NotifyWebApiPushEv
         ev.hasTo = true;
         std::strncpy(ev.toOnlineId.data, n.toNpid.c_str(), sizeof(ev.toOnlineId.data) - 1);
     }
+    ev.extdData = n.extdData; // extended-data (key,value) pairs -> dispatched as pExtdData
     NpWebApi::EnqueuePushEvent(ev);
 }
 

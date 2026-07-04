@@ -11,6 +11,7 @@
 #include <semaphore>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include "common/types.h"
 #ifdef _WIN32
@@ -88,6 +89,7 @@ enum class CommandType : u16 {
     GetScoreAccountId = 37,
     GetScoreGameDataByAccId = 38,
     GetToken = 39,
+    SetAppearOffline = 40,
 };
 
 enum class NotificationType : u16 {
@@ -190,10 +192,15 @@ struct NotifyWebApiPushEvent {
     std::string data;     // raw event body (typically PSN-format JSON)
     std::string fromNpid; // may be empty
     std::string toNpid;   // may be empty
+    // Optional extended-data (key,value) pairs (e.g. friendlist trigger/additionalTrigger,
+    // presence gameStatus/gameData). Empty when the server sends none / is older.
+    std::vector<std::pair<std::string, std::string>> extdData;
 };
 
 struct MatchingBinAttr {
     u32 attr_id = 0;
+    u64 update_date = 0;
+    u32 update_member_id = 0;
     std::vector<u8> data;
 };
 
@@ -204,8 +211,12 @@ struct NotifyRoomEvent {
     u32 event_cause = 0;
     s32 error_code = 0;
     u32 flags = 0;
+    bool has_passwd_mask = false;
+    u64 passwd_slot_mask = 0;
 
     std::string member_npid;
+    u64 member_account_id = 0;
+    u32 member_platform = 0;
     u32 member_id = 0;
     u32 member_team_id = 0;
     bool member_is_owner = false;
@@ -275,6 +286,8 @@ public:
     u64 RemoveFriend(const std::string& npid);
     u64 AddBlock(const std::string& npid);
     u64 RemoveBlock(const std::string& npid);
+    // Set the Appear-Offline preference mid-session (server handles us as offline while set).
+    u64 SetAppearOffline(bool enable);
 
 private:
     void ConnectThread();
@@ -306,6 +319,7 @@ private:
     std::string m_npid;
     std::string m_password;
     std::string m_token;
+    bool m_appear_offline = false; // user's Appear-Offline preference (sent at login)
 
     std::atomic<bool> m_terminate{false};
     std::atomic<bool> m_connected{false};
