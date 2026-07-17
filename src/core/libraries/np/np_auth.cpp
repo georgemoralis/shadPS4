@@ -8,6 +8,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_handler.h"
 #include "core/libraries/system/userservice.h"
 
 namespace Libraries::Np::NpAuth {
@@ -118,11 +119,20 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
 
-    LOG_ERROR(Lib_NpAuth, "(STUBBED) called, req_id = {:#x}, async = {}", req_id, request.async);
-
-    // Not sure what values are expected here, so zeroing these for now.
+    // we need a unique id so let's use token we use for webapi it is unique per user
+    const std::string token = NpHandler::GetInstance().GetBearerToken(param->user_id);
     std::memset(auth_code, 0, sizeof(OrbisNpAuthorizationCode));
-    std::strncpy(auth_code->code, "AUTHCODE", 9);
+    if (!token.empty() && token.size() < sizeof(auth_code->code)) {
+        LOG_INFO(Lib_NpAuth, "called, req_id = {:#x}, async = {}, code = shadNet token", req_id,
+                 request.async);
+        std::memcpy(auth_code->code, token.data(), token.size());
+    } else {
+        LOG_WARNING(Lib_NpAuth,
+                    "called, req_id = {:#x}, async = {}, no shadNet token for user_id = {}; "
+                    "falling back to placeholder code",
+                    req_id, request.async, param->user_id);
+        std::strncpy(auth_code->code, "AUTHCODE", 9);
+    }
     if (issuer_id != nullptr) {
         *issuer_id = 100;
     }
