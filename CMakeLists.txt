@@ -850,6 +850,10 @@ if (ENABLE_DISCORD_RPC)
     list(APPEND COMMON src/common/discord_rpc_handler.cpp src/common/discord_rpc_handler.h)
 endif()
 
+set(NET_CORE  src/core/net/p2p_crypto.cpp
+              src/core/net/p2p_crypto.h
+)
+
 set(CORE src/core/aerolib/stubs.cpp
          src/core/aerolib/stubs.h
          src/core/aerolib/aerolib.cpp
@@ -961,6 +965,7 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/user_manager.h
          src/core/user_settings.cpp
          src/core/user_settings.h
+         ${NET_CORE}
 )
 
 if (ARCHITECTURE STREQUAL "x86_64")
