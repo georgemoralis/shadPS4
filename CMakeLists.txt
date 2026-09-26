@@ -851,8 +851,14 @@ if (ENABLE_DISCORD_RPC)
     list(APPEND COMMON src/common/discord_rpc_handler.cpp src/common/discord_rpc_handler.h)
 endif()
 
-set(NET_CORE  src/core/net/p2p_crypto.cpp
+set(NET_CORE  src/core/net/host_net.h
+              src/core/net/p2p_codec.cpp
+              src/core/net/p2p_codec.h
+              src/core/net/p2p_crypto.cpp
               src/core/net/p2p_crypto.h
+              src/core/net/p2p_tcp.h
+              src/core/net/p2p_transport.cpp
+              src/core/net/p2p_transport.h
 )
 
 set(CORE src/core/aerolib/stubs.cpp
